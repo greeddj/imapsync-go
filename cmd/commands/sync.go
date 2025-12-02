@@ -3,7 +3,6 @@ package commands
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -273,53 +272,82 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		srcFolder := mapping.Source
 		dstFolder := mapping.Destination
 		var dstFolderExists bool
-		var srcMessages []*imap.Message
+		var srcMessageIDs map[string]bool
 		var dstMessageIDs map[string]bool
-		var err error
+		var srcErr, dstErr error
 
-		spin.Update(fmt.Sprintf("Fetching source: %s", srcFolder))
-		srcMessages, err = srcClient.FetchMessages(srcFolder)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch source folder %s: %w", srcFolder, err)
-		}
+		// Fetch IDs from both servers in parallel (fast - envelopes only)
+		var wg sync.WaitGroup
 
-		dstMessageIDs = make(map[string]bool)
+		// Fetch source message IDs
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			spin.Update(fmt.Sprintf("Fetching source IDs: %s", srcFolder))
+			srcMessageIDs, srcErr = srcClient.FetchMessageIDs(srcFolder)
+		}()
 
-		if useCache && cacheManager != nil {
-			spin.Update(fmt.Sprintf("Checking cache for: %s", dstFolder))
-			cachedDst := cacheManager.DestCache.GetMailbox(dstFolder)
-			if cachedDst != nil && len(cachedDst.Messages) > 0 {
-				for msgID := range cachedDst.Messages {
-					dstMessageIDs[msgID] = true
+		// Fetch destination IDs (or use cache)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dstMessageIDs = make(map[string]bool)
+
+			// Check cache first
+			if useCache && cacheManager != nil {
+				spin.Update(fmt.Sprintf("Checking cache for: %s", dstFolder))
+				cachedDst := cacheManager.DestCache.GetMailbox(dstFolder)
+				if cachedDst != nil && len(cachedDst.Messages) > 0 {
+					for msgID := range cachedDst.Messages {
+						dstMessageIDs[msgID] = true
+					}
+					spin.Update(fmt.Sprintf("Using cached destination for %s (%d messages)", dstFolder, len(cachedDst.Messages)))
+					dstFolderExists = true
+					return
 				}
-				spin.Update(fmt.Sprintf("Using cached destination for %s (%d messages)", dstFolder, len(cachedDst.Messages)))
 			}
-		}
 
-		if len(dstMessageIDs) == 0 {
-			spin.Update(fmt.Sprintf("Fetching destination: %s", dstFolder))
+			// No cache, fetch from server
+			spin.Update(fmt.Sprintf("Fetching destination IDs: %s", dstFolder))
 			fetchedIDs, err := dstClient.FetchMessageIDs(dstFolder)
 			if err != nil {
-				// Folder might not exist, treat as empty
 				spin.Update(fmt.Sprintf("Destination folder %s not found or empty, will create", dstFolder))
+				dstErr = nil // Not a fatal error
 			} else {
 				dstFolderExists = true
 				dstMessageIDs = fetchedIDs
 			}
+		}()
+
+		wg.Wait()
+		spin.Flush() // Print parallel fetch status and start new line
+
+		if srcErr != nil {
+			return nil, fmt.Errorf("failed to fetch source folder %s: %w", srcFolder, srcErr)
+		}
+		_ = dstErr // Destination errors are non-fatal (folder may not exist yet)
+
+		// Find IDs that need syncing (exist in source but not in destination)
+		newIDs := make(map[string]bool)
+		for id := range srcMessageIDs {
+			if !dstMessageIDs[id] {
+				newIDs[id] = true
+			}
 		}
 
-		var messagesToSync []*imap.Message
-		for _, msg := range srcMessages {
-			if msg.Envelope == nil || msg.Envelope.MessageId == "" {
-				continue
-			}
-			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
-			if !dstMessageIDs[msgID] {
-				messagesToSync = append(messagesToSync, msg)
-			} else {
-				spin.Update(fmt.Sprintf("Message %s already exists in destination, skipping", msg.Envelope.Subject))
-			}
+		if len(newIDs) == 0 {
+			spin.Update(fmt.Sprintf("Folder %s: all %d messages already synced", srcFolder, len(srcMessageIDs)))
+			continue
 		}
+
+		spin.Update(fmt.Sprintf("Folder %s: %d new messages to sync (of %d total)", srcFolder, len(newIDs), len(srcMessageIDs)))
+
+		// Fetch full bodies only for messages that need syncing
+		messagesToSync, err := srcClient.FetchMessagesByIDs(srcFolder, newIDs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch messages from %s: %w", srcFolder, err)
+		}
+		spin.Flush() // Print body fetch status and start new line
 
 		if len(messagesToSync) > 0 {
 			plan := FolderSyncPlan{
