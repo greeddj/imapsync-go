@@ -298,17 +298,13 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 
 		if len(dstMessageIDs) == 0 {
 			spin.Update(fmt.Sprintf("Fetching destination: %s", dstFolder))
-			dstMessages, err := dstClient.FetchMessages(dstFolder)
+			fetchedIDs, err := dstClient.FetchMessageIDs(dstFolder)
 			if err != nil {
 				// Folder might not exist, treat as empty
 				spin.Update(fmt.Sprintf("Destination folder %s not found or empty, will create", dstFolder))
 			} else {
 				dstFolderExists = true
-				for _, msg := range dstMessages {
-					if msg.Envelope != nil && msg.Envelope.MessageId != "" {
-						dstMessageIDs[strings.Trim(msg.Envelope.MessageId, "<>")] = true
-					}
-				}
+				dstMessageIDs = fetchedIDs
 			}
 		}
 
