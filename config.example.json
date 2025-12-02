@@ -1,0 +1,28 @@
+{
+  "src": {
+    "label": "old",
+    "server": "mail.oldhost.com:993",
+    "user": "user@oldhost.com",
+    "pass": "password"
+  },
+  "dst": {
+    "label": "new",
+    "server": "imap.newhost.com:993",
+    "user": "user@newhost.com",
+    "pass": "password"
+  },
+  "map": [
+    {
+      "src": "INBOX",
+      "dst": "INBOX"
+    },
+    {
+      "src": "Sent",
+      "dst": "Sent"
+    },
+    {
+      "src": "Archive.2023",
+      "dst": "Archive/2023"
+    }
+  ]
+}
