@@ -274,7 +274,7 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		var dstFolderExists bool
 		var srcMessageIDs map[string]bool
 		var dstMessageIDs map[string]bool
-		var srcErr, dstErr error
+		var srcErr error
 
 		// Fetch IDs from both servers in parallel (fast - envelopes only)
 		var wg sync.WaitGroup
@@ -311,8 +311,8 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 			spin.Update(fmt.Sprintf("Fetching destination IDs: %s", dstFolder))
 			fetchedIDs, err := dstClient.FetchMessageIDs(dstFolder)
 			if err != nil {
+				// Folder might not exist yet, not a fatal error
 				spin.Update(fmt.Sprintf("Destination folder %s not found or empty, will create", dstFolder))
-				dstErr = nil // Not a fatal error
 			} else {
 				dstFolderExists = true
 				dstMessageIDs = fetchedIDs
@@ -325,7 +325,6 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		if srcErr != nil {
 			return nil, fmt.Errorf("failed to fetch source folder %s: %w", srcFolder, srcErr)
 		}
-		_ = dstErr // Destination errors are non-fatal (folder may not exist yet)
 
 		// Find IDs that need syncing (exist in source but not in destination)
 		newIDs := make(map[string]bool)
