@@ -12,6 +12,7 @@
 
 - IMAP→IMAP copy with per-folder mapping and dry visibility via `show`.
 - JSON or YAML configuration with optional environment overrides for every flag.
+- Parallel fetching: Source and destination metadata are fetched concurrently.
 - Parallel uploads with automatic reconnect/backoff logic and mailbox auto-creation.
 - AES-encrypted cache under `~/.imapsync/cache` for mailbox metadata and message IDs.
 - Rich CLI experience (spinner, quiet/verbose modes) plus confirmation prompts to avoid accidents.

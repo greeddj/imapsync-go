@@ -395,6 +395,76 @@ func (c *Client) FetchMessages(folder string) ([]*imap.Message, error) {
 	return all, nil
 }
 
+// FetchMessagesByIDs retrieves full messages that match the given Message-IDs.
+func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool) ([]*imap.Message, error) {
+	if len(targetIDs) == 0 {
+		return []*imap.Message{}, nil
+	}
+
+	c.UpdateProgress(fmt.Sprintf("[%s] Fetching %d specific messages from %s...", c.prefix, len(targetIDs), folder))
+
+	mbox, err := c.Select(folder, true)
+	if err != nil {
+		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
+	}
+
+	if mbox.Messages == 0 {
+		return []*imap.Message{}, nil
+	}
+
+	// First pass: find UIDs of messages we need
+	seqset := new(imap.SeqSet)
+	seqset.AddRange(1, mbox.Messages)
+
+	envMessages := make(chan *imap.Message, messageChanBuffer)
+	done := make(chan error, 1)
+	go func() { done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, envMessages) }()
+
+	var targetUIDs []uint32
+	for msg := range envMessages {
+		if msg.Envelope != nil && msg.Envelope.MessageId != "" {
+			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
+			if targetIDs[msgID] {
+				targetUIDs = append(targetUIDs, msg.Uid)
+			}
+		}
+	}
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("[%s] envelope fetch error: %v", c.prefix, err)
+	}
+
+	if len(targetUIDs) == 0 {
+		return []*imap.Message{}, nil
+	}
+
+	c.UpdateProgress(fmt.Sprintf("[%s] Found %d messages to fetch from %s", c.prefix, len(targetUIDs), folder))
+
+	// Second pass: fetch full bodies for target UIDs only
+	uidSet := new(imap.SeqSet)
+	for _, uid := range targetUIDs {
+		uidSet.AddNum(uid)
+	}
+
+	messages := make(chan *imap.Message, messageChanBuffer)
+	done = make(chan error, 1)
+	go func() { done <- c.UidFetch(uidSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages) }()
+
+	var result []*imap.Message
+	count := 0
+	for msg := range messages {
+		result = append(result, msg)
+		count++
+		if count%progressUpdateInterval == 0 {
+			c.UpdateProgress(fmt.Sprintf("[%s] Fetched %d/%d messages from %s...", c.prefix, count, len(targetUIDs), folder))
+		}
+	}
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)
+	}
+
+	return result, nil
+}
+
 // AppendMessage uploads a single message to the destination folder.
 func (c *Client) AppendMessage(folder string, msg *imap.Message) error {
 	body := msg.GetBody(&imap.BodySectionName{})
