@@ -107,7 +107,7 @@ homebrew_casks:
     repository:
       owner: greeddj
       name: homebrew-tap
-      token: "{{ .Env.GITHUB_TOKEN }}"
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: https://github.com/greeddj/imapsync-go
     description: "IMAP to IMAP synchronization tool"
     license: MIT
