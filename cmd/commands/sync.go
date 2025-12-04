@@ -109,7 +109,7 @@ func Sync(cCtx *cli.Context) error {
 	dstClient.SetProgressWriter(pw)
 	dstClient.SetProgressTracker(dstTracker)
 
-	summary, err := buildSyncPlan(srcClient, dstClient, mappings, srcTracker, dstTracker)
+	summary, err := buildSyncPlan(srcClient, dstClient, mappings, srcTracker, dstTracker, pw, verbose)
 	if err != nil {
 		pw.Stop()
 		return err
@@ -271,7 +271,7 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 }
 
 // buildSyncPlan compares source and destination folders to determine what needs syncing.
-func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *gopretty.Tracker) (*SyncSummary, error) {
+func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *gopretty.Tracker, pw *progress.Writer, verbose bool) (*SyncSummary, error) {
 	summary := &SyncSummary{
 		Plans: make([]FolderSyncPlan, 0),
 	}
@@ -315,7 +315,12 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		wg.Wait()
 
 		if srcErr != nil {
-			return nil, fmt.Errorf("failed to fetch source folder %s: %w", srcFolder, srcErr)
+			if verbose {
+				pw.Log("Failed to fetch source folder %s, skipping by error: %v", srcFolder, srcErr)
+			} else {
+				pw.Log("Failed to fetch source folder %s, skipping", srcFolder)
+			}
+			continue
 		}
 
 		// Find IDs that need syncing (exist in source but not in destination)
