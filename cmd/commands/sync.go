@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/utils"
+	"github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/urfave/cli/v2"
 )
 
@@ -66,31 +68,84 @@ func Sync(cCtx *cli.Context) error {
 		mappings = cfg.Map
 	}
 
-	fmt.Println("Fetching source...")
+	// Setup progress writer for scanning phase
+	pw := progress.NewWriter()
+	pw.SetAutoStop(false)
+	pw.SetTrackerLength(25)
+	pw.SetMessageLength(50)
+	pw.SetNumTrackersExpected(2)
+	pw.SetStyle(progress.StyleDefault)
+	pw.SetTrackerPosition(progress.PositionRight)
+	pw.Style().Visibility.ETAOverall = false
+	pw.Style().Visibility.TrackerOverall = false
+	pw.Style().Options.Separator = " "
+	pw.Style().Options.DoneString = "done!"
+
+	go pw.Render()
+
+	// Create trackers for source and destination scanning
+	srcTracker := &progress.Tracker{
+		Message: fmt.Sprintf("[%s] Scanning folders", cfg.Src.Label),
+		Total:   100,
+		Units:   progress.UnitsDefault,
+	}
+	dstTracker := &progress.Tracker{
+		Message: fmt.Sprintf("[%s] Scanning folders", cfg.Dst.Label),
+		Total:   100,
+		Units:   progress.UnitsDefault,
+	}
+
+	pw.AppendTracker(srcTracker)
+	pw.AppendTracker(dstTracker)
+
+	srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
+
 	srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
 	if err != nil {
+		srcTracker.MarkAsErrored()
+		pw.Stop()
 		return fmt.Errorf("source connection failed: %w", err)
 	}
 	defer func() {
 		_ = srcClient.Logout()
 	}()
 	srcClient.SetPrefix(cfg.Src.Label)
+	srcClient.SetProgressWriter(pw)
+	srcClient.SetProgressTracker(srcTracker)
 
-	fmt.Println("Fetching destination...")
+	dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
+
 	dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
 	if err != nil {
+		dstTracker.MarkAsErrored()
+		pw.Stop()
 		return fmt.Errorf("destination connection failed: %w", err)
 	}
 	defer func() {
 		_ = dstClient.Logout()
 	}()
 	dstClient.SetPrefix(cfg.Dst.Label)
+	dstClient.SetProgressWriter(pw)
+	dstClient.SetProgressTracker(dstTracker)
 
-	fmt.Println("Building sync plan...")
-	summary, err := buildSyncPlan(srcClient, dstClient, mappings)
+	summary, err := buildSyncPlan(srcClient, dstClient, mappings, srcTracker, dstTracker)
 	if err != nil {
+		pw.Stop()
 		return err
 	}
+
+	// Mark scanning as complete
+	srcTracker.MarkAsDone()
+	dstTracker.MarkAsDone()
+
+	// Wait for trackers to render final state
+	time.Sleep(300 * time.Millisecond)
+
+	pw.Stop()
+
+	// Clear progress output
+	fmt.Print("\r\033[K\r\033[K")
+	fmt.Println()
 
 	if summary.TotalNew > 0 && !quiet {
 		fmt.Printf("Messages to be copied to destination:\n")
@@ -131,33 +186,81 @@ func Sync(cCtx *cli.Context) error {
 		return nil
 	}
 
+	// Setup progress writer for sync phase
+	syncPW := progress.NewWriter()
+	syncPW.SetAutoStop(false)
+	syncPW.SetTrackerLength(25)
+	syncPW.SetMessageLength(50)
+	syncPW.SetNumTrackersExpected(len(summary.Plans))
+	syncPW.SetStyle(progress.StyleDefault)
+	syncPW.SetTrackerPosition(progress.PositionRight)
+	syncPW.Style().Visibility.ETA = true
+	syncPW.Style().Visibility.ETAOverall = false
+	syncPW.Style().Visibility.TrackerOverall = false
+	syncPW.Style().Options.Separator = " "
+	syncPW.Style().Options.DoneString = "done!"
+
+	go syncPW.Render()
+
+	// Create all trackers upfront
+	folderTrackers := make([]*progress.Tracker, 0, len(summary.Plans))
+	for i, plan := range summary.Plans {
+		if plan.NewMessages == 0 {
+			continue
+		}
+		folderTracker := &progress.Tracker{
+			Message: fmt.Sprintf("[%d/%d] %s → %s", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder),
+			Total:   int64(plan.NewMessages),
+			Units:   progress.UnitsDefault,
+		}
+		syncPW.AppendTracker(folderTracker)
+		folderTrackers = append(folderTrackers, folderTracker)
+	}
+
 	totalSynced := 0
 	totalErrors := 0
 
+	trackerIdx := 0
 	for i, plan := range summary.Plans {
 		if plan.NewMessages == 0 {
 			continue
 		}
 
-		fmt.Printf("Syncing folder %d/%d: %s → %s (%d messages)\n", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
-
-		fmt.Printf("Checking folder: %s\n", plan.DestinationFolder)
+		folderTracker := folderTrackers[trackerIdx]
+		trackerIdx++
 		if !plan.DestinationFolderExists {
-			created, err := dstClient.CreateMailbox(plan.DestinationFolder)
+			folderTracker.UpdateMessage(fmt.Sprintf("[%d/%d] Creating %s", i+1, len(summary.Plans), plan.DestinationFolder))
+			_, err := dstClient.CreateMailbox(plan.DestinationFolder)
 			if err != nil {
-				fmt.Printf("Failed to create folder %s: %v\n", plan.DestinationFolder, err)
+				folderTracker.MarkAsErrored()
 				totalErrors++
 				continue
 			}
-			if created {
-				fmt.Printf("Created destination folder: %s\n", plan.DestinationFolder)
-			}
 		}
 
-		synced, errors := syncFolders(cfg, plan.DestinationFolder, plan.MessagesToSync, cfg.Workers, verbose)
+		folderTracker.UpdateMessage(fmt.Sprintf("[%d/%d] %s → %s", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder))
+		synced, errors := syncFolders(cfg, plan.DestinationFolder, plan.MessagesToSync, cfg.Workers, verbose, folderTracker)
 		totalSynced += synced
 		totalErrors += errors
+
+		if errors > 0 {
+			folderTracker.MarkAsErrored()
+		} else {
+			folderTracker.MarkAsDone()
+		}
 	}
+
+	// Wait for final rendering
+	time.Sleep(300 * time.Millisecond)
+
+	syncPW.Stop()
+
+	// Clear progress output
+	fmt.Print("\r")
+	for range folderTrackers {
+		fmt.Print("\033[K\r")
+	}
+	fmt.Println()
 
 	if totalErrors > 0 {
 		fmt.Printf("Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSynced, totalErrors)
@@ -169,7 +272,7 @@ func Sync(cCtx *cli.Context) error {
 }
 
 // syncFolders syncs messages using multiple parallel workers.
-func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message, numWorkers int, verbose bool) (int, int) {
+func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message, numWorkers int, verbose bool, tracker *progress.Tracker) (int, int) {
 	jobs := make(chan *imap.Message, jobChannelBuffer)
 	var wg sync.WaitGroup
 	var syncedCount int64
@@ -193,11 +296,13 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 
 			for msg := range jobs {
 				if err := workerClient.AppendMessage(dstFolder, msg); err != nil {
-					fmt.Printf("Worker %d: error syncing dir %s on message: %v\n", workerID, dstFolder, err)
 					atomic.AddInt64(&errorCount, 1)
 				} else {
-					atomic.AddInt64(&syncedCount, 1)
-					fmt.Printf("Syncing dir %s [messages %d/%d]\n", dstFolder, atomic.LoadInt64(&syncedCount), len(messages))
+					synced := atomic.AddInt64(&syncedCount, 1)
+					tracker.Increment(1)
+					if verbose {
+						fmt.Printf("Synced %d/%d messages to %s\n", synced, len(messages), dstFolder)
+					}
 				}
 			}
 		}(i)
@@ -214,12 +319,16 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 }
 
 // buildSyncPlan compares source and destination folders to determine what needs syncing.
-func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping) (*SyncSummary, error) {
+func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker) (*SyncSummary, error) {
 	summary := &SyncSummary{
 		Plans: make([]FolderSyncPlan, 0),
 	}
 
-	for _, mapping := range mappings {
+	// Set tracker totals based on number of folders to scan
+	srcTracker.UpdateTotal(int64(len(mappings)))
+	dstTracker.UpdateTotal(int64(len(mappings)))
+
+	for idx, mapping := range mappings {
 		srcFolder := mapping.Source
 		dstFolder := mapping.Destination
 		var dstFolderExists bool
@@ -230,20 +339,21 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		// Fetch IDs from both servers in parallel (fast - envelopes only)
 		var wg sync.WaitGroup
 
+		// Update trackers
+		srcTracker.UpdateMessage(fmt.Sprintf("Scanning %s (%d/%d)", srcFolder, idx+1, len(mappings)))
+		dstTracker.UpdateMessage(fmt.Sprintf("Scanning %s (%d/%d)", dstFolder, idx+1, len(mappings)))
+
 		// Fetch source message IDs
 		wg.Go(func() {
-			fmt.Printf("Fetching source IDs: %s\n", srcFolder)
 			srcMessageIDs, srcErr = srcClient.FetchMessageIDs(srcFolder)
 		})
 
 		wg.Go(func() {
 			dstMessageIDs = make(map[string]bool)
 
-			fmt.Printf("Fetching destination IDs: %s\n", dstFolder)
 			fetchedIDs, err := dstClient.FetchMessageIDs(dstFolder)
 			if err != nil {
 				// Folder might not exist yet, not a fatal error
-				fmt.Printf("Destination folder %s not found or empty, will create\n", dstFolder)
 			} else {
 				dstFolderExists = true
 				dstMessageIDs = fetchedIDs
@@ -265,17 +375,18 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		}
 
 		if len(newIDs) == 0 {
-			fmt.Printf("Folder %s: all %d messages already synced\n", srcFolder, len(srcMessageIDs))
+			srcTracker.Increment(1)
+			dstTracker.Increment(1)
 			continue
 		}
 
-		fmt.Printf("Folder %s: %d new messages to sync (of %d total)\n", srcFolder, len(newIDs), len(srcMessageIDs))
 		// Fetch full bodies only for messages that need syncing
 		messagesToSync, err := srcClient.FetchMessagesByIDs(srcFolder, newIDs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch messages from %s: %w", srcFolder, err)
 		}
-		// Body fetch completed
+		srcTracker.Increment(1)
+		dstTracker.Increment(1)
 
 		if len(messagesToSync) > 0 {
 			plan := FolderSyncPlan{

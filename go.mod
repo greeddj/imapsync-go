@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/emersion/go-imap v1.2.1
-	github.com/jedib0t/go-pretty/v6 v6.7.0
+	github.com/jedib0t/go-pretty/v6 v6.7.5
 	github.com/urfave/cli/v2 v2.27.7
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -22,6 +22,7 @@ require (
 	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.37.0 // indirect
 	golang.org/x/telemetry v0.0.0-20250908211612-aef8a434d053 // indirect
+	golang.org/x/term v0.29.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	golang.org/x/tools v0.37.0 // indirect
 	golang.org/x/tools/go/expect v0.1.1-deprecated // indirect

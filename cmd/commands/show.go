@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/utils"
+	"github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v2"
@@ -17,7 +19,23 @@ import (
 // Show displays information about mailboxes in source and destination IMAP accounts.
 func Show(cCtx *cli.Context) error {
 	verbose := cCtx.Bool("verbose")
-	fmt.Println("Loading configuration...")
+	// Setup progress writer
+	pw := progress.NewWriter()
+	pw.SetAutoStop(false)
+	pw.SetTrackerLength(25)
+	pw.SetMessageLength(50)
+	pw.SetNumTrackersExpected(2)
+	pw.SetStyle(progress.StyleDefault)
+	pw.SetTrackerPosition(progress.PositionRight)
+	pw.Style().Visibility.ETAOverall = false
+	pw.Style().Visibility.TrackerOverall = false
+	pw.Style().Options.Separator = " "
+	pw.Style().Options.DoneString = "done!"
+
+	// Start rendering
+	go pw.Render()
+
+	pw.Log("Loading configuration...")
 	cfg, err := config.New(cCtx)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -33,59 +51,80 @@ func Show(cCtx *cli.Context) error {
 	srcResult := make(chan accountResult, 1)
 	dstResult := make(chan accountResult, 1)
 
+	// Create trackers for both servers
+	srcTracker := &progress.Tracker{
+		Message: fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label),
+		Total:   100,
+		Units:   progress.UnitsDefault,
+	}
+	dstTracker := &progress.Tracker{
+		Message: fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label),
+		Total:   100,
+		Units:   progress.UnitsDefault,
+	}
+
+	pw.AppendTracker(srcTracker)
+	pw.AppendTracker(dstTracker)
+
 	var wg sync.WaitGroup
-	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		result := accountResult{}
-
-		fmt.Printf("[%s] Connecting to source...\n", cfg.Src.Label)
-
+		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
 		srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
 		if err != nil {
 			result.err = fmt.Errorf("[%s] source connection failed: %v", cfg.Src.Label, err)
+			srcTracker.MarkAsErrored()
 			srcResult <- result
 			return
 		}
 		result.client = srcClient
 		srcClient.SetPrefix(cfg.Src.Label)
+		srcClient.SetProgressWriter(pw)
+		srcClient.SetProgressTracker(srcTracker)
 
+		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", cfg.Src.Label))
 		mailboxes, err := srcClient.ListMailboxes()
 		if err != nil {
 			result.err = fmt.Errorf("[%s] failed to list source mailboxes: %v", cfg.Src.Label, err)
+			srcTracker.MarkAsErrored()
 			srcResult <- result
 			return
 		}
 
 		result.mailboxes = mailboxes
+		srcTracker.MarkAsDone()
 		srcResult <- result
-	}()
+	})
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		result := accountResult{}
-
-		fmt.Printf("[%s] Connecting to destination...\n", cfg.Dst.Label)
+		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
 		dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
 		if err != nil {
 			result.err = fmt.Errorf("[%s] destination connection failed: %v", cfg.Dst.Label, err)
+			dstTracker.MarkAsErrored()
 			dstResult <- result
 			return
 		}
 		result.client = dstClient
 		dstClient.SetPrefix(cfg.Dst.Label)
+		dstClient.SetProgressWriter(pw)
+		dstClient.SetProgressTracker(dstTracker)
 
+		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", cfg.Dst.Label))
 		mailboxes, err := dstClient.ListMailboxes()
 		if err != nil {
 			result.err = fmt.Errorf("[%s] failed to list destination mailboxes: %v", cfg.Dst.Label, err)
+			dstTracker.MarkAsErrored()
 			dstResult <- result
 			return
 		}
 
 		result.mailboxes = mailboxes
+		dstTracker.MarkAsDone()
 		dstResult <- result
-	}()
+	})
 
 	wg.Wait()
 	close(srcResult)
@@ -93,6 +132,16 @@ func Show(cCtx *cli.Context) error {
 
 	srcRes := <-srcResult
 	dstRes := <-dstResult
+
+	// Wait for both trackers to complete and render
+	time.Sleep(300 * time.Millisecond)
+
+	// Stop progress writer
+	pw.Stop()
+
+	// Clear any remaining progress output
+	fmt.Print("\r\033[K\r\033[K")
+	fmt.Println()
 
 	// Cleanup function to logout from both clients.
 	cleanup := func() {
@@ -112,8 +161,6 @@ func Show(cCtx *cli.Context) error {
 	if dstRes.err != nil {
 		return dstRes.err
 	}
-
-	fmt.Println("Mailbox metadata collected.")
 
 	printAccountInfo("Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
 	fmt.Println()
