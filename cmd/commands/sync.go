@@ -69,7 +69,7 @@ func Sync(cCtx *cli.Context) error {
 	}
 
 	// Setup progress writer for scanning phase
-	pw := progress.NewWriter(2)
+	pw := progress.NewWriter(2, quiet)
 	pw.Start()
 
 	// Create trackers for source and destination scanning
@@ -128,10 +128,10 @@ func Sync(cCtx *cli.Context) error {
 		for _, plan := range summary.Plans {
 			foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
 			if len(plan.MessagesToSync) > 0 {
-				fmt.Printf("· %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, len(plan.MessagesToSync))
+				fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, len(plan.MessagesToSync))
 				if verbose {
 					for _, msg := range plan.MessagesToSync {
-						fmt.Printf("  · %s (ID: %s)\n", msg.Envelope.Subject, msg.Envelope.MessageId)
+						fmt.Printf("  • %s (ID: %s)\n", msg.Envelope.Subject, msg.Envelope.MessageId)
 					}
 					fmt.Println()
 				}
@@ -141,7 +141,7 @@ func Sync(cCtx *cli.Context) error {
 		if len(foldersToCreate) > 0 {
 			fmt.Printf("\n🗂️ Folders to be created on destination:\n")
 			for _, folder := range foldersToCreate {
-				fmt.Printf("· %s\n", folder)
+				fmt.Printf("• %s\n", folder)
 			}
 		}
 		fmt.Printf("\n📨 Total new messages to sync: %d\n", summary.TotalNew)
@@ -162,7 +162,7 @@ func Sync(cCtx *cli.Context) error {
 	}
 
 	// Setup progress writer for sync phase
-	syncPW := progress.NewWriter(len(summary.Plans))
+	syncPW := progress.NewWriter(len(summary.Plans), quiet)
 	syncPW.Start()
 
 	// Create all trackers upfront
@@ -253,7 +253,7 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 					synced := atomic.AddInt64(&syncedCount, 1)
 					tracker.Increment(1)
 					if verbose {
-						pw.Log("Synced %d/%d messages to %s", synced, len(messages), dstFolder)
+						pw.Log("Synced %d/%d messages to %s, processed msg id %s", synced, len(messages), dstFolder, msg.Envelope.MessageId)
 					}
 				}
 			}

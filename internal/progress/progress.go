@@ -3,6 +3,7 @@ package progress
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -16,10 +17,14 @@ type Writer struct {
 }
 
 // NewWriter creates a new progress writer with pre-configured settings and colors.
-func NewWriter(numTrackers int) *Writer {
+func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw := progress.NewWriter()
 	pw.SetAutoStop(false)
-	pw.SetOutputWriter(os.Stdout)
+	if quiet {
+		pw.SetOutputWriter(io.Discard)
+	} else {
+		pw.SetOutputWriter(os.Stdout)
+	}
 	pw.SetTrackerLength(30)
 	pw.SetMessageLength(100)
 	pw.SetNumTrackersExpected(numTrackers)

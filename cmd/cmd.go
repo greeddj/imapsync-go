@@ -12,10 +12,14 @@ import (
 )
 
 var (
-	// gitRef stores the version tag from build-time injection.
-	gitRef = "v0.0.0-dev"
-	// gitCommit stores the git commit hash from build-time injection.
-	gitCommit = "0000000"
+	// Version stores the version tag from build-time injection.
+	Version = "dev"
+	// Commit stores the git commit hash from build-time injection.
+	Commit = "none"
+	// Date stores the build date from build-time injection.
+	Date = "unknown"
+	// BuiltBy stores who built the binary.
+	BuiltBy = "manual"
 	// appName is the application name.
 	appName = "imapsync-go"
 )
@@ -30,7 +34,7 @@ func Run() error {
 		Suggest:                false,
 		Usage:                  "IMAP to IMAP synchronization tool",
 		UseShortOptionHandling: true,
-		Version:                fmt.Sprintf("%s (%s) // %s", gitRef, gitCommit, runtime.Version()),
+		Version:                fmt.Sprintf("%s (commit: %s, built: %s by %s) // %s", Version, Commit, Date, BuiltBy, runtime.Version()),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "config",
@@ -45,14 +49,6 @@ func Run() error {
 				Name:   "show",
 				Usage:  "show IMAP dirs in source and destination servers",
 				Action: commands.Show,
-				Flags: []cli.Flag{
-					&cli.BoolFlag{
-						Name:    "verbose",
-						Aliases: []string{"V"},
-						Value:   false,
-						EnvVars: []string{"IMAPSYNC_VERBOSE"},
-					},
-				},
 			},
 			{
 				Name:   "sync",

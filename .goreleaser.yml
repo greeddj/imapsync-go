@@ -1,0 +1,123 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: imapsync-go
+    main: ./main.go
+    binary: imapsync-go
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/greeddj/imapsync-go/cmd.Version={{.Version}}
+      - -X github.com/greeddj/imapsync-go/cmd.Commit={{.ShortCommit}}
+      - -X github.com/greeddj/imapsync-go/cmd.Date={{.Date}}
+      - -X github.com/greeddj/imapsync-go/cmd.BuiltBy=goreleaser
+
+archives:
+  - id: imapsync-go
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    files:
+      - LICENSE
+      - README.md
+      - config.example.yaml
+      - config.example.json
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+dockers:
+  - id: amd64
+    ids:
+      - imapsync-go
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-amd64"
+      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-amd64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+
+  - id: arm64
+    ids:
+      - imapsync-go
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-arm64"
+      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-arm64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+
+docker_manifests:
+  - name_template: "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-amd64"
+      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/greeddj/{{ .ProjectName }}:latest"
+    image_templates:
+      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-amd64"
+      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-arm64"
+
+brews:
+  - name: imapsync-go
+    repository:
+      owner: greeddj
+      name: homebrew-tap
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    homepage: https://github.com/greeddj/imapsync-go
+    description: "IMAP to IMAP synchronization tool"
+    license: MIT
+    install: |
+      bin.install "imapsync-go"
+    test: |
+      system "#{bin}/imapsync-go", "--version"
+
+release:
+  github:
+    owner: greeddj
+    name: imapsync-go
+  prerelease: auto

@@ -17,9 +17,8 @@ import (
 
 // Show displays information about mailboxes in source and destination IMAP accounts.
 func Show(cCtx *cli.Context) error {
-	verbose := cCtx.Bool("verbose")
 	// Setup progress writer
-	pw := progress.NewWriter(2)
+	pw := progress.NewWriter(2, false)
 	pw.Start()
 
 	pw.Log("Loading configuration...")
@@ -50,7 +49,7 @@ func Show(cCtx *cli.Context) error {
 	wg.Go(func() {
 		result := accountResult{}
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
-		srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
+		srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, false, true, nil)
 		if err != nil {
 			result.err = fmt.Errorf("[%s] source connection failed: %v", cfg.Src.Label, err)
 			srcTracker.MarkAsErrored()
@@ -79,7 +78,7 @@ func Show(cCtx *cli.Context) error {
 	wg.Go(func() {
 		result := accountResult{}
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
-		dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+		dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, false, true, nil)
 		if err != nil {
 			result.err = fmt.Errorf("[%s] destination connection failed: %v", cfg.Dst.Label, err)
 			dstTracker.MarkAsErrored()

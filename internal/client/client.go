@@ -108,11 +108,11 @@ func (c *Client) SetProgressTracker(tracker ProgressTracker) {
 }
 
 // log outputs a message either to progress writer or stdout based on availability.
-func (c *Client) log(format string, args ...interface{}) {
+func (c *Client) log(format string, args ...any) {
 	if c.tracker != nil {
 		c.tracker.UpdateMessage(fmt.Sprintf(format, args...))
-	} else if c.verbose {
-		fmt.Printf(format+"\n", args...)
+	} else if c.verbose && c.pw != nil {
+		c.pw.Log(format, args...)
 	}
 }
 
