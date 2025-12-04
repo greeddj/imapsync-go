@@ -46,6 +46,7 @@ curl -LO https://github.com/greeddj/imapsync-go/releases/latest/download/imapsyn
 tar xzf imapsync-go_<version>_Linux_x86_64.tar.gz
 chmod +x imapsync-go
 sudo mv imapsync-go /usr/local/bin/
+sudo xattr -rd com.apple.quarantine /usr/local/bin/imapsync-go
 ```
 
 ## Usage
@@ -102,36 +103,34 @@ map:
 ### Running with Homebrew
 
 ```bash
+export IMAPSYNC_CONFIG="/Users/$(whoami)/.imapsync/prod_config.json"
+
 # Show available folders
-imapsync-go show -c config.yaml
+imapsync-go show
 
 # Sync all configured folders
-imapsync-go sync -c config.yaml -w 4
+imapsync-go sync -w 4
 
 # Sync specific folder
-imapsync-go sync -c config.yaml -s INBOX -d INBOX
+imapsync-go sync -s INBOX -d INBOX
+imapsync-go sync -s 'Test.[some_group].box' -d 'Test/some_group/box'
 
 # Auto-confirm without prompt
-imapsync-go sync -c config.yaml -y
+imapsync-go sync -y
 ```
 
 ### Running with Docker
 
 ```bash
-# Mount config file and run
-docker run --rm -v $(pwd)/config.json:/config.json \
-  ghcr.io/greeddj/imapsync-go:latest \
-  sync -c /config.json -w 4
+# show folders
+docker run --rm -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json show
 
-# Show folders
-docker run --rm -v $(pwd)/config.yaml:/config.yaml \
-  ghcr.io/greeddj/imapsync-go:latest \
-  show -c /config.yaml
+podman run --rm -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json show
 
-# With podman
-podman run --rm -v $(pwd)/config.json:/config.json:Z \
-  ghcr.io/greeddj/imapsync-go:latest \
-  sync -c /config.json -w 4
+# sync folders
+docker run --rm  -it -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json sync -w 4
+
+podman run --rm -it -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json sync -w 4
 ```
 
 ### Command-line Options
@@ -152,22 +151,6 @@ podman run --rm -v $(pwd)/config.json:/config.json:Z \
 **Show command:**
 
 - `-V, --verbose` - Enable verbose output
-
-## Examples
-
-```bash
-# Sync with 8 workers
-imapsync-go sync -c config.yaml -w 8
-
-# Sync specific folder without confirmation
-imapsync-go sync -c config.yaml -s INBOX -d INBOX -y
-
-# Verbose output
-imapsync-go sync -c config.yaml -V
-
-# Check version
-imapsync-go --version
-```
 
 ## License
 
