@@ -30,10 +30,9 @@ Pull the image from GitHub Container Registry:
 
 ```bash
 # Latest version
-docker pull ghcr.io/greeddj/imapsync-go:latest
-
-# or with podman
 podman pull ghcr.io/greeddj/imapsync-go:latest
+# or
+podman pull ghcr.io/greeddj/imapsync-go:1.0.0
 ```
 
 ### Binary Release
@@ -122,15 +121,18 @@ imapsync-go sync -y
 ### Running with Docker
 
 ```bash
-# show folders
-docker run --rm -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json show
 
-podman run --rm -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json show
+# show folders
+podman run --rm \
+-v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest \
+-c /config.json \
+show
 
 # sync folders
-docker run --rm  -it -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json sync -w 4
-
-podman run --rm -it -v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest -c /config.json sync -w 4
+podman run --rm -it \
+-v /Users/$(whoami)/.imapsync/prod_config.json:/config.json ghcr.io/greeddj/imapsync-go:latest \
+-c /config.json \
+sync -w 4
 ```
 
 ### Command-line Options
