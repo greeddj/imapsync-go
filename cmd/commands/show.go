@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
+	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/utils"
-	"github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v2"
@@ -20,20 +19,8 @@ import (
 func Show(cCtx *cli.Context) error {
 	verbose := cCtx.Bool("verbose")
 	// Setup progress writer
-	pw := progress.NewWriter()
-	pw.SetAutoStop(false)
-	pw.SetTrackerLength(25)
-	pw.SetMessageLength(50)
-	pw.SetNumTrackersExpected(2)
-	pw.SetStyle(progress.StyleDefault)
-	pw.SetTrackerPosition(progress.PositionRight)
-	pw.Style().Visibility.ETAOverall = false
-	pw.Style().Visibility.TrackerOverall = false
-	pw.Style().Options.Separator = " "
-	pw.Style().Options.DoneString = "done!"
-
-	// Start rendering
-	go pw.Render()
+	pw := progress.NewWriter(2)
+	pw.Start()
 
 	pw.Log("Loading configuration...")
 	cfg, err := config.New(cCtx)
@@ -52,16 +39,8 @@ func Show(cCtx *cli.Context) error {
 	dstResult := make(chan accountResult, 1)
 
 	// Create trackers for both servers
-	srcTracker := &progress.Tracker{
-		Message: fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label),
-		Total:   100,
-		Units:   progress.UnitsDefault,
-	}
-	dstTracker := &progress.Tracker{
-		Message: fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label),
-		Total:   100,
-		Units:   progress.UnitsDefault,
-	}
+	srcTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label), 100)
+	dstTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label), 100)
 
 	pw.AppendTracker(srcTracker)
 	pw.AppendTracker(dstTracker)
@@ -133,15 +112,8 @@ func Show(cCtx *cli.Context) error {
 	srcRes := <-srcResult
 	dstRes := <-dstResult
 
-	// Wait for both trackers to complete and render
-	time.Sleep(300 * time.Millisecond)
-
-	// Stop progress writer
-	pw.Stop()
-
-	// Clear any remaining progress output
-	fmt.Print("\r\033[K\r\033[K")
-	fmt.Println()
+	// Stop progress and clear output
+	pw.StopAndClear(2)
 
 	// Cleanup function to logout from both clients.
 	cleanup := func() {
