@@ -48,4 +48,6 @@ build_linux: check
 
 oci executor="podman" tag="local": build_linux
 	@echo "===== Build Local OCI {{PROJECT}} ====="
+	cp dist/{{PROJECT}} imapsync-go
 	{{executor}} build -t {{PROJECT}}:{{tag}} -f Dockerfile .
+	rm -f imapsync-go

@@ -102,7 +102,7 @@ docker_manifests:
       - "ghcr.io/greeddj/{{ .ProjectName }}:latest-amd64"
       - "ghcr.io/greeddj/{{ .ProjectName }}:latest-arm64"
 
-brews:
+homebrew_casks:
   - name: imapsync-go
     repository:
       owner: greeddj
@@ -111,10 +111,14 @@ brews:
     homepage: https://github.com/greeddj/imapsync-go
     description: "IMAP to IMAP synchronization tool"
     license: MIT
-    install: |
-      bin.install "imapsync-go"
-    test: |
-      system "#{bin}/imapsync-go", "--version"
+    binaries:
+      - imapsync-go
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/imapsync-go"]
+          end
 
 release:
   github:
