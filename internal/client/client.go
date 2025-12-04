@@ -31,12 +31,6 @@ const (
 	progressUpdateInterval = 10
 )
 
-// progressReporter surfaces progress updates to the UI layer.
-type progressReporter interface {
-	Update(message string)
-	IsQuiet() bool
-}
-
 // Client embeds an IMAP client with retry-friendly helpers.
 type Client struct {
 	*client.Client
@@ -54,9 +48,8 @@ type Client struct {
 	lastReconnect time.Time     // Timestamp of last reconnection attempt.
 	reconnectDur  time.Duration // Minimum duration between reconnects.
 
-	prefix   string           // Log message prefix.
-	progress progressReporter // Progress update interface.
-	verbose  bool             // Enable verbose logging.
+	prefix  string // Log message prefix.
+	verbose bool   // Enable verbose logging.
 }
 
 // New establishes a connection and logs into the IMAP server.
@@ -91,18 +84,6 @@ func (c *Client) SetPrefix(p string) {
 	c.prefix = p
 }
 
-// SetProgress wires a progress reporter for spinner/log updates.
-func (c *Client) SetProgress(p progressReporter) {
-	c.progress = p
-}
-
-// UpdateProgress sends a message to the configured progress reporter if available.
-func (c *Client) UpdateProgress(message string) {
-	if c.progress != nil && !c.progress.IsQuiet() {
-		c.progress.Update(message)
-	}
-}
-
 // connectAndLogin establishes a new IMAP connection and authenticates the user.
 func (c *Client) connectAndLogin() error {
 	conn, err := c.dialFn(c.serverAddr)
@@ -134,7 +115,7 @@ func (c *Client) Reconnect() error {
 	sinceLast := now.Sub(c.lastReconnect)
 	if sinceLast < c.reconnectDur {
 		wait := c.reconnectDur - sinceLast
-		c.UpdateProgress(fmt.Sprintf("[%s] 🔄 Reconnecting in %s...", c.prefix, wait))
+		fmt.Printf("[%s] 🔄 Reconnecting in %s...\n", c.prefix, wait)
 		time.Sleep(wait)
 	}
 
@@ -146,16 +127,16 @@ func (c *Client) Reconnect() error {
 	delay := c.backoff
 
 	for i := 1; i <= maxReconnectAttempts; i++ {
-		c.UpdateProgress(fmt.Sprintf("[%s] 🔄 Reconnect attempt %d...", c.prefix, i))
+		fmt.Printf("[%s] 🔄 Reconnect attempt %d...\n", c.prefix, i)
 		err = c.connectAndLogin()
 		if err == nil {
-			c.UpdateProgress(fmt.Sprintf("[%s] 🔄 Reconnected successfully", c.prefix))
+			fmt.Printf("[%s] 🔄 Reconnected successfully\n", c.prefix)
 			c.lastReconnect = time.Now()
 			c.backoff = 2 * time.Second
 			return nil
 		}
 
-		c.UpdateProgress(fmt.Sprintf("[%s] 🔄 Failed: %v, retrying in %s", c.prefix, err, delay))
+		fmt.Printf("[%s] 🔄 Failed: %v, retrying in %s\n", c.prefix, err, delay)
 		time.Sleep(delay)
 		delay *= 2
 	}
@@ -300,14 +281,14 @@ func (c *Client) createParentFolders(name, delimiter string) error {
 		}
 
 		if !exists {
-			c.UpdateProgress(fmt.Sprintf("[%s] Creating parent folder: %s", c.prefix, parentPath))
+			fmt.Printf("[%s] Creating parent folder: %s\n", c.prefix, parentPath)
 			err = c.safeCall(func() error {
 				return c.Create(parentPath)
 			})
 			if err != nil {
 				return fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, err)
 			}
-			c.UpdateProgress(fmt.Sprintf("[%s] Created parent folder: %s", c.prefix, parentPath))
+			fmt.Printf("[%s] Created parent folder: %s\n", c.prefix, parentPath)
 		}
 	}
 
@@ -316,20 +297,20 @@ func (c *Client) createParentFolders(name, delimiter string) error {
 
 // FetchMessageIDs scans a folder and returns all message IDs.
 func (c *Client) FetchMessageIDs(folder string) (map[string]bool, error) {
-	c.UpdateProgress(fmt.Sprintf("[%s] Fetching folder %s...", c.prefix, folder))
+	fmt.Printf("[%s] Fetching folder %s...\n", c.prefix, folder)
 
 	mbox, err := c.Select(folder, true)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
 	}
-	c.UpdateProgress(fmt.Sprintf("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages))
+	fmt.Printf("[%s] Selected folder %s (%d messages)\n", c.prefix, folder, mbox.Messages)
 
 	ids := make(map[string]bool)
 	if mbox.Messages == 0 {
 		return ids, nil
 	}
 
-	c.UpdateProgress(fmt.Sprintf("[%s] Fetching message IDs from %s...", c.prefix, folder))
+	fmt.Printf("[%s] Fetching %d message IDs from %s...\n", c.prefix, mbox.Messages, folder)
 
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(1, mbox.Messages)
@@ -347,9 +328,6 @@ func (c *Client) FetchMessageIDs(folder string) (map[string]bool, error) {
 			}
 		}
 		count++
-		if count%10 == 0 {
-			c.UpdateProgress(fmt.Sprintf("[%s] Processed %d/%d messages from %s...", c.prefix, count, mbox.Messages, folder))
-		}
 	}
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("[%s] fetch IDs error: %v", c.prefix, err)
@@ -359,18 +337,18 @@ func (c *Client) FetchMessageIDs(folder string) (map[string]bool, error) {
 
 // FetchMessages retrieves full message envelopes and bodies for a folder.
 func (c *Client) FetchMessages(folder string) ([]*imap.Message, error) {
-	c.UpdateProgress(fmt.Sprintf("[%s] Fetching folder %s...", c.prefix, folder))
+	fmt.Printf("[%s] Fetching folder %s...\n", c.prefix, folder)
 
 	mbox, err := c.Select(folder, true)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
 	}
-	c.UpdateProgress(fmt.Sprintf("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages))
+	fmt.Printf("[%s] Selected folder %s (%d messages)\n", c.prefix, folder, mbox.Messages)
 	if mbox.Messages == 0 {
 		return []*imap.Message{}, nil
 	}
 
-	c.UpdateProgress(fmt.Sprintf("[%s] Fetching %d messages from %s...", c.prefix, mbox.Messages, folder))
+	fmt.Printf("[%s] Fetching %d messages from %s...\n", c.prefix, mbox.Messages, folder)
 
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(1, mbox.Messages)
@@ -386,7 +364,7 @@ func (c *Client) FetchMessages(folder string) ([]*imap.Message, error) {
 		all = append(all, msg)
 		count++
 		if count%progressUpdateInterval == 0 {
-			c.UpdateProgress(fmt.Sprintf("[%s] Processed %d/%d messages from %s...", c.prefix, count, mbox.Messages, folder))
+			fmt.Printf("[%s] Processed %d/%d messages from %s...\n", c.prefix, count, mbox.Messages, folder)
 		}
 	}
 	if err := <-done; err != nil {
@@ -401,7 +379,7 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool) ([
 		return []*imap.Message{}, nil
 	}
 
-	c.UpdateProgress(fmt.Sprintf("[%s] Fetching %d specific messages from %s...", c.prefix, len(targetIDs), folder))
+	fmt.Printf("[%s] Fetching %d specific messages from %s...\n", c.prefix, len(targetIDs), folder)
 
 	mbox, err := c.Select(folder, true)
 	if err != nil {
@@ -437,7 +415,7 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool) ([
 		return []*imap.Message{}, nil
 	}
 
-	c.UpdateProgress(fmt.Sprintf("[%s] Found %d messages to fetch from %s", c.prefix, len(targetUIDs), folder))
+	fmt.Printf("[%s] Found %d messages to fetch from %s\n", c.prefix, len(targetUIDs), folder)
 
 	// Second pass: fetch full bodies for target UIDs only
 	uidSet := new(imap.SeqSet)
@@ -450,13 +428,8 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool) ([
 	go func() { done <- c.UidFetch(uidSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages) }()
 
 	var result []*imap.Message
-	count := 0
 	for msg := range messages {
 		result = append(result, msg)
-		count++
-		if count%progressUpdateInterval == 0 {
-			c.UpdateProgress(fmt.Sprintf("[%s] Fetched %d/%d messages from %s...", c.prefix, count, len(targetUIDs), folder))
-		}
 	}
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)
@@ -486,7 +459,7 @@ func (c *Client) AppendMessage(folder string, msg *imap.Message) error {
 		return fmt.Errorf("[%s] append failed: %v", c.prefix, err)
 	}
 	if c.verbose {
-		c.UpdateProgress(fmt.Sprintf("[%s] Message %q appended to %s", c.prefix, msg.Envelope.MessageId, folder))
+		fmt.Printf("[%s] Message %q appended to %s\n", c.prefix, msg.Envelope.MessageId, folder)
 	}
 	return nil
 }
@@ -500,7 +473,7 @@ type MailboxInfo struct {
 
 // ListMailboxes fetches all folders plus lightweight statistics for each.
 func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
-	c.UpdateProgress(fmt.Sprintf("[%s] Getting mailbox list...", c.prefix))
+	fmt.Printf("[%s] Getting mailbox list...\n", c.prefix)
 
 	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
 	done := make(chan error, 1)
@@ -519,16 +492,16 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 		return nil, fmt.Errorf("[%s] list mailboxes error: %v", c.prefix, err)
 	}
 
-	c.UpdateProgress(fmt.Sprintf("[%s] Getting mailbox statistics...", c.prefix))
+	fmt.Printf("[%s] Getting mailbox statistics...\n", c.prefix)
 	for i, mbox := range result {
-		c.UpdateProgress(fmt.Sprintf("[%s] Analyzing folder %d/%d: %s", c.prefix, i+1, len(result), mbox.Name))
+		fmt.Printf("[%s] Analyzing folder %d/%d: %s\n", c.prefix, i+1, len(result), mbox.Name)
 
 		status, err := c.Status(mbox.Name, []imap.StatusItem{
 			imap.StatusMessages,
 		})
 
 		if err != nil {
-			c.UpdateProgress(fmt.Sprintf("[%s] Cannot get status for %s: %v", c.prefix, mbox.Name, err))
+			fmt.Printf("[%s] Cannot get status for %s: %v\n", c.prefix, mbox.Name, err)
 			continue
 		}
 
@@ -537,7 +510,7 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 		if status.Messages > 0 {
 			size, err := c.getFolderSize(mbox.Name)
 			if err != nil {
-				c.UpdateProgress(fmt.Sprintf("[%s] Cannot get size for %s: %v", c.prefix, mbox.Name, err))
+				fmt.Printf("[%s] Cannot get size for %s: %v\n", c.prefix, mbox.Name, err)
 			} else {
 				mbox.Size = size
 			}

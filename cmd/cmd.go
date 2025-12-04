@@ -52,12 +52,6 @@ func Run() error {
 						Value:   false,
 						EnvVars: []string{"IMAPSYNC_VERBOSE"},
 					},
-					&cli.BoolFlag{
-						Name:    "cached",
-						Value:   false,
-						Usage:   "use cached data if available (faster, but may be outdated)",
-						EnvVars: []string{"IMAPSYNC_CACHED"},
-					},
 				},
 			},
 			{
@@ -92,12 +86,6 @@ func Run() error {
 						Aliases: []string{"q"},
 						Value:   false,
 						EnvVars: []string{"IMAPSYNC_QUIET"},
-					},
-					&cli.BoolFlag{
-						Name:    "no-cache",
-						Value:   false,
-						Usage:   "disable cache, always fetch from servers",
-						EnvVars: []string{"IMAPSYNC_NO_CACHE"},
 					},
 					&cli.BoolFlag{
 						Name:    "confirm",

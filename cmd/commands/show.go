@@ -6,10 +6,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/greeddj/imapsync-go/internal/cache"
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
-	"github.com/greeddj/imapsync-go/internal/stdout"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
@@ -19,64 +17,10 @@ import (
 // Show displays information about mailboxes in source and destination IMAP accounts.
 func Show(cCtx *cli.Context) error {
 	verbose := cCtx.Bool("verbose")
-	useCached := cCtx.Bool("cached")
-
-	spin := stdout.New(false, verbose)
-	defer spin.Stop()
-
-	spin.Update("Loading configuration...")
+	fmt.Println("Loading configuration...")
 	cfg, err := config.New(cCtx)
 	if err != nil {
-		spin.Error(fmt.Sprintf("load config: %v", err))
 		return fmt.Errorf("load config: %w", err)
-	}
-
-	spin.Update("Preparing cache manager...")
-
-	cacheManager, err := cache.NewCacheManager(cfg.Src, cfg.Dst)
-	if err != nil {
-		spin.Error(fmt.Sprintf("cache manager error: %v", err))
-		return fmt.Errorf("cache manager error: %v", err)
-	}
-
-	var srcMailboxes, dstMailboxes []*client.MailboxInfo
-
-	if useCached {
-		spin.Update("Loading from cache...")
-
-		err := cacheManager.Load()
-		if err == nil {
-			srcCached := cacheManager.GetSourceMailboxes()
-			dstCached := cacheManager.GetDestMailboxes()
-
-			if len(srcCached) > 0 || len(dstCached) > 0 {
-				spin.Update("Using cached mailbox metadata")
-
-				srcMailboxes = make([]*client.MailboxInfo, len(srcCached))
-				for i, m := range srcCached {
-					srcMailboxes[i] = &client.MailboxInfo{
-						Name:     m.Name,
-						Messages: m.Messages,
-						Size:     m.Size,
-					}
-				}
-
-				dstMailboxes = make([]*client.MailboxInfo, len(dstCached))
-				for i, m := range dstCached {
-					dstMailboxes[i] = &client.MailboxInfo{
-						Name:     m.Name,
-						Messages: m.Messages,
-						Size:     m.Size,
-					}
-				}
-
-				printAccountInfo("Source (cached)", cfg.Src.Server, cfg.Src.User, srcMailboxes, spin)
-				fmt.Println()
-				printAccountInfo("Destination (cached)", cfg.Dst.Server, cfg.Dst.User, dstMailboxes, spin)
-				return nil
-			}
-		}
-		spin.Update("⚠️ Cache missing or stale, fetching live data...")
 	}
 
 	// accountResult holds the result of fetching account information.
@@ -96,7 +40,7 @@ func Show(cCtx *cli.Context) error {
 		defer wg.Done()
 		result := accountResult{}
 
-		spin.Update(fmt.Sprintf("[%s] Connecting to source...", cfg.Src.Label))
+		fmt.Printf("[%s] Connecting to source...\n", cfg.Src.Label)
 
 		srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
 		if err != nil {
@@ -105,7 +49,6 @@ func Show(cCtx *cli.Context) error {
 			return
 		}
 		result.client = srcClient
-		srcClient.SetProgress(spin)
 		srcClient.SetPrefix(cfg.Src.Label)
 
 		mailboxes, err := srcClient.ListMailboxes()
@@ -123,7 +66,7 @@ func Show(cCtx *cli.Context) error {
 		defer wg.Done()
 		result := accountResult{}
 
-		spin.Update(fmt.Sprintf("[%s] Connecting to destination...", cfg.Dst.Label))
+		fmt.Printf("[%s] Connecting to destination...\n", cfg.Dst.Label)
 		dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
 		if err != nil {
 			result.err = fmt.Errorf("[%s] destination connection failed: %v", cfg.Dst.Label, err)
@@ -131,7 +74,6 @@ func Show(cCtx *cli.Context) error {
 			return
 		}
 		result.client = dstClient
-		dstClient.SetProgress(spin)
 		dstClient.SetPrefix(cfg.Dst.Label)
 
 		mailboxes, err := dstClient.ListMailboxes()
@@ -171,43 +113,17 @@ func Show(cCtx *cli.Context) error {
 		return dstRes.err
 	}
 
-	spin.Success("Mailbox metadata collected.")
+	fmt.Println("Mailbox metadata collected.")
 
-	if !useCached {
-		for _, mbox := range srcRes.mailboxes {
-			cacheManager.SourceCache.Mailboxes[mbox.Name] = &cache.MailboxCache{
-				Mailbox:      mbox.Name,
-				MessageCount: mbox.Messages,
-				TotalSize:    mbox.Size,
-				Messages:     make(map[string]*cache.MessageInfo),
-			}
-		}
-
-		for _, mbox := range dstRes.mailboxes {
-			cacheManager.DestCache.Mailboxes[mbox.Name] = &cache.MailboxCache{
-				Mailbox:      mbox.Name,
-				MessageCount: mbox.Messages,
-				TotalSize:    mbox.Size,
-				Messages:     make(map[string]*cache.MessageInfo),
-			}
-		}
-
-		if err := cacheManager.Save(); err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
-			}
-		}
-	}
-
-	printAccountInfo("Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes, spin)
+	printAccountInfo("Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
 	fmt.Println()
-	printAccountInfo("Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes, spin)
+	printAccountInfo("Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
 
 	return nil
 }
 
 // printAccountInfo displays mailbox information in a formatted table.
-func printAccountInfo(title, server, user string, mailboxes []*client.MailboxInfo, spin *stdout.Spinner) {
+func printAccountInfo(title, server, user string, mailboxes []*client.MailboxInfo) {
 	headerTable := table.NewWriter()
 	headerTable.SetOutputMirror(os.Stdout)
 	headerTable.Style().Options.DrawBorder = false
@@ -222,7 +138,6 @@ func printAccountInfo(title, server, user string, mailboxes []*client.MailboxInf
 	fmt.Println()
 
 	if len(mailboxes) == 0 {
-		spin.Error("No folders found")
 		return
 	}
 

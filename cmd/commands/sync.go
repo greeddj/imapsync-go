@@ -7,10 +7,8 @@ import (
 	"sync/atomic"
 
 	"github.com/emersion/go-imap"
-	"github.com/greeddj/imapsync-go/internal/cache"
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
-	"github.com/greeddj/imapsync-go/internal/stdout"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/urfave/cli/v2"
 )
@@ -42,36 +40,15 @@ func Sync(cCtx *cli.Context) error {
 	quiet := cCtx.Bool("quiet")
 	verbose := cCtx.Bool("verbose")
 	autoConfirm := cCtx.Bool("confirm")
-	useCache := !cCtx.Bool("no-cache")
 
-	spin := stdout.New(quiet, verbose)
-	defer spin.Stop()
-
-	spin.Update("Fetching config...")
+	fmt.Println("Fetching config...")
 	cfg, err := config.New(cCtx)
 	if err != nil {
-		spin.Error(fmt.Sprintf("Config error: %v", err))
+		fmt.Printf("Config error: %v\n", err)
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	spin.Update(fmt.Sprintf("Starting sync with %d workers", cfg.Workers))
-
-	var cacheManager *cache.CacheManager
-
-	if useCache {
-		spin.Update("Initializing cache...")
-		cacheManager, err = cache.NewCacheManager(cfg.Src, cfg.Dst)
-		if err != nil {
-			spin.Update(fmt.Sprintf("Warning: failed to initialize cache: %v", err))
-			useCache = false
-		} else {
-			if err := cacheManager.Load(); err != nil {
-				spin.Update(fmt.Sprintf("Warning: failed to load cache: %v", err))
-			} else if verbose {
-				fmt.Println(cacheManager.GetCacheInfo())
-			}
-		}
-	}
+	fmt.Printf("Starting sync with %d workers\n", cfg.Workers)
 
 	var mappings []config.DirectoryMapping
 
@@ -80,7 +57,7 @@ func Sync(cCtx *cli.Context) error {
 			{Source: srcFolder, Destination: dstFolder},
 		}
 	} else if srcFolder != "" || dstFolder != "" {
-		spin.Error("both --src-folder and --dest-folder must be specified")
+		fmt.Println("both --src-folder and --dest-folder must be specified")
 		return fmt.Errorf("both --src-folder and --dest-folder must be specified")
 	} else {
 		if len(cfg.Map) == 0 {
@@ -89,7 +66,7 @@ func Sync(cCtx *cli.Context) error {
 		mappings = cfg.Map
 	}
 
-	spin.Update("Fetching source...")
+	fmt.Println("Fetching source...")
 	srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
 	if err != nil {
 		return fmt.Errorf("source connection failed: %w", err)
@@ -97,10 +74,9 @@ func Sync(cCtx *cli.Context) error {
 	defer func() {
 		_ = srcClient.Logout()
 	}()
-	srcClient.SetProgress(spin)
 	srcClient.SetPrefix(cfg.Src.Label)
 
-	spin.Update("Fetching destination...")
+	fmt.Println("Fetching destination...")
 	dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
 	if err != nil {
 		return fmt.Errorf("destination connection failed: %w", err)
@@ -108,17 +84,15 @@ func Sync(cCtx *cli.Context) error {
 	defer func() {
 		_ = dstClient.Logout()
 	}()
-	dstClient.SetProgress(spin)
 	dstClient.SetPrefix(cfg.Dst.Label)
 
-	spin.Update("Building sync plan...")
-	summary, err := buildSyncPlan(srcClient, dstClient, mappings, spin, cacheManager, useCache)
+	fmt.Println("Building sync plan...")
+	summary, err := buildSyncPlan(srcClient, dstClient, mappings)
 	if err != nil {
 		return err
 	}
 
 	if summary.TotalNew > 0 && !quiet {
-		spin.Stop()
 		fmt.Printf("Messages to be copied to destination:\n")
 		foldersToCreate := make([]string, 0, len(summary.Plans))
 		for _, plan := range summary.Plans {
@@ -148,14 +122,12 @@ func Sync(cCtx *cli.Context) error {
 				return err
 			}
 			if !confirmed {
-				spin.Restart()
-				spin.Error("Sync canceled by user")
+				fmt.Println("Sync canceled by user")
 				return nil
 			}
 		}
-		spin.Restart()
 	} else {
-		spin.Success("All folders already synced!")
+		fmt.Println("All folders already synced!")
 		return nil
 	}
 
@@ -167,57 +139,37 @@ func Sync(cCtx *cli.Context) error {
 			continue
 		}
 
-		spin.Update(fmt.Sprintf("Syncing folder %d/%d: %s → %s (%d messages)", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder, plan.NewMessages))
+		fmt.Printf("Syncing folder %d/%d: %s → %s (%d messages)\n", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
 
-		spin.Update(fmt.Sprintf("Checking folder: %s", plan.DestinationFolder))
+		fmt.Printf("Checking folder: %s\n", plan.DestinationFolder)
 		if !plan.DestinationFolderExists {
 			created, err := dstClient.CreateMailbox(plan.DestinationFolder)
 			if err != nil {
-				spin.Print(fmt.Sprintf("Failed to create folder %s: %v", plan.DestinationFolder, err))
+				fmt.Printf("Failed to create folder %s: %v\n", plan.DestinationFolder, err)
 				totalErrors++
 				continue
 			}
 			if created {
-				spin.Update(fmt.Sprintf("Created destination folder: %s", plan.DestinationFolder))
+				fmt.Printf("Created destination folder: %s\n", plan.DestinationFolder)
 			}
 		}
 
-		synced, errors := syncFolders(cfg, plan.DestinationFolder, plan.MessagesToSync, cfg.Workers, spin, verbose)
+		synced, errors := syncFolders(cfg, plan.DestinationFolder, plan.MessagesToSync, cfg.Workers, verbose)
 		totalSynced += synced
 		totalErrors += errors
-
-		spin.Update(fmt.Sprintf("Folder %s: synced %d/%d messages", plan.DestinationFolder, synced, plan.NewMessages))
-	}
-
-	if useCache && cacheManager != nil {
-		spin.Update("Updating cache...")
-		for _, plan := range summary.Plans {
-			if plan.NewMessages > 0 {
-				dstMsgs, err := dstClient.FetchMessages(plan.DestinationFolder)
-				if err != nil {
-					spin.Update(fmt.Sprintf("Warning: failed to update cache for %s: %v", plan.DestinationFolder, err))
-					continue
-				}
-				cacheManager.DestCache.UpdateMailbox(plan.DestinationFolder, dstMsgs)
-			}
-		}
-
-		if err := cacheManager.Save(); err != nil {
-			spin.Update(fmt.Sprintf("Warning: failed to save cache: %v", err))
-		}
 	}
 
 	if totalErrors > 0 {
-		spin.Error(fmt.Sprintf("Sync completed with errors. %d messages uploaded, %d errors occurred", totalSynced, totalErrors))
+		fmt.Printf("Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSynced, totalErrors)
 		return fmt.Errorf("sync completed with %d errors", totalErrors)
 	}
 
-	spin.Success(fmt.Sprintf("Sync completed successfully. %d new messages uploaded", totalSynced))
+	fmt.Printf("Sync completed successfully. %d new messages uploaded\n", totalSynced)
 	return nil
 }
 
 // syncFolders syncs messages using multiple parallel workers.
-func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message, numWorkers int, spin *stdout.Spinner, verbose bool) (int, int) {
+func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message, numWorkers int, verbose bool) (int, int) {
 	jobs := make(chan *imap.Message, jobChannelBuffer)
 	var wg sync.WaitGroup
 	var syncedCount int64
@@ -230,23 +182,22 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 
 			workerClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
 			if err != nil {
-				spin.Update(fmt.Sprintf("Worker %d: failed to connect: %v", workerID, err))
+				fmt.Printf("Worker %d: failed to connect: %v\n", workerID, err)
 				atomic.AddInt64(&errorCount, 1)
 				return
 			}
 			defer func() {
 				_ = workerClient.Logout()
 			}()
-			workerClient.SetProgress(spin)
 			workerClient.SetPrefix(fmt.Sprintf("%s-%d", cfg.Dst.Label, workerID))
 
 			for msg := range jobs {
 				if err := workerClient.AppendMessage(dstFolder, msg); err != nil {
-					workerClient.UpdateProgress(fmt.Sprintf("Worker %d: error syncing dir %s on message: %v", workerID, dstFolder, err))
+					fmt.Printf("Worker %d: error syncing dir %s on message: %v\n", workerID, dstFolder, err)
 					atomic.AddInt64(&errorCount, 1)
 				} else {
 					atomic.AddInt64(&syncedCount, 1)
-					workerClient.UpdateProgress(fmt.Sprintf("Syncing dir %s [messages %d/%d]", dstFolder, atomic.LoadInt64(&syncedCount), len(messages)))
+					fmt.Printf("Syncing dir %s [messages %d/%d]\n", dstFolder, atomic.LoadInt64(&syncedCount), len(messages))
 				}
 			}
 		}(i)
@@ -263,7 +214,7 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 }
 
 // buildSyncPlan compares source and destination folders to determine what needs syncing.
-func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, spin *stdout.Spinner, cacheManager *cache.CacheManager, useCache bool) (*SyncSummary, error) {
+func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping) (*SyncSummary, error) {
 	summary := &SyncSummary{
 		Plans: make([]FolderSyncPlan, 0),
 	}
@@ -280,47 +231,26 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		var wg sync.WaitGroup
 
 		// Fetch source message IDs
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			spin.Update(fmt.Sprintf("Fetching source IDs: %s", srcFolder))
+		wg.Go(func() {
+			fmt.Printf("Fetching source IDs: %s\n", srcFolder)
 			srcMessageIDs, srcErr = srcClient.FetchMessageIDs(srcFolder)
-		}()
+		})
 
-		// Fetch destination IDs (or use cache)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			dstMessageIDs = make(map[string]bool)
 
-			// Check cache first
-			if useCache && cacheManager != nil {
-				spin.Update(fmt.Sprintf("Checking cache for: %s", dstFolder))
-				cachedDst := cacheManager.DestCache.GetMailbox(dstFolder)
-				if cachedDst != nil && len(cachedDst.Messages) > 0 {
-					for msgID := range cachedDst.Messages {
-						dstMessageIDs[msgID] = true
-					}
-					spin.Update(fmt.Sprintf("Using cached destination for %s (%d messages)", dstFolder, len(cachedDst.Messages)))
-					dstFolderExists = true
-					return
-				}
-			}
-
-			// No cache, fetch from server
-			spin.Update(fmt.Sprintf("Fetching destination IDs: %s", dstFolder))
+			fmt.Printf("Fetching destination IDs: %s\n", dstFolder)
 			fetchedIDs, err := dstClient.FetchMessageIDs(dstFolder)
 			if err != nil {
 				// Folder might not exist yet, not a fatal error
-				spin.Update(fmt.Sprintf("Destination folder %s not found or empty, will create", dstFolder))
+				fmt.Printf("Destination folder %s not found or empty, will create\n", dstFolder)
 			} else {
 				dstFolderExists = true
 				dstMessageIDs = fetchedIDs
 			}
-		}()
+		})
 
 		wg.Wait()
-		spin.Flush() // Print parallel fetch status and start new line
 
 		if srcErr != nil {
 			return nil, fmt.Errorf("failed to fetch source folder %s: %w", srcFolder, srcErr)
@@ -335,18 +265,17 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		}
 
 		if len(newIDs) == 0 {
-			spin.Update(fmt.Sprintf("Folder %s: all %d messages already synced", srcFolder, len(srcMessageIDs)))
+			fmt.Printf("Folder %s: all %d messages already synced\n", srcFolder, len(srcMessageIDs))
 			continue
 		}
 
-		spin.Update(fmt.Sprintf("Folder %s: %d new messages to sync (of %d total)", srcFolder, len(newIDs), len(srcMessageIDs)))
-
+		fmt.Printf("Folder %s: %d new messages to sync (of %d total)\n", srcFolder, len(newIDs), len(srcMessageIDs))
 		// Fetch full bodies only for messages that need syncing
 		messagesToSync, err := srcClient.FetchMessagesByIDs(srcFolder, newIDs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch messages from %s: %w", srcFolder, err)
 		}
-		spin.Flush() // Print body fetch status and start new line
+		// Body fetch completed
 
 		if len(messagesToSync) > 0 {
 			plan := FolderSyncPlan{
