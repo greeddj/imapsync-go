@@ -536,9 +536,12 @@ func (c *Client) AppendMessage(folder string, msg *imap.Message) error {
 	flags := []string{imap.SeenFlag}
 	date := msg.Envelope.Date
 
-	literal := bytes.NewReader(raw)
+	err = c.safeCall(func() error {
+		literal := bytes.NewReader(raw)
+		return c.Append(folder, flags, date, literal)
+	})
 
-	if err := c.Append(folder, flags, date, literal); err != nil {
+	if err != nil {
 		return fmt.Errorf("[%s] append failed: %v", c.prefix, err)
 	}
 	if c.verbose {

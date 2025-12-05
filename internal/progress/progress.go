@@ -32,14 +32,6 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.SetTrackerPosition(progress.PositionRight)
 	pw.SetUpdateFrequency(time.Millisecond * 100)
 
-	// Configure visibility
-	pw.Style().Visibility.ETA = true
-	pw.Style().Visibility.ETAOverall = false
-	pw.Style().Visibility.TrackerOverall = false
-	pw.Style().Visibility.Time = true
-	pw.Style().Visibility.Value = false
-	pw.Style().Visibility.Percentage = true
-
 	// Configure colors
 	pw.Style().Colors = progress.StyleColors{
 		Message: text.Colors{text.FgHiCyan},
@@ -61,6 +53,15 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 		Finished75: "⣶",
 		Unfinished: "⣀",
 	}
+
+	// Configure visibility
+	pw.Style().Visibility.ETA = true
+	pw.Style().Visibility.ETAOverall = false
+	pw.Style().Visibility.TrackerOverall = false
+	pw.Style().Visibility.Time = true
+	pw.Style().Visibility.Value = false
+	pw.Style().Visibility.Percentage = true
+	pw.Style().Options.SnipIndicator = "..."
 
 	// Configure options
 	pw.Style().Options.Separator = " "

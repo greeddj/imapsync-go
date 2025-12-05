@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/greeddj/imapsync-go/internal/client"
@@ -38,7 +39,7 @@ func Sync(cCtx *cli.Context) error {
 	verbose := cCtx.Bool("verbose")
 	autoConfirm := cCtx.Bool("confirm")
 
-	if !quiet {
+	if !quiet && verbose {
 		fmt.Println("Fetching config...")
 	}
 	cfg, err := config.New(cCtx)
@@ -47,7 +48,7 @@ func Sync(cCtx *cli.Context) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	if !quiet {
+	if !quiet && verbose {
 		fmt.Printf("Starting sync with %d workers\n", cfg.Workers)
 	}
 
@@ -67,7 +68,7 @@ func Sync(cCtx *cli.Context) error {
 		mappings = cfg.Map
 	}
 
-	if !quiet {
+	if !quiet && verbose {
 		fmt.Println("Connecting to servers...")
 	}
 
@@ -167,6 +168,19 @@ func Sync(cCtx *cli.Context) error {
 		}
 	}
 
+	// Expand mappings to include subfolders
+	if !quiet && verbose {
+		fmt.Println("Checking for subfolders...")
+	}
+	expandedMappings, err := expandMappingsWithSubfolders(srcClient, mappings, srcDelimiter, dstDelimiter, verbose, quiet)
+	if err != nil {
+		return fmt.Errorf("failed to expand mappings: %w", err)
+	}
+	if len(expandedMappings) > len(mappings) && !quiet && verbose {
+		fmt.Printf("📂 Found %d subfolders, total folders to sync: %d\n", len(expandedMappings)-len(mappings), len(expandedMappings))
+	}
+	mappings = expandedMappings
+
 	// Setup progress writer for scanning phase
 	pw := progress.NewWriter(2, quiet)
 	pw.Start()
@@ -247,9 +261,72 @@ func Sync(cCtx *cli.Context) error {
 		}
 	}
 
+	// Pre-create all destination folders
+	if len(activePlans) > 0 {
+		if !quiet {
+			fmt.Println("\n📁 Creating destination folders...")
+		}
+
+		creationPW := progress.NewWriter(1, quiet)
+		creationPW.Start()
+		creationTracker := progress.NewTracker("Creating folders", int64(len(activePlans)))
+		creationPW.AppendTracker(creationTracker)
+
+		foldersToCreate := make(map[string]bool)
+		for _, plan := range activePlans {
+			if !plan.DestinationFolderExists {
+				foldersToCreate[plan.DestinationFolder] = true
+			}
+		}
+
+		creationTracker.UpdateTotal(int64(len(foldersToCreate)))
+		createdCount := 0
+		failedCount := 0
+
+		for folder := range foldersToCreate {
+			creationTracker.UpdateMessage(fmt.Sprintf("Creating %s (%d/%d)", folder, createdCount+failedCount+1, len(foldersToCreate)))
+
+			created, err := dstClient.CreateMailbox(folder)
+			if err != nil {
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "Mailbox exists") {
+					if verbose {
+						creationPW.Log("Folder %s already exists", folder)
+					}
+					createdCount++
+				} else {
+					creationPW.Log("Failed to create folder %q: %v", folder, err)
+					failedCount++
+				}
+			} else if created {
+				if verbose {
+					creationPW.Log("Created folder %q", folder)
+				}
+				createdCount++
+			} else {
+				createdCount++
+			}
+
+			creationTracker.Increment(1)
+		}
+
+		// Update final message
+		creationTracker.UpdateMessage(fmt.Sprintf("Created %d folders", createdCount))
+		creationTracker.MarkAsDone()
+		time.Sleep(100 * time.Millisecond)
+		creationPW.Stop()
+
+		if failedCount > 0 {
+			return fmt.Errorf("failed to create %d folders", failedCount)
+		}
+	}
+
 	totalSynced := 0
 	totalErrors := 0
 
+	if !quiet {
+		fmt.Println("\n📥 Syncing messages...")
+	}
 	// Process plans in chunks based on worker count
 	chunkSize := cfg.Workers
 	for chunkStart := 0; chunkStart < len(activePlans); chunkStart += chunkSize {
@@ -296,31 +373,7 @@ func Sync(cCtx *cli.Context) error {
 				}()
 				folderClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Dst.Label, planIndex))
 
-				if !p.DestinationFolderExists {
-					if verbose {
-						syncPW.Log("Attempting to create folder: %q", p.DestinationFolder)
-					}
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Creating %s", planIndex, len(activePlans), p.DestinationFolder))
-					created, err := folderClient.CreateMailbox(p.DestinationFolder)
-					if err != nil {
-						// Check if error is "mailbox already exists" - not fatal
-						errMsg := err.Error()
-						if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "Mailbox exists") {
-							if verbose {
-								syncPW.Log("Folder %s already exists, continuing...", p.DestinationFolder)
-							}
-						} else {
-							tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to create folder", planIndex, len(activePlans)))
-							tracker.MarkAsErrored()
-							atomic.AddInt64(&chunkErrorsAtomic, 1)
-							syncPW.Log("Failed to create folder %q: %v", p.DestinationFolder, err)
-							return
-						}
-					} else if created && verbose {
-						syncPW.Log("Created folder %q", p.DestinationFolder)
-					}
-				}
-
+				// Folders are already created in the pre-creation phase
 				tracker.UpdateTotal(int64(p.NewMessages))
 				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
 				synced, errors := syncFolders(cfg, p.SourceFolder, p.DestinationFolder, p.MessagesToSync, folderClient, verbose, syncPW, tracker, planIndex, len(activePlans))
@@ -343,6 +396,9 @@ func Sync(cCtx *cli.Context) error {
 		// Update totals
 		totalSynced += int(atomic.LoadInt64(&chunkSyncedAtomic))
 		totalErrors += int(atomic.LoadInt64(&chunkErrorsAtomic))
+
+		// Give trackers time to update final state
+		time.Sleep(100 * time.Millisecond)
 
 		// Stop progress for this chunk
 		syncPW.Stop()
@@ -426,8 +482,6 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		if srcErr != nil {
 			if verbose {
 				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %v", srcFolder, srcErr)
-			} else {
-				pw.Log("⚠️ Failed to fetch source folder %s, skipping", srcFolder)
 			}
 			continue
 		}
@@ -500,4 +554,88 @@ func detectDelimiter(folderPath string) string {
 		}
 	}
 	return "none"
+}
+
+// expandMappingsWithSubfolders expands each mapping to include all subfolders
+func expandMappingsWithSubfolders(srcClient *client.Client, mappings []config.DirectoryMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]config.DirectoryMapping, error) {
+	expanded := make([]config.DirectoryMapping, 0, len(mappings))
+
+	for _, mapping := range mappings {
+		// Add the original mapping
+		expanded = append(expanded, mapping)
+
+		// Get subfolders for this source folder
+		subfolders, err := getSubfolders(srcClient, mapping.Source, srcDelimiter)
+		if err != nil {
+			if verbose && !quiet {
+				fmt.Printf("  ⚠️  Failed to get subfolders for %s: %v\n", mapping.Source, err)
+			}
+			continue
+		}
+
+		// Add mapping for each subfolder
+		for _, subfolder := range subfolders {
+			// Calculate relative path from source root
+			var relativePath string
+			if srcDelimiter != "" {
+				relativePath = strings.TrimPrefix(subfolder, mapping.Source+srcDelimiter)
+			} else {
+				relativePath = strings.TrimPrefix(subfolder, mapping.Source)
+			}
+
+			// Build destination path
+			var dstPath string
+			if dstDelimiter != "" && relativePath != "" {
+				// Convert delimiter if needed
+				if srcDelimiter != "" && srcDelimiter != dstDelimiter {
+					relativePath = strings.ReplaceAll(relativePath, srcDelimiter, dstDelimiter)
+				}
+				dstPath = mapping.Destination + dstDelimiter + relativePath
+			} else {
+				dstPath = mapping.Destination
+			}
+
+			expanded = append(expanded, config.DirectoryMapping{
+				Source:      subfolder,
+				Destination: dstPath,
+			})
+
+			if verbose && !quiet {
+				fmt.Printf("  📁 Found subfolder: %s → %s\n", subfolder, dstPath)
+			}
+		}
+	}
+
+	return expanded, nil
+}
+
+// getSubfolders returns all subfolders of a given folder
+func getSubfolders(c *client.Client, folder string, delimiter string) ([]string, error) {
+	pattern := folder
+	if delimiter != "" {
+		pattern = folder + delimiter + "*"
+	} else {
+		pattern = folder + "/*"
+	}
+
+	mailboxes := make(chan *imap.MailboxInfo, 10)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- c.List("", pattern, mailboxes)
+	}()
+
+	var subfolders []string
+	for mbox := range mailboxes {
+		// Skip the folder itself
+		if mbox.Name != folder {
+			subfolders = append(subfolders, mbox.Name)
+		}
+	}
+
+	if err := <-done; err != nil {
+		return nil, err
+	}
+
+	return subfolders, nil
 }
