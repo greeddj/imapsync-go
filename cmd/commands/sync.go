@@ -3,6 +3,7 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -11,13 +12,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/utils"
-	gopretty "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/urfave/cli/v2"
-)
-
-const (
-	// jobChannelBuffer defines the buffer size for the worker job channel.
-	jobChannelBuffer = 100
 )
 
 // FolderSyncPlan describes how a single source folder should be copied to its destination.
@@ -43,14 +38,18 @@ func Sync(cCtx *cli.Context) error {
 	verbose := cCtx.Bool("verbose")
 	autoConfirm := cCtx.Bool("confirm")
 
-	fmt.Println("Fetching config...")
+	if !quiet {
+		fmt.Println("Fetching config...")
+	}
 	cfg, err := config.New(cCtx)
 	if err != nil {
 		fmt.Printf("Config error: %v\n", err)
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	fmt.Printf("Starting sync with %d workers\n", cfg.Workers)
+	if !quiet {
+		fmt.Printf("Starting sync with %d workers\n", cfg.Workers)
+	}
 
 	var mappings []config.DirectoryMapping
 
@@ -68,6 +67,106 @@ func Sync(cCtx *cli.Context) error {
 		mappings = cfg.Map
 	}
 
+	if !quiet {
+		fmt.Println("Connecting to servers...")
+	}
+
+	srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
+	if err != nil {
+		return fmt.Errorf("source connection failed: %w", err)
+	}
+	defer func() {
+		_ = srcClient.Logout()
+	}()
+	srcClient.SetPrefix(cfg.Src.Label)
+
+	dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+	if err != nil {
+		return fmt.Errorf("destination connection failed: %w", err)
+	}
+	defer func() {
+		_ = dstClient.Logout()
+	}()
+	dstClient.SetPrefix(cfg.Dst.Label)
+
+	// Check delimiters
+	srcDelimiter := srcClient.GetDelimiter()
+	dstDelimiter := dstClient.GetDelimiter()
+
+	if !quiet && verbose {
+		fmt.Printf("📁 Server delimiters:\n")
+		fmt.Printf("  Source [%s]: %q\n", cfg.Src.Label, srcDelimiter)
+		fmt.Printf("  Destination [%s]: %q\n\n", cfg.Dst.Label, dstDelimiter)
+	}
+
+	// Validate folder paths compatibility with server delimiters
+	var validationErrors []string
+	needsFix := false
+	for i, mapping := range mappings {
+		// Check source folder compatibility
+		if srcDelimiter != "" && !validateFolderPath(mapping.Source, srcDelimiter) {
+			oldDelim := detectDelimiter(mapping.Source)
+			validationErrors = append(validationErrors,
+				fmt.Sprintf("Mapping %d: Source folder %q uses delimiter %q, server expects %q",
+					i+1, mapping.Source, oldDelim, srcDelimiter))
+			needsFix = true
+		}
+
+		// Check destination folder compatibility
+		if dstDelimiter != "" && !validateFolderPath(mapping.Destination, dstDelimiter) {
+			oldDelim := detectDelimiter(mapping.Destination)
+			validationErrors = append(validationErrors,
+				fmt.Sprintf("Mapping %d: Destination folder %q uses delimiter %q, server expects %q",
+					i+1, mapping.Destination, oldDelim, dstDelimiter))
+			needsFix = true
+		}
+	}
+
+	if needsFix {
+		fmt.Printf("⚠️  Folder path delimiter mismatch detected:\n")
+		for _, err := range validationErrors {
+			fmt.Printf("  • %s\n", err)
+		}
+		fmt.Println()
+
+		var shouldFix bool
+		if autoConfirm {
+			shouldFix = true
+			fmt.Println("✅ Auto-confirming delimiter fix...")
+		} else {
+			confirmed, err := utils.AskConfirm("🔧 Fix folder delimiters to match server configuration?")
+			if err != nil {
+				return err
+			}
+			shouldFix = confirmed
+		}
+
+		if shouldFix {
+			// Fix delimiters in mappings
+			for i := range mappings {
+				if srcDelimiter != "" {
+					oldDelim := detectDelimiter(mappings[i].Source)
+					if oldDelim != "none" && oldDelim != srcDelimiter {
+						oldPath := mappings[i].Source
+						mappings[i].Source = strings.ReplaceAll(mappings[i].Source, oldDelim, srcDelimiter)
+						fmt.Printf("  ✓ Fixed source: %q → %q\n", oldPath, mappings[i].Source)
+					}
+				}
+				if dstDelimiter != "" {
+					oldDelim := detectDelimiter(mappings[i].Destination)
+					if oldDelim != "none" && oldDelim != dstDelimiter {
+						oldPath := mappings[i].Destination
+						mappings[i].Destination = strings.ReplaceAll(mappings[i].Destination, oldDelim, dstDelimiter)
+						fmt.Printf("  ✓ Fixed destination: %q → %q\n", oldPath, mappings[i].Destination)
+					}
+				}
+			}
+			fmt.Println()
+		} else {
+			return fmt.Errorf("sync canceled: folder delimiters do not match server configuration")
+		}
+	}
+
 	// Setup progress writer for scanning phase
 	pw := progress.NewWriter(2, quiet)
 	pw.Start()
@@ -79,37 +178,12 @@ func Sync(cCtx *cli.Context) error {
 	pw.AppendTracker(srcTracker)
 	pw.AppendTracker(dstTracker)
 
-	srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
-
-	srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
-	if err != nil {
-		srcTracker.MarkAsErrored()
-		pw.Stop()
-		return fmt.Errorf("source connection failed: %w", err)
-	}
-	defer func() {
-		_ = srcClient.Logout()
-	}()
-	srcClient.SetPrefix(cfg.Src.Label)
 	srcClient.SetProgressWriter(pw)
 	srcClient.SetProgressTracker(srcTracker)
-
-	dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
-
-	dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
-	if err != nil {
-		dstTracker.MarkAsErrored()
-		pw.Stop()
-		return fmt.Errorf("destination connection failed: %w", err)
-	}
-	defer func() {
-		_ = dstClient.Logout()
-	}()
-	dstClient.SetPrefix(cfg.Dst.Label)
 	dstClient.SetProgressWriter(pw)
 	dstClient.SetProgressTracker(dstTracker)
 
-	summary, err := buildSyncPlan(srcClient, dstClient, mappings, srcTracker, dstTracker, pw, verbose)
+	summary, err := buildSyncPlan(srcClient, dstClient, mappings, srcTracker, dstTracker, pw, cfg.Src.Label, cfg.Dst.Label, verbose)
 	if err != nil {
 		pw.Stop()
 		return err
@@ -122,97 +196,157 @@ func Sync(cCtx *cli.Context) error {
 	// Stop and clear progress
 	pw.StopAndClear(2)
 
-	if summary.TotalNew > 0 && !quiet {
-		fmt.Printf("📤 Messages to be copied to destination:\n")
-		foldersToCreate := make([]string, 0, len(summary.Plans))
-		for _, plan := range summary.Plans {
-			foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
-			if len(plan.MessagesToSync) > 0 {
-				fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, len(plan.MessagesToSync))
-				if verbose {
-					for _, msg := range plan.MessagesToSync {
-						fmt.Printf("  • %s (ID: %s)\n", msg.Envelope.Subject, msg.Envelope.MessageId)
+	if summary.TotalNew > 0 {
+		if !quiet {
+			fmt.Printf("📤 Messages to be copied to destination:\n")
+			foldersToCreate := make([]string, 0, len(summary.Plans))
+			for _, plan := range summary.Plans {
+				foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
+				if len(plan.MessagesToSync) > 0 {
+					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, len(plan.MessagesToSync))
+					if verbose {
+						for _, msg := range plan.MessagesToSync {
+							fmt.Printf("  • %s (ID: %s)\n", msg.Envelope.Subject, msg.Envelope.MessageId)
+						}
+						fmt.Println()
 					}
-					fmt.Println()
+				}
+			}
+
+			if len(foldersToCreate) > 0 {
+				fmt.Printf("\n🗂️ Folders to be created on destination:\n")
+				for _, folder := range foldersToCreate {
+					fmt.Printf("• %s\n", folder)
+				}
+			}
+			fmt.Printf("\n📨 Total new messages to sync: %d\n", summary.TotalNew)
+
+			if !autoConfirm {
+				confirmed, err := utils.AskConfirm("✍️ Proceed with synchronization?")
+				if err != nil {
+					return err
+				}
+				if !confirmed {
+					fmt.Println("❌ Sync canceled by user")
+					return nil
 				}
 			}
 		}
-
-		if len(foldersToCreate) > 0 {
-			fmt.Printf("\n🗂️ Folders to be created on destination:\n")
-			for _, folder := range foldersToCreate {
-				fmt.Printf("• %s\n", folder)
-			}
-		}
-		fmt.Printf("\n📨 Total new messages to sync: %d\n", summary.TotalNew)
-
-		if !autoConfirm {
-			confirmed, err := utils.AskConfirm("✍️ Proceed with synchronization?")
-			if err != nil {
-				return err
-			}
-			if !confirmed {
-				fmt.Println("❌ Sync canceled by user")
-				return nil
-			}
-		}
 	} else {
-		fmt.Println("✅ All folders already synced!")
+		if !quiet {
+			fmt.Println("✅ All folders already synced!")
+		}
 		return nil
 	}
 
-	// Setup progress writer for sync phase
-	syncPW := progress.NewWriter(len(summary.Plans), quiet)
-	syncPW.Start()
-
-	// Create all trackers upfront
-	folderTrackers := make([]*gopretty.Tracker, 0, len(summary.Plans))
-	for i, plan := range summary.Plans {
-		if plan.NewMessages == 0 {
-			continue
+	// Collect active plans
+	activePlans := make([]FolderSyncPlan, 0)
+	for _, plan := range summary.Plans {
+		if plan.NewMessages > 0 {
+			activePlans = append(activePlans, plan)
 		}
-		folderTracker := progress.NewTracker(
-			fmt.Sprintf("⚙️ %d/%d %s → %s", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder),
-			int64(plan.NewMessages),
-		)
-		syncPW.AppendTracker(folderTracker)
-		folderTrackers = append(folderTrackers, folderTracker)
 	}
+
 	totalSynced := 0
 	totalErrors := 0
 
-	trackerIdx := 0
-	for i, plan := range summary.Plans {
-		if plan.NewMessages == 0 {
-			continue
+	// Process plans in chunks based on worker count
+	chunkSize := cfg.Workers
+	for chunkStart := 0; chunkStart < len(activePlans); chunkStart += chunkSize {
+		chunkEnd := min(chunkStart+chunkSize, len(activePlans))
+		chunk := activePlans[chunkStart:chunkEnd]
+
+		// Setup progress writer for this chunk
+		syncPW := progress.NewWriter(len(chunk), quiet)
+		syncPW.Start()
+
+		// Create trackers for this chunk
+		trackers := make([]*progress.Tracker, len(chunk))
+		for i := range chunk {
+			trackers[i] = progress.NewTracker(
+				fmt.Sprintf("%d/%d Waiting...", chunkStart+i+1, len(activePlans)),
+				100,
+			)
+			syncPW.AppendTracker(trackers[i])
 		}
 
-		folderTracker := folderTrackers[trackerIdx]
-		trackerIdx++
-		if !plan.DestinationFolderExists {
-			folderTracker.UpdateMessage(fmt.Sprintf("⚙️ %d/%d Creating %s", i+1, len(summary.Plans), plan.DestinationFolder))
-			_, err := dstClient.CreateMailbox(plan.DestinationFolder)
-			if err != nil {
-				folderTracker.MarkAsErrored()
-				totalErrors++
-				continue
-			}
+		// Process chunk in parallel
+		var chunkWg sync.WaitGroup
+		var chunkSyncedAtomic int64
+		var chunkErrorsAtomic int64
+
+		for i, plan := range chunk {
+			chunkWg.Add(1)
+			go func(idx int, planIndex int, p FolderSyncPlan, tracker *progress.Tracker) {
+				defer chunkWg.Done()
+
+				tracker.UpdateMessage(fmt.Sprintf("%d/%d Connecting...", planIndex, len(activePlans)))
+
+				// Create a dedicated client for this goroutine
+				folderClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+				if err != nil {
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect", planIndex, len(activePlans)))
+					tracker.MarkAsErrored()
+					atomic.AddInt64(&chunkErrorsAtomic, 1)
+					syncPW.Log("Failed to connect for folder %s: %v", p.DestinationFolder, err)
+					return
+				}
+				defer func() {
+					_ = folderClient.Logout()
+				}()
+				folderClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Dst.Label, planIndex))
+
+				if !p.DestinationFolderExists {
+					if verbose {
+						syncPW.Log("Attempting to create folder: %q", p.DestinationFolder)
+					}
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d Creating %s", planIndex, len(activePlans), p.DestinationFolder))
+					created, err := folderClient.CreateMailbox(p.DestinationFolder)
+					if err != nil {
+						// Check if error is "mailbox already exists" - not fatal
+						errMsg := err.Error()
+						if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "Mailbox exists") {
+							if verbose {
+								syncPW.Log("Folder %s already exists, continuing...", p.DestinationFolder)
+							}
+						} else {
+							tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to create folder", planIndex, len(activePlans)))
+							tracker.MarkAsErrored()
+							atomic.AddInt64(&chunkErrorsAtomic, 1)
+							syncPW.Log("Failed to create folder %q: %v", p.DestinationFolder, err)
+							return
+						}
+					} else if created && verbose {
+						syncPW.Log("Created folder %q", p.DestinationFolder)
+					}
+				}
+
+				tracker.UpdateTotal(int64(p.NewMessages))
+				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
+				synced, errors := syncFolders(cfg, p.SourceFolder, p.DestinationFolder, p.MessagesToSync, folderClient, verbose, syncPW, tracker, planIndex, len(activePlans))
+				atomic.AddInt64(&chunkSyncedAtomic, int64(synced))
+				atomic.AddInt64(&chunkErrorsAtomic, int64(errors))
+
+				if errors > 0 {
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s (errors: %d)", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder, errors))
+					tracker.MarkAsErrored()
+				} else {
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
+					tracker.MarkAsDone()
+				}
+			}(i, chunkStart+i+1, plan, trackers[i])
 		}
 
-		folderTracker.UpdateMessage(fmt.Sprintf("⚙️ %d/%d %s → %s", i+1, len(summary.Plans), plan.SourceFolder, plan.DestinationFolder))
-		synced, errors := syncFolders(cfg, plan.DestinationFolder, plan.MessagesToSync, cfg.Workers, verbose, syncPW, folderTracker)
-		totalSynced += synced
-		totalErrors += errors
+		// Wait for chunk to complete
+		chunkWg.Wait()
 
-		if errors > 0 {
-			folderTracker.MarkAsErrored()
-		} else {
-			folderTracker.MarkAsDone()
-		}
+		// Update totals
+		totalSynced += int(atomic.LoadInt64(&chunkSyncedAtomic))
+		totalErrors += int(atomic.LoadInt64(&chunkErrorsAtomic))
+
+		// Stop progress for this chunk
+		syncPW.Stop()
 	}
-
-	// Stop and clear progress
-	syncPW.StopAndClear(len(folderTrackers))
 
 	if totalErrors > 0 {
 		fmt.Printf("❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSynced, totalErrors)
@@ -223,55 +357,30 @@ func Sync(cCtx *cli.Context) error {
 	return nil
 }
 
-// syncFolders syncs messages using multiple parallel workers.
-func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message, numWorkers int, verbose bool, pw *progress.Writer, tracker *gopretty.Tracker) (int, int) {
-	jobs := make(chan *imap.Message, jobChannelBuffer)
-	var wg sync.WaitGroup
+// syncFolders syncs messages using a single client (already connected and with folder created).
+func syncFolders(cfg *config.Config, srcFolder, dstFolder string, messages []*imap.Message, dstClient *client.Client, verbose bool, pw *progress.Writer, tracker *progress.Tracker, planIndex, totalPlans int) (int, int) {
 	var syncedCount int64
 	var errorCount int64
 
-	for i := range numWorkers {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			workerClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
-			if err != nil {
-				pw.Log("Worker %d: failed to connect: %v", workerID, err)
-				atomic.AddInt64(&errorCount, 1)
-				return
+	for i, msg := range messages {
+		if err := dstClient.AppendMessage(dstFolder, msg); err != nil {
+			pw.Log("Failed to append message %d/%d: %v", i+1, len(messages), err)
+			atomic.AddInt64(&errorCount, 1)
+		} else {
+			synced := atomic.AddInt64(&syncedCount, 1)
+			tracker.Increment(1)
+			tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s (%d/%d)", planIndex, totalPlans, srcFolder, dstFolder, synced, len(messages)))
+			if verbose {
+				pw.Log("Synced %d/%d messages to %s, processed msg id %s", synced, len(messages), dstFolder, msg.Envelope.MessageId)
 			}
-			defer func() {
-				_ = workerClient.Logout()
-			}()
-			workerClient.SetPrefix(fmt.Sprintf("%s-%d", cfg.Dst.Label, workerID))
-
-			for msg := range jobs {
-				if err := workerClient.AppendMessage(dstFolder, msg); err != nil {
-					atomic.AddInt64(&errorCount, 1)
-				} else {
-					synced := atomic.AddInt64(&syncedCount, 1)
-					tracker.Increment(1)
-					if verbose {
-						pw.Log("Synced %d/%d messages to %s, processed msg id %s", synced, len(messages), dstFolder, msg.Envelope.MessageId)
-					}
-				}
-			}
-		}(i)
+		}
 	}
-
-	for _, msg := range messages {
-		jobs <- msg
-	}
-	close(jobs)
-
-	wg.Wait()
 
 	return int(syncedCount), int(errorCount)
 }
 
 // buildSyncPlan compares source and destination folders to determine what needs syncing.
-func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *gopretty.Tracker, pw *progress.Writer, verbose bool) (*SyncSummary, error) {
+func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, pw *progress.Writer, srcLabel, dstLabel string, verbose bool) (*SyncSummary, error) {
 	summary := &SyncSummary{
 		Plans: make([]FolderSyncPlan, 0),
 	}
@@ -292,8 +401,8 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		var wg sync.WaitGroup
 
 		// Update trackers
-		srcTracker.UpdateMessage(fmt.Sprintf("Scanning %s (%d/%d)", srcFolder, idx+1, len(mappings)))
-		dstTracker.UpdateMessage(fmt.Sprintf("Scanning %s (%d/%d)", dstFolder, idx+1, len(mappings)))
+		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
+		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
 
 		// Fetch source message IDs
 		wg.Go(func() {
@@ -316,9 +425,9 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 
 		if srcErr != nil {
 			if verbose {
-				pw.Log("Failed to fetch source folder %s, skipping by error: %v", srcFolder, srcErr)
+				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %v", srcFolder, srcErr)
 			} else {
-				pw.Log("Failed to fetch source folder %s, skipping", srcFolder)
+				pw.Log("⚠️ Failed to fetch source folder %s, skipping", srcFolder)
 			}
 			continue
 		}
@@ -338,10 +447,14 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 		}
 
 		// Fetch full bodies only for messages that need syncing
-		messagesToSync, err := srcClient.FetchMessagesByIDs(srcFolder, newIDs)
+		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
+		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Waiting for %s (%d/%d)", dstLabel, srcFolder, idx+1, len(mappings)))
+		messagesToSync, err := srcClient.FetchMessagesByIDs(srcFolder, newIDs, srcTracker, len(newIDs))
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch messages from %s: %w", srcFolder, err)
 		}
+		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
+		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
 		srcTracker.Increment(1)
 		dstTracker.Increment(1)
 
@@ -359,4 +472,32 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 	}
 
 	return summary, nil
+}
+
+// validateFolderPath checks if folder path uses the correct delimiter for the server
+func validateFolderPath(folderPath, serverDelimiter string) bool {
+	if serverDelimiter == "" {
+		return true
+	}
+
+	// Check if path contains any common delimiters
+	commonDelimiters := []string{"/", ".", "\\"}
+	for _, delim := range commonDelimiters {
+		if delim != serverDelimiter && strings.Contains(folderPath, delim) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// detectDelimiter tries to detect which delimiter is used in the folder path
+func detectDelimiter(folderPath string) string {
+	commonDelimiters := []string{"/", ".", "\\"}
+	for _, delim := range commonDelimiters {
+		if strings.Contains(folderPath, delim) {
+			return delim
+		}
+	}
+	return "none"
 }

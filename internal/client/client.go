@@ -14,6 +14,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/greeddj/imapsync-go/internal/progress"
 )
 
 const (
@@ -30,6 +31,26 @@ const (
 	// progressUpdateInterval defines how often to update progress during batch operations.
 	progressUpdateInterval = 10
 )
+
+// Global lock map for folder creation to prevent race conditions
+var (
+	folderLocksMu sync.Mutex
+	folderLocks   = make(map[string]*sync.Mutex)
+)
+
+// getFolderLock returns a mutex for a specific folder path
+func getFolderLock(path string) *sync.Mutex {
+	folderLocksMu.Lock()
+	defer folderLocksMu.Unlock()
+
+	if lock, exists := folderLocks[path]; exists {
+		return lock
+	}
+
+	lock := &sync.Mutex{}
+	folderLocks[path] = lock
+	return lock
+}
 
 // ProgressWriter is a minimal interface for progress tracking and logging.
 // This avoids circular dependency with the progress package.
@@ -63,6 +84,7 @@ type Client struct {
 	verbose       bool                                // Enable verbose logging.
 	pw            ProgressWriter                      // Optional progress writer for logging.
 	tracker       ProgressTracker                     // Optional progress tracker for updates.
+	delimiter     string                              // Cached hierarchy delimiter from server.
 }
 
 // New establishes a connection and logs into the IMAP server.
@@ -89,6 +111,14 @@ func New(addr, username, password string, workers int, verbose, useTLS bool, tls
 		return nil, err
 	}
 
+	// Get and cache the delimiter
+	delimiter, err := c.getDelimiter()
+	if err != nil {
+		_ = c.Logout()
+		return nil, fmt.Errorf("failed to get delimiter: %w", err)
+	}
+	c.delimiter = delimiter
+
 	return c, nil
 }
 
@@ -105,6 +135,11 @@ func (c *Client) SetProgressWriter(pw ProgressWriter) {
 // SetProgressTracker sets an optional progress tracker for updating progress.
 func (c *Client) SetProgressTracker(tracker ProgressTracker) {
 	c.tracker = tracker
+}
+
+// GetDelimiter returns the cached hierarchy delimiter for this server.
+func (c *Client) GetDelimiter() string {
+	return c.delimiter
 }
 
 // log outputs a message either to progress writer or stdout based on availability.
@@ -226,6 +261,11 @@ func (c *Client) SafeSearch(criteria *imap.SearchCriteria) ([]uint32, error) {
 
 // CreateMailbox ensures the destination folder (and parents) exist on the server.
 func (c *Client) CreateMailbox(name string) (bool, error) {
+	// Lock this specific folder path to prevent concurrent creation
+	lock := getFolderLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if exists, err := c.mailboxExists(name); err != nil {
 		return false, err
 	} else if exists {
@@ -307,8 +347,13 @@ func (c *Client) createParentFolders(name, delimiter string) error {
 	for i := 1; i < len(parts); i++ {
 		parentPath := strings.Join(parts[:i], delimiter)
 
+		// Get a lock specific to this folder path to prevent race conditions
+		lock := getFolderLock(parentPath)
+		lock.Lock()
+
 		exists, err := c.mailboxExists(parentPath)
 		if err != nil {
+			lock.Unlock()
 			return fmt.Errorf("[%s] failed to check parent folder %s: %w", c.prefix, parentPath, err)
 		}
 
@@ -318,10 +363,13 @@ func (c *Client) createParentFolders(name, delimiter string) error {
 				return c.Create(parentPath)
 			})
 			if err != nil {
+				lock.Unlock()
 				return fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, err)
 			}
 			c.log("[%s] Created parent folder: %s", c.prefix, parentPath)
 		}
+
+		lock.Unlock()
 	}
 
 	return nil
@@ -406,7 +454,7 @@ func (c *Client) FetchMessages(folder string) ([]*imap.Message, error) {
 }
 
 // FetchMessagesByIDs retrieves full messages that match the given Message-IDs.
-func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool) ([]*imap.Message, error) {
+func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tracker *progress.Tracker, totalToFetch int) ([]*imap.Message, error) {
 	if len(targetIDs) == 0 {
 		return []*imap.Message{}, nil
 	}
@@ -462,6 +510,9 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool) ([
 	var result []*imap.Message
 	for msg := range messages {
 		result = append(result, msg)
+		if tracker != nil {
+			tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result), len(targetUIDs)))
+		}
 	}
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)

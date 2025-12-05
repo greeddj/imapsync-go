@@ -29,14 +29,14 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.SetMessageLength(100)
 	pw.SetNumTrackersExpected(numTrackers)
 	pw.SetStyle(progress.StyleDefault)
-	pw.SetTrackerPosition(progress.PositionLeft)
+	pw.SetTrackerPosition(progress.PositionRight)
 	pw.SetUpdateFrequency(time.Millisecond * 100)
 
 	// Configure visibility
 	pw.Style().Visibility.ETA = true
 	pw.Style().Visibility.ETAOverall = false
 	pw.Style().Visibility.TrackerOverall = false
-	pw.Style().Visibility.Time = false
+	pw.Style().Visibility.Time = true
 	pw.Style().Visibility.Value = false
 	pw.Style().Visibility.Percentage = true
 
@@ -117,3 +117,6 @@ func NewTracker(message string, total int64) *progress.Tracker {
 		Units:   progress.UnitsDefault,
 	}
 }
+
+// Tracker is an alias for the underlying progress.Tracker type.
+type Tracker = progress.Tracker
