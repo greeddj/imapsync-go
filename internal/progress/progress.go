@@ -9,11 +9,20 @@ import (
 
 	"github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/jedib0t/go-pretty/v6/text"
+	"golang.org/x/term"
 )
 
 // Writer is a wrapper around progress.Writer with pre-configured settings.
 type Writer struct {
 	pw progress.Writer
+}
+
+// getTerminalWidth returns the current terminal width, defaulting to 120 if detection fails.
+func getTerminalWidth() int {
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
+		return width
+	}
+	return 120 // default width
 }
 
 // NewWriter creates a new progress writer with pre-configured settings and colors.
@@ -25,8 +34,24 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	} else {
 		pw.SetOutputWriter(os.Stdout)
 	}
-	pw.SetTrackerLength(30)
-	pw.SetMessageLength(100)
+
+	// Calculate optimal lengths based on terminal width
+	terminalWidth := getTerminalWidth()
+
+	// Reserve space for: percentage (8 chars), tracker bar (30 chars), stats/time (~25 chars), separators (6 chars)
+	// Total reserved: ~69 chars
+	trackerBarLength := 30
+	statsReserved := 69
+
+	// Remaining space goes to message
+	messageLength := terminalWidth - statsReserved
+	if messageLength < 40 {
+		messageLength = 40    // minimum message length
+		trackerBarLength = 20 // shrink tracker if terminal is narrow
+	}
+
+	pw.SetTrackerLength(trackerBarLength)
+	pw.SetMessageLength(messageLength)
 	pw.SetNumTrackersExpected(numTrackers)
 	pw.SetStyle(progress.StyleDefault)
 	pw.SetTrackerPosition(progress.PositionRight)
