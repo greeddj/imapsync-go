@@ -284,7 +284,7 @@ func Sync(cCtx *cli.Context) error {
 		failedCount := 0
 
 		for folder := range foldersToCreate {
-			creationTracker.UpdateMessage(fmt.Sprintf("Creating %s (%d/%d)", folder, createdCount+failedCount+1, len(foldersToCreate)))
+			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+failedCount+1, len(foldersToCreate), folder))
 
 			created, err := dstClient.CreateMailbox(folder)
 			if err != nil {
@@ -376,15 +376,15 @@ func Sync(cCtx *cli.Context) error {
 				// Folders are already created in the pre-creation phase
 				tracker.UpdateTotal(int64(p.NewMessages))
 				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
-				synced, errors := syncFolders(cfg, p.SourceFolder, p.DestinationFolder, p.MessagesToSync, folderClient, verbose, syncPW, tracker, planIndex, len(activePlans))
+				synced, errors := syncFolders(cfg, p.SourceFolder, p.DestinationFolder, p.MessagesToSync, folderClient, verbose, syncPW, tracker, planIndex, len(activePlans), p.NewMessages)
 				atomic.AddInt64(&chunkSyncedAtomic, int64(synced))
 				atomic.AddInt64(&chunkErrorsAtomic, int64(errors))
 
 				if errors > 0 {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s (errors: %d)", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder, errors))
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s", planIndex, len(activePlans), synced, errors, p.SourceFolder, p.DestinationFolder))
 					tracker.MarkAsErrored()
 				} else {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d %s → %s", planIndex, len(activePlans), synced, p.SourceFolder, p.DestinationFolder))
 					tracker.MarkAsDone()
 				}
 			}(i, chunkStart+i+1, plan, trackers[i])
@@ -414,7 +414,7 @@ func Sync(cCtx *cli.Context) error {
 }
 
 // syncFolders syncs messages using a single client (already connected and with folder created).
-func syncFolders(cfg *config.Config, srcFolder, dstFolder string, messages []*imap.Message, dstClient *client.Client, verbose bool, pw *progress.Writer, tracker *progress.Tracker, planIndex, totalPlans int) (int, int) {
+func syncFolders(cfg *config.Config, srcFolder, dstFolder string, messages []*imap.Message, dstClient *client.Client, verbose bool, pw *progress.Writer, tracker *progress.Tracker, planIndex, totalPlans, totalMessages int) (int, int) {
 	var syncedCount int64
 	var errorCount int64
 
@@ -425,7 +425,7 @@ func syncFolders(cfg *config.Config, srcFolder, dstFolder string, messages []*im
 		} else {
 			synced := atomic.AddInt64(&syncedCount, 1)
 			tracker.Increment(1)
-			tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s (%d/%d)", planIndex, totalPlans, srcFolder, dstFolder, synced, len(messages)))
+			tracker.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s", planIndex, totalPlans, synced, totalMessages, srcFolder, dstFolder))
 			if verbose {
 				pw.Log("Synced %d/%d messages to %s, processed msg id %s", synced, len(messages), dstFolder, msg.Envelope.MessageId)
 			}
