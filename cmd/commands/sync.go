@@ -162,10 +162,11 @@ func Sync(cCtx *cli.Context) error {
 					}
 				}
 			}
-			fmt.Println()
 		} else {
-			return fmt.Errorf("sync canceled: folder delimiters do not match server configuration")
+			fmt.Println()
+			fmt.Println("⚠️ Please note if delimiter is not corresponding to the server configuration, the folder structure may not be correctly interpreted.")
 		}
+		fmt.Println()
 	}
 
 	// Expand mappings to include subfolders
