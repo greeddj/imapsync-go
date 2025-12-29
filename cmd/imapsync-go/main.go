@@ -1,40 +1,39 @@
 // Package cmd wires CLI configuration and subcommands.
-package cmd
+package main
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"runtime"
+	"os/signal"
+	"syscall"
 
-	"github.com/greeddj/imapsync-go/cmd/commands"
+	"github.com/greeddj/imapsync-go/cmd/imapsync-go/commands"
+	"github.com/greeddj/imapsync-go/cmd/imapsync-go/helpers"
 
 	"github.com/urfave/cli/v2"
 )
 
+//nolint:gochecknoglobals
 var (
-	// Version stores the version tag from build-time injection.
-	Version = "dev"
-	// Commit stores the git commit hash from build-time injection.
-	Commit = "none"
-	// Date stores the build date from build-time injection.
-	Date = "unknown"
-	// BuiltBy stores who built the binary.
-	BuiltBy = "manual"
-	// appName is the application name.
-	appName = "imapsync-go"
+	Version string
+	Commit  string
+	Date    string
+	BuiltBy string
 )
 
-// Run configures and executes the imapsync-go CLI application.
-func Run() error {
-	cli.VersionPrinter = func(cCtx *cli.Context) {
-		fmt.Println(cCtx.App.Version)
-	}
+// main is the entry point for the imapsync-go application.
+func main() {
+	os.Exit(run())
+}
+
+// run configures and executes the imapsync-go CLI application.
+func run() int {
 	app := &cli.App{
-		Name:                   appName,
-		Suggest:                false,
+		Name:                   "imapsync-go",
 		Usage:                  "IMAP to IMAP synchronization tool",
 		UseShortOptionHandling: true,
-		Version:                fmt.Sprintf("%s (commit: %s, built: %s by %s) // %s", Version, Commit, Date, BuiltBy, runtime.Version()),
+		Version:                helpers.Version(Version, Commit, Date, BuiltBy),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "config",
@@ -74,19 +73,16 @@ func Run() error {
 					&cli.BoolFlag{
 						Name:    "verbose",
 						Aliases: []string{"V"},
-						Value:   false,
 						EnvVars: []string{"IMAPSYNC_VERBOSE"},
 					},
 					&cli.BoolFlag{
 						Name:    "quiet",
 						Aliases: []string{"q"},
-						Value:   false,
 						EnvVars: []string{"IMAPSYNC_QUIET"},
 					},
 					&cli.BoolFlag{
 						Name:    "confirm",
 						Aliases: []string{"y", "yes"},
-						Value:   false,
 						Usage:   "auto-confirm (skip confirmation prompt)",
 						EnvVars: []string{"IMAPSYNC_CONFIRM"},
 					},
@@ -95,9 +91,12 @@ func Run() error {
 		},
 	}
 
-	err := app.Run(os.Args)
-	if err != nil {
-		return fmt.Errorf("app.Run: %w", err)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer stop()
+
+	if err := app.RunContext(ctx, os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
 	}
-	return nil
+	return 0
 }

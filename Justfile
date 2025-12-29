@@ -1,18 +1,12 @@
 PROJECT := "imapsync-go"
-PKG := "github.com/greeddj/{{PROJECT}}"
-
-VERSION := `git describe --tags --abbrev=0 2>/dev/null || echo "dev"`
+VERSION := `sh -c 'git describe --tags --abbrev=0 2>/dev/null || git rev-parse --abbrev-ref HEAD'`
 COMMIT := `git rev-parse --short HEAD`
 DATE := `date -u +%Y-%m-%dT%H:%M:%SZ`
-
-FLAGS := "-s -w -extldflags '-static' -X {{PKG}}/cmd.Version={{VERSION}} -X {{PKG}}/cmd.Commit={{COMMIT}} -X {{PKG}}/cmd.Date={{DATE}} -X {{PKG}}/cmd.BuiltBy=just"
-BUILD := "CGO_ENABLED=0 go build -mod vendor"
-
-tools:
-	@echo "===== Add tools ====="
-	brew install golangci/tap/golangci-lint
-	go install honnef.co/go/tools/cmd/staticcheck@latest
-	go install golang.org/x/vuln/cmd/govulncheck@latest
+LDFLAGS := "-s -w" \
+  + " -X main.Version=" + VERSION \
+  + " -X main.Commit=" + COMMIT \
+  + " -X main.Date=" + DATE \
+  + " -X main.BuiltBy=just"
 
 deps:
 	@echo "===== Check deps for {{PROJECT}} ====="
@@ -21,33 +15,34 @@ deps:
 
 lint:
 	@echo "===== Lint {{PROJECT}} ====="
-	golangci-lint run ./...
+	golangci-lint run ./... --timeout=5m
+
+test:
+	@echo "===== Test {{PROJECT}} ====="
+	go test ./...
 
 check: deps
 	@echo "===== Check {{PROJECT}} ====="
-	go vet -mod vendor ./...
-	staticcheck ./...
-	govulncheck ./...
+	go vet ./...
+	go tool staticcheck ./...
+	go tool govulncheck ./...
 
-# Run unit tests
-test:
-	@echo "===== Unit tests for {{PROJECT}} ====="
-	go test ./internal/...
+run: check lint test
+	@echo "===== Run {{PROJECT}} ====="
+	go run -race ./cmd/{{ PROJECT }}/main.go
 
-build: check
+build: check lint test
 	@echo "===== Build {{PROJECT}} ====="
 	mkdir -p dist
-	if [ -f dist/{{PROJECT}} ]; then rm -f dist/{{PROJECT}}; else echo "Not exist dist/{{PROJECT}}"; fi
-	{{BUILD}} -ldflags="{{FLAGS}}" -o dist/{{PROJECT}} main.go
+	test -f dist/{{PROJECT}} && rm -f dist/{{PROJECT}} || echo "Not exist dist/{{PROJECT}}"
+	CGO_ENABLED=0 go build -trimpath -ldflags="{{LDFLAGS}}"  -o ./dist/{{PROJECT}} ./cmd/{{ PROJECT }}/main.go
 
 build_linux: check
 	@echo "===== Build {{PROJECT}} for Linux / amd64 ====="
 	mkdir -p dist
-	if [ -f dist/{{PROJECT}} ]; then rm -f dist/{{PROJECT}}; else echo "Not exist dist/{{PROJECT}}"; fi
-	GOOS="linux" GOARCH="amd64" {{BUILD}} -ldflags="{{FLAGS}}" -o dist/{{PROJECT}} main.go
+	test -f dist/{{PROJECT}} && rm -f dist/{{PROJECT}} || echo "Not exist dist/{{PROJECT}}"
+	GOOS="linux" GOARCH="amd64" CGO_ENABLED=0 go build -trimpath -ldflags="{{LDFLAGS}}" -o dist/{{PROJECT}} ./cmd/{{ PROJECT }}/main.go
 
 oci executor="podman" tag="local": build_linux
 	@echo "===== Build Local OCI {{PROJECT}} ====="
-	cp dist/{{PROJECT}} imapsync-go
 	{{executor}} build -t {{PROJECT}}:{{tag}} -f Dockerfile .
-	rm -f imapsync-go
