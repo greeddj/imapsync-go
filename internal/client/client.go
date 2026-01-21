@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,8 @@ const (
 	maxReconnectAttempts = 5
 	// progressUpdateInterval defines how often to update progress during batch operations.
 	progressUpdateInterval = 10
+	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
+	uidFetchBatchSize = 500
 )
 
 // Global lock map for folder creation to prevent race conditions
@@ -497,25 +500,32 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tr
 
 	c.log("[%s] Found %d messages to fetch from %s", c.prefix, len(targetUIDs), folder)
 
-	// Second pass: fetch full bodies for target UIDs only
-	uidSet := new(imap.SeqSet)
-	for _, uid := range targetUIDs {
-		uidSet.AddNum(uid)
-	}
-
-	messages := make(chan *imap.Message, messageChanBuffer)
-	done = make(chan error, 1)
-	go func() { done <- c.UidFetch(uidSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages) }()
+	// Second pass: fetch full bodies for target UIDs only (batched)
+	slices.Sort(targetUIDs)
 
 	var result []*imap.Message
-	for msg := range messages {
-		result = append(result, msg)
-		if tracker != nil {
-			tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result), len(targetUIDs)))
+	for start := 0; start < len(targetUIDs); start += uidFetchBatchSize {
+		end := min(start+uidFetchBatchSize, len(targetUIDs))
+		uidSet := new(imap.SeqSet)
+		for _, uid := range targetUIDs[start:end] {
+			uidSet.AddNum(uid)
 		}
-	}
-	if err := <-done; err != nil {
-		return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)
+
+		messages := make(chan *imap.Message, messageChanBuffer)
+		batchDone := make(chan error, 1)
+		go func() {
+			batchDone <- c.UidFetch(uidSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
+		}()
+
+		for msg := range messages {
+			result = append(result, msg)
+			if tracker != nil {
+				tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result), len(targetUIDs)))
+			}
+		}
+		if err := <-batchDone; err != nil {
+			return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)
+		}
 	}
 
 	return result, nil
