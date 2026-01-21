@@ -3,6 +3,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -88,6 +90,7 @@ type Client struct {
 	pw            ProgressWriter                      // Optional progress writer for logging.
 	tracker       ProgressTracker                     // Optional progress tracker for updates.
 	delimiter     string                              // Cached hierarchy delimiter from server.
+	cancelled     atomic.Bool                         // Indicates context cancellation.
 }
 
 // New establishes a connection and logs into the IMAP server.
@@ -145,6 +148,38 @@ func (c *Client) GetDelimiter() string {
 	return c.delimiter
 }
 
+// Cancel marks the client as canceled and terminates the underlying connection.
+func (c *Client) Cancel() {
+	c.cancelled.Store(true)
+	if c.Client != nil {
+		_ = c.Terminate()
+	}
+}
+
+func (c *Client) isCancelled() bool {
+	return c.cancelled.Load()
+}
+
+func normalizeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (c *Client) withCancel(ctx context.Context) func() {
+	ctx = normalizeContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.Cancel()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
 // log outputs a message either to progress writer or stdout based on availability.
 func (c *Client) log(format string, args ...any) {
 	if c.tracker != nil {
@@ -178,12 +213,18 @@ func (c *Client) connectAndLogin() error {
 
 // Reconnect tears down and rebuilds the underlying IMAP session with backoff.
 func (c *Client) Reconnect() error {
+	if c.isCancelled() {
+		return context.Canceled
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := time.Now()
 	sinceLast := now.Sub(c.lastReconnect)
 	if sinceLast < c.reconnectDur {
+		if c.isCancelled() {
+			return context.Canceled
+		}
 		wait := c.reconnectDur - sinceLast
 		c.log("[%s] 🔄 Reconnecting in %s...", c.prefix, wait)
 		time.Sleep(wait)
@@ -197,6 +238,9 @@ func (c *Client) Reconnect() error {
 	delay := c.backoff
 
 	for i := 1; i <= maxReconnectAttempts; i++ {
+		if c.isCancelled() {
+			return context.Canceled
+		}
 		c.log("[%s] 🔄 Reconnect attempt %d...", c.prefix, i)
 		err = c.connectAndLogin()
 		if err == nil {
@@ -206,6 +250,9 @@ func (c *Client) Reconnect() error {
 			return nil
 		}
 
+		if c.isCancelled() {
+			return context.Canceled
+		}
 		c.log("[%s] 🔄 Failed: %v, retrying in %s", c.prefix, err, delay)
 		time.Sleep(delay)
 		delay *= 2
@@ -217,14 +264,26 @@ func (c *Client) Reconnect() error {
 
 // safeCall wraps an IMAP operation with automatic reconnection on connection errors.
 func (c *Client) safeCall(fn func() error) error {
+	if c.isCancelled() {
+		return context.Canceled
+	}
 	err := fn()
 	if err == nil {
 		return nil
 	}
 
+	if c.isCancelled() {
+		return context.Canceled
+	}
 	if isConnError(err) {
+		if c.isCancelled() {
+			return context.Canceled
+		}
 		if rerr := c.Reconnect(); rerr != nil {
 			return rerr
+		}
+		if c.isCancelled() {
+			return context.Canceled
 		}
 		return fn()
 	}
@@ -263,27 +322,52 @@ func (c *Client) SafeSearch(criteria *imap.SearchCriteria) ([]uint32, error) {
 }
 
 // CreateMailbox ensures the destination folder (and parents) exist on the server.
-func (c *Client) CreateMailbox(name string) (bool, error) {
+func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	// Lock this specific folder path to prevent concurrent creation
 	lock := getFolderLock(name)
 	lock.Lock()
 	defer lock.Unlock()
 
 	if exists, err := c.mailboxExists(name); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
 		return false, err
 	} else if exists {
 		return false, nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	delimiter, err := c.getDelimiter()
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
 		return false, fmt.Errorf("[%s] failed to get delimiter: %w", c.prefix, err)
 	}
 
 	if delimiter != "" && strings.Contains(name, delimiter) {
 		if err := c.createParentFolders(name, delimiter); err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			return false, err
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 
 	err = c.safeCall(func() error {
@@ -291,6 +375,9 @@ func (c *Client) CreateMailbox(name string) (bool, error) {
 	})
 
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
 		return false, fmt.Errorf("[%s] failed to create mailbox %s: %w", c.prefix, name, err)
 	}
 
@@ -379,11 +466,22 @@ func (c *Client) createParentFolders(name, delimiter string) error {
 }
 
 // FetchMessageIDs scans a folder and returns all message IDs.
-func (c *Client) FetchMessageIDs(folder string) (map[string]bool, error) {
+func (c *Client) FetchMessageIDs(ctx context.Context, folder string) (map[string]bool, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
 	mbox, err := c.Select(folder, true)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
 	}
 	c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages)
@@ -404,7 +502,7 @@ func (c *Client) FetchMessageIDs(folder string) (map[string]bool, error) {
 
 	count := 0
 	for msg := range messages {
-		if msg.Envelope != nil && msg.Envelope.MessageId != "" {
+		if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
 			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
 			if msgID != "" {
 				ids[msgID] = true
@@ -413,17 +511,34 @@ func (c *Client) FetchMessageIDs(folder string) (map[string]bool, error) {
 		count++
 	}
 	if err := <-done; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] fetch IDs error: %v", c.prefix, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return ids, nil
 }
 
 // FetchMessages retrieves full message envelopes and bodies for a folder.
-func (c *Client) FetchMessages(folder string) ([]*imap.Message, error) {
+func (c *Client) FetchMessages(ctx context.Context, folder string) ([]*imap.Message, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
 	mbox, err := c.Select(folder, true)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
 	}
 	c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages)
@@ -444,20 +559,36 @@ func (c *Client) FetchMessages(folder string) ([]*imap.Message, error) {
 	var all []*imap.Message
 	count := 0
 	for msg := range messages {
-		all = append(all, msg)
+		if ctx.Err() == nil {
+			all = append(all, msg)
+		}
 		count++
 		if count%progressUpdateInterval == 0 {
 			c.log("[%s] Processed %d/%d messages from %s...", c.prefix, count, mbox.Messages, folder)
 		}
 	}
 	if err := <-done; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] fetch error: %v", c.prefix, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return all, nil
 }
 
 // FetchMessagesByIDs retrieves full messages that match the given Message-IDs.
-func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tracker *progress.Tracker, totalToFetch int) ([]*imap.Message, error) {
+func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetIDs map[string]bool, tracker *progress.Tracker, totalToFetch int) ([]*imap.Message, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if len(targetIDs) == 0 {
 		return []*imap.Message{}, nil
 	}
@@ -466,6 +597,9 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tr
 
 	mbox, err := c.Select(folder, true)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
 	}
 
@@ -483,7 +617,7 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tr
 
 	var targetUIDs []uint32
 	for msg := range envMessages {
-		if msg.Envelope != nil && msg.Envelope.MessageId != "" {
+		if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
 			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
 			if targetIDs[msgID] {
 				targetUIDs = append(targetUIDs, msg.Uid)
@@ -491,7 +625,13 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tr
 		}
 	}
 	if err := <-done; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] envelope fetch error: %v", c.prefix, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	if len(targetUIDs) == 0 {
@@ -505,6 +645,9 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tr
 
 	var result []*imap.Message
 	for start := 0; start < len(targetUIDs); start += uidFetchBatchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := min(start+uidFetchBatchSize, len(targetUIDs))
 		uidSet := new(imap.SeqSet)
 		for _, uid := range targetUIDs[start:end] {
@@ -518,21 +661,37 @@ func (c *Client) FetchMessagesByIDs(folder string, targetIDs map[string]bool, tr
 		}()
 
 		for msg := range messages {
-			result = append(result, msg)
-			if tracker != nil {
+			if ctx.Err() == nil {
+				result = append(result, msg)
+			}
+			if tracker != nil && ctx.Err() == nil {
 				tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result), len(targetUIDs)))
 			}
 		}
 		if err := <-batchDone; err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return result, nil
 }
 
 // AppendMessage uploads a single message to the destination folder.
-func (c *Client) AppendMessage(folder string, msg *imap.Message) error {
+func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Message) error {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	body := msg.GetBody(&imap.BodySectionName{})
 	if body == nil {
 		return fmt.Errorf("[%s] message has no body", c.prefix)
@@ -541,6 +700,9 @@ func (c *Client) AppendMessage(folder string, msg *imap.Message) error {
 	raw, err := io.ReadAll(body)
 	if err != nil {
 		return fmt.Errorf("[%s] read body: %v", c.prefix, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	flags := []string{imap.SeenFlag}
@@ -552,6 +714,9 @@ func (c *Client) AppendMessage(folder string, msg *imap.Message) error {
 	})
 
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("[%s] append failed: %v", c.prefix, err)
 	}
 	if c.verbose {
@@ -567,8 +732,59 @@ type MailboxInfo struct {
 	Size     uint64
 }
 
+// ListSubfolders returns subfolders matching the given folder and delimiter.
+func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) ([]string, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	pattern := folder
+	if delimiter != "" {
+		pattern = folder + delimiter + "*"
+	} else {
+		pattern = folder + "/*"
+	}
+
+	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.List("", pattern, mailboxes)
+	}()
+
+	var subfolders []string
+	for mbox := range mailboxes {
+		if ctx.Err() == nil && mbox.Name != folder {
+			subfolders = append(subfolders, mbox.Name)
+		}
+	}
+
+	if err := <-done; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("[%s] list subfolders error: %v", c.prefix, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return subfolders, nil
+}
+
 // ListMailboxes fetches all folders plus lightweight statistics for each.
-func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
+func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.log("[%s] Getting mailbox list...", c.prefix)
 
 	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
@@ -579,13 +795,21 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 
 	var result []*MailboxInfo
 	for m := range mailboxes {
-		result = append(result, &MailboxInfo{
-			Name: m.Name,
-		})
+		if ctx.Err() == nil {
+			result = append(result, &MailboxInfo{
+				Name: m.Name,
+			})
+		}
 	}
 
 	if err := <-done; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("[%s] list mailboxes error: %v", c.prefix, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	c.log("[%s] Getting mailbox statistics...", c.prefix)
@@ -596,6 +820,9 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 	}
 
 	for i, mbox := range result {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if c.tracker != nil {
 			c.tracker.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), mbox.Name))
 		}
@@ -605,6 +832,9 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 		})
 
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if c.tracker != nil {
 				c.tracker.Increment(1)
 			}
@@ -614,7 +844,7 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 		mbox.Messages = status.Messages
 
 		if status.Messages > 0 {
-			size, err := c.getFolderSize(mbox.Name)
+			size, err := c.getFolderSize(ctx, mbox.Name)
 			if err == nil {
 				mbox.Size = size
 			}
@@ -634,9 +864,20 @@ func (c *Client) ListMailboxes() ([]*MailboxInfo, error) {
 }
 
 // getFolderSize calculates the total size of all messages in a folder.
-func (c *Client) getFolderSize(folder string) (uint64, error) {
+func (c *Client) getFolderSize(ctx context.Context, folder string) (uint64, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	mbox, err := c.Select(folder, true)
 	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
 		return 0, err
 	}
 
@@ -656,10 +897,18 @@ func (c *Client) getFolderSize(folder string) (uint64, error) {
 
 	var totalSize uint64
 	for msg := range messages {
-		totalSize += uint64(msg.Size)
+		if ctx.Err() == nil {
+			totalSize += uint64(msg.Size)
+		}
 	}
 
 	if err := <-done; err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 

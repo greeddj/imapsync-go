@@ -11,7 +11,7 @@ import (
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/commands"
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/helpers"
 
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
 //nolint:gochecknoglobals
@@ -29,9 +29,15 @@ func main() {
 
 // run configures and executes the imapsync-go CLI application.
 func run() int {
-	app := &cli.App{
+	// Customize the version printer to show only the version.
+	cli.VersionPrinter = func(c *cli.Command) {
+		_, _ = fmt.Fprintln(c.Writer, Version)
+	}
+
+	app := &cli.Command{
 		Name:                   "imapsync-go",
 		Usage:                  "IMAP to IMAP synchronization tool",
+		HideHelpCommand:        true,
 		UseShortOptionHandling: true,
 		Version:                helpers.Version(Version, Commit, Date, BuiltBy),
 		Flags: []cli.Flag{
@@ -40,61 +46,19 @@ func run() int {
 				Aliases: []string{"c"},
 				Value:   "config.json",
 				Usage:   "path to configuration file (JSON or YAML)",
-				EnvVars: []string{"IMAPSYNC_CONFIG"},
+				Sources: cli.EnvVars("IMAPSYNC_CONFIG"),
 			},
 		},
 		Commands: []*cli.Command{
-			{
-				Name:   "show",
-				Usage:  "show IMAP dirs in source and destination servers",
-				Action: commands.Show,
-			},
-			{
-				Name:   "sync",
-				Usage:  "sync IMAP dir(s) between two servers",
-				Action: commands.Sync,
-				Flags: []cli.Flag{
-					&cli.StringFlag{
-						Name:    "src-folder",
-						Aliases: []string{"s"},
-						EnvVars: []string{"IMAPSYNC_SOURCE_FOLDER"},
-					},
-					&cli.StringFlag{
-						Name:    "dest-folder",
-						Aliases: []string{"d"},
-						EnvVars: []string{"IMAPSYNC_DESTINATION_FOLDER"},
-					},
-					&cli.IntFlag{
-						Name:    "workers",
-						Aliases: []string{"w"},
-						Value:   4,
-						EnvVars: []string{"IMAPSYNC_WORKERS"},
-					},
-					&cli.BoolFlag{
-						Name:    "verbose",
-						Aliases: []string{"V"},
-						EnvVars: []string{"IMAPSYNC_VERBOSE"},
-					},
-					&cli.BoolFlag{
-						Name:    "quiet",
-						Aliases: []string{"q"},
-						EnvVars: []string{"IMAPSYNC_QUIET"},
-					},
-					&cli.BoolFlag{
-						Name:    "confirm",
-						Aliases: []string{"y", "yes"},
-						Usage:   "auto-confirm (skip confirmation prompt)",
-						EnvVars: []string{"IMAPSYNC_CONFIRM"},
-					},
-				},
-			},
+			commands.Sync(),
+			commands.Show(),
 		},
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := app.RunContext(ctx, os.Args); err != nil {
+	if err := app.Run(ctx, os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}

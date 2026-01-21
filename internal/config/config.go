@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -49,8 +49,8 @@ type DirectoryMapping struct {
 // It automatically detects the format (JSON or YAML) based on file extension.
 // Supported extensions: .json, .yaml, .yml
 // It returns an error if the file cannot be read or contains invalid data.
-func New(cCtx *cli.Context) (*Config, error) {
-	configPath := cCtx.String("config")
+func New(c *cli.Command) (*Config, error) {
+	configPath := c.String("config")
 	filePath, err := filepath.Abs(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for config file %q: %w", filePath, err)
@@ -90,7 +90,7 @@ func New(cCtx *cli.Context) (*Config, error) {
 	}
 
 	// Validate and set worker count.
-	workers := cCtx.Int("workers")
+	workers := c.Int("workers")
 	if workers == 0 || workers > maxWorkers {
 		cfg.Workers = defaultWorkers
 	} else {

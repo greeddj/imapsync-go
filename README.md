@@ -150,10 +150,6 @@ sync -w 4
 - `-V, --verbose` - Enable verbose output
 - `-q, --quiet` - Suppress non-error output
 
-**Show command:**
-
-- `-V, --verbose` - Enable verbose output
-
 ## License
 
 MIT

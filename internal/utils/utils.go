@@ -3,6 +3,7 @@ package utils
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -19,7 +20,10 @@ const (
 
 // AskConfirm prompts the user with the provided message and returns true if the user confirms.
 // It allows up to maxConfirmAttempts tries before returning false.
-func AskConfirm(prompt string) (bool, error) {
+func AskConfirm(ctx context.Context, prompt string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	reader := bufio.NewReader(os.Stdin)
 
 	message := strings.TrimSpace(prompt)
@@ -29,8 +33,11 @@ func AskConfirm(prompt string) (bool, error) {
 
 	fmt.Println()
 	for i := range maxConfirmAttempts {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		fmt.Printf("%s [y/N]: ", message)
-		response, err := reader.ReadString('\n')
+		response, err := readLine(ctx, reader)
 		if err != nil {
 			return false, fmt.Errorf("error reading user input: %w", err)
 		}
@@ -49,6 +56,26 @@ func AskConfirm(prompt string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func readLine(ctx context.Context, reader *bufio.Reader) (string, error) {
+	type result struct {
+		line string
+		err  error
+	}
+
+	resultCh := make(chan result, 1)
+	go func() {
+		line, err := reader.ReadString('\n')
+		resultCh <- result{line: line, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res := <-resultCh:
+		return res.line, res.err
+	}
 }
 
 // FormatSize converts bytes to a human-readable string (B, KB, MB, GB).
