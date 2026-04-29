@@ -7,8 +7,8 @@ import (
 func TestFormatSize(t *testing.T) {
 	tests := []struct {
 		name     string
-		bytes    uint64
 		expected string
+		bytes    uint64
 	}{
 		{
 			name:     "bytes",

@@ -60,8 +60,8 @@ func AskConfirm(ctx context.Context, prompt string) (bool, error) {
 
 func readLine(ctx context.Context, reader *bufio.Reader) (string, error) {
 	type result struct {
-		line string
 		err  error
+		line string
 	}
 
 	resultCh := make(chan result, 1)

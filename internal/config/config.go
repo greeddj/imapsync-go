@@ -25,10 +25,10 @@ const (
 
 // Config holds the entire configuration for the application.
 type Config struct {
-	Workers int                `json:"-"   yaml:"-"`   // Number of parallel workers (from CLI)
-	Src     Credentials        `json:"src" yaml:"src"` // Source IMAP credentials
-	Dst     Credentials        `json:"dst" yaml:"dst"` // Destination IMAP credentials
-	Map     []DirectoryMapping `json:"map" yaml:"map"` // Folder mapping rules
+	Src     Credentials        `json:"src" yaml:"src"`
+	Dst     Credentials        `json:"dst" yaml:"dst"`
+	Map     []DirectoryMapping `json:"map" yaml:"map"`
+	Workers int                `json:"-"   yaml:"-"`
 }
 
 // Credentials holds IMAP connection data.

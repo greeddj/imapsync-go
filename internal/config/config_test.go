@@ -8,9 +8,9 @@ import (
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name        string
+		errContains string
 		config      Config
 		wantErr     bool
-		errContains string
 	}{
 		{
 			name: "valid config",

@@ -37,9 +37,9 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 
 	// accountResult holds the result of fetching account information.
 	type accountResult struct {
-		client    *client.Client        // IMAP client connection.
-		mailboxes []*client.MailboxInfo // List of mailboxes.
-		err       error                 // Error if fetch failed.
+		err       error
+		client    *client.Client
+		mailboxes []*client.MailboxInfo
 	}
 
 	srcResult := make(chan accountResult, 1)

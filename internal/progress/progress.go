@@ -129,7 +129,7 @@ func (w *Writer) StopAndClear(numLines int) {
 
 	// Clear progress output
 	fmt.Print("\r")
-	for i := 0; i < numLines; i++ {
+	for range numLines {
 		fmt.Print("\033[K\r")
 	}
 	fmt.Println()
