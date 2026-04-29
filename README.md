@@ -2,7 +2,7 @@
 
 `imapsync-go` is a lightweight Go CLI that mirrors folders between two IMAP accounts. It builds a sync plan from message IDs, streams mail bodies directly between servers.
 
-> **Note:** This project was created in collaboration with the GPT 5.1 Codex agent model.
+> **Note:** This project was created in collaboration with the Claude Code.
 
 ## Motivation
 
@@ -149,6 +149,23 @@ sync -w 4
 - `-y, --confirm` - Auto-confirm without prompt
 - `-V, --verbose` - Enable verbose output
 - `-q, --quiet` - Suppress non-error output
+
+## Idempotency caveats
+
+`imapsync-go` decides what to copy by diffing message **`Message-Id`** headers
+between source and destination. This is fast and re-running a partial sync is
+safe, but it has two known limitations:
+
+- **Messages without a `Message-Id` are skipped.** Drafts, some bulk mail and
+  messages from broken senders may not have one. They cannot be tracked across
+  servers, so they are never copied. The CLI prints a warning per folder when
+  this happens so you know how many were skipped.
+- **Servers that rewrite `Message-Id` on `APPEND` will cause duplicates on
+  re-run.** A few IMAP servers (notably some Exchange configurations) replace
+  the inbound `Message-Id` with their own value. The diff on the next run will
+  see the original IDs as still "missing" on the destination and re-upload
+  them. If you suspect this, do the sync in a single pass and avoid re-running
+  it against the same destination.
 
 ## License
 

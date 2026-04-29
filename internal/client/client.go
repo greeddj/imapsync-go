@@ -501,8 +501,10 @@ func (c *Client) FetchMessageIDs(ctx context.Context, folder string) (map[string
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
 	var ids map[string]bool
+	var missingCount int
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		ids = make(map[string]bool)
+		missingCount = 0
 		mbox, err := cli.Select(folder, true)
 		if err != nil {
 			return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
@@ -522,18 +524,35 @@ func (c *Client) FetchMessageIDs(ctx context.Context, folder string) (map[string
 		}()
 
 		for msg := range messages {
-			if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
-				msgID := strings.Trim(msg.Envelope.MessageId, "<>")
-				if msgID != "" {
-					ids[msgID] = true
-				}
+			if ctx.Err() != nil {
+				continue
 			}
+			if msg.Envelope == nil || msg.Envelope.MessageId == "" {
+				missingCount++
+				continue
+			}
+			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
+			if msgID == "" {
+				missingCount++
+				continue
+			}
+			ids[msgID] = true
 		}
 		if err := <-done; err != nil {
 			return fmt.Errorf("[%s] fetch IDs: %w", c.prefix, err)
 		}
 		return nil
 	})
+
+	// Warn the user about messages that cannot be tracked: without a Message-Id
+	// the diff has no key to match on, so these messages are silently skipped
+	// from sync — they will never be copied. If the destination strips
+	// Message-Ids on append, the same messages will look "missing" on every
+	// run and be uploaded as duplicates.
+	if err == nil && missingCount > 0 && c.pw != nil {
+		c.pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped — sync cannot track them",
+			c.prefix, folder, missingCount)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
