@@ -2,19 +2,16 @@
 package commands
 
 import (
-	"context"
-
 	"github.com/greeddj/imapsync-go/internal/app"
 	"github.com/urfave/cli/v3"
 )
 
+// Sync returns the "sync" subcommand definition.
 func Sync() *cli.Command {
 	return &cli.Command{
-		Name:  "sync",
-		Usage: "sync IMAP dir(s) between two servers",
-		Action: func(ctx context.Context, c *cli.Command) error {
-			return app.ActionSync(ctx, c)
-		},
+		Name:   "sync",
+		Usage:  "sync IMAP dir(s) between two servers",
+		Action: app.ActionSync,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "src-folder",

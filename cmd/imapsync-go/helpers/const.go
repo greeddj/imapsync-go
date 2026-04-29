@@ -1,3 +1,5 @@
+// Package helpers contains small CLI-side utilities shared between the entry
+// point and subcommand wiring.
 package helpers
 
 const (

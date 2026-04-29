@@ -1,0 +1,41 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose    # HTTP response body must be closed
+    - errorlint    # error wrapping issues (uses %w correctly, errors.Is/As)
+    - gocritic     # opinionated diagnostic checks
+    - nilerr       # returning nil where err is non-nil
+    - noctx        # net/http calls without context
+    - revive       # broad style/lint pass (replaces deprecated golint)
+    - unparam      # unused function parameters
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - "disableStutteringCheck"
+        - name: var-naming
+        - name: package-comments
+        - name: error-return
+        - name: error-naming
+        - name: error-strings
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - revive
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

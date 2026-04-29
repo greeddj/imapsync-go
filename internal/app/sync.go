@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -64,16 +65,17 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 	var mappings []config.DirectoryMapping
 
-	if srcFolder != "" && dstFolder != "" {
+	switch {
+	case srcFolder != "" && dstFolder != "":
 		mappings = []config.DirectoryMapping{
 			{Source: srcFolder, Destination: dstFolder},
 		}
-	} else if srcFolder != "" || dstFolder != "" {
+	case srcFolder != "" || dstFolder != "":
 		fmt.Println("both --src-folder and --dest-folder must be specified")
-		return fmt.Errorf("both --src-folder and --dest-folder must be specified")
-	} else {
+		return errors.New("both --src-folder and --dest-folder must be specified")
+	default:
 		if len(cfg.Map) == 0 {
-			return fmt.Errorf("no folder mappings in config")
+			return errors.New("no folder mappings in config")
 		}
 		mappings = cfg.Map
 	}
@@ -325,11 +327,11 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+failedCount+1, len(foldersToCreate), folder))
 
 			created, err := dstClient.CreateMailbox(ctx, folder)
-			if err != nil {
-				if ctx.Err() != nil {
-					creationPW.Stop()
-					return ctx.Err()
-				}
+			switch {
+			case err != nil && ctx.Err() != nil:
+				creationPW.Stop()
+				return ctx.Err()
+			case err != nil:
 				errMsg := err.Error()
 				if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "Mailbox exists") {
 					if verbose {
@@ -340,12 +342,12 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					creationPW.Log("Failed to create folder %q: %v", folder, err)
 					failedCount++
 				}
-			} else if created {
+			case created:
 				if verbose {
 					creationPW.Log("Created folder %q", folder)
 				}
 				createdCount++
-			} else {
+			default:
 				createdCount++
 			}
 

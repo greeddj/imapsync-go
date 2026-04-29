@@ -105,11 +105,14 @@ func New(addr, username, password string, _ int, verbose, useTLS bool, tlsConfig
 		folderLocks:  make(map[string]*sync.Mutex),
 	}
 
+	// dialFn runs from inside the reconnect loop, which has its own
+	// cancellation channel via c.cancelled + Terminate(); plumbing a
+	// context into the dialer would duplicate that mechanism.
 	c.dialFn = func(addr string) (net.Conn, error) {
 		if useTLS {
-			return tls.Dial("tcp", addr, tlsConfig)
+			return tls.Dial("tcp", addr, tlsConfig) //nolint:noctx // see comment above
 		}
-		return net.Dial("tcp", addr)
+		return net.Dial("tcp", addr) //nolint:noctx // see comment above
 	}
 
 	if err := c.connectAndLogin(); err != nil {

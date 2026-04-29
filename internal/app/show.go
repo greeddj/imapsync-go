@@ -1,3 +1,4 @@
+// Package app holds the orchestration logic for the imapsync-go CLI subcommands.
 package app
 
 import (
