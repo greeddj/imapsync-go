@@ -36,28 +36,6 @@ const (
 	uidFetchBatchSize = 500
 )
 
-// Global lock map for folder creation to prevent race conditions across goroutines
-// that share the destination Client semantics (each goroutine has its own *Client,
-// but they may concurrently create the same folder path).
-var (
-	folderLocksMu sync.Mutex
-	folderLocks   = make(map[string]*sync.Mutex)
-)
-
-// getFolderLock returns a mutex for a specific folder path.
-func getFolderLock(path string) *sync.Mutex {
-	folderLocksMu.Lock()
-	defer folderLocksMu.Unlock()
-
-	if lock, exists := folderLocks[path]; exists {
-		return lock
-	}
-
-	lock := &sync.Mutex{}
-	folderLocks[path] = lock
-	return lock
-}
-
 // ProgressWriter is a minimal interface for progress tracking and logging.
 // This avoids circular dependency with the progress package.
 type ProgressWriter interface {
@@ -85,6 +63,7 @@ type Client struct {
 	tracker       ProgressTracker
 	tlsConfig     *tls.Config
 	dialFn        func(addr string) (net.Conn, error)
+	folderLocks   map[string]*sync.Mutex
 	c             atomic.Pointer[imapclient.Client]
 	prefix        string
 	delimiter     string
@@ -94,9 +73,25 @@ type Client struct {
 	backoff       time.Duration
 	reconnectDur  time.Duration
 	mu            sync.Mutex
+	folderLocksMu sync.Mutex
 	cancelled     atomic.Bool
 	useTLS        bool
 	verbose       bool
+}
+
+// folderLock returns the mutex guarding creation of the given folder path.
+// Locks are per-Client; concurrent CreateMailbox calls on the same instance
+// for nested paths can race on parent creation without this.
+func (c *Client) folderLock(path string) *sync.Mutex {
+	c.folderLocksMu.Lock()
+	defer c.folderLocksMu.Unlock()
+
+	if lock, ok := c.folderLocks[path]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	c.folderLocks[path] = lock
+	return lock
 }
 
 // New establishes a connection and logs into the IMAP server.
@@ -110,6 +105,7 @@ func New(addr, username, password string, _ int, verbose, useTLS bool, tlsConfig
 		backoff:      initialBackoff,
 		reconnectDur: reconnectInterval,
 		verbose:      verbose,
+		folderLocks:  make(map[string]*sync.Mutex),
 	}
 
 	c.dialFn = func(addr string) (net.Conn, error) {
@@ -394,7 +390,7 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 
-	lock := getFolderLock(name)
+	lock := c.folderLock(name)
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -453,7 +449,7 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 		}
 		parentPath := strings.Join(parts[:i], delimiter)
 
-		lock := getFolderLock(parentPath)
+		lock := c.folderLock(parentPath)
 		lock.Lock()
 
 		var exists bool
