@@ -523,8 +523,8 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 		dstFolder := mapping.Destination
 		var dstFolderExists bool
 		var srcMessageIDs map[string]bool
-		var dstMessageIDs map[string]bool
-		var srcErr error
+		dstMessageIDs := make(map[string]bool)
+		var srcErr, dstErr error
 
 		// Fetch IDs from both servers in parallel (fast - envelopes only)
 		var wg sync.WaitGroup
@@ -538,16 +538,25 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			srcMessageIDs, srcErr = srcClient.FetchMessageIDs(ctx, srcFolder)
 		})
 
+		// Probe destination existence first; only fetch IDs if it exists.
+		// A "missing folder" is benign (we'll create it); a transport error must
+		// be fatal — otherwise we'd mistake it for empty and re-upload everything.
 		wg.Go(func() {
-			dstMessageIDs = make(map[string]bool)
-
+			exists, err := dstClient.MailboxExists(ctx, dstFolder)
+			if err != nil {
+				dstErr = err
+				return
+			}
+			if !exists {
+				return
+			}
+			dstFolderExists = true
 			fetchedIDs, err := dstClient.FetchMessageIDs(ctx, dstFolder)
 			if err != nil {
-				// Folder might not exist yet, not a fatal error
-			} else {
-				dstFolderExists = true
-				dstMessageIDs = fetchedIDs
+				dstErr = err
+				return
 			}
+			dstMessageIDs = fetchedIDs
 		})
 
 		wg.Wait()
@@ -560,6 +569,9 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %v", srcFolder, srcErr)
 			}
 			continue
+		}
+		if dstErr != nil {
+			return nil, fmt.Errorf("scan destination folder %q: %w", dstFolder, dstErr)
 		}
 
 		// Find IDs that need syncing (exist in source but not in destination)

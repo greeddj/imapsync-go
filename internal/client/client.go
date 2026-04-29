@@ -357,6 +357,34 @@ func (c *Client) refreshDelimiter() (string, error) {
 	return delimiter, err
 }
 
+// MailboxExists reports whether a mailbox with the given name exists on the server.
+func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
+	ctx = normalizeContext(ctx)
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	var exists bool
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		ok, e := mailboxExists(cli, name)
+		if e != nil {
+			return e
+		}
+		exists = ok
+		return nil
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
+	}
+	return exists, nil
+}
+
 // CreateMailbox ensures the destination folder (and parents) exist on the server.
 func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 	ctx = normalizeContext(ctx)
