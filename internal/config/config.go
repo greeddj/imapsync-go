@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	// maxWorkers defines the maximum number of parallel workers allowed.
+	// minWorkers is the lower bound on the parallel worker count.
+	minWorkers = 1
+	// maxWorkers is the upper bound on the parallel worker count.
 	maxWorkers = 10
-	// defaultWorkers is the default number of workers if not specified.
-	defaultWorkers = 1
 	// defaultSourceLabel is the default label for source server.
 	defaultSourceLabel = "src"
 	// defaultDestLabel is the default label for destination server.
@@ -89,13 +89,10 @@ func New(c *cli.Command) (*Config, error) {
 		cfg.Dst.Label = defaultDestLabel
 	}
 
-	// Validate and set worker count.
-	workers := c.Int("workers")
-	if workers == 0 || workers > maxWorkers {
-		cfg.Workers = defaultWorkers
-	} else {
-		cfg.Workers = workers
-	}
+	// Clamp worker count to [minWorkers, maxWorkers]. The user-facing default
+	// (4) lives on the CLI flag — config only enforces the safe range, so an
+	// out-of-range value is corrected without silently falling back to 1.
+	cfg.Workers = clampWorkers(c.Int("workers"))
 
 	// Validate required fields.
 	if err := cfg.validate(); err != nil {
@@ -103,6 +100,18 @@ func New(c *cli.Command) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// clampWorkers bounds the worker count to [minWorkers, maxWorkers].
+func clampWorkers(n int) int {
+	switch {
+	case n < minWorkers:
+		return minWorkers
+	case n > maxWorkers:
+		return maxWorkers
+	default:
+		return n
+	}
 }
 
 // validate checks that all required configuration fields are present.

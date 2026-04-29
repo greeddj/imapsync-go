@@ -150,6 +150,28 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestClampWorkers(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"negative", -3, minWorkers},
+		{"zero", 0, minWorkers},
+		{"min", 1, 1},
+		{"in range", 5, 5},
+		{"max", maxWorkers, maxWorkers},
+		{"over max", 99, maxWorkers},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clampWorkers(tt.in); got != tt.want {
+				t.Errorf("clampWorkers(%d) = %d; want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSetDefaultLabels(t *testing.T) {
 	cfg := &Config{
 		Src: Credentials{
