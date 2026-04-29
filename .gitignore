@@ -37,3 +37,6 @@ dist/
 
 .DS_Store
 .worktrees/
+
+# Claude Code: local-only overrides (permissions, env, etc.) — keep out of VCS
+.claude/settings.local.json
