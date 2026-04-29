@@ -64,7 +64,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
 		srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, false, true, nil)
 		if err != nil {
-			result.err = fmt.Errorf("[%s] source connection failed: %v", cfg.Src.Label, err)
+			result.err = fmt.Errorf("[%s] source connection failed: %w", cfg.Src.Label, err)
 			srcTracker.MarkAsErrored()
 			srcResult <- result
 			return
@@ -77,7 +77,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", cfg.Src.Label))
 		mailboxes, err := srcClient.ListMailboxes(ctx)
 		if err != nil {
-			result.err = fmt.Errorf("[%s] failed to list source mailboxes: %v", cfg.Src.Label, err)
+			result.err = fmt.Errorf("[%s] failed to list source mailboxes: %w", cfg.Src.Label, err)
 			srcTracker.MarkAsErrored()
 			srcResult <- result
 			return
@@ -98,7 +98,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
 		dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, false, true, nil)
 		if err != nil {
-			result.err = fmt.Errorf("[%s] destination connection failed: %v", cfg.Dst.Label, err)
+			result.err = fmt.Errorf("[%s] destination connection failed: %w", cfg.Dst.Label, err)
 			dstTracker.MarkAsErrored()
 			dstResult <- result
 			return
@@ -111,7 +111,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", cfg.Dst.Label))
 		mailboxes, err := dstClient.ListMailboxes(ctx)
 		if err != nil {
-			result.err = fmt.Errorf("[%s] failed to list destination mailboxes: %v", cfg.Dst.Label, err)
+			result.err = fmt.Errorf("[%s] failed to list destination mailboxes: %w", cfg.Dst.Label, err)
 			dstTracker.MarkAsErrored()
 			dstResult <- result
 			return
