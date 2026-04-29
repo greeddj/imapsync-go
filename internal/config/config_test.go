@@ -1,150 +1,54 @@
 package config
 
 import (
-	"strings"
+	"errors"
 	"testing"
 )
 
 func TestValidate(t *testing.T) {
+	valid := Credentials{
+		Server: "imap.example.com:993",
+		User:   "user@example.com",
+		Pass:   "password",
+	}
+
 	tests := []struct {
-		name        string
-		errContains string
-		config      Config
-		wantErr     bool
+		wantErr error
+		name    string
+		config  Config
 	}{
+		{nil, "valid config", Config{Src: valid, Dst: valid}},
 		{
-			name: "valid config",
-			config: Config{
-				Src: Credentials{
-					Server: "imap.source.com:993",
-					User:   "user@source.com",
-					Pass:   "password",
-				},
-				Dst: Credentials{
-					Server: "imap.dest.com:993",
-					User:   "user@dest.com",
-					Pass:   "password",
-				},
-			},
-			wantErr: false,
+			ErrSrcServerRequired, "missing source server",
+			Config{Src: Credentials{User: valid.User, Pass: valid.Pass}, Dst: valid},
 		},
 		{
-			name: "missing source server",
-			config: Config{
-				Src: Credentials{
-					Server: "",
-					User:   "user@source.com",
-					Pass:   "password",
-				},
-				Dst: Credentials{
-					Server: "imap.dest.com:993",
-					User:   "user@dest.com",
-					Pass:   "password",
-				},
-			},
-			wantErr:     true,
-			errContains: "source server is required",
+			ErrSrcUserRequired, "missing source user",
+			Config{Src: Credentials{Server: valid.Server, Pass: valid.Pass}, Dst: valid},
 		},
 		{
-			name: "missing source user",
-			config: Config{
-				Src: Credentials{
-					Server: "imap.source.com:993",
-					User:   "",
-					Pass:   "password",
-				},
-				Dst: Credentials{
-					Server: "imap.dest.com:993",
-					User:   "user@dest.com",
-					Pass:   "password",
-				},
-			},
-			wantErr:     true,
-			errContains: "source user is required",
+			ErrSrcPassRequired, "missing source password",
+			Config{Src: Credentials{Server: valid.Server, User: valid.User}, Dst: valid},
 		},
 		{
-			name: "missing source password",
-			config: Config{
-				Src: Credentials{
-					Server: "imap.source.com:993",
-					User:   "user@source.com",
-					Pass:   "",
-				},
-				Dst: Credentials{
-					Server: "imap.dest.com:993",
-					User:   "user@dest.com",
-					Pass:   "password",
-				},
-			},
-			wantErr:     true,
-			errContains: "source password is required",
+			ErrDstServerRequired, "missing destination server",
+			Config{Src: valid, Dst: Credentials{User: valid.User, Pass: valid.Pass}},
 		},
 		{
-			name: "missing destination server",
-			config: Config{
-				Src: Credentials{
-					Server: "imap.source.com:993",
-					User:   "user@source.com",
-					Pass:   "password",
-				},
-				Dst: Credentials{
-					Server: "",
-					User:   "user@dest.com",
-					Pass:   "password",
-				},
-			},
-			wantErr:     true,
-			errContains: "destination server is required",
+			ErrDstUserRequired, "missing destination user",
+			Config{Src: valid, Dst: Credentials{Server: valid.Server, Pass: valid.Pass}},
 		},
 		{
-			name: "missing destination user",
-			config: Config{
-				Src: Credentials{
-					Server: "imap.source.com:993",
-					User:   "user@source.com",
-					Pass:   "password",
-				},
-				Dst: Credentials{
-					Server: "imap.dest.com:993",
-					User:   "",
-					Pass:   "password",
-				},
-			},
-			wantErr:     true,
-			errContains: "destination user is required",
-		},
-		{
-			name: "missing destination password",
-			config: Config{
-				Src: Credentials{
-					Server: "imap.source.com:993",
-					User:   "user@source.com",
-					Pass:   "password",
-				},
-				Dst: Credentials{
-					Server: "imap.dest.com:993",
-					User:   "user@dest.com",
-					Pass:   "",
-				},
-			},
-			wantErr:     true,
-			errContains: "destination password is required",
+			ErrDstPassRequired, "missing destination password",
+			Config{Src: valid, Dst: Credentials{Server: valid.Server, User: valid.User}},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.config.validate()
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("expected error, got nil")
-				} else if !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("expected error containing %q, got %v", tt.errContains, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("validate() error = %v; want %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -174,29 +78,21 @@ func TestClampWorkers(t *testing.T) {
 
 func TestSetDefaultLabels(t *testing.T) {
 	cfg := &Config{
-		Src: Credentials{
-			Server: "imap.source.com:993",
-			User:   "user@source.com",
-			Pass:   "password",
-		},
-		Dst: Credentials{
-			Server: "imap.dest.com:993",
-			User:   "user@dest.com",
-			Pass:   "password",
-		},
+		Src: Credentials{Server: "s", User: "u", Pass: "p"},
+		Dst: Credentials{Server: "s", User: "u", Pass: "p"},
 	}
 
 	if cfg.Src.Label == "" {
-		cfg.Src.Label = "src"
+		cfg.Src.Label = defaultSourceLabel
 	}
 	if cfg.Dst.Label == "" {
-		cfg.Dst.Label = "dst"
+		cfg.Dst.Label = defaultDestLabel
 	}
 
-	if cfg.Src.Label != "src" {
-		t.Errorf("expected default source label 'src', got %s", cfg.Src.Label)
+	if cfg.Src.Label != defaultSourceLabel {
+		t.Errorf("expected default source label %q, got %s", defaultSourceLabel, cfg.Src.Label)
 	}
-	if cfg.Dst.Label != "dst" {
-		t.Errorf("expected default dest label 'dst', got %s", cfg.Dst.Label)
+	if cfg.Dst.Label != defaultDestLabel {
+		t.Errorf("expected default dst label %q, got %s", defaultDestLabel, cfg.Dst.Label)
 	}
 }

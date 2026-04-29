@@ -3,6 +3,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,17 @@ import (
 
 	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
+)
+
+// Sentinel errors returned by Config.validate. Callers can match on these
+// with errors.Is to distinguish missing fields from other failures.
+var (
+	ErrSrcServerRequired = errors.New("source server is required")
+	ErrSrcUserRequired   = errors.New("source user is required")
+	ErrSrcPassRequired   = errors.New("source password is required")
+	ErrDstServerRequired = errors.New("destination server is required")
+	ErrDstUserRequired   = errors.New("destination user is required")
+	ErrDstPassRequired   = errors.New("destination password is required")
 )
 
 const (
@@ -117,22 +129,22 @@ func clampWorkers(n int) int {
 // validate checks that all required configuration fields are present.
 func (c *Config) validate() error {
 	if c.Src.Server == "" {
-		return fmt.Errorf("source server is required")
+		return ErrSrcServerRequired
 	}
 	if c.Src.User == "" {
-		return fmt.Errorf("source user is required")
+		return ErrSrcUserRequired
 	}
 	if c.Src.Pass == "" {
-		return fmt.Errorf("source password is required")
+		return ErrSrcPassRequired
 	}
 	if c.Dst.Server == "" {
-		return fmt.Errorf("destination server is required")
+		return ErrDstServerRequired
 	}
 	if c.Dst.User == "" {
-		return fmt.Errorf("destination user is required")
+		return ErrDstUserRequired
 	}
 	if c.Dst.Pass == "" {
-		return fmt.Errorf("destination password is required")
+		return ErrDstPassRequired
 	}
 	return nil
 }
