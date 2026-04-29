@@ -17,7 +17,6 @@ import (
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
-	"github.com/greeddj/imapsync-go/internal/progress"
 )
 
 const (
@@ -62,7 +61,7 @@ func getFolderLock(path string) *sync.Mutex {
 // ProgressWriter is a minimal interface for progress tracking and logging.
 // This avoids circular dependency with the progress package.
 type ProgressWriter interface {
-	Log(msg string, a ...interface{})
+	Log(msg string, a ...any)
 }
 
 // ProgressTracker is a minimal interface for updating tracker messages.
@@ -82,19 +81,19 @@ type ProgressTracker interface {
 // reconnects and retries the closure once with the fresh client.
 type Client struct {
 	lastReconnect time.Time
-	serverAddr    string
-	username      string
-	password      string
-	prefix        string
-	delimiter     string
 	pw            ProgressWriter
 	tracker       ProgressTracker
-	c             atomic.Pointer[imapclient.Client]
-	dialFn        func(addr string) (net.Conn, error)
 	tlsConfig     *tls.Config
-	mu            sync.Mutex
+	dialFn        func(addr string) (net.Conn, error)
+	c             atomic.Pointer[imapclient.Client]
+	prefix        string
+	delimiter     string
+	password      string
+	username      string
+	serverAddr    string
 	backoff       time.Duration
 	reconnectDur  time.Duration
+	mu            sync.Mutex
 	cancelled     atomic.Bool
 	useTLS        bool
 	verbose       bool
@@ -606,27 +605,30 @@ func (c *Client) FetchMessages(ctx context.Context, folder string) ([]*imap.Mess
 	return all, nil
 }
 
-// FetchMessagesByIDs retrieves full messages that match the given Message-IDs.
+// StreamMessagesByIDs fetches messages matching targetIDs and invokes
+// onMessage for each one as it arrives, batched by uidFetchBatchSize.
 //
-// The first stage maps Message-Id to UID by scanning envelopes; the second
-// stage fetches bodies in batches of uidFetchBatchSize. Each stage is wrapped
-// in its own safeCall so that a reconnect mid-fetch re-Selects the folder
-// before retrying just the failing batch.
-func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetIDs map[string]bool, tracker *progress.Tracker, _ int) ([]*imap.Message, error) {
+// Streaming avoids materializing every body into memory at once — important
+// for large mailboxes where the cumulative body size can be many GB.
+//
+// If onMessage returns an error, the channel from the in-flight batch is
+// drained (so the producer goroutine exits cleanly) and the error is
+// returned without scheduling further batches.
+func (c *Client) StreamMessagesByIDs(ctx context.Context, folder string, targetIDs map[string]bool, onMessage func(*imap.Message) error) error {
 	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return err
 	}
-
 	if len(targetIDs) == 0 {
-		return []*imap.Message{}, nil
+		return nil
 	}
 
-	c.log("[%s] Fetching %d specific messages from %s...", c.prefix, len(targetIDs), folder)
+	c.log("[%s] Streaming %d specific messages from %s...", c.prefix, len(targetIDs), folder)
 
+	// Stage 1: envelope scan — map Message-Id to UID.
 	var targetUIDs []uint32
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		targetUIDs = nil
@@ -662,33 +664,35 @@ func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetID
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
-		return nil, err
+		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return err
 	}
-
 	if len(targetUIDs) == 0 {
-		return []*imap.Message{}, nil
+		return nil
 	}
 
-	c.log("[%s] Found %d messages to fetch from %s", c.prefix, len(targetUIDs), folder)
+	c.log("[%s] Streaming %d messages from %s", c.prefix, len(targetUIDs), folder)
 	slices.Sort(targetUIDs)
 
-	var result []*imap.Message
+	// Stage 2: batched body fetch, streamed to onMessage.
+	var cbErr error
 	for start := 0; start < len(targetUIDs); start += uidFetchBatchSize {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
+		if cbErr != nil {
+			return cbErr
+		}
+
 		end := min(start+uidFetchBatchSize, len(targetUIDs))
 		uids := targetUIDs[start:end]
 
-		var batch []*imap.Message
 		err := c.safeCall(func(cli *imapclient.Client) error {
-			batch = nil
-			// Re-Select the folder so a reconnect-then-retry has the right state.
+			// Re-Select so a reconnect-then-retry has the right state.
 			if _, err := cli.Select(folder, true); err != nil {
 				return fmt.Errorf("[%s] reselect folder %s: %w", c.prefix, folder, err)
 			}
@@ -703,11 +707,13 @@ func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetID
 			}()
 
 			for msg := range messages {
-				if ctx.Err() == nil {
-					batch = append(batch, msg)
+				// Once cancelled or callback errored, just drain so the
+				// producer goroutine can exit and we don't leak it.
+				if ctx.Err() != nil || cbErr != nil {
+					continue
 				}
-				if tracker != nil && ctx.Err() == nil {
-					tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result)+len(batch), len(targetUIDs)))
+				if e := onMessage(msg); e != nil {
+					cbErr = e
 				}
 			}
 			if err := <-batchDone; err != nil {
@@ -717,16 +723,15 @@ func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetID
 		})
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return ctx.Err()
 			}
-			return nil, err
+			return err
 		}
-		result = append(result, batch...)
+		if cbErr != nil {
+			return cbErr
+		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return nil
 }
 
 // AppendMessage uploads a single message to the destination folder.

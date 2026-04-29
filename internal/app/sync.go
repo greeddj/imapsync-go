@@ -17,18 +17,22 @@ import (
 )
 
 // FolderSyncPlan describes how a single source folder should be copied to its destination.
+//
+// MessageIDs holds the diff (Message-Ids present on src but missing on dst);
+// bodies are deliberately not fetched at planning time so a confirm prompt can
+// show counts without materializing potentially many GB of mail in memory.
 type FolderSyncPlan struct {
+	MessageIDs              map[string]bool
 	SourceFolder            string
 	DestinationFolder       string
-	DestinationFolderExists bool
 	NewMessages             int
-	MessagesToSync          []*imap.Message
+	DestinationFolderExists bool
 }
 
 // SyncSummary aggregates the per-folder plans along with total message counts.
 type SyncSummary struct {
-	TotalNew int
 	Plans    []FolderSyncPlan
+	TotalNew int
 }
 
 // ActionSync copies messages between IMAP servers according to the provided configuration.
@@ -243,11 +247,11 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			foldersToCreate := make([]string, 0, len(summary.Plans))
 			for _, plan := range summary.Plans {
 				foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
-				if len(plan.MessagesToSync) > 0 {
-					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, len(plan.MessagesToSync))
+				if plan.NewMessages > 0 {
+					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
 					if verbose {
-						for _, msg := range plan.MessagesToSync {
-							fmt.Printf("  • %s (ID: %s)\n", msg.Envelope.Subject, msg.Envelope.MessageId)
+						for id := range plan.MessageIDs {
+							fmt.Printf("  • %s\n", id)
 						}
 						fmt.Println()
 					}
@@ -395,7 +399,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 		for i, plan := range chunk {
 			chunkWg.Add(1)
-			go func(idx int, planIndex int, p FolderSyncPlan, tracker *progress.Tracker) {
+			go func(planIndex int, p FolderSyncPlan, tracker *progress.Tracker) {
 				defer chunkWg.Done()
 
 				if err := ctx.Err(); err != nil {
@@ -406,29 +410,62 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 				tracker.UpdateMessage(fmt.Sprintf("%d/%d Connecting...", planIndex, len(activePlans)))
 
-				// Create a dedicated client for this goroutine
-				folderClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+				// Each worker owns its own src+dst connections. go-imap clients
+				// are not safe for concurrent use across folders, so sharing the
+				// outer srcClient/dstClient between workers is not an option.
+				folderSrcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
 				if err != nil {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect", planIndex, len(activePlans)))
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (src)", planIndex, len(activePlans)))
 					tracker.MarkAsErrored()
 					atomic.AddInt64(&chunkErrorsAtomic, 1)
-					syncPW.Log("Failed to connect for folder %s: %v", p.DestinationFolder, err)
+					syncPW.Log("Failed to connect (src) for folder %s: %v", p.SourceFolder, err)
 					return
 				}
-				defer func() {
-					_ = folderClient.Logout()
-				}()
-				folderClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Dst.Label, planIndex))
+				defer func() { _ = folderSrcClient.Logout() }()
+				folderSrcClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Src.Label, planIndex))
 
-				// Folders are already created in the pre-creation phase
+				folderDstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+				if err != nil {
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (dst)", planIndex, len(activePlans)))
+					tracker.MarkAsErrored()
+					atomic.AddInt64(&chunkErrorsAtomic, 1)
+					syncPW.Log("Failed to connect (dst) for folder %s: %v", p.DestinationFolder, err)
+					return
+				}
+				defer func() { _ = folderDstClient.Logout() }()
+				folderDstClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Dst.Label, planIndex))
+
 				tracker.UpdateTotal(int64(p.NewMessages))
 				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
-				synced, errors := syncFolders(ctx, cfg, p.SourceFolder, p.DestinationFolder, p.MessagesToSync, folderClient, verbose, syncPW, tracker, planIndex, len(activePlans), p.NewMessages)
-				if err := ctx.Err(); err != nil {
+
+				var synced, errors int
+				streamErr := folderSrcClient.StreamMessagesByIDs(ctx, p.SourceFolder, p.MessageIDs, func(msg *imap.Message) error {
+					if err := folderDstClient.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						errors++
+						syncPW.Log("Failed to append message to %s: %v", p.DestinationFolder, err)
+						return nil
+					}
+					synced++
+					tracker.Increment(1)
+					tracker.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s", planIndex, len(activePlans), synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
+					if verbose {
+						syncPW.Log("Synced %d/%d to %s, processed msg id %s", synced, p.NewMessages, p.DestinationFolder, msg.Envelope.MessageId)
+					}
+					return nil
+				})
+				if ctx.Err() != nil {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Canceled %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
 					tracker.MarkAsErrored()
 					return
 				}
+				if streamErr != nil {
+					syncPW.Log("Stream error for folder %s: %v", p.SourceFolder, streamErr)
+					errors++
+				}
+
 				atomic.AddInt64(&chunkSyncedAtomic, int64(synced))
 				atomic.AddInt64(&chunkErrorsAtomic, int64(errors))
 
@@ -439,7 +476,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d %s → %s", planIndex, len(activePlans), synced, p.SourceFolder, p.DestinationFolder))
 					tracker.MarkAsDone()
 				}
-			}(i, chunkStart+i+1, plan, trackers[i])
+			}(chunkStart+i+1, plan, trackers[i])
 		}
 
 		// Wait for chunk to complete
@@ -468,38 +505,6 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 	fmt.Println("✨ Sync completed successfully. ✨")
 	return nil
-}
-
-// syncFolders syncs messages using a single client (already connected and with folder created).
-func syncFolders(ctx context.Context, cfg *config.Config, srcFolder, dstFolder string, messages []*imap.Message, dstClient *client.Client, verbose bool, pw *progress.Writer, tracker *progress.Tracker, planIndex, totalPlans, totalMessages int) (int, int) {
-	var syncedCount int64
-	var errorCount int64
-
-	if err := ctx.Err(); err != nil {
-		return int(syncedCount), int(errorCount)
-	}
-
-	for i, msg := range messages {
-		if err := ctx.Err(); err != nil {
-			return int(syncedCount), int(errorCount)
-		}
-		if err := dstClient.AppendMessage(ctx, dstFolder, msg); err != nil {
-			if ctx.Err() != nil {
-				return int(syncedCount), int(errorCount)
-			}
-			pw.Log("Failed to append message %d/%d: %v", i+1, len(messages), err)
-			atomic.AddInt64(&errorCount, 1)
-		} else {
-			synced := atomic.AddInt64(&syncedCount, 1)
-			tracker.Increment(1)
-			tracker.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s", planIndex, totalPlans, synced, totalMessages, srcFolder, dstFolder))
-			if verbose {
-				pw.Log("Synced %d/%d messages to %s, processed msg id %s", synced, len(messages), dstFolder, msg.Envelope.MessageId)
-			}
-		}
-	}
-
-	return int(syncedCount), int(errorCount)
 }
 
 // buildSyncPlan compares source and destination folders to determine what needs syncing.
@@ -588,29 +593,19 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			continue
 		}
 
-		// Fetch full bodies only for messages that need syncing
-		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
-		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Waiting for %s (%d/%d)", dstLabel, srcFolder, idx+1, len(mappings)))
-		messagesToSync, err := srcClient.FetchMessagesByIDs(ctx, srcFolder, newIDs, srcTracker, len(newIDs))
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch messages from %s: %w", srcFolder, err)
-		}
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
 		srcTracker.Increment(1)
 		dstTracker.Increment(1)
 
-		if len(messagesToSync) > 0 {
-			plan := FolderSyncPlan{
-				SourceFolder:            srcFolder,
-				DestinationFolder:       dstFolder,
-				DestinationFolderExists: dstFolderExists,
-				NewMessages:             len(messagesToSync),
-				MessagesToSync:          messagesToSync,
-			}
-			summary.Plans = append(summary.Plans, plan)
-			summary.TotalNew += len(messagesToSync)
-		}
+		summary.Plans = append(summary.Plans, FolderSyncPlan{
+			SourceFolder:            srcFolder,
+			DestinationFolder:       dstFolder,
+			DestinationFolderExists: dstFolderExists,
+			NewMessages:             len(newIDs),
+			MessageIDs:              newIDs,
+		})
+		summary.TotalNew += len(newIDs)
 	}
 
 	return summary, nil
