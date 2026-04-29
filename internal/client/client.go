@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
+	imapclient "github.com/emersion/go-imap/client"
 	"github.com/greeddj/imapsync-go/internal/progress"
 )
 
@@ -37,13 +37,15 @@ const (
 	uidFetchBatchSize = 500
 )
 
-// Global lock map for folder creation to prevent race conditions
+// Global lock map for folder creation to prevent race conditions across goroutines
+// that share the destination Client semantics (each goroutine has its own *Client,
+// but they may concurrently create the same folder path).
 var (
 	folderLocksMu sync.Mutex
 	folderLocks   = make(map[string]*sync.Mutex)
 )
 
-// getFolderLock returns a mutex for a specific folder path
+// getFolderLock returns a mutex for a specific folder path.
 func getFolderLock(path string) *sync.Mutex {
 	folderLocksMu.Lock()
 	defer folderLocksMu.Unlock()
@@ -71,30 +73,35 @@ type ProgressTracker interface {
 	MarkAsErrored()
 }
 
-// Client embeds an IMAP client with retry-friendly helpers.
+// Client wraps a go-imap client with reconnect/retry logic.
+//
+// The underlying *imapclient.Client is held in an atomic.Pointer so that
+// Reconnect can swap it without racing with the watcher goroutine spawned by
+// withCancel. All IMAP operations go through safeCall, which receives the
+// current client as an argument; on a connection error it transparently
+// reconnects and retries the closure once with the fresh client.
 type Client struct {
-	*client.Client
-
-	serverAddr    string                              // IMAP server address.
-	useTLS        bool                                // Whether to use TLS for connections.
-	tlsConfig     *tls.Config                         // TLS configuration.
-	username      string                              // IMAP username.
-	password      string                              // IMAP password.
-	dialFn        func(addr string) (net.Conn, error) // Connection dialer function.
-	mu            sync.Mutex                          // Protects reconnection state.
-	backoff       time.Duration                       // Current reconnection backoff duration.
-	lastReconnect time.Time                           // Timestamp of last reconnection attempt.
-	reconnectDur  time.Duration                       // Minimum duration between reconnects.
-	prefix        string                              // Log message prefix.
-	verbose       bool                                // Enable verbose logging.
-	pw            ProgressWriter                      // Optional progress writer for logging.
-	tracker       ProgressTracker                     // Optional progress tracker for updates.
-	delimiter     string                              // Cached hierarchy delimiter from server.
-	cancelled     atomic.Bool                         // Indicates context cancellation.
+	lastReconnect time.Time
+	serverAddr    string
+	username      string
+	password      string
+	prefix        string
+	delimiter     string
+	pw            ProgressWriter
+	tracker       ProgressTracker
+	c             atomic.Pointer[imapclient.Client]
+	dialFn        func(addr string) (net.Conn, error)
+	tlsConfig     *tls.Config
+	mu            sync.Mutex
+	backoff       time.Duration
+	reconnectDur  time.Duration
+	cancelled     atomic.Bool
+	useTLS        bool
+	verbose       bool
 }
 
 // New establishes a connection and logs into the IMAP server.
-func New(addr, username, password string, workers int, verbose, useTLS bool, tlsConfig *tls.Config) (*Client, error) {
+func New(addr, username, password string, _ int, verbose, useTLS bool, tlsConfig *tls.Config) (*Client, error) {
 	c := &Client{
 		serverAddr:   addr,
 		useTLS:       useTLS,
@@ -117,8 +124,7 @@ func New(addr, username, password string, workers int, verbose, useTLS bool, tls
 		return nil, err
 	}
 
-	// Get and cache the delimiter
-	delimiter, err := c.getDelimiter()
+	delimiter, err := c.refreshDelimiter()
 	if err != nil {
 		_ = c.Logout()
 		return nil, fmt.Errorf("failed to get delimiter: %w", err)
@@ -129,36 +135,35 @@ func New(addr, username, password string, workers int, verbose, useTLS bool, tls
 }
 
 // SetPrefix configures the log prefix used in progress messages.
-func (c *Client) SetPrefix(p string) {
-	c.prefix = p
-}
+func (c *Client) SetPrefix(p string) { c.prefix = p }
 
 // SetProgressWriter sets the progress writer for logging.
-func (c *Client) SetProgressWriter(pw ProgressWriter) {
-	c.pw = pw
-}
+func (c *Client) SetProgressWriter(pw ProgressWriter) { c.pw = pw }
 
 // SetProgressTracker sets an optional progress tracker for updating progress.
-func (c *Client) SetProgressTracker(tracker ProgressTracker) {
-	c.tracker = tracker
-}
+func (c *Client) SetProgressTracker(t ProgressTracker) { c.tracker = t }
 
 // GetDelimiter returns the cached hierarchy delimiter for this server.
-func (c *Client) GetDelimiter() string {
-	return c.delimiter
+func (c *Client) GetDelimiter() string { return c.delimiter }
+
+// Logout terminates the IMAP session.
+func (c *Client) Logout() error {
+	cli := c.c.Load()
+	if cli == nil {
+		return nil
+	}
+	return cli.Logout()
 }
 
 // Cancel marks the client as canceled and terminates the underlying connection.
 func (c *Client) Cancel() {
 	c.cancelled.Store(true)
-	if c.Client != nil {
-		_ = c.Terminate()
+	if cli := c.c.Load(); cli != nil {
+		_ = cli.Terminate()
 	}
 }
 
-func (c *Client) isCancelled() bool {
-	return c.cancelled.Load()
-}
+func (c *Client) isCancelled() bool { return c.cancelled.Load() }
 
 func normalizeContext(ctx context.Context) context.Context {
 	if ctx == nil {
@@ -167,6 +172,9 @@ func normalizeContext(ctx context.Context) context.Context {
 	return ctx
 }
 
+// withCancel bridges context.Context to the underlying connection. When the
+// context is canceled, the connection is Terminate()d so blocked IMAP calls
+// return immediately. The returned function must be called to stop the watcher.
 func (c *Client) withCancel(ctx context.Context) func() {
 	ctx = normalizeContext(ctx)
 	done := make(chan struct{})
@@ -180,7 +188,7 @@ func (c *Client) withCancel(ctx context.Context) func() {
 	return func() { close(done) }
 }
 
-// log outputs a message either to progress writer or stdout based on availability.
+// log routes a formatted message to the tracker (preferred) or progress writer.
 func (c *Client) log(format string, args ...any) {
 	if c.tracker != nil {
 		c.tracker.UpdateMessage(fmt.Sprintf(format, args...))
@@ -196,23 +204,23 @@ func (c *Client) connectAndLogin() error {
 		return err
 	}
 
-	client, err := client.New(conn)
+	cli, err := imapclient.New(conn)
 	if err != nil {
 		_ = conn.Close()
 		return err
 	}
 
-	if err := client.Login(c.username, c.password); err != nil {
-		_ = client.Logout()
+	if err := cli.Login(c.username, c.password); err != nil {
+		_ = cli.Logout()
 		return err
 	}
 
-	c.Client = client
+	c.c.Store(cli)
 	return nil
 }
 
-// Reconnect tears down and rebuilds the underlying IMAP session with backoff.
-func (c *Client) Reconnect() error {
+// reconnect tears down and rebuilds the underlying IMAP session with backoff.
+func (c *Client) reconnect() error {
 	if c.isCancelled() {
 		return context.Canceled
 	}
@@ -230,8 +238,9 @@ func (c *Client) Reconnect() error {
 		time.Sleep(wait)
 	}
 
-	if c.Client != nil {
-		_ = c.Logout()
+	if cli := c.c.Load(); cli != nil {
+		_ = cli.Logout()
+		c.c.Store(nil)
 	}
 
 	var err error
@@ -246,7 +255,7 @@ func (c *Client) Reconnect() error {
 		if err == nil {
 			c.log("[%s] 🔄 Reconnected successfully", c.prefix)
 			c.lastReconnect = time.Now()
-			c.backoff = 2 * time.Second
+			c.backoff = initialBackoff
 			return nil
 		}
 
@@ -262,33 +271,42 @@ func (c *Client) Reconnect() error {
 	return fmt.Errorf("[%s] failed to reconnect after retries: %w", c.prefix, err)
 }
 
-// safeCall wraps an IMAP operation with automatic reconnection on connection errors.
-func (c *Client) safeCall(fn func() error) error {
+// safeCall runs fn with the current IMAP client. If fn returns a connection
+// error, safeCall reconnects and retries fn once with the fresh client.
+//
+// The closure must be re-runnable: any state that fn accumulates on the first
+// attempt (slices, maps, counters) has to be reset at the top of the closure.
+func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 	if c.isCancelled() {
 		return context.Canceled
 	}
-	err := fn()
+	cli := c.c.Load()
+	if cli == nil {
+		return errors.New("imap client not connected")
+	}
+
+	err := fn(cli)
 	if err == nil {
 		return nil
 	}
-
 	if c.isCancelled() {
 		return context.Canceled
 	}
-	if isConnError(err) {
-		if c.isCancelled() {
-			return context.Canceled
-		}
-		if rerr := c.Reconnect(); rerr != nil {
-			return rerr
-		}
-		if c.isCancelled() {
-			return context.Canceled
-		}
-		return fn()
+	if !isConnError(err) {
+		return err
 	}
 
-	return err
+	if rerr := c.reconnect(); rerr != nil {
+		return rerr
+	}
+	if c.isCancelled() {
+		return context.Canceled
+	}
+	cli = c.c.Load()
+	if cli == nil {
+		return errors.New("imap client not connected after reconnect")
+	}
+	return fn(cli)
 }
 
 // isConnError determines if an error is connection-related and warrants a reconnect attempt.
@@ -299,26 +317,44 @@ func isConnError(err error) bool {
 		errors.As(err, &netErr)
 }
 
-// SafeSelect selects a mailbox and retries on transient connection errors.
-func (c *Client) SafeSelect(mailbox string, readOnly bool) (*imap.MailboxStatus, error) {
-	var mbox *imap.MailboxStatus
-	err := c.safeCall(func() error {
-		var e error
-		mbox, e = c.Select(mailbox, readOnly)
-		return e
-	})
-	return mbox, err
+// mailboxExists checks if a mailbox with the given name exists on the server.
+// Channel is fully drained to avoid blocking the producer goroutine.
+func mailboxExists(cli *imapclient.Client, name string) (bool, error) {
+	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
+	done := make(chan error, 1)
+
+	go func() { done <- cli.List("", name, mailboxes) }()
+
+	exists := false
+	for range mailboxes {
+		exists = true
+	}
+	if err := <-done; err != nil {
+		return false, fmt.Errorf("list mailbox %q: %w", name, err)
+	}
+	return exists, nil
 }
 
-// SafeSearch wraps IMAP search with automatic reconnects.
-func (c *Client) SafeSearch(criteria *imap.SearchCriteria) ([]uint32, error) {
-	var ids []uint32
-	err := c.safeCall(func() error {
-		var e error
-		ids, e = c.Search(criteria)
-		return e
+// refreshDelimiter retrieves the hierarchy delimiter used by the IMAP server.
+func (c *Client) refreshDelimiter() (string, error) {
+	var delimiter string
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		mailboxes := make(chan *imap.MailboxInfo, 1)
+		done := make(chan error, 1)
+		go func() { done <- cli.List("", "", mailboxes) }()
+
+		delimiter = "/"
+		for mbox := range mailboxes {
+			if mbox.Delimiter != "" {
+				delimiter = mbox.Delimiter
+			}
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("[%s] list delimiter: %w", c.prefix, err)
+		}
+		return nil
 	})
-	return ids, err
+	return delimiter, err
 }
 
 // CreateMailbox ensures the destination folder (and parents) exist on the server.
@@ -331,34 +367,31 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 
-	// Lock this specific folder path to prevent concurrent creation
 	lock := getFolderLock(name)
 	lock.Lock()
 	defer lock.Unlock()
 
-	if exists, err := c.mailboxExists(name); err != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
+	var existed bool
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		ok, e := mailboxExists(cli, name)
+		if e != nil {
+			return e
 		}
-		return false, err
-	} else if exists {
-		return false, nil
-	}
-
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-
-	delimiter, err := c.getDelimiter()
+		existed = ok
+		return nil
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		return false, fmt.Errorf("[%s] failed to get delimiter: %w", c.prefix, err)
+		return false, err
+	}
+	if existed {
+		return false, nil
 	}
 
-	if delimiter != "" && strings.Contains(name, delimiter) {
-		if err := c.createParentFolders(name, delimiter); err != nil {
+	if c.delimiter != "" && strings.Contains(name, c.delimiter) {
+		if err := c.createParentFolders(ctx, name, c.delimiter); err != nil {
 			if ctx.Err() != nil {
 				return false, ctx.Err()
 			}
@@ -370,10 +403,9 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 
-	err = c.safeCall(func() error {
-		return c.Create(name)
+	err = c.safeCall(func(cli *imapclient.Client) error {
+		return cli.Create(name)
 	})
-
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
@@ -384,64 +416,28 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 	return true, nil
 }
 
-// mailboxExists checks if a mailbox with the given name exists on the server.
-func (c *Client) mailboxExists(name string) (bool, error) {
-	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- c.List("", name, mailboxes)
-	}()
-
-	exists := false
-	for range mailboxes {
-		exists = true
-		break
-	}
-
-	if err := <-done; err != nil {
-		return false, fmt.Errorf("[%s] failed to check mailbox existence: %w", c.prefix, err)
-	}
-
-	return exists, nil
-}
-
-// getDelimiter retrieves the hierarchy delimiter used by the IMAP server.
-func (c *Client) getDelimiter() (string, error) {
-	mailboxes := make(chan *imap.MailboxInfo, 1)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- c.List("", "", mailboxes)
-	}()
-
-	delimiter := "/"
-	for mbox := range mailboxes {
-		if mbox.Delimiter != "" {
-			delimiter = mbox.Delimiter
-			break
-		}
-	}
-
-	if err := <-done; err != nil {
-		return "", fmt.Errorf("[%s] failed to get delimiter: %w", c.prefix, err)
-	}
-
-	return delimiter, nil
-}
-
-// createParentFolders recursively creates all parent folders in a hierarchy.
-func (c *Client) createParentFolders(name, delimiter string) error {
+// createParentFolders walks down the hierarchy, creating any missing parent folder.
+func (c *Client) createParentFolders(ctx context.Context, name, delimiter string) error {
 	parts := strings.Split(name, delimiter)
 
 	for i := 1; i < len(parts); i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		parentPath := strings.Join(parts[:i], delimiter)
 
-		// Get a lock specific to this folder path to prevent race conditions
 		lock := getFolderLock(parentPath)
 		lock.Lock()
 
-		exists, err := c.mailboxExists(parentPath)
+		var exists bool
+		err := c.safeCall(func(cli *imapclient.Client) error {
+			ok, e := mailboxExists(cli, parentPath)
+			if e != nil {
+				return e
+			}
+			exists = ok
+			return nil
+		})
 		if err != nil {
 			lock.Unlock()
 			return fmt.Errorf("[%s] failed to check parent folder %s: %w", c.prefix, parentPath, err)
@@ -449,8 +445,8 @@ func (c *Client) createParentFolders(name, delimiter string) error {
 
 		if !exists {
 			c.log("[%s] Creating parent folder: %s", c.prefix, parentPath)
-			err = c.safeCall(func() error {
-				return c.Create(parentPath)
+			err = c.safeCall(func(cli *imapclient.Client) error {
+				return cli.Create(parentPath)
 			})
 			if err != nil {
 				lock.Unlock()
@@ -477,44 +473,45 @@ func (c *Client) FetchMessageIDs(ctx context.Context, folder string) (map[string
 
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
-	mbox, err := c.Select(folder, true)
+	var ids map[string]bool
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		ids = make(map[string]bool)
+		mbox, err := cli.Select(folder, true)
+		if err != nil {
+			return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
+		}
+		c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages)
+		if mbox.Messages == 0 {
+			return nil
+		}
+		c.log("[%s] Fetching %d message IDs from %s...", c.prefix, mbox.Messages, folder)
+
+		seqset := new(imap.SeqSet)
+		seqset.AddRange(1, mbox.Messages)
+		messages := make(chan *imap.Message, messageChanBuffer)
+		done := make(chan error, 1)
+		go func() {
+			done <- cli.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope}, messages)
+		}()
+
+		for msg := range messages {
+			if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
+				msgID := strings.Trim(msg.Envelope.MessageId, "<>")
+				if msgID != "" {
+					ids[msgID] = true
+				}
+			}
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("[%s] fetch IDs: %w", c.prefix, err)
+		}
+		return nil
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
-	}
-	c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages)
-
-	ids := make(map[string]bool)
-	if mbox.Messages == 0 {
-		return ids, nil
-	}
-
-	c.log("[%s] Fetching %d message IDs from %s...", c.prefix, mbox.Messages, folder)
-
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(1, mbox.Messages)
-	items := []imap.FetchItem{imap.FetchEnvelope}
-	messages := make(chan *imap.Message, messageChanBuffer)
-	done := make(chan error, 1)
-	go func() { done <- c.Fetch(seqset, items, messages) }()
-
-	count := 0
-	for msg := range messages {
-		if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
-			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
-			if msgID != "" {
-				ids[msgID] = true
-			}
-		}
-		count++
-	}
-	if err := <-done; err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("[%s] fetch IDs error: %v", c.prefix, err)
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -532,46 +529,48 @@ func (c *Client) FetchMessages(ctx context.Context, folder string) ([]*imap.Mess
 		return nil, err
 	}
 
-	c.log("[%s] Fetching folder %s...", c.prefix, folder)
+	var all []*imap.Message
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		all = nil
+		c.log("[%s] Fetching folder %s...", c.prefix, folder)
+		mbox, err := cli.Select(folder, true)
+		if err != nil {
+			return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
+		}
+		c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages)
+		if mbox.Messages == 0 {
+			return nil
+		}
+		c.log("[%s] Fetching %d messages from %s...", c.prefix, mbox.Messages, folder)
 
-	mbox, err := c.Select(folder, true)
+		seqset := new(imap.SeqSet)
+		seqset.AddRange(1, mbox.Messages)
+		messages := make(chan *imap.Message, messageChanBuffer)
+		done := make(chan error, 1)
+		go func() {
+			done <- cli.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
+		}()
+
+		count := 0
+		for msg := range messages {
+			if ctx.Err() == nil {
+				all = append(all, msg)
+			}
+			count++
+			if count%progressUpdateInterval == 0 {
+				c.log("[%s] Processed %d/%d messages from %s...", c.prefix, count, mbox.Messages, folder)
+			}
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("[%s] fetch: %w", c.prefix, err)
+		}
+		return nil
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
-	}
-	c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, mbox.Messages)
-	if mbox.Messages == 0 {
-		return []*imap.Message{}, nil
-	}
-
-	c.log("[%s] Fetching %d messages from %s...", c.prefix, mbox.Messages, folder)
-
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(1, mbox.Messages)
-	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}
-
-	messages := make(chan *imap.Message, messageChanBuffer)
-	done := make(chan error, 1)
-	go func() { done <- c.Fetch(seqset, items, messages) }()
-
-	var all []*imap.Message
-	count := 0
-	for msg := range messages {
-		if ctx.Err() == nil {
-			all = append(all, msg)
-		}
-		count++
-		if count%progressUpdateInterval == 0 {
-			c.log("[%s] Processed %d/%d messages from %s...", c.prefix, count, mbox.Messages, folder)
-		}
-	}
-	if err := <-done; err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("[%s] fetch error: %v", c.prefix, err)
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -580,7 +579,12 @@ func (c *Client) FetchMessages(ctx context.Context, folder string) ([]*imap.Mess
 }
 
 // FetchMessagesByIDs retrieves full messages that match the given Message-IDs.
-func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetIDs map[string]bool, tracker *progress.Tracker, totalToFetch int) ([]*imap.Message, error) {
+//
+// The first stage maps Message-Id to UID by scanning envelopes; the second
+// stage fetches bodies in batches of uidFetchBatchSize. Each stage is wrapped
+// in its own safeCall so that a reconnect mid-fetch re-Selects the folder
+// before retrying just the failing batch.
+func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetIDs map[string]bool, tracker *progress.Tracker, _ int) ([]*imap.Message, error) {
 	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -595,40 +599,44 @@ func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetID
 
 	c.log("[%s] Fetching %d specific messages from %s...", c.prefix, len(targetIDs), folder)
 
-	mbox, err := c.Select(folder, true)
+	var targetUIDs []uint32
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		targetUIDs = nil
+		mbox, err := cli.Select(folder, true)
+		if err != nil {
+			return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
+		}
+		if mbox.Messages == 0 {
+			return nil
+		}
+
+		seqset := new(imap.SeqSet)
+		seqset.AddRange(1, mbox.Messages)
+
+		envMessages := make(chan *imap.Message, messageChanBuffer)
+		envDone := make(chan error, 1)
+		go func() {
+			envDone <- cli.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, envMessages)
+		}()
+
+		for msg := range envMessages {
+			if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
+				msgID := strings.Trim(msg.Envelope.MessageId, "<>")
+				if targetIDs[msgID] {
+					targetUIDs = append(targetUIDs, msg.Uid)
+				}
+			}
+		}
+		if err := <-envDone; err != nil {
+			return fmt.Errorf("[%s] envelope fetch: %w", c.prefix, err)
+		}
+		return nil
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("[%s] cannot select folder %s: %v", c.prefix, folder, err)
-	}
-
-	if mbox.Messages == 0 {
-		return []*imap.Message{}, nil
-	}
-
-	// First pass: find UIDs of messages we need
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(1, mbox.Messages)
-
-	envMessages := make(chan *imap.Message, messageChanBuffer)
-	done := make(chan error, 1)
-	go func() { done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, envMessages) }()
-
-	var targetUIDs []uint32
-	for msg := range envMessages {
-		if ctx.Err() == nil && msg.Envelope != nil && msg.Envelope.MessageId != "" {
-			msgID := strings.Trim(msg.Envelope.MessageId, "<>")
-			if targetIDs[msgID] {
-				targetUIDs = append(targetUIDs, msg.Uid)
-			}
-		}
-	}
-	if err := <-done; err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("[%s] envelope fetch error: %v", c.prefix, err)
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -639,8 +647,6 @@ func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetID
 	}
 
 	c.log("[%s] Found %d messages to fetch from %s", c.prefix, len(targetUIDs), folder)
-
-	// Second pass: fetch full bodies for target UIDs only (batched)
 	slices.Sort(targetUIDs)
 
 	var result []*imap.Message
@@ -649,36 +655,49 @@ func (c *Client) FetchMessagesByIDs(ctx context.Context, folder string, targetID
 			return nil, err
 		}
 		end := min(start+uidFetchBatchSize, len(targetUIDs))
-		uidSet := new(imap.SeqSet)
-		for _, uid := range targetUIDs[start:end] {
-			uidSet.AddNum(uid)
-		}
+		uids := targetUIDs[start:end]
 
-		messages := make(chan *imap.Message, messageChanBuffer)
-		batchDone := make(chan error, 1)
-		go func() {
-			batchDone <- c.UidFetch(uidSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
-		}()
+		var batch []*imap.Message
+		err := c.safeCall(func(cli *imapclient.Client) error {
+			batch = nil
+			// Re-Select the folder so a reconnect-then-retry has the right state.
+			if _, err := cli.Select(folder, true); err != nil {
+				return fmt.Errorf("[%s] reselect folder %s: %w", c.prefix, folder, err)
+			}
+			uidSet := new(imap.SeqSet)
+			for _, uid := range uids {
+				uidSet.AddNum(uid)
+			}
+			messages := make(chan *imap.Message, messageChanBuffer)
+			batchDone := make(chan error, 1)
+			go func() {
+				batchDone <- cli.UidFetch(uidSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
+			}()
 
-		for msg := range messages {
-			if ctx.Err() == nil {
-				result = append(result, msg)
+			for msg := range messages {
+				if ctx.Err() == nil {
+					batch = append(batch, msg)
+				}
+				if tracker != nil && ctx.Err() == nil {
+					tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result)+len(batch), len(targetUIDs)))
+				}
 			}
-			if tracker != nil && ctx.Err() == nil {
-				tracker.UpdateMessage(fmt.Sprintf("[%s] Fetching from %s (%d/%d)", c.prefix, folder, len(result), len(targetUIDs)))
+			if err := <-batchDone; err != nil {
+				return fmt.Errorf("[%s] body fetch: %w", c.prefix, err)
 			}
-		}
-		if err := <-batchDone; err != nil {
+			return nil
+		})
+		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("[%s] body fetch error: %v", c.prefix, err)
+			return nil, err
 		}
+		result = append(result, batch...)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
 	return result, nil
 }
 
@@ -699,7 +718,7 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Mes
 
 	raw, err := io.ReadAll(body)
 	if err != nil {
-		return fmt.Errorf("[%s] read body: %v", c.prefix, err)
+		return fmt.Errorf("[%s] read body: %w", c.prefix, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -708,16 +727,14 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Mes
 	flags := []string{imap.SeenFlag}
 	date := msg.Envelope.Date
 
-	err = c.safeCall(func() error {
-		literal := bytes.NewReader(raw)
-		return c.Append(folder, flags, date, literal)
+	err = c.safeCall(func(cli *imapclient.Client) error {
+		return cli.Append(folder, flags, date, bytes.NewReader(raw))
 	})
-
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("[%s] append failed: %v", c.prefix, err)
+		return fmt.Errorf("[%s] append: %w", c.prefix, err)
 	}
 	if c.verbose {
 		c.log("[%s] Message %q appended to %s", c.prefix, msg.Envelope.MessageId, folder)
@@ -749,29 +766,32 @@ func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) (
 		pattern = folder + "/*"
 	}
 
-	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-	done := make(chan error, 1)
-	go func() {
-		done <- c.List("", pattern, mailboxes)
-	}()
-
 	var subfolders []string
-	for mbox := range mailboxes {
-		if ctx.Err() == nil && mbox.Name != folder {
-			subfolders = append(subfolders, mbox.Name)
-		}
-	}
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		subfolders = nil
+		mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
+		done := make(chan error, 1)
+		go func() { done <- cli.List("", pattern, mailboxes) }()
 
-	if err := <-done; err != nil {
+		for mbox := range mailboxes {
+			if ctx.Err() == nil && mbox.Name != folder {
+				subfolders = append(subfolders, mbox.Name)
+			}
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("[%s] list subfolders: %w", c.prefix, err)
+		}
+		return nil
+	})
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("[%s] list subfolders error: %v", c.prefix, err)
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
 	return subfolders, nil
 }
 
@@ -787,26 +807,28 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 
 	c.log("[%s] Getting mailbox list...", c.prefix)
 
-	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-	done := make(chan error, 1)
-	go func() {
-		done <- c.List("", "*", mailboxes)
-	}()
-
 	var result []*MailboxInfo
-	for m := range mailboxes {
-		if ctx.Err() == nil {
-			result = append(result, &MailboxInfo{
-				Name: m.Name,
-			})
-		}
-	}
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		result = nil
+		mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
+		done := make(chan error, 1)
+		go func() { done <- cli.List("", "*", mailboxes) }()
 
-	if err := <-done; err != nil {
+		for m := range mailboxes {
+			if ctx.Err() == nil {
+				result = append(result, &MailboxInfo{Name: m.Name})
+			}
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("[%s] list mailboxes: %w", c.prefix, err)
+		}
+		return nil
+	})
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("[%s] list mailboxes error: %v", c.prefix, err)
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -814,7 +836,6 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 
 	c.log("[%s] Getting mailbox statistics...", c.prefix)
 
-	// Update tracker total based on actual mailbox count
 	if c.tracker != nil {
 		c.tracker.UpdateTotal(int64(len(result)))
 	}
@@ -827,10 +848,15 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 			c.tracker.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), mbox.Name))
 		}
 
-		status, err := c.Status(mbox.Name, []imap.StatusItem{
-			imap.StatusMessages,
+		var status *imap.MailboxStatus
+		err := c.safeCall(func(cli *imapclient.Client) error {
+			s, e := cli.Status(mbox.Name, []imap.StatusItem{imap.StatusMessages})
+			if e != nil {
+				return e
+			}
+			status = s
+			return nil
 		})
-
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -842,7 +868,6 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 		}
 
 		mbox.Messages = status.Messages
-
 		if status.Messages > 0 {
 			size, err := c.getFolderSize(ctx, mbox.Name)
 			if err == nil {
@@ -855,7 +880,6 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 		}
 	}
 
-	// Update final message
 	if c.tracker != nil {
 		c.tracker.UpdateMessage(fmt.Sprintf("[%s] Done (%d mailboxes)", c.prefix, len(result)))
 	}
@@ -873,36 +897,37 @@ func (c *Client) getFolderSize(ctx context.Context, folder string) (uint64, erro
 		return 0, err
 	}
 
-	mbox, err := c.Select(folder, true)
-	if err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		return 0, err
-	}
-
-	if mbox.Messages == 0 {
-		return 0, nil
-	}
-
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(1, mbox.Messages)
-
-	messages := make(chan *imap.Message, messageChanBuffer)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchRFC822Size}, messages)
-	}()
-
 	var totalSize uint64
-	for msg := range messages {
-		if ctx.Err() == nil {
-			totalSize += uint64(msg.Size)
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		totalSize = 0
+		mbox, err := cli.Select(folder, true)
+		if err != nil {
+			return err
 		}
-	}
+		if mbox.Messages == 0 {
+			return nil
+		}
 
-	if err := <-done; err != nil {
+		seqset := new(imap.SeqSet)
+		seqset.AddRange(1, mbox.Messages)
+
+		messages := make(chan *imap.Message, messageChanBuffer)
+		done := make(chan error, 1)
+		go func() {
+			done <- cli.Fetch(seqset, []imap.FetchItem{imap.FetchRFC822Size}, messages)
+		}()
+
+		for msg := range messages {
+			if ctx.Err() == nil {
+				totalSize += uint64(msg.Size)
+			}
+		}
+		if err := <-done; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
@@ -911,6 +936,5 @@ func (c *Client) getFolderSize(ctx context.Context, folder string) (uint64, erro
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-
 	return totalSize, nil
 }
