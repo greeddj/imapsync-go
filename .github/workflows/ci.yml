@@ -21,16 +21,16 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Run check
-        run: |
-          go vet ./...;
-          go tool staticcheck ./...;
-          go tool govulncheck ./...;
+      - name: Install just
+        uses: extractions/setup-just@v3
+
+      - name: Run static checks
+        run: just check
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.11.4
           install-mode: binary
 
       - name: Run tests
