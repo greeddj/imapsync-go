@@ -394,8 +394,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 		// Process chunk in parallel
 		var chunkWg sync.WaitGroup
-		var chunkSyncedAtomic int64
-		var chunkErrorsAtomic int64
+		var chunkSynced, chunkErrors atomic.Int64
 
 		for i, plan := range chunk {
 			chunkWg.Add(1)
@@ -417,7 +416,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				if err != nil {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (src)", planIndex, len(activePlans)))
 					tracker.MarkAsErrored()
-					atomic.AddInt64(&chunkErrorsAtomic, 1)
+					chunkErrors.Add(1)
 					syncPW.Log("Failed to connect (src) for folder %s: %v", p.SourceFolder, err)
 					return
 				}
@@ -428,7 +427,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				if err != nil {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (dst)", planIndex, len(activePlans)))
 					tracker.MarkAsErrored()
-					atomic.AddInt64(&chunkErrorsAtomic, 1)
+					chunkErrors.Add(1)
 					syncPW.Log("Failed to connect (dst) for folder %s: %v", p.DestinationFolder, err)
 					return
 				}
@@ -466,8 +465,8 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					errors++
 				}
 
-				atomic.AddInt64(&chunkSyncedAtomic, int64(synced))
-				atomic.AddInt64(&chunkErrorsAtomic, int64(errors))
+				chunkSynced.Add(int64(synced))
+				chunkErrors.Add(int64(errors))
 
 				if errors > 0 {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s", planIndex, len(activePlans), synced, errors, p.SourceFolder, p.DestinationFolder))
@@ -488,8 +487,8 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		}
 
 		// Update totals
-		totalSynced += int(atomic.LoadInt64(&chunkSyncedAtomic))
-		totalErrors += int(atomic.LoadInt64(&chunkErrorsAtomic))
+		totalSynced += int(chunkSynced.Load())
+		totalErrors += int(chunkErrors.Load())
 
 		// Give trackers time to update final state
 		time.Sleep(100 * time.Millisecond)
