@@ -12,7 +12,6 @@ import (
 
 // AppendMessage uploads a single message to the destination folder.
 func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Message) error {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 

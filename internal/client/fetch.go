@@ -16,7 +16,6 @@ import (
 // progress writer — without that header the diff has no key to match on, so
 // they cannot be tracked across servers and will be silently skipped.
 func (c *Client) FetchMessageIDs(ctx context.Context, folder string) (map[string]bool, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -88,7 +87,6 @@ func (c *Client) FetchMessageIDs(ctx context.Context, folder string) (map[string
 
 // FetchMessages retrieves full message envelopes and bodies for a folder.
 func (c *Client) FetchMessages(ctx context.Context, folder string) ([]*imap.Message, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -155,7 +153,6 @@ func (c *Client) FetchMessages(ctx context.Context, folder string) ([]*imap.Mess
 // drained (so the producer goroutine exits cleanly) and the error is
 // returned without scheduling further batches.
 func (c *Client) StreamMessagesByIDs(ctx context.Context, folder string, targetIDs map[string]bool, onMessage func(*imap.Message) error) error {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 

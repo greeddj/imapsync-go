@@ -36,7 +36,6 @@ func mailboxExists(cli *imapclient.Client, name string) (bool, error) {
 
 // MailboxExists reports whether a mailbox with the given name exists on the server.
 func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -64,7 +63,6 @@ func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 
 // CreateMailbox ensures the destination folder (and parents) exist on the server.
 func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -168,7 +166,6 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 
 // ListSubfolders returns subfolders matching the given folder and delimiter.
 func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) ([]string, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -214,7 +211,6 @@ func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) (
 
 // ListMailboxes fetches all folders plus lightweight statistics for each.
 func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -306,7 +302,6 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 
 // getFolderSize calculates the total size of all messages in a folder.
 func (c *Client) getFolderSize(ctx context.Context, folder string) (uint64, error) {
-	ctx = normalizeContext(ctx)
 	stop := c.withCancel(ctx)
 	defer stop()
 

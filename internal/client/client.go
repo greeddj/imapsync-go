@@ -157,18 +157,13 @@ func (c *Client) Cancel() {
 
 func (c *Client) isCancelled() bool { return c.cancelled.Load() }
 
-func normalizeContext(ctx context.Context) context.Context {
-	if ctx == nil {
-		return context.Background()
-	}
-	return ctx
-}
-
 // withCancel bridges context.Context to the underlying connection. When the
 // context is canceled, the connection is Terminate()d so blocked IMAP calls
 // return immediately. The returned function must be called to stop the watcher.
+//
+// ctx must be non-nil; passing nil is a programmer error and will panic on
+// the first ctx.Done() — preferred over silently substituting Background().
 func (c *Client) withCancel(ctx context.Context) func() {
-	ctx = normalizeContext(ctx)
 	done := make(chan struct{})
 	go func() {
 		select {

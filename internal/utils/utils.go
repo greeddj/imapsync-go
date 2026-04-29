@@ -20,10 +20,9 @@ const (
 
 // AskConfirm prompts the user with the provided message and returns true if the user confirms.
 // It allows up to maxConfirmAttempts tries before returning false.
+//
+// ctx must be non-nil; passing nil is a programmer error.
 func AskConfirm(ctx context.Context, prompt string) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	reader := bufio.NewReader(os.Stdin)
 
 	message := strings.TrimSpace(prompt)
