@@ -459,6 +459,11 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
 
 				var synced, errors int
+				// Throttle UpdateMessage so a 100k-message sync doesn't spend
+				// measurable CPU on fmt.Sprintf and tracker churn. The
+				// progress writer renders at ~10 Hz anyway; updating faster
+				// just produces work the renderer drops.
+				var lastUpdate time.Time
 				streamErr := folderSrcClient.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
 					if err := folderDstClient.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
 						if ctx.Err() != nil {
@@ -470,7 +475,10 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					}
 					synced++
 					tracker.Increment(1)
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s", planIndex, len(activePlans), synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
+					if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
+						lastUpdate = now
+						tracker.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s", planIndex, len(activePlans), synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
+					}
 					if verbose {
 						syncPW.Log("Synced %d/%d to %s, processed msg id %s", synced, p.NewMessages, p.DestinationFolder, msg.Envelope.MessageId)
 					}

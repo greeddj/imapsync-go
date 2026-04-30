@@ -28,6 +28,13 @@ var messageIDHeaderSection = &imap.BodySectionName{
 	Peek: true,
 }
 
+// fullBodyPeekSection requests the entire RFC822 body without flipping the
+// \Seen flag on the source. This matters: a sync tool must not mutate the
+// source mailbox state. The previous implementation used FetchRFC822 which
+// is functionally equivalent to BODY[] (RFC 3501 §6.4.5) and *does* mark
+// messages as read.
+var fullBodyPeekSection = &imap.BodySectionName{Peek: true}
+
 // FetchMessageMap returns Message-Id → UID for every message in folder.
 //
 // One pass over the folder yields both pieces. Messages without a usable
@@ -239,7 +246,7 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 			}
 			messages := make(chan *imap.Message, messageChanBuffer)
 			batchDone := make(chan error, 1)
-			items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}
+			items := []imap.FetchItem{imap.FetchEnvelope, fullBodyPeekSection.FetchItem()}
 			go func() { batchDone <- cli.UidFetch(uidSet, items, messages) }()
 
 			for msg := range messages {

@@ -1,16 +1,22 @@
 package client
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 
 	"github.com/emersion/go-imap"
-	imapclient "github.com/emersion/go-imap/client"
 )
 
 // AppendMessage uploads a single message to the destination folder.
+//
+// The body is streamed straight from the *imap.Message (which already holds
+// it in memory) into the APPEND literal — no extra io.ReadAll buffer. The
+// trade-off is that the literal is not replayable: a transient network error
+// mid-APPEND cannot be retried, because the body has been partially sent.
+// That's acceptable for our flow: the next sync run is idempotent (the
+// Message-Id diff will pick up the message again), and avoiding the second
+// in-memory copy halves peak RAM with multi-MB attachments and 10 workers.
 func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Message) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -18,27 +24,22 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Mes
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if c.isCancelled() {
+		return context.Canceled
+	}
 
-	body := msg.GetBody(&imap.BodySectionName{})
+	body := msg.GetBody(fullBodyPeekSection)
 	if body == nil {
 		return fmt.Errorf("[%s] message has no body", c.prefix)
 	}
 
-	raw, err := io.ReadAll(body)
-	if err != nil {
-		return fmt.Errorf("[%s] read body: %w", c.prefix, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
+	cli := c.c.Load()
+	if cli == nil {
+		return errors.New("imap client not connected")
 	}
 
 	flags := []string{imap.SeenFlag}
-	date := msg.Envelope.Date
-
-	err = c.safeCall(func(cli *imapclient.Client) error {
-		return cli.Append(folder, flags, date, bytes.NewReader(raw))
-	})
-	if err != nil {
+	if err := cli.Append(folder, flags, msg.Envelope.Date, body); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
