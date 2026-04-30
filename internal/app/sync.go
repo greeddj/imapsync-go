@@ -13,8 +13,10 @@ import (
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
+	"github.com/greeddj/imapsync-go/internal/ratelimit"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/time/rate"
 )
 
 // FolderSyncPlan describes how a single source folder should be copied to its destination.
@@ -63,6 +65,20 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		fmt.Printf("Starting sync with %d workers\n", cfg.Workers)
 	}
 
+	// Rate-limit budgets are shared across every Client that talks to the
+	// same side: src.ReadLimiter governs all download traffic, dst.WriteLimiter
+	// all upload traffic. Either may be nil ("unlimited").
+	srcReadLim := ratelimit.NewLimiter(cfg.RateLimit.DownBPS)
+	dstWriteLim := ratelimit.NewLimiter(cfg.RateLimit.UpBPS)
+	srcOpts := client.Options{UseTLS: true, Verbose: verbose, ReadLimiter: srcReadLim}
+	dstOpts := client.Options{UseTLS: true, Verbose: verbose, WriteLimiter: dstWriteLim}
+
+	if !quiet {
+		if w := buildProviderWarning(cfg, srcReadLim, dstWriteLim); w != "" {
+			fmt.Print(w)
+		}
+	}
+
 	var mappings []config.DirectoryMapping
 
 	switch {
@@ -87,7 +103,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
+	srcClient, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
 	if err != nil {
 		return fmt.Errorf("source connection failed: %w", err)
 	}
@@ -100,7 +116,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		srcClient.Cancel()
 		return err
 	}
-	dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+	dstClient, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
 	if err != nil {
 		return fmt.Errorf("destination connection failed: %w", err)
 	}
@@ -414,7 +430,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				// Each worker owns its own src+dst connections. go-imap clients
 				// are not safe for concurrent use across folders, so sharing the
 				// outer srcClient/dstClient between workers is not an option.
-				folderSrcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, verbose, true, nil)
+				folderSrcClient, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
 				if err != nil {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (src)", planIndex, len(activePlans)))
 					tracker.MarkAsErrored()
@@ -425,7 +441,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				defer func() { _ = folderSrcClient.Logout() }()
 				folderSrcClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Src.Label, planIndex))
 
-				folderDstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, verbose, true, nil)
+				folderDstClient, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
 				if err != nil {
 					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (dst)", planIndex, len(activePlans)))
 					tracker.MarkAsErrored()
@@ -708,4 +724,68 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client,
 // getSubfolders returns all subfolders of a given folder
 func getSubfolders(ctx context.Context, c *client.Client, folder string, delimiter string) ([]string, error) {
 	return c.ListSubfolders(ctx, folder, delimiter)
+}
+
+// buildProviderWarning produces a human-readable banner for accounts on
+// providers with known IMAP limits. Empty string when neither side is a known
+// provider, so the caller can print unconditionally.
+//
+// The banner is informational, not blocking — it sits before the confirm
+// prompt in the sync flow so the user has a chance to abort and re-run with
+// safer flags before kicking off a transfer that might hit a daily quota.
+func buildProviderWarning(cfg *config.Config, srcReadLim, dstWriteLim *rate.Limiter) string {
+	type sideHit struct {
+		limiter  *rate.Limiter
+		side     string // "source" / "destination"
+		host     string
+		provider client.Provider
+		isUpload bool
+	}
+
+	var hits []sideHit
+	if p, ok := client.DetectProvider(cfg.Src.Server); ok {
+		hits = append(hits, sideHit{
+			limiter: srcReadLim, side: "source", host: cfg.Src.Server, provider: p, isUpload: false,
+		})
+	}
+	if p, ok := client.DetectProvider(cfg.Dst.Server); ok {
+		hits = append(hits, sideHit{
+			limiter: dstWriteLim, side: "destination", host: cfg.Dst.Server, provider: p, isUpload: true,
+		})
+	}
+	if len(hits) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n⚠️  Provider with known IMAP limits detected:\n")
+	for _, h := range hits {
+		fmt.Fprintf(&b, "   %s [%s] — %s\n", h.side, h.host, h.provider.Name)
+		if h.provider.MaxConnections > 0 {
+			fmt.Fprintf(&b, "     • max simultaneous connections: %d\n", h.provider.MaxConnections)
+			if cfg.Workers >= h.provider.MaxConnections {
+				fmt.Fprintf(&b, "       (current --workers=%d may exceed this; consider lowering)\n", cfg.Workers)
+			}
+		}
+		if h.provider.DailyDownMB > 0 || h.provider.DailyUpMB > 0 {
+			fmt.Fprintf(&b, "     • daily quota: %d MB down, %d MB up\n",
+				h.provider.DailyDownMB, h.provider.DailyUpMB)
+		}
+		if h.limiter == nil {
+			recommended := h.provider.DownBPS
+			flag := "--bps-down"
+			if h.isUpload {
+				recommended = h.provider.UpBPS
+				flag = "--bps-up"
+			}
+			if recommended > 0 {
+				fmt.Fprintf(&b, "     • no rate limit set — recommended: %s %d\n", flag, recommended)
+			}
+		}
+		if h.provider.Notes != "" {
+			fmt.Fprintf(&b, "     • notes: %s\n", h.provider.Notes)
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
 }

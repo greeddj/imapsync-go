@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,8 @@ import (
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/greeddj/imapsync-go/internal/ratelimit"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -27,6 +28,12 @@ const (
 	reconnectInterval = 10 * time.Second
 	// maxReconnectAttempts is the maximum number of reconnection retries.
 	maxReconnectAttempts = 5
+	// throttledBackoff is the wait imposed after the server signals a rate
+	// limit. Long enough that an aggressive caller cools down rather than
+	// drilling into the same throttle.
+	throttledBackoff = 5 * time.Minute
+	// defaultDialTimeout is the maximum time spent on a single TCP/TLS dial.
+	defaultDialTimeout = 30 * time.Second
 	// progressUpdateInterval defines how often to update progress during batch operations.
 	progressUpdateInterval = 10
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
@@ -47,20 +54,42 @@ type ProgressTracker interface {
 	MarkAsErrored()
 }
 
+// Options carries the optional knobs for New. Zero-value is fine for plain
+// TLS connections without throttling.
+//
+// ReadLimiter and WriteLimiter, when non-nil, are typically shared across
+// every Client that talks to the same account so that the byte budget is a
+// global cap, not a per-connection cap.
+type Options struct {
+	TLSConfig    *tls.Config
+	ReadLimiter  *rate.Limiter
+	WriteLimiter *rate.Limiter
+	DialTimeout  time.Duration
+	UseTLS       bool
+	Verbose      bool
+}
+
+// dialFunc captures how a fresh connection is produced. It is overridable in
+// tests; production wiring is set up in New.
+type dialFunc func(ctx context.Context, addr string) (net.Conn, error)
+
 // Client wraps a go-imap client with reconnect/retry logic.
 //
 // The underlying *imapclient.Client is held in an atomic.Pointer so that
 // Reconnect can swap it without racing with the watcher goroutine spawned by
 // withCancel. All IMAP operations go through safeCall, which receives the
-// current client as an argument; on a connection error it transparently
+// current client as an argument; on a transient error it transparently
 // reconnects and retries the closure once with the fresh client.
 type Client struct {
 	lastReconnect time.Time
 	pw            ProgressWriter
 	tracker       ProgressTracker
 	tlsConfig     *tls.Config
-	dialFn        func(addr string) (net.Conn, error)
+	readLimiter   *rate.Limiter
+	writeLimiter  *rate.Limiter
+	dialFn        dialFunc
 	folderLocks   map[string]*sync.Mutex
+	cancelCh      chan struct{}
 	c             atomic.Pointer[imapclient.Client]
 	prefix        string
 	delimiter     string
@@ -69,6 +98,7 @@ type Client struct {
 	serverAddr    string
 	backoff       time.Duration
 	reconnectDur  time.Duration
+	dialTimeout   time.Duration
 	mu            sync.Mutex
 	folderLocksMu sync.Mutex
 	cancelled     atomic.Bool
@@ -92,30 +122,55 @@ func (c *Client) folderLock(path string) *sync.Mutex {
 }
 
 // New establishes a connection and logs into the IMAP server.
-func New(addr, username, password string, _ int, verbose, useTLS bool, tlsConfig *tls.Config) (*Client, error) {
+//
+// ctx is used only for the initial dial and login; once Client is returned,
+// reconnects are driven by the internal cancellation channel (closed by
+// Cancel) so that long-running consumers do not need to keep the original
+// context alive.
+func New(ctx context.Context, addr, username, password string, opts Options) (*Client, error) {
+	timeout := opts.DialTimeout
+	if timeout == 0 {
+		timeout = defaultDialTimeout
+	}
+
 	c := &Client{
 		serverAddr:   addr,
-		useTLS:       useTLS,
-		tlsConfig:    tlsConfig,
+		useTLS:       opts.UseTLS,
+		tlsConfig:    opts.TLSConfig,
 		username:     username,
 		password:     password,
 		backoff:      initialBackoff,
 		reconnectDur: reconnectInterval,
-		verbose:      verbose,
+		dialTimeout:  timeout,
+		verbose:      opts.Verbose,
 		folderLocks:  make(map[string]*sync.Mutex),
+		readLimiter:  opts.ReadLimiter,
+		writeLimiter: opts.WriteLimiter,
+		cancelCh:     make(chan struct{}),
 	}
 
-	// dialFn runs from inside the reconnect loop, which has its own
-	// cancellation channel via c.cancelled + Terminate(); plumbing a
-	// context into the dialer would duplicate that mechanism.
-	c.dialFn = func(addr string) (net.Conn, error) {
-		if useTLS {
-			return tls.Dial("tcp", addr, tlsConfig) //nolint:noctx // see comment above
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		nd := &net.Dialer{Timeout: c.dialTimeout}
+		var (
+			conn net.Conn
+			err  error
+		)
+		if c.useTLS {
+			td := &tls.Dialer{NetDialer: nd, Config: c.tlsConfig}
+			conn, err = td.DialContext(ctx, "tcp", addr)
+		} else {
+			conn, err = nd.DialContext(ctx, "tcp", addr)
 		}
-		return net.Dial("tcp", addr) //nolint:noctx // see comment above
+		if err != nil {
+			return nil, err
+		}
+		if c.readLimiter != nil || c.writeLimiter != nil {
+			conn = ratelimit.New(conn, c.readLimiter, c.writeLimiter)
+		}
+		return conn, nil
 	}
 
-	if err := c.connectAndLogin(); err != nil {
+	if err := c.connectAndLogin(ctx); err != nil {
 		return nil, err
 	}
 
@@ -151,8 +206,11 @@ func (c *Client) Logout() error {
 }
 
 // Cancel marks the client as canceled and terminates the underlying connection.
+// It is safe to call multiple times.
 func (c *Client) Cancel() {
-	c.cancelled.Store(true)
+	if c.cancelled.CompareAndSwap(false, true) {
+		close(c.cancelCh)
+	}
 	if cli := c.c.Load(); cli != nil {
 		_ = cli.Terminate()
 	}
@@ -178,6 +236,21 @@ func (c *Client) withCancel(ctx context.Context) func() {
 	return func() { close(done) }
 }
 
+// internalContext returns a context that is cancelled when the client itself
+// is cancelled. Used for reconnect dialing where the original caller context
+// may already be gone.
+func (c *Client) internalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-c.cancelCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // log routes a formatted message to the tracker (preferred) or progress writer.
 func (c *Client) log(format string, args ...any) {
 	if c.tracker != nil {
@@ -187,9 +260,25 @@ func (c *Client) log(format string, args ...any) {
 	}
 }
 
+// sleepCtx sleeps for d, returning early with ctx.Err() if the context is
+// cancelled. d <= 0 returns nil immediately.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // connectAndLogin establishes a new IMAP connection and authenticates the user.
-func (c *Client) connectAndLogin() error {
-	conn, err := c.dialFn(c.serverAddr)
+func (c *Client) connectAndLogin(ctx context.Context) error {
+	conn, err := c.dialFn(ctx, c.serverAddr)
 	if err != nil {
 		return err
 	}
@@ -210,6 +299,8 @@ func (c *Client) connectAndLogin() error {
 }
 
 // reconnect tears down and rebuilds the underlying IMAP session with backoff.
+// It honours error classification: permanent errors abort immediately, server
+// throttling triggers a long cool-down between attempts.
 func (c *Client) reconnect() error {
 	if c.isCancelled() {
 		return context.Canceled
@@ -217,15 +308,17 @@ func (c *Client) reconnect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	ctx, cancel := c.internalContext()
+	defer cancel()
+
 	now := time.Now()
 	sinceLast := now.Sub(c.lastReconnect)
 	if sinceLast < c.reconnectDur {
-		if c.isCancelled() {
-			return context.Canceled
-		}
 		wait := c.reconnectDur - sinceLast
 		c.log("[%s] 🔄 Reconnecting in %s...", c.prefix, wait)
-		time.Sleep(wait)
+		if err := sleepCtx(ctx, wait); err != nil {
+			return err
+		}
 	}
 
 	if cli := c.c.Load(); cli != nil {
@@ -233,36 +326,51 @@ func (c *Client) reconnect() error {
 		c.c.Store(nil)
 	}
 
-	var err error
+	var lastErr error
 	delay := c.backoff
 
 	for i := 1; i <= maxReconnectAttempts; i++ {
-		if c.isCancelled() {
-			return context.Canceled
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		c.log("[%s] 🔄 Reconnect attempt %d...", c.prefix, i)
-		err = c.connectAndLogin()
+		err := c.connectAndLogin(ctx)
 		if err == nil {
 			c.log("[%s] 🔄 Reconnected successfully", c.prefix)
 			c.lastReconnect = time.Now()
 			c.backoff = initialBackoff
 			return nil
 		}
+		lastErr = err
 
-		if c.isCancelled() {
-			return context.Canceled
+		switch classifyError(err) {
+		case ClassPermanent:
+			// Auth fails won't get better with retries; bail out fast.
+			c.log("[%s] 🔄 Permanent error, giving up: %v", c.prefix, err)
+			c.lastReconnect = time.Now()
+			return err
+		case ClassThrottled:
+			c.log("[%s] 🔄 Server throttled, backing off %s", c.prefix, throttledBackoff)
+			if serr := sleepCtx(ctx, throttledBackoff); serr != nil {
+				return serr
+			}
+			continue
+		case ClassTransient, ClassUnknown:
+			c.log("[%s] 🔄 Failed: %v, retrying in %s", c.prefix, err, delay)
+			if serr := sleepCtx(ctx, delay); serr != nil {
+				return serr
+			}
+			delay *= 2
 		}
-		c.log("[%s] 🔄 Failed: %v, retrying in %s", c.prefix, err, delay)
-		time.Sleep(delay)
-		delay *= 2
 	}
 
 	c.lastReconnect = time.Now()
-	return fmt.Errorf("[%s] failed to reconnect after retries: %w", c.prefix, err)
+	return fmt.Errorf("[%s] failed to reconnect after retries: %w", c.prefix, lastErr)
 }
 
-// safeCall runs fn with the current IMAP client. If fn returns a connection
+// safeCall runs fn with the current IMAP client. If fn returns a transient
 // error, safeCall reconnects and retries fn once with the fresh client.
+// Permanent and throttled errors are surfaced to the caller as-is.
 //
 // The closure must be re-runnable: any state that fn accumulates on the first
 // attempt (slices, maps, counters) has to be reset at the top of the closure.
@@ -282,7 +390,7 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 	if c.isCancelled() {
 		return context.Canceled
 	}
-	if !isConnError(err) {
+	if !isRetryable(err) {
 		return err
 	}
 
@@ -297,14 +405,6 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 		return errors.New("imap client not connected after reconnect")
 	}
 	return fn(cli)
-}
-
-// isConnError determines if an error is connection-related and warrants a reconnect attempt.
-func isConnError(err error) bool {
-	var netErr net.Error
-	return errors.Is(err, io.EOF) ||
-		errors.Is(err, net.ErrClosed) ||
-		errors.As(err, &netErr)
 }
 
 // refreshDelimiter retrieves the hierarchy delimiter used by the IMAP server.

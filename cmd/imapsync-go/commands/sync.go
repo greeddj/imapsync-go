@@ -45,6 +45,24 @@ func Sync() *cli.Command {
 				Usage:   "auto-confirm (skip confirmation prompt)",
 				Sources: cli.EnvVars("IMAPSYNC_CONFIRM"),
 			},
+			&cli.IntFlag{
+				Name:    "bps-down",
+				Usage:   "max bytes/sec read from the source server (0 = unlimited; for Gmail try 300000)",
+				Value:   0,
+				Sources: cli.EnvVars("IMAPSYNC_BPS_DOWN"),
+			},
+			&cli.IntFlag{
+				Name:    "bps-up",
+				Usage:   "max bytes/sec written to the destination server (0 = unlimited; for Gmail try 300000)",
+				Value:   0,
+				Sources: cli.EnvVars("IMAPSYNC_BPS_UP"),
+			},
+			&cli.IntFlag{
+				Name:    "max-connections",
+				Usage:   "hard cap on simultaneous IMAP connections per side (0 = workers)",
+				Value:   0,
+				Sources: cli.EnvVars("IMAPSYNC_MAX_CONNECTIONS"),
+			},
 		},
 	}
 }

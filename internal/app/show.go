@@ -63,7 +63,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 			return
 		}
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
-		srcClient, err := client.New(cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, 1, false, true, nil)
+		srcClient, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, client.Options{UseTLS: true})
 		if err != nil {
 			result.err = fmt.Errorf("[%s] source connection failed: %w", cfg.Src.Label, err)
 			srcTracker.MarkAsErrored()
@@ -97,7 +97,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 			return
 		}
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
-		dstClient, err := client.New(cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, 1, false, true, nil)
+		dstClient, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, client.Options{UseTLS: true})
 		if err != nil {
 			result.err = fmt.Errorf("[%s] destination connection failed: %w", cfg.Dst.Label, err)
 			dstTracker.MarkAsErrored()
