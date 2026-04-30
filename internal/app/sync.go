@@ -8,9 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/emersion/go-imap"
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
@@ -373,10 +371,8 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			creationTracker.Increment(1)
 		}
 
-		// Update final message
 		creationTracker.UpdateMessage(fmt.Sprintf("Created %d folders", createdCount))
 		creationTracker.MarkAsDone()
-		time.Sleep(100 * time.Millisecond)
 		creationPW.Stop()
 
 		if failedCount > 0 {
@@ -384,151 +380,94 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
-	totalSynced := 0
-	totalErrors := 0
-
 	if !quiet {
 		fmt.Println("\n📥 Syncing messages...")
 	}
-	// Process plans in chunks based on worker count
-	chunkSize := cfg.Workers
-	for chunkStart := 0; chunkStart < len(activePlans); chunkStart += chunkSize {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		chunkEnd := min(chunkStart+chunkSize, len(activePlans))
-		chunk := activePlans[chunkStart:chunkEnd]
 
-		// Setup progress writer for this chunk
-		syncPW := progress.NewWriter(len(chunk), quiet)
-		syncPW.Start()
-
-		// Create trackers for this chunk
-		trackers := make([]*progress.Tracker, len(chunk))
-		for i := range chunk {
-			trackers[i] = progress.NewTracker(
-				fmt.Sprintf("%d/%d Waiting...", chunkStart+i+1, len(activePlans)),
-				100,
-			)
-			syncPW.AppendTracker(trackers[i])
-		}
-
-		// Process chunk in parallel
-		var chunkWg sync.WaitGroup
-		var chunkSynced, chunkErrors atomic.Int64
-
-		for i, plan := range chunk {
-			chunkWg.Add(1)
-			go func(planIndex int, p FolderSyncPlan, tracker *progress.Tracker) {
-				defer chunkWg.Done()
-
-				if err := ctx.Err(); err != nil {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Canceled", planIndex, len(activePlans)))
-					tracker.MarkAsErrored()
-					return
-				}
-
-				tracker.UpdateMessage(fmt.Sprintf("%d/%d Connecting...", planIndex, len(activePlans)))
-
-				// Each worker owns its own src+dst connections. go-imap clients
-				// are not safe for concurrent use across folders, so sharing the
-				// outer srcClient/dstClient between workers is not an option.
-				folderSrcClient, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
-				if err != nil {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (src)", planIndex, len(activePlans)))
-					tracker.MarkAsErrored()
-					chunkErrors.Add(1)
-					syncPW.Log("Failed to connect (src) for folder %s: %v", p.SourceFolder, err)
-					return
-				}
-				defer func() { _ = folderSrcClient.Logout() }()
-				folderSrcClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Src.Label, planIndex))
-
-				folderDstClient, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
-				if err != nil {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Failed to connect (dst)", planIndex, len(activePlans)))
-					tracker.MarkAsErrored()
-					chunkErrors.Add(1)
-					syncPW.Log("Failed to connect (dst) for folder %s: %v", p.DestinationFolder, err)
-					return
-				}
-				defer func() { _ = folderDstClient.Logout() }()
-				folderDstClient.SetPrefix(fmt.Sprintf("%s-folder-%d", cfg.Dst.Label, planIndex))
-
-				tracker.UpdateTotal(int64(p.NewMessages))
-				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
-
-				var synced, errors int
-				// Throttle UpdateMessage so a 100k-message sync doesn't spend
-				// measurable CPU on fmt.Sprintf and tracker churn. The
-				// progress writer renders at ~10 Hz anyway; updating faster
-				// just produces work the renderer drops.
-				var lastUpdate time.Time
-				streamErr := folderSrcClient.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
-					if err := folderDstClient.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
-						if ctx.Err() != nil {
-							return ctx.Err()
-						}
-						errors++
-						syncPW.Log("Failed to append message to %s: %v", p.DestinationFolder, err)
-						return nil
-					}
-					synced++
-					tracker.Increment(1)
-					if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
-						lastUpdate = now
-						tracker.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s", planIndex, len(activePlans), synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
-					}
-					if verbose {
-						syncPW.Log("Synced %d/%d to %s, processed msg id %s", synced, p.NewMessages, p.DestinationFolder, msg.Envelope.MessageId)
-					}
-					return nil
-				})
-				if ctx.Err() != nil {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Canceled %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
-					tracker.MarkAsErrored()
-					return
-				}
-				if streamErr != nil {
-					syncPW.Log("Stream error for folder %s: %v", p.SourceFolder, streamErr)
-					errors++
-				}
-
-				chunkSynced.Add(int64(synced))
-				chunkErrors.Add(int64(errors))
-
-				if errors > 0 {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s", planIndex, len(activePlans), synced, errors, p.SourceFolder, p.DestinationFolder))
-					tracker.MarkAsErrored()
-				} else {
-					tracker.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d %s → %s", planIndex, len(activePlans), synced, p.SourceFolder, p.DestinationFolder))
-					tracker.MarkAsDone()
-				}
-			}(chunkStart+i+1, plan, trackers[i])
-		}
-
-		// Wait for chunk to complete
-		chunkWg.Wait()
-
-		if err := ctx.Err(); err != nil {
-			syncPW.Stop()
-			return err
-		}
-
-		// Update totals
-		totalSynced += int(chunkSynced.Load())
-		totalErrors += int(chunkErrors.Load())
-
-		// Give trackers time to update final state
-		time.Sleep(100 * time.Millisecond)
-
-		// Stop progress for this chunk
-		syncPW.Stop()
+	// Cap parallelism by --workers, --max-connections, and number of plans.
+	// Each worker holds one src + one dst connection for the whole sync, so
+	// the number of open IMAP sessions per side equals effectiveWorkers + 1
+	// (the "+1" is the planning client we already opened).
+	effectiveWorkers := cfg.Workers
+	if maxConn := cfg.RateLimit.MaxConnections; maxConn > 0 && maxConn < effectiveWorkers {
+		effectiveWorkers = maxConn
+	}
+	if effectiveWorkers > len(activePlans) {
+		effectiveWorkers = len(activePlans)
+	}
+	if effectiveWorkers < 1 {
+		effectiveWorkers = 1
 	}
 
-	if totalErrors > 0 {
-		fmt.Printf("❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSynced, totalErrors)
-		return fmt.Errorf("sync completed with %d errors", totalErrors)
+	workers, err := newSyncWorkerPool(ctx, cfg, srcOpts, dstOpts, effectiveWorkers)
+	if err != nil {
+		return err
+	}
+	defer workers.close()
+
+	// One progress writer for the whole sync, with a tracker per plan
+	// up front. Reusing the writer across all plans replaces the older
+	// "writer-per-chunk" approach that produced visible flicker and forced
+	// a 100ms sleep between chunks.
+	syncPW := progress.NewWriter(len(activePlans), quiet)
+	syncPW.Start()
+	defer syncPW.Stop()
+
+	trackers := make([]*progress.Tracker, len(activePlans))
+	for i := range activePlans {
+		trackers[i] = progress.NewTracker(
+			fmt.Sprintf("%d/%d Waiting...", i+1, len(activePlans)),
+			100,
+		)
+		syncPW.AppendTracker(trackers[i])
+	}
+
+	// free is a bounded semaphore of pre-built workers. Whoever runs first
+	// pulls a worker, syncs one plan, returns the worker.
+	free := make(chan *syncWorker, effectiveWorkers)
+	for _, w := range workers.all {
+		free <- w
+	}
+
+	var (
+		wg          sync.WaitGroup
+		totalSynced atomic.Int64
+		totalErrors atomic.Int64
+	)
+
+	for i, plan := range activePlans {
+		if ctx.Err() != nil {
+			break
+		}
+		var w *syncWorker
+		select {
+		case w = <-free:
+		case <-ctx.Done():
+		}
+		if w == nil {
+			break
+		}
+		wg.Add(1)
+		go func(idx int, p FolderSyncPlan, w *syncWorker, tr *progress.Tracker) {
+			defer wg.Done()
+			defer func() { free <- w }()
+			synced, errs := runFolderSync(ctx, w, p, tr, idx, len(activePlans), syncPW, verbose)
+			totalSynced.Add(int64(synced))
+			totalErrors.Add(int64(errs))
+		}(i, plan, w, trackers[i])
+	}
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	totalSyncedN := int(totalSynced.Load())
+	totalErrorsN := int(totalErrors.Load())
+
+	if totalErrorsN > 0 {
+		fmt.Printf("❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSyncedN, totalErrorsN)
+		return fmt.Errorf("sync completed with %d errors", totalErrorsN)
 	}
 
 	fmt.Println("✨ Sync completed successfully. ✨")

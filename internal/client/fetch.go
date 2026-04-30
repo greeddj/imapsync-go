@@ -111,9 +111,11 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		return nil
 	})
 
-	if err == nil && missingCount > 0 && c.pw != nil {
-		c.pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped — sync cannot track them",
-			c.prefix, folder, missingCount)
+	if err == nil && missingCount > 0 {
+		if pw := c.progressWriter(); pw != nil {
+			pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped — sync cannot track them",
+				c.prefix, folder, missingCount)
+		}
 	}
 	if err != nil {
 		if ctx.Err() != nil {

@@ -82,8 +82,6 @@ type dialFunc func(ctx context.Context, addr string) (net.Conn, error)
 // reconnects and retries the closure once with the fresh client.
 type Client struct {
 	lastReconnect  time.Time
-	pw             ProgressWriter
-	tracker        ProgressTracker
 	tlsConfig      *tls.Config
 	readLimiter    *rate.Limiter
 	writeLimiter   *rate.Limiter
@@ -92,6 +90,8 @@ type Client struct {
 	cancelCh       chan struct{}
 	c              atomic.Pointer[imapclient.Client]
 	selectedFolder atomic.Pointer[string]
+	pw             atomic.Pointer[progressWriterRef]
+	tracker        atomic.Pointer[progressTrackerRef]
 	delimiter      string
 	prefix         string
 	password       string
@@ -109,6 +109,13 @@ type Client struct {
 	useTLS         bool
 	verbose        bool
 }
+
+// progressWriterRef and progressTrackerRef carry an interface value through
+// atomic.Pointer. Storing an interface directly would require atomic.Value
+// (which loses compile-time typing) and the wrapper costs only a tiny heap
+// allocation per Set call, which happens at most a handful of times per run.
+type progressWriterRef struct{ pw ProgressWriter }
+type progressTrackerRef struct{ t ProgressTracker }
 
 // folderLock returns the mutex guarding creation of the given folder path.
 // Locks are per-Client; concurrent CreateMailbox calls on the same instance
@@ -213,11 +220,41 @@ func (c *Client) selectIfNeeded(cli *imapclient.Client, folder string) (*imap.Ma
 // SetPrefix configures the log prefix used in progress messages.
 func (c *Client) SetPrefix(p string) { c.prefix = p }
 
-// SetProgressWriter sets the progress writer for logging.
-func (c *Client) SetProgressWriter(pw ProgressWriter) { c.pw = pw }
+// SetProgressWriter sets the progress writer for logging. Safe to call from
+// any goroutine, including while another goroutine is using the writer.
+func (c *Client) SetProgressWriter(pw ProgressWriter) {
+	if pw == nil {
+		c.pw.Store(nil)
+		return
+	}
+	c.pw.Store(&progressWriterRef{pw: pw})
+}
 
 // SetProgressTracker sets an optional progress tracker for updating progress.
-func (c *Client) SetProgressTracker(t ProgressTracker) { c.tracker = t }
+// Safe for concurrent use; see SetProgressWriter.
+func (c *Client) SetProgressTracker(t ProgressTracker) {
+	if t == nil {
+		c.tracker.Store(nil)
+		return
+	}
+	c.tracker.Store(&progressTrackerRef{t: t})
+}
+
+// progressWriter returns the currently configured ProgressWriter, or nil.
+func (c *Client) progressWriter() ProgressWriter {
+	if r := c.pw.Load(); r != nil {
+		return r.pw
+	}
+	return nil
+}
+
+// progressTracker returns the currently configured ProgressTracker, or nil.
+func (c *Client) progressTracker() ProgressTracker {
+	if r := c.tracker.Load(); r != nil {
+		return r.t
+	}
+	return nil
+}
 
 // GetDelimiter returns the cached hierarchy delimiter for this server.
 func (c *Client) GetDelimiter() string { return c.delimiter }
@@ -279,10 +316,15 @@ func (c *Client) internalContext() (context.Context, context.CancelFunc) {
 
 // log routes a formatted message to the tracker (preferred) or progress writer.
 func (c *Client) log(format string, args ...any) {
-	if c.tracker != nil {
-		c.tracker.UpdateMessage(fmt.Sprintf(format, args...))
-	} else if c.verbose && c.pw != nil {
-		c.pw.Log(format, args...)
+	if t := c.progressTracker(); t != nil {
+		t.UpdateMessage(fmt.Sprintf(format, args...))
+		return
+	}
+	if !c.verbose {
+		return
+	}
+	if pw := c.progressWriter(); pw != nil {
+		pw.Log(format, args...)
 	}
 }
 

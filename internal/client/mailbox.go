@@ -173,16 +173,17 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 
 	c.log("[%s] Getting mailbox statistics...", c.prefix)
 
-	if c.tracker != nil {
-		c.tracker.UpdateTotal(int64(len(result)))
+	tr := c.progressTracker()
+	if tr != nil {
+		tr.UpdateTotal(int64(len(result)))
 	}
 
 	for i, mbox := range result {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if c.tracker != nil {
-			c.tracker.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), mbox.Name))
+		if tr != nil {
+			tr.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), mbox.Name))
 		}
 
 		var status *imap.MailboxStatus
@@ -198,8 +199,8 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if c.tracker != nil {
-				c.tracker.Increment(1)
+			if tr != nil {
+				tr.Increment(1)
 			}
 			continue
 		}
@@ -212,13 +213,13 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 			}
 		}
 
-		if c.tracker != nil {
-			c.tracker.Increment(1)
+		if tr != nil {
+			tr.Increment(1)
 		}
 	}
 
-	if c.tracker != nil {
-		c.tracker.UpdateMessage(fmt.Sprintf("[%s] Done (%d mailboxes)", c.prefix, len(result)))
+	if tr != nil {
+		tr.UpdateMessage(fmt.Sprintf("[%s] Done (%d mailboxes)", c.prefix, len(result)))
 	}
 
 	return result, nil

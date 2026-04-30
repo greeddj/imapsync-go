@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
@@ -14,6 +13,7 @@ import (
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 // ActionShow displays information about mailboxes in source and destination IMAP accounts.
@@ -22,7 +22,6 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	// Setup progress writer
 	pw := progress.NewWriter(2, false)
 	pw.Start()
 	defer pw.Stop()
@@ -36,123 +35,72 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	// accountResult holds the result of fetching account information.
-	type accountResult struct {
-		err       error
-		client    *client.Client
-		mailboxes []*client.MailboxInfo
-	}
-
-	srcResult := make(chan accountResult, 1)
-	dstResult := make(chan accountResult, 1)
-
-	// Create trackers for both servers
 	srcTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label), 100)
 	dstTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label), 100)
-
 	pw.AppendTracker(srcTracker)
 	pw.AppendTracker(dstTracker)
 
-	var wg sync.WaitGroup
-
-	wg.Go(func() {
-		result := accountResult{}
-		if err := ctx.Err(); err != nil {
-			result.err = err
-			srcResult <- result
-			return
-		}
-		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Src.Label))
-		srcClient, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, client.Options{UseTLS: true})
+	// loadAccount fetches mailboxes for one side and returns both the open
+	// client (so we can Logout from the caller) and the mailbox slice.
+	type accountResult struct {
+		cli       *client.Client
+		mailboxes []*client.MailboxInfo
+	}
+	loadAccount := func(ctx context.Context, label string, creds config.Credentials, tr *progress.Tracker) (accountResult, error) {
+		tr.UpdateMessage(fmt.Sprintf("[%s] Connecting...", label))
+		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, client.Options{UseTLS: true})
 		if err != nil {
-			result.err = fmt.Errorf("[%s] source connection failed: %w", cfg.Src.Label, err)
-			srcTracker.MarkAsErrored()
-			srcResult <- result
-			return
+			tr.MarkAsErrored()
+			return accountResult{}, fmt.Errorf("[%s] connect: %w", label, err)
 		}
-		result.client = srcClient
-		srcClient.SetPrefix(cfg.Src.Label)
-		srcClient.SetProgressWriter(pw)
-		srcClient.SetProgressTracker(srcTracker)
+		cli.SetPrefix(label)
+		cli.SetProgressWriter(pw)
+		cli.SetProgressTracker(tr)
 
-		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", cfg.Src.Label))
-		mailboxes, err := srcClient.ListMailboxes(ctx)
+		tr.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", label))
+		mailboxes, err := cli.ListMailboxes(ctx)
 		if err != nil {
-			result.err = fmt.Errorf("[%s] failed to list source mailboxes: %w", cfg.Src.Label, err)
-			srcTracker.MarkAsErrored()
-			srcResult <- result
-			return
+			tr.MarkAsErrored()
+			return accountResult{cli: cli}, fmt.Errorf("[%s] list mailboxes: %w", label, err)
 		}
+		tr.MarkAsDone()
+		return accountResult{cli: cli, mailboxes: mailboxes}, nil
+	}
 
-		result.mailboxes = mailboxes
-		srcTracker.MarkAsDone()
-		srcResult <- result
+	// Run both sides in parallel; errgroup propagates the first error and
+	// keeps WithContext-derived ctx in sync so the loser cancels promptly.
+	g, gCtx := errgroup.WithContext(ctx)
+	var srcRes, dstRes accountResult
+
+	g.Go(func() error {
+		r, err := loadAccount(gCtx, cfg.Src.Label, cfg.Src, srcTracker)
+		srcRes = r
+		return err
+	})
+	g.Go(func() error {
+		r, err := loadAccount(gCtx, cfg.Dst.Label, cfg.Dst, dstTracker)
+		dstRes = r
+		return err
 	})
 
-	wg.Go(func() {
-		result := accountResult{}
-		if err := ctx.Err(); err != nil {
-			result.err = err
-			dstResult <- result
-			return
-		}
-		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Connecting...", cfg.Dst.Label))
-		dstClient, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, client.Options{UseTLS: true})
-		if err != nil {
-			result.err = fmt.Errorf("[%s] destination connection failed: %w", cfg.Dst.Label, err)
-			dstTracker.MarkAsErrored()
-			dstResult <- result
-			return
-		}
-		result.client = dstClient
-		dstClient.SetPrefix(cfg.Dst.Label)
-		dstClient.SetProgressWriter(pw)
-		dstClient.SetProgressTracker(dstTracker)
+	groupErr := g.Wait()
 
-		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Fetching mailboxes...", cfg.Dst.Label))
-		mailboxes, err := dstClient.ListMailboxes(ctx)
-		if err != nil {
-			result.err = fmt.Errorf("[%s] failed to list destination mailboxes: %w", cfg.Dst.Label, err)
-			dstTracker.MarkAsErrored()
-			dstResult <- result
-			return
-		}
-
-		result.mailboxes = mailboxes
-		dstTracker.MarkAsDone()
-		dstResult <- result
-	})
-
-	wg.Wait()
-	close(srcResult)
-	close(dstResult)
-
-	srcRes := <-srcResult
-	dstRes := <-dstResult
-
-	// Stop progress and clear output
 	pw.StopAndClear(2)
+
+	defer func() {
+		if srcRes.cli != nil {
+			_ = srcRes.cli.Logout()
+		}
+		if dstRes.cli != nil {
+			_ = dstRes.cli.Logout()
+		}
+	}()
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	// Cleanup function to logout from both clients.
-	cleanup := func() {
-		if srcRes.client != nil {
-			_ = srcRes.client.Logout()
-		}
-		if dstRes.client != nil {
-			_ = dstRes.client.Logout()
-		}
-	}
-	defer cleanup()
-
-	// Check for errors from either account.
-	if srcRes.err != nil {
-		return srcRes.err
-	}
-	if dstRes.err != nil {
-		return dstRes.err
+	if groupErr != nil {
+		return groupErr
 	}
 
 	printAccountInfo("Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
