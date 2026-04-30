@@ -17,3 +17,13 @@ map:
     dst: Sent
   - src: Archive
     dst: Archive
+
+# Optional throttle. Zero / omitted means unlimited.
+# For Gmail accounts, set both to 300000 to stay safely under the
+# 2.5 GB/day download and 500 MB/day upload IMAP quotas, and cap
+# max_connections at ~10 (Gmail's hard cap is 15 simultaneous IMAP
+# sessions per account).
+rate_limit:
+  down_bps: 0
+  up_bps: 0
+  max_connections: 0

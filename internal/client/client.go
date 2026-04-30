@@ -34,8 +34,6 @@ const (
 	throttledBackoff = 5 * time.Minute
 	// defaultDialTimeout is the maximum time spent on a single TCP/TLS dial.
 	defaultDialTimeout = 30 * time.Second
-	// progressUpdateInterval defines how often to update progress during batch operations.
-	progressUpdateInterval = 10
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
 	uidFetchBatchSize = 500
 )

@@ -24,5 +24,10 @@
       "src": "Archive.2023",
       "dst": "Archive/2023"
     }
-  ]
+  ],
+  "rate_limit": {
+    "down_bps": 0,
+    "up_bps": 0,
+    "max_connections": 0
+  }
 }

@@ -148,21 +148,23 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			return err
 		}
 		// Check source folder compatibility
-		if srcDelimiter != "" && !validateFolderPath(mapping.Source, srcDelimiter) {
-			oldDelim := detectDelimiter(mapping.Source)
-			validationErrors = append(validationErrors,
-				fmt.Sprintf("Mapping %d: Source folder %q uses delimiter %q, server expects %q",
-					i+1, mapping.Source, oldDelim, srcDelimiter))
-			needsFix = true
+		if srcDelimiter != "" {
+			if oldDelim, ok := folderDelimiter(mapping.Source, srcDelimiter); !ok {
+				validationErrors = append(validationErrors,
+					fmt.Sprintf("Mapping %d: Source folder %q uses delimiter %q, server expects %q",
+						i+1, mapping.Source, oldDelim, srcDelimiter))
+				needsFix = true
+			}
 		}
 
 		// Check destination folder compatibility
-		if dstDelimiter != "" && !validateFolderPath(mapping.Destination, dstDelimiter) {
-			oldDelim := detectDelimiter(mapping.Destination)
-			validationErrors = append(validationErrors,
-				fmt.Sprintf("Mapping %d: Destination folder %q uses delimiter %q, server expects %q",
-					i+1, mapping.Destination, oldDelim, dstDelimiter))
-			needsFix = true
+		if dstDelimiter != "" {
+			if oldDelim, ok := folderDelimiter(mapping.Destination, dstDelimiter); !ok {
+				validationErrors = append(validationErrors,
+					fmt.Sprintf("Mapping %d: Destination folder %q uses delimiter %q, server expects %q",
+						i+1, mapping.Destination, oldDelim, dstDelimiter))
+				needsFix = true
+			}
 		}
 	}
 
@@ -189,19 +191,16 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		}
 
 		if shouldFix {
-			// Fix delimiters in mappings
 			for i := range mappings {
 				if srcDelimiter != "" {
-					oldDelim := detectDelimiter(mappings[i].Source)
-					if oldDelim != "none" && oldDelim != srcDelimiter {
+					if oldDelim, _ := folderDelimiter(mappings[i].Source, srcDelimiter); oldDelim != "none" && oldDelim != srcDelimiter {
 						oldPath := mappings[i].Source
 						mappings[i].Source = strings.ReplaceAll(mappings[i].Source, oldDelim, srcDelimiter)
 						fmt.Printf("  ✓ Fixed source: %q → %q\n", oldPath, mappings[i].Source)
 					}
 				}
 				if dstDelimiter != "" {
-					oldDelim := detectDelimiter(mappings[i].Destination)
-					if oldDelim != "none" && oldDelim != dstDelimiter {
+					if oldDelim, _ := folderDelimiter(mappings[i].Destination, dstDelimiter); oldDelim != "none" && oldDelim != dstDelimiter {
 						oldPath := mappings[i].Destination
 						mappings[i].Destination = strings.ReplaceAll(mappings[i].Destination, oldDelim, dstDelimiter)
 						fmt.Printf("  ✓ Fixed destination: %q → %q\n", oldPath, mappings[i].Destination)
@@ -588,32 +587,20 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 	return summary, nil
 }
 
-// validateFolderPath checks if folder path uses the correct delimiter for the server
-func validateFolderPath(folderPath, serverDelimiter string) bool {
-	if serverDelimiter == "" {
-		return true
-	}
-
-	// Check if path contains any common delimiters
-	commonDelimiters := []string{"/", ".", "\\"}
-	for _, delim := range commonDelimiters {
-		if delim != serverDelimiter && strings.Contains(folderPath, delim) {
-			return false
+// folderDelimiter inspects path and reports which of the common IMAP
+// hierarchy delimiters it appears to use, plus whether that delimiter agrees
+// with the server's. ok is true also when path contains no delimiter at all
+// (there is nothing to mismatch).
+//
+// "none" is returned for the detected value when the path is flat — callers
+// rely on that string to skip rewrite logic in the fix-up loop.
+func folderDelimiter(path, serverDelimiter string) (detected string, ok bool) {
+	for _, d := range [...]string{"/", ".", "\\"} {
+		if strings.Contains(path, d) {
+			return d, serverDelimiter == "" || d == serverDelimiter
 		}
 	}
-
-	return true
-}
-
-// detectDelimiter tries to detect which delimiter is used in the folder path
-func detectDelimiter(folderPath string) string {
-	commonDelimiters := []string{"/", ".", "\\"}
-	for _, delim := range commonDelimiters {
-		if strings.Contains(folderPath, delim) {
-			return delim
-		}
-	}
-	return "none"
+	return "none", true
 }
 
 // expandMappingsWithSubfolders expands each mapping to include all subfolders

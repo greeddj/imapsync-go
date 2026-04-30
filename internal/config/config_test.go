@@ -1,8 +1,11 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestValidate(t *testing.T) {
@@ -94,5 +97,50 @@ func TestSetDefaultLabels(t *testing.T) {
 	}
 	if cfg.Dst.Label != defaultDestLabel {
 		t.Errorf("expected default dst label %q, got %s", defaultDestLabel, cfg.Dst.Label)
+	}
+}
+
+func TestRateLimitJSON(t *testing.T) {
+	t.Parallel()
+	data := []byte(`{"src":{"server":"s","user":"u","pass":"p"},"dst":{"server":"s","user":"u","pass":"p"},"rate_limit":{"down_bps":300000,"up_bps":50000,"max_connections":7}}`)
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cfg.RateLimit.DownBPS != 300000 || cfg.RateLimit.UpBPS != 50000 || cfg.RateLimit.MaxConnections != 7 {
+		t.Errorf("RateLimit = %+v", cfg.RateLimit)
+	}
+}
+
+func TestRateLimitYAML(t *testing.T) {
+	t.Parallel()
+	data := []byte(`
+src: {server: s, user: u, pass: p}
+dst: {server: s, user: u, pass: p}
+rate_limit:
+  down_bps: 300000
+  up_bps: 50000
+  max_connections: 7
+`)
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cfg.RateLimit.DownBPS != 300000 || cfg.RateLimit.UpBPS != 50000 || cfg.RateLimit.MaxConnections != 7 {
+		t.Errorf("RateLimit = %+v", cfg.RateLimit)
+	}
+}
+
+// Backwards compatibility: a config without a rate_limit block must parse
+// cleanly and leave the limits at zero (= unlimited).
+func TestRateLimitOmittedJSON(t *testing.T) {
+	t.Parallel()
+	data := []byte(`{"src":{"server":"s","user":"u","pass":"p"},"dst":{"server":"s","user":"u","pass":"p"}}`)
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cfg.RateLimit != (RateLimit{}) {
+		t.Errorf("RateLimit = %+v, want zero value", cfg.RateLimit)
 	}
 }

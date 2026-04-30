@@ -149,6 +149,38 @@ sync -w 4
 - `-y, --confirm` - Auto-confirm without prompt
 - `-V, --verbose` - Enable verbose output
 - `-q, --quiet` - Suppress non-error output
+- `--bps-down` - Max bytes/sec read from the source server (0 = unlimited)
+- `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited)
+- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = workers)
+
+The same values can be set in config under a `rate_limit` block (`down_bps`,
+`up_bps`, `max_connections`) and via env vars `IMAPSYNC_BPS_DOWN`,
+`IMAPSYNC_BPS_UP`, `IMAPSYNC_MAX_CONNECTIONS`. Flags win over config when
+both are set.
+
+## Provider quotas (Gmail)
+
+When either side is `imap.gmail.com`, `imapsync-go` prints a warning before
+the confirm prompt with the relevant Workspace IMAP limits:
+
+- 15 simultaneous IMAP connections per account
+- 2,500 MB/day download, 500 MB/day upload via IMAP
+- Exceeding the bandwidth limit suspends the account for 1–24 hours
+
+For Gmail, run with explicit throttling so the daily quotas don't trigger an
+account lockout mid-migration:
+
+```bash
+imapsync-go sync \
+  --bps-down 300000 \
+  --bps-up 300000 \
+  --max-connections 10 \
+  -w 4
+```
+
+The defaults (no throttle) match `imapsync`'s default behaviour — they're
+appropriate for self-hosted IMAP servers on a LAN, not for big-provider
+mailboxes.
 
 ## Idempotency caveats
 
