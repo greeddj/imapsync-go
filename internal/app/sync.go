@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,15 +20,17 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// FolderSyncPlan describes how a single source folder should be copied to its destination.
+// FolderSyncPlan describes how a single source folder should be copied to its
+// destination.
 //
-// MessageIDs holds the diff (Message-Ids present on src but missing on dst);
-// bodies are deliberately not fetched at planning time so a confirm prompt can
-// show counts without materializing potentially many GB of mail in memory.
+// SrcUIDs holds the source UIDs (sorted) for messages present on src but
+// missing on dst; bodies are deliberately not fetched at planning time so a
+// confirm prompt can show counts without materializing potentially many GB
+// of mail in memory.
 type FolderSyncPlan struct {
-	MessageIDs              map[string]bool
 	SourceFolder            string
 	DestinationFolder       string
+	SrcUIDs                 []uint32
 	NewMessages             int
 	DestinationFolderExists bool
 }
@@ -268,8 +271,8 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				if plan.NewMessages > 0 {
 					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
 					if verbose {
-						for id := range plan.MessageIDs {
-							fmt.Printf("  • %s\n", id)
+						for _, uid := range plan.SrcUIDs {
+							fmt.Printf("  • UID %d\n", uid)
 						}
 						fmt.Println()
 					}
@@ -456,7 +459,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				tracker.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIndex, len(activePlans), p.SourceFolder, p.DestinationFolder))
 
 				var synced, errors int
-				streamErr := folderSrcClient.StreamMessagesByIDs(ctx, p.SourceFolder, p.MessageIDs, func(msg *imap.Message) error {
+				streamErr := folderSrcClient.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
 					if err := folderDstClient.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
 						if ctx.Err() != nil {
 							return ctx.Err()
@@ -543,26 +546,33 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 		}
 		srcFolder := mapping.Source
 		dstFolder := mapping.Destination
-		var dstFolderExists bool
-		var srcMessageIDs map[string]bool
-		dstMessageIDs := make(map[string]bool)
-		var srcErr, dstErr error
+		var (
+			dstFolderExists bool
+			srcMessageMap   map[string]uint32
+			dstMessageIDs   map[string]struct{}
+			srcErr, dstErr  error
+		)
 
-		// Fetch IDs from both servers in parallel (fast - envelopes only)
+		// Fetch IDs from both servers in parallel — both calls are
+		// envelope-only (BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] + UID), so
+		// they're cheap relative to body fetches.
 		var wg sync.WaitGroup
 
 		// Update trackers
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
 
-		// Fetch source message IDs
+		// Fetch source Message-Id → UID. We need the UIDs later to drive
+		// the body fetch in StreamMessagesByUIDs without re-scanning the
+		// folder.
 		wg.Go(func() {
-			srcMessageIDs, srcErr = srcClient.FetchMessageIDs(ctx, srcFolder)
+			srcMessageMap, srcErr = srcClient.FetchMessageMap(ctx, srcFolder)
 		})
 
 		// Probe destination existence first; only fetch IDs if it exists.
-		// A "missing folder" is benign (we'll create it); a transport error must
-		// be fatal — otherwise we'd mistake it for empty and re-upload everything.
+		// A "missing folder" is benign (we'll create it); a transport error
+		// must be fatal — otherwise we'd mistake it for empty and re-upload
+		// everything.
 		wg.Go(func() {
 			exists, err := dstClient.MailboxExists(ctx, dstFolder)
 			if err != nil {
@@ -573,7 +583,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				return
 			}
 			dstFolderExists = true
-			fetchedIDs, err := dstClient.FetchMessageIDs(ctx, dstFolder)
+			fetchedIDs, err := dstClient.FetchMessageIDSet(ctx, dstFolder)
 			if err != nil {
 				dstErr = err
 				return
@@ -596,19 +606,22 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			return nil, fmt.Errorf("scan destination folder %q: %w", dstFolder, dstErr)
 		}
 
-		// Find IDs that need syncing (exist in source but not in destination)
-		newIDs := make(map[string]bool)
-		for id := range srcMessageIDs {
-			if !dstMessageIDs[id] {
-				newIDs[id] = true
+		// Diff: collect source UIDs whose Message-Id is not on dst.
+		newUIDs := make([]uint32, 0)
+		for id, uid := range srcMessageMap {
+			if _, present := dstMessageIDs[id]; !present {
+				newUIDs = append(newUIDs, uid)
 			}
 		}
 
-		if len(newIDs) == 0 {
+		if len(newUIDs) == 0 {
 			srcTracker.Increment(1)
 			dstTracker.Increment(1)
 			continue
 		}
+		// Sort here so the planning preview prints in a stable order and
+		// the downstream UID FETCH benefits from compactable ranges.
+		slices.Sort(newUIDs)
 
 		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
 		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
@@ -619,10 +632,10 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			SourceFolder:            srcFolder,
 			DestinationFolder:       dstFolder,
 			DestinationFolderExists: dstFolderExists,
-			NewMessages:             len(newIDs),
-			MessageIDs:              newIDs,
+			NewMessages:             len(newUIDs),
+			SrcUIDs:                 newUIDs,
 		})
-		summary.TotalNew += len(newIDs)
+		summary.TotalNew += len(newUIDs)
 	}
 
 	return summary, nil

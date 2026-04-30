@@ -16,25 +16,9 @@ type MailboxInfo struct {
 	Size     uint64
 }
 
-// mailboxExists checks if a mailbox with the given name exists on the server.
-// Channel is fully drained to avoid blocking the producer goroutine.
-func mailboxExists(cli *imapclient.Client, name string) (bool, error) {
-	mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-	done := make(chan error, 1)
-
-	go func() { done <- cli.List("", name, mailboxes) }()
-
-	exists := false
-	for range mailboxes {
-		exists = true
-	}
-	if err := <-done; err != nil {
-		return false, fmt.Errorf("list mailbox %q: %w", name, err)
-	}
-	return exists, nil
-}
-
-// MailboxExists reports whether a mailbox with the given name exists on the server.
+// MailboxExists reports whether a mailbox with the given name exists on the
+// server. Backed by the per-Client mailbox cache so that the many existence
+// checks done at planning time amortize to a single LIST.
 func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -42,26 +26,12 @@ func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-
-	var exists bool
-	err := c.safeCall(func(cli *imapclient.Client) error {
-		ok, e := mailboxExists(cli, name)
-		if e != nil {
-			return e
-		}
-		exists = ok
-		return nil
-	})
-	if err != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		return false, err
-	}
-	return exists, nil
+	return c.hasMailbox(ctx, name)
 }
 
-// CreateMailbox ensures the destination folder (and parents) exist on the server.
+// CreateMailbox ensures the destination folder (and any missing parents) exist
+// on the server. Returns true when a new mailbox was created on this call,
+// false when it already existed.
 func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -74,15 +44,7 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	var existed bool
-	err := c.safeCall(func(cli *imapclient.Client) error {
-		ok, e := mailboxExists(cli, name)
-		if e != nil {
-			return e
-		}
-		existed = ok
-		return nil
-	})
+	existed, err := c.hasMailbox(ctx, name)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
@@ -115,6 +77,7 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 		}
 		return false, fmt.Errorf("[%s] failed to create mailbox %s: %w", c.prefix, name, err)
 	}
+	c.addMailboxToCache(name)
 
 	return true, nil
 }
@@ -132,15 +95,7 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 		lock := c.folderLock(parentPath)
 		lock.Lock()
 
-		var exists bool
-		err := c.safeCall(func(cli *imapclient.Client) error {
-			ok, e := mailboxExists(cli, parentPath)
-			if e != nil {
-				return e
-			}
-			exists = ok
-			return nil
-		})
+		exists, err := c.hasMailbox(ctx, parentPath)
 		if err != nil {
 			lock.Unlock()
 			return fmt.Errorf("[%s] failed to check parent folder %s: %w", c.prefix, parentPath, err)
@@ -155,6 +110,7 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 				lock.Unlock()
 				return fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, err)
 			}
+			c.addMailboxToCache(parentPath)
 			c.log("[%s] Created parent folder: %s", c.prefix, parentPath)
 		}
 
@@ -164,7 +120,9 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 	return nil
 }
 
-// ListSubfolders returns subfolders matching the given folder and delimiter.
+// ListSubfolders returns subfolders of folder, derived from the cached
+// mailbox list. delimiter is used to compute the prefix; when empty the
+// client's cached server delimiter is substituted.
 func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) ([]string, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -172,41 +130,7 @@ func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) (
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	pattern := folder
-	if delimiter != "" {
-		pattern = folder + delimiter + "*"
-	} else {
-		pattern = folder + "/*"
-	}
-
-	var subfolders []string
-	err := c.safeCall(func(cli *imapclient.Client) error {
-		subfolders = nil
-		mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-		done := make(chan error, 1)
-		go func() { done <- cli.List("", pattern, mailboxes) }()
-
-		for mbox := range mailboxes {
-			if ctx.Err() == nil && mbox.Name != folder {
-				subfolders = append(subfolders, mbox.Name)
-			}
-		}
-		if err := <-done; err != nil {
-			return fmt.Errorf("[%s] list subfolders: %w", c.prefix, err)
-		}
-		return nil
-	})
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return subfolders, nil
+	return c.listSubfoldersFromCache(ctx, folder, delimiter)
 }
 
 // ListMailboxes fetches all folders plus lightweight statistics for each.

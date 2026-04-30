@@ -81,29 +81,33 @@ type dialFunc func(ctx context.Context, addr string) (net.Conn, error)
 // current client as an argument; on a transient error it transparently
 // reconnects and retries the closure once with the fresh client.
 type Client struct {
-	lastReconnect time.Time
-	pw            ProgressWriter
-	tracker       ProgressTracker
-	tlsConfig     *tls.Config
-	readLimiter   *rate.Limiter
-	writeLimiter  *rate.Limiter
-	dialFn        dialFunc
-	folderLocks   map[string]*sync.Mutex
-	cancelCh      chan struct{}
-	c             atomic.Pointer[imapclient.Client]
-	prefix        string
-	delimiter     string
-	password      string
-	username      string
-	serverAddr    string
-	backoff       time.Duration
-	reconnectDur  time.Duration
-	dialTimeout   time.Duration
-	mu            sync.Mutex
-	folderLocksMu sync.Mutex
-	cancelled     atomic.Bool
-	useTLS        bool
-	verbose       bool
+	lastReconnect  time.Time
+	pw             ProgressWriter
+	tracker        ProgressTracker
+	tlsConfig      *tls.Config
+	readLimiter    *rate.Limiter
+	writeLimiter   *rate.Limiter
+	dialFn         dialFunc
+	folderLocks    map[string]*sync.Mutex
+	cancelCh       chan struct{}
+	c              atomic.Pointer[imapclient.Client]
+	selectedFolder atomic.Pointer[string]
+	delimiter      string
+	prefix         string
+	password       string
+	username       string
+	serverAddr     string
+	mailboxCache   mailboxCache
+	dialTimeout    time.Duration
+	reconnectDur   time.Duration
+	backoff        time.Duration
+	connGen        atomic.Uint64
+	mailboxCacheMu sync.RWMutex
+	mu             sync.Mutex
+	folderLocksMu  sync.Mutex
+	cancelled      atomic.Bool
+	useTLS         bool
+	verbose        bool
 }
 
 // folderLock returns the mutex guarding creation of the given folder path.
@@ -174,14 +178,36 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 		return nil, err
 	}
 
-	delimiter, err := c.refreshDelimiter()
-	if err != nil {
+	// One LIST "" "*" populates both the existence cache and the
+	// hierarchy delimiter — the older refreshDelimiter call is gone.
+	if err := c.loadMailboxCache(ctx); err != nil {
 		_ = c.Logout()
-		return nil, fmt.Errorf("failed to get delimiter: %w", err)
+		return nil, fmt.Errorf("failed to load mailbox list: %w", err)
 	}
-	c.delimiter = delimiter
+	c.delimiter = c.mailboxCache.delimiter
 
 	return c, nil
+}
+
+// selectIfNeeded selects folder on cli unless that folder is already selected
+// on the current connection. Each successful reconnect bumps connGen and
+// clears selectedFolder via Cancel/reconnect, so a stale state never causes
+// us to skip a needed Select.
+func (c *Client) selectIfNeeded(cli *imapclient.Client, folder string) (*imap.MailboxStatus, error) {
+	cur := c.selectedFolder.Load()
+	if cur != nil && *cur == folder {
+		// Server-side state is unchanged — re-issuing Select would be a
+		// wasted round-trip. Caller doesn't get the MailboxStatus back, but
+		// nobody downstream needs it on the cached path.
+		return nil, nil
+	}
+	mbox, err := cli.Select(folder, true)
+	if err != nil {
+		return nil, err
+	}
+	f := folder
+	c.selectedFolder.Store(&f)
+	return mbox, nil
 }
 
 // SetPrefix configures the log prefix used in progress messages.
@@ -325,6 +351,11 @@ func (c *Client) reconnect() error {
 		_ = cli.Logout()
 		c.c.Store(nil)
 	}
+	// Anything held about the previous connection's state — selected folder,
+	// in-flight literals — is gone with that socket. Bump the generation so
+	// later code knows to re-Select before issuing fetches.
+	c.selectedFolder.Store(nil)
+	c.connGen.Add(1)
 
 	var lastErr error
 	delay := c.backoff
@@ -405,26 +436,4 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 		return errors.New("imap client not connected after reconnect")
 	}
 	return fn(cli)
-}
-
-// refreshDelimiter retrieves the hierarchy delimiter used by the IMAP server.
-func (c *Client) refreshDelimiter() (string, error) {
-	var delimiter string
-	err := c.safeCall(func(cli *imapclient.Client) error {
-		mailboxes := make(chan *imap.MailboxInfo, 1)
-		done := make(chan error, 1)
-		go func() { done <- cli.List("", "", mailboxes) }()
-
-		delimiter = "/"
-		for mbox := range mailboxes {
-			if mbox.Delimiter != "" {
-				delimiter = mbox.Delimiter
-			}
-		}
-		if err := <-done; err != nil {
-			return fmt.Errorf("[%s] list delimiter: %w", c.prefix, err)
-		}
-		return nil
-	})
-	return delimiter, err
 }
