@@ -43,6 +43,14 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg *imap.Mes
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// The literal has been partially consumed, so we can't retry THIS
+		// message — but repair the connection so the next APPEND in the
+		// same plan doesn't fail again at the IMAP layer. Without this,
+		// one server-side disconnect cascades into "Not logged in" for
+		// every remaining message in the folder.
+		if isRetryable(err) && !c.isCancelled() {
+			_ = c.reconnect()
+		}
 		return fmt.Errorf("[%s] append: %w", c.prefix, err)
 	}
 	if c.verbose {
