@@ -314,6 +314,8 @@ func (c *Client) internalContext() (context.Context, context.CancelFunc) {
 
 // log routes a formatted message to the tracker (preferred) or progress writer.
 func (c *Client) log(format string, args ...any) {
+	// Tracker drives the live UX, so it updates regardless of verbose.
+	// The verbose check below only gates the secondary log-writer fallback.
 	if t := c.progressTracker(); t != nil {
 		t.UpdateMessage(fmt.Sprintf(format, args...))
 		return

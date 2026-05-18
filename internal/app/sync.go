@@ -313,7 +313,9 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
-	// Pre-create all destination folders
+	// Pre-creation MUST stay a pre-stage: each worker holds its own mailbox
+	// cache, so a worker-side CreateMailbox would race against other workers'
+	// stale caches.
 	if len(activePlans) > 0 {
 		if !quiet {
 			fmt.Println("\n📁 Creating destination folders...")
