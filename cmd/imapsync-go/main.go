@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/commands"
@@ -56,6 +57,18 @@ func run() int {
 			commands.Show(),
 		},
 	}
+
+	// user invokes Ctrl+\ when the program appears hung; the dump shows which
+	// goroutine is blocked and where.
+	sigquit := make(chan os.Signal, 1)
+	signal.Notify(sigquit, syscall.SIGQUIT)
+	go func() {
+		for range sigquit {
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			os.Stderr.Write(buf[:n]) //nolint:errcheck
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +23,17 @@ import (
 // verboseUIDLimit caps the per-plan UID dump in --verbose preview so a
 // large plan (tens of thousands of UIDs) doesn't bury the confirm prompt.
 const verboseUIDLimit = 20
+
+// traceTracker writes a one-line diagnostic to stderr when IMAPSYNC_TRACE is
+// set. Used to surface duplicate Tracker allocations for the same plan — a
+// symptom of the "two render lines for one INBOX" regression under network
+// flap where multiple Tracker objects end up attached to the same writer.
+func traceTracker(site, message string) {
+	if os.Getenv("IMAPSYNC_TRACE") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[trace] tracker created: site=%s message=%q\n", site, message)
+}
 
 // FolderSyncPlan describes how a single source folder should be copied to its
 // destination.
@@ -260,7 +272,9 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	srcTracker := progress.NewTracker(fmt.Sprintf("[%s] Scanning folders", cfg.Src.Label), 100)
 	dstTracker := progress.NewTracker(fmt.Sprintf("[%s] Scanning folders", cfg.Dst.Label), 100)
 
+	traceTracker("scan-src", srcTracker.Message)
 	pw.AppendTracker(srcTracker)
+	traceTracker("scan-dst", dstTracker.Message)
 	pw.AppendTracker(dstTracker)
 
 	srcClient.SetProgressWriter(pw)
@@ -374,6 +388,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		creationPW := progress.NewWriter(1, quiet)
 		creationPW.Start()
 		creationTracker := progress.NewTracker("Creating folders", int64(len(foldersToCreate)))
+		traceTracker("folder-create", creationTracker.Message)
 		creationPW.AppendTracker(creationTracker)
 
 		createdCount := 0
@@ -444,6 +459,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			fmt.Sprintf("%d/%d Waiting: %s → %s", i+1, len(activePlans), plan.SourceFolder, plan.DestinationFolder),
 			100,
 		)
+		traceTracker("plan", trackers[i].Message)
 		syncPW.AppendTracker(trackers[i])
 	}
 

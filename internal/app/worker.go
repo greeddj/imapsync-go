@@ -148,6 +148,12 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			pw.Log("Synced %d/%d to %s, processed msg id %s",
 				synced, p.NewMessages, p.DestinationFolder, msg.Envelope.MessageId)
 		}
+		// AppendMessage that completed in flight after ctx cancel must not
+		// continue iterating; the next message would race with Cancel() racing
+		// against the worker.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return nil
 	})
 	if ctx.Err() != nil {

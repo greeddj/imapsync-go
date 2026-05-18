@@ -38,6 +38,7 @@ If something is hard to test, it must be either tested at integration level or d
 
 - **`ActionSync`, `ActionShow`** — top-level urfave/cli action entry points; require a fully running config and live IMAP connections. Tested implicitly through their sub-functions (`buildSyncPlan`, `expandMappingsWithSubfolders`, `runFolderSync`, `newSyncWorkerPool`), each at 80–100% line coverage.
 - **`printAccountInfo`** — go-pretty table renderer hitting `os.Stdout` directly. A meaningful test requires either a refactor to take `io.Writer` (out of scope for B.1a) or stdout capture; neither buys coverage of real behaviour because the function is a thin layout wrapper.
+- **`runFolderSync` post-append `ctx.Err()` check** — guards against a successful in-flight append continuing iteration after Ctrl+C. Architecturally unreachable in a fake-server test: `withCancel(ctx)` terminates the IMAP connection when ctx is canceled, so `cli.Append` always returns an error rather than nil in that window. The observable `(synced, errors)` outcome is identical with or without the check; it shaves at most one wasted iteration in the race between cancellation and a completing append.
 
 If the tester finds an untested branch that does not match an existing exclusion, the choice is:
 

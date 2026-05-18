@@ -43,7 +43,9 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 
 	srcTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label), 100)
 	dstTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label), 100)
+	traceTracker("show-src", srcTracker.Message)
 	pw.AppendTracker(srcTracker)
+	traceTracker("show-dst", dstTracker.Message)
 	pw.AppendTracker(dstTracker)
 
 	// loadAccount fetches mailboxes for one side and returns both the open
