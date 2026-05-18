@@ -1,25 +1,39 @@
 {
   "permissions": {
     "allow": [
-      "Bash(go test *)",
-      "Bash(go build *)",
-      "Bash(go vet *)",
-      "Bash(go run *)",
-      "Bash(go tool staticcheck *)",
-      "Bash(go tool govulncheck *)",
-      "Bash(go tool fieldalignment *)",
-      "Bash(go version)",
-      "Bash(just lint)",
-      "Bash(just check)",
-      "Bash(just test)",
-      "Bash(just run)",
-      "Bash(just build)",
-      "Bash(just build_linux)",
-      "Bash(just deps)"
+      "Bash(go:*)",
+      "Bash(just:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(awk:*)",
+      "Bash(sed:*)",
+      "Bash(sort:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git blame:*)",
+      "Bash(git branch:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(golangci-lint:*)",
+      "Agent(architect)",
+      "Agent(developer)",
+      "Agent(tester)",
+      "Agent(security)",
+      "Agent(tech-writer)"
+    ],
+    "ask": [
+      "WebSearch",
+      "Bash(rm *)",
+      "Bash(git reset:*)",
+      "Bash(git rebase:*)",
+      "Bash(git checkout:*)"
     ],
     "deny": [
-      "Bash(rm *)",
-      "Bash(git push *)"
+      "Bash(git push:*)"
     ]
   }
 }

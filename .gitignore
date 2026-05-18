@@ -40,3 +40,4 @@ dist/
 
 # Claude Code: local-only overrides (permissions, env, etc.) — keep out of VCS
 .claude/settings.local.json
+.claude/plan.md

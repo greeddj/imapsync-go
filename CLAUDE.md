@@ -90,3 +90,31 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 - Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it.
 - `client.New(ctx, addr, user, pass, Options{...})` — keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation.
 - Dependencies are vendored under `vendor/`. Build with whatever the host Go provides; the module pins `go 1.26`.
+
+## Multi-agent workflow
+
+This repo ships a `.claude/` directory with five role-specific subagents and a shared rule set. They exist to keep non-trivial changes architecturally honest:
+
+- **architect** (opus) — gatekeeper. Validates the brief, may reject, orchestrates the rest.
+- **developer** (sonnet) — implements within a precise brief; writes WHY-comments and unit tests.
+- **tester** (sonnet) — runs the suite, audits coverage and invariants, proposes deliberate exclusions.
+- **security** (opus) — CVE + attack-surface audit; reasons about combined risk.
+- **tech-writer** (sonnet) — comment hygiene + CLAUDE.md / README.md / `config.example.*` sync.
+
+Entry points:
+
+- `/architect <task>` — hand the task to the architect (the architect decides whether to proceed).
+- `/workflow <task>` — full architect-led delegation chain (preferred for non-trivial changes).
+- `/dev`, `/qa`, `/sec`, `/docs` — invoke a single agent directly (use when you know which step you need).
+- `/deps`, `/lint`, `/test`, `/check`, `/fix`, `/build`, `/build-linux`, `/oci`, `/run` — thin wrappers over the `Justfile` targets.
+
+The rules each agent reads live in `.claude/rules/`:
+
+- [workflow.md](.claude/rules/workflow.md) — delegation protocol (architect-led + fallback).
+- [architecture.md](.claude/rules/architecture.md) — layering and sync-flow invariants the architect enforces.
+- [go-style.md](.claude/rules/go-style.md) — Go style, stricter than community defaults.
+- [testing.md](.claude/rules/testing.md) — what is tested, what is deliberately excluded.
+- [security.md](.claude/rules/security.md) — standing security checklist + combined-surface checks.
+- [docs.md](.claude/rules/docs.md) — comment + doc audit rules.
+
+Skills in `.claude/skills/` (auto-loaded by agents when relevant): `idiomatic-go-review`, `imap-sync-correctness`, `coverage-audit`, `security-audit`, `doc-sync`.
