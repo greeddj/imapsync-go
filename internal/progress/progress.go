@@ -36,16 +36,27 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 		pw.SetOutputWriter(os.Stdout)
 	}
 
-	// Calculate optimal lengths based on terminal width
+	// Calculate optimal lengths based on terminal width.
+	//
+	// The line layout is "message  PCT  bar  [time; ~ETA: time]" and the
+	// total rendered width MUST stay strictly below the terminal width.
+	// If it equals terminalWidth, some terminals wrap the trailing space
+	// to the next line, and go-pretty's cursor-up + erase-line redraw
+	// cycle then strips only the wrapped portion — the original line
+	// becomes a "zombie" on screen that StopAndClear cannot erase.
+	//
+	// The stats portion (percent + bar + time + separators) is bounded
+	// above by ~80 chars for a long sync ("99.99% ⡇...⢸ [1h12m1s; ~ETA: 12m34s]");
+	// reserve a margin on top of that so colour codes, double-width braille
+	// glyphs on misconfigured fonts, and any future format changes cannot
+	// push us over.
 	terminalWidth := getTerminalWidth()
-
-	// Reserve space for: percentage (8 chars), tracker bar (30 chars), stats/time (~25 chars), separators (6 chars)
-	// Total reserved: ~69 chars
 	trackerBarLength := 30
-	statsReserved := 69
+	statsReserved := 80 // bar + percent + time + ETA + separators, generous
 
-	// Remaining space goes to message
-	messageLength := terminalWidth - statsReserved
+	const safetyMargin = 4
+
+	messageLength := terminalWidth - statsReserved - safetyMargin
 	if messageLength < 40 {
 		messageLength = 40    // minimum message length
 		trackerBarLength = 20 // shrink tracker if terminal is narrow
@@ -130,12 +141,14 @@ func (w *Writer) StopAndClear() {
 	// Stop the writer
 	w.pw.Stop()
 
-	// Clear progress output
-	fmt.Print("\r")
+	// After Stop, the cursor sits on a blank line one below the last
+	// rendered tracker. Go up numTrackers times, erasing each tracker
+	// line as we pass, then return to column 0 of the topmost erased
+	// row so the next caller-printed line starts there cleanly.
 	for range w.numTrackers {
-		fmt.Print("\033[K\r")
+		fmt.Print("\033[A\033[K")
 	}
-	fmt.Println()
+	fmt.Print("\r")
 }
 
 // NewTracker creates a new tracker with the given message and total.
