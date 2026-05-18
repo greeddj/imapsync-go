@@ -28,6 +28,9 @@ func TestClassifyError(t *testing.T) {
 		{name: "throttledQuota", err: errors.New("user has exceeded quota"), want: ClassThrottled},
 		{name: "throttledLockout", err: errors.New("Account in lockout state"), want: ClassThrottled},
 
+		{name: "transientNotLoggedIn", err: errors.New("BAD Not logged in"), want: ClassTransient},
+		{name: "transientNotLoggedInLowercase", err: errors.New("nO nOt LoGgEd In"), want: ClassTransient},
+
 		{name: "permAuth", err: errors.New("authentication failed"), want: ClassPermanent},
 		{name: "permCreds", err: errors.New("Invalid credentials"), want: ClassPermanent},
 		{name: "permMailbox", err: errors.New("NO such mailbox"), want: ClassPermanent},

@@ -74,6 +74,11 @@ func classifyError(err error) ErrClass {
 	case strings.Contains(msg, "lockout"):
 		return ClassThrottled
 
+	// Server-side session logout (Gmail's idle disconnect, post-quota
+	// kick). The connection is dead but a fresh login will succeed.
+	case strings.Contains(msg, "not logged in"):
+		return ClassTransient
+
 	// Permanent: authentication or addressing problems.
 	case strings.Contains(msg, "authentication") && strings.Contains(msg, "fail"):
 		return ClassPermanent
