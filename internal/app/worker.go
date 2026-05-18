@@ -86,9 +86,10 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	var lastErrMsg string
 
 	updateTrackerMsg := func() {
+		base := fmt.Sprintf("%d/%d (%d↑/%d) %s → %s",
+			planIdx+1, planCount, synced, p.NewMessages, p.SourceFolder, p.DestinationFolder)
 		if errors == 0 {
-			tr.UpdateMessage(fmt.Sprintf("%d/%d (%d↑/%d) %s → %s",
-				planIdx+1, planCount, synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
+			tr.UpdateMessage(base)
 			return
 		}
 		// Trim the inline reason so a long server message doesn't wrap
@@ -97,8 +98,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		if len(reason) > 40 {
 			reason = reason[:37] + "..."
 		}
-		tr.UpdateMessage(fmt.Sprintf("%d/%d (%d↑ %d✗ %q) %s → %s",
-			planIdx+1, planCount, synced, errors, reason, p.SourceFolder, p.DestinationFolder))
+		tr.UpdateMessage(fmt.Sprintf("%s [%d✗ %q]", base, errors, reason))
 	}
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
