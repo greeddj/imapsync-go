@@ -5,9 +5,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
@@ -826,5 +829,428 @@ func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
 	// (no "/" in "DEVOPS" to replace) the dst is "jira.DEVOPS".
 	if got[1].Destination != "jira.DEVOPS" {
 		t.Errorf("jira/DEVOPS destination=%q, want jira.DEVOPS", got[1].Destination)
+	}
+}
+
+// Test_maybeDiff_freesMaps asserts that maybeDiff releases srcMap and dstIDs
+// after the diff, and that the resulting plan contains the correct SrcUIDs.
+func Test_maybeDiff_freesMaps(t *testing.T) {
+	t.Parallel()
+
+	t.Run("happyPath_diffProducesUIDs", func(t *testing.T) {
+		t.Parallel()
+		mappings := []config.DirectoryMapping{
+			{Source: "INBOX", Destination: "INBOX"},
+		}
+		plans := make([]FolderSyncPlan, 1)
+		var totalNew atomic.Int64
+
+		s := &folderScan{
+			srcMap: map[string]uint32{"a@x": 1, "b@x": 2},
+			dstIDs: map[string]struct{}{"b@x": {}},
+		}
+
+		// First call: only one side arrived — must not diff yet.
+		if maybeDiff(s, 0, mappings, plans, &totalNew) {
+			t.Fatal("maybeDiff returned true on first call, want false")
+		}
+		if s.srcMap == nil || s.dstIDs == nil {
+			t.Fatal("maps freed prematurely after first call")
+		}
+
+		// Second call: both sides arrived — diff fires.
+		if !maybeDiff(s, 0, mappings, plans, &totalNew) {
+			t.Fatal("maybeDiff returned false on second call, want true")
+		}
+		if s.srcMap != nil {
+			t.Error("srcMap not nil after diff")
+		}
+		if s.dstIDs != nil {
+			t.Error("dstIDs not nil after diff")
+		}
+		want := []uint32{1}
+		if !slices.Equal(plans[0].SrcUIDs, want) {
+			t.Errorf("SrcUIDs=%v, want %v", plans[0].SrcUIDs, want)
+		}
+		if totalNew.Load() != 1 {
+			t.Errorf("totalNew=%d, want 1", totalNew.Load())
+		}
+	})
+
+	t.Run("srcErr_freesMaps", func(t *testing.T) {
+		t.Parallel()
+		mappings := []config.DirectoryMapping{
+			{Source: "INBOX", Destination: "INBOX"},
+		}
+		plans := make([]FolderSyncPlan, 1)
+		var totalNew atomic.Int64
+
+		s := &folderScan{
+			srcErr: fmt.Errorf("src scan failed"),
+			srcMap: map[string]uint32{"a@x": 1},
+			dstIDs: map[string]struct{}{"b@x": {}},
+		}
+
+		// First call: one side arrived — no diff yet.
+		if maybeDiff(s, 0, mappings, plans, &totalNew) {
+			t.Fatal("maybeDiff returned true on first call, want false")
+		}
+
+		// Second call: both sides arrived — error branch must free maps and
+		// leave the plan empty.
+		if !maybeDiff(s, 0, mappings, plans, &totalNew) {
+			t.Fatal("maybeDiff returned false on second call, want true")
+		}
+		if s.srcMap != nil {
+			t.Error("srcMap not nil after srcErr branch")
+		}
+		if s.dstIDs != nil {
+			t.Error("dstIDs not nil after srcErr branch")
+		}
+		if plans[0].SourceFolder != "" {
+			t.Errorf("plan populated despite srcErr: %+v", plans[0])
+		}
+		if totalNew.Load() != 0 {
+			t.Errorf("totalNew=%d, want 0", totalNew.Load())
+		}
+	})
+
+	t.Run("dstErr_freesMaps", func(t *testing.T) {
+		t.Parallel()
+		mappings := []config.DirectoryMapping{
+			{Source: "INBOX", Destination: "INBOX"},
+		}
+		plans := make([]FolderSyncPlan, 1)
+		var totalNew atomic.Int64
+
+		s := &folderScan{
+			dstErr: fmt.Errorf("dst scan failed"),
+			srcMap: map[string]uint32{"a@x": 1},
+			dstIDs: map[string]struct{}{"b@x": {}},
+		}
+
+		// First call: one side arrived — no diff yet.
+		if maybeDiff(s, 0, mappings, plans, &totalNew) {
+			t.Fatal("maybeDiff returned true on first call, want false")
+		}
+
+		// Second call: both sides arrived — dstErr branch must free maps and
+		// leave the plan empty.
+		if !maybeDiff(s, 0, mappings, plans, &totalNew) {
+			t.Fatal("maybeDiff returned false on second call, want true")
+		}
+		if s.srcMap != nil {
+			t.Error("srcMap not nil after dstErr branch")
+		}
+		if s.dstIDs != nil {
+			t.Error("dstIDs not nil after dstErr branch")
+		}
+		if plans[0].SourceFolder != "" {
+			t.Errorf("plan populated despite dstErr: %+v", plans[0])
+		}
+		if totalNew.Load() != 0 {
+			t.Errorf("totalNew=%d, want 0", totalNew.Load())
+		}
+	})
+}
+
+// Test_buildSyncPlan_srcAdvancesAheadOfDst asserts that the src tracker
+// advances independently when dst is slow: after 120ms src must be ahead.
+func Test_buildSyncPlan_srcAdvancesAheadOfDst(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	msgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX":  {{uid: 1, msgID: "a@x"}},
+		"Drafts": {{uid: 1, msgID: "b@x"}},
+	}
+
+	// src responds instantly; dst sleeps 250ms per EXAMINE.
+	srcSrv.addConnHandler(msgIDFetchHandler(srcSrv, []string{"INBOX", "Drafts"}, msgs))
+	dstSrv.addConnHandler(slowExamineHandler(dstSrv, []string{"INBOX", "Drafts"}, msgs, 250*time.Millisecond))
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{
+		{Source: "INBOX", Destination: "INBOX"},
+		{Source: "Drafts", Destination: "Drafts"},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	}()
+
+	// Sample after src should have finished but dst is still sleeping.
+	time.Sleep(120 * time.Millisecond)
+	srcVal := srcTr.Value()
+	dstVal := dstTr.Value()
+
+	<-done
+
+	if srcVal <= dstVal {
+		t.Errorf("expected src tracker (%d) ahead of dst tracker (%d) at 120ms", srcVal, dstVal)
+	}
+}
+
+// Test_buildSyncPlan_dstErrorMidStream asserts that a dst BAD error on mapping
+// 2 (with slow src) causes buildSyncPlan to return quickly with a wrapped error.
+func Test_buildSyncPlan_dstErrorMidStream(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	msgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"A": {{uid: 1, msgID: "a@x"}},
+		"B": {{uid: 1, msgID: "b@x"}},
+		"C": {{uid: 1, msgID: "c@x"}},
+	}
+	mailboxes := []string{"A", "B", "C"}
+
+	// src is slow (250ms per folder) so it would take >750ms to finish all 3.
+	srcSrv.addConnHandler(slowExamineHandler(srcSrv, mailboxes, msgs, 250*time.Millisecond))
+	// dst: A succeeds, B returns BAD, C would succeed but we never reach it.
+	dstSrv.addConnHandler(func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		callCount := 0
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			arg := ""
+			if len(parts) == 3 {
+				arg = parts[2]
+			}
+			dstSrv.mu.Lock()
+			dstSrv.counts[verb]++
+			dstSrv.mu.Unlock()
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				for _, mb := range mailboxes {
+					_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" %s\r\n", mb)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "EXAMINE", "SELECT":
+				callCount++
+				if callCount == 2 {
+					_, _ = fmt.Fprintf(conn, "%s BAD internal error\r\n", tag)
+					continue
+				}
+				folder := strings.Trim(arg, `"`)
+				_, _ = fmt.Fprintf(conn, "* 0 EXISTS\r\n* 0 RECENT\r\n")
+				_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, folder)
+			case "FETCH":
+				_, _ = fmt.Fprintf(conn, "%s OK FETCH completed\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	})
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{
+		{Source: "A", Destination: "A"},
+		{Source: "B", Destination: "B"},
+		{Source: "C", Destination: "C"},
+	}
+
+	start := time.Now()
+	_, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error from dst BAD, got nil")
+	}
+	if !strings.Contains(err.Error(), "scan destination folder") {
+		t.Errorf("error %q does not contain %q", err.Error(), "scan destination folder")
+	}
+	// Src would need ~750ms for all 3 folders; dst error on folder 2 must
+	// cancel src and return well before src finishes folder 3.
+	if elapsed > 600*time.Millisecond {
+		t.Errorf("buildSyncPlan took %v, want <600ms (dst error must cancel src promptly)", elapsed)
+	}
+}
+
+// Test_buildSyncPlan_cancelHaltsBothSides asserts that canceling the context
+// while both goroutines are blocked causes buildSyncPlan to return promptly
+// with context.Canceled, and that no goroutines are leaked.
+func Test_buildSyncPlan_cancelHaltsBothSides(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	msgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {{uid: 1, msgID: "a@x"}},
+	}
+	mailboxes := []string{"INBOX"}
+
+	// Both sides sleep 300ms per EXAMINE — long enough that we can cancel mid-flight.
+	srcSrv.addConnHandler(slowExamineHandler(srcSrv, mailboxes, msgs, 300*time.Millisecond))
+	dstSrv.addConnHandler(slowExamineHandler(dstSrv, mailboxes, msgs, 300*time.Millisecond))
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	baseline := runtime.NumGoroutine()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- func() error {
+			_, err := buildSyncPlan(ctx, srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+			return err
+		}()
+	}()
+
+	// Cancel while both goroutines are sleeping inside EXAMINE.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected non-nil error after cancel, got nil")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("buildSyncPlan did not return within 500ms after cancel")
+	}
+
+	// Goroutines spawned by buildSyncPlan must have exited.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseline+2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > baseline+2 {
+		t.Errorf("goroutine count %d exceeds baseline %d by more than 2 after cancel", got, baseline)
+	}
+}
+
+// Test_buildSyncPlan_orderPreserved asserts that summary.Plans preserves the
+// input mappings order even when dst folders complete in reverse order.
+func Test_buildSyncPlan_orderPreserved(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	msgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"A": {{uid: 1, msgID: "a@x"}},
+		"B": {{uid: 2, msgID: "b@x"}},
+		"C": {{uid: 3, msgID: "c@x"}},
+	}
+
+	// src is fast; dst uses a counter-based delay: first call 300ms, second 200ms, third 100ms.
+	// Completions arrive in order [C, B, A] but plans must be returned as [A, B, C].
+	srcSrv.addConnHandler(msgIDFetchHandler(srcSrv, []string{"A", "B", "C"}, msgs))
+
+	var dstExamineCall atomic.Int32
+	dstSrv.addConnHandler(func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		var selectedFolder string
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			arg := ""
+			if len(parts) == 3 {
+				arg = parts[2]
+			}
+			dstSrv.mu.Lock()
+			dstSrv.counts[verb]++
+			dstSrv.mu.Unlock()
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				for _, mb := range []string{"A", "B", "C"} {
+					_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" %s\r\n", mb)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "EXAMINE", "SELECT":
+				// First call sleeps 300ms, second 200ms, third 100ms → completes C, B, A.
+				call := dstExamineCall.Add(1)
+				delay := time.Duration(4-call) * 100 * time.Millisecond
+				time.Sleep(delay)
+				selectedFolder = strings.Trim(arg, `"`)
+				_, _ = fmt.Fprintf(conn, "* 0 EXISTS\r\n* 0 RECENT\r\n")
+				_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, selectedFolder)
+			case "FETCH":
+				_, _ = fmt.Fprintf(conn, "%s OK FETCH completed\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	})
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{
+		{Source: "A", Destination: "A"},
+		{Source: "B", Destination: "B"},
+		{Source: "C", Destination: "C"},
+	}
+
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+	if len(summary.Plans) != 3 {
+		t.Fatalf("Plans=%d, want 3", len(summary.Plans))
+	}
+	for i, m := range mappings {
+		if summary.Plans[i].SourceFolder != m.Source {
+			t.Errorf("Plans[%d].SourceFolder=%q, want %q", i, summary.Plans[i].SourceFolder, m.Source)
+		}
 	}
 }

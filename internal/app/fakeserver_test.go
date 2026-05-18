@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 )
@@ -313,6 +314,81 @@ func msgIDFetchHandler(srv *fakeServer, mailboxes []string, msgs map[string][]st
 				}
 				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
 			case "EXAMINE", "SELECT":
+				selectedFolder = strings.Trim(arg, `"`)
+				n := len(msgs[selectedFolder])
+				_, _ = fmt.Fprintf(conn, "* %d EXISTS\r\n* 0 RECENT\r\n", n)
+				_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, verb)
+			case "FETCH":
+				for i, m := range msgs[selectedFolder] {
+					hdr := imapMsgIDHeader(m.msgID)
+					_, _ = fmt.Fprintf(conn,
+						"* %d FETCH (UID %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
+						i+1, m.uid, len(hdr), hdr,
+					)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK FETCH completed\r\n", tag)
+			case "STATUS":
+				mboxName := strings.Trim(strings.SplitN(arg, " ", 2)[0], `"`)
+				_, _ = fmt.Fprintf(conn, "* STATUS %s (MESSAGES 0)\r\n", mboxName)
+				_, _ = fmt.Fprintf(conn, "%s OK STATUS completed\r\n", tag)
+			case "UID":
+				srv.mu.Lock()
+				srv.counts["UID FETCH"]++
+				srv.mu.Unlock()
+				_, _ = fmt.Fprintf(conn, "%s OK UID FETCH completed\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	}
+}
+
+// slowExamineHandler wraps msgIDFetchHandler but sleeps delay before each
+// EXAMINE/SELECT response. The delay simulates asymmetric server latency so
+// tests can observe that the other side's tracker advances independently.
+func slowExamineHandler(srv *fakeServer, mailboxes []string, msgs map[string][]struct {
+	msgID string
+	uid   uint32
+}, delay time.Duration) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		var selectedFolder string
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			arg := ""
+			if len(parts) == 3 {
+				arg = parts[2]
+			}
+			srv.mu.Lock()
+			srv.counts[verb]++
+			srv.mu.Unlock()
+
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				for _, mb := range mailboxes {
+					_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" %s\r\n", mb)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "EXAMINE", "SELECT":
+				// Inject latency before responding so the fast side can advance ahead.
+				time.Sleep(delay)
 				selectedFolder = strings.Trim(arg, `"`)
 				n := len(msgs[selectedFolder])
 				_, _ = fmt.Fprintf(conn, "* %d EXISTS\r\n* 0 RECENT\r\n", n)

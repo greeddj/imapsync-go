@@ -493,118 +493,149 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-// buildSyncPlan compares source and destination folders to determine what needs syncing.
+// folderScan holds the per-slot results from the parallel src and dst scans.
+// done is incremented by each side; when it reaches 2, maybeDiff fires.
+// Pointer fields precede non-pointer fields to minimise the GC scan range.
+type folderScan struct {
+	srcMap    map[string]uint32
+	dstIDs    map[string]struct{}
+	srcErr    error
+	dstErr    error
+	dstExists bool
+	mu        sync.Mutex
+	done      atomic.Int32
+}
+
 func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, pw *progress.Writer, srcLabel, dstLabel string, verbose bool) (*SyncSummary, error) {
-	summary := &SyncSummary{
-		Plans: make([]FolderSyncPlan, 0),
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	// Set tracker totals based on number of folders to scan
-	srcTracker.UpdateTotal(int64(len(mappings)))
-	dstTracker.UpdateTotal(int64(len(mappings)))
+	n := len(mappings)
+	srcTracker.UpdateTotal(int64(n))
+	dstTracker.UpdateTotal(int64(n))
 
-	for idx, mapping := range mappings {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		srcFolder := mapping.Source
-		dstFolder := mapping.Destination
-		var (
-			dstFolderExists bool
-			srcMessageMap   map[string]uint32
-			dstMessageIDs   map[string]struct{}
-			srcErr, dstErr  error
-		)
+	scans := make([]folderScan, n)
+	plans := make([]FolderSyncPlan, n)
+	var totalNew atomic.Int64
 
-		// Fetch IDs from both servers in parallel — both calls are
-		// envelope-only (BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] + UID), so
-		// they're cheap relative to body fetches.
-		var wg sync.WaitGroup
+	// errgroup.WithContext: if either goroutine returns a non-nil error,
+	// gCtx is cancelled, which causes the other goroutine's next gCtx.Err()
+	// check to bail out immediately — no need to drain all remaining folders.
+	g, gCtx := errgroup.WithContext(ctx)
 
-		// Update trackers
-		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
-		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
-
-		// Fetch source Message-Id → UID. We need the UIDs later to drive
-		// the body fetch in StreamMessagesByUIDs without re-scanning the
-		// folder.
-		wg.Go(func() {
-			srcMessageMap, srcErr = srcClient.FetchMessageMap(ctx, srcFolder)
-		})
-
-		// Probe destination existence first; only fetch IDs if it exists.
-		// A "missing folder" is benign (we'll create it); a transport error
-		// must be fatal — otherwise we'd mistake it for empty and re-upload
-		// everything.
-		wg.Go(func() {
-			exists, err := dstClient.MailboxExists(ctx, dstFolder)
+	g.Go(func() error {
+		for idx, m := range mappings {
+			if err := gCtx.Err(); err != nil {
+				return err
+			}
+			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, m.Source, idx+1, n))
+			mp, err := srcClient.FetchMessageMap(gCtx, m.Source)
 			if err != nil {
-				dstErr = err
-				return
+				scans[idx].srcErr = err
+			} else {
+				scans[idx].srcMap = mp
 			}
-			if !exists {
-				return
-			}
-			dstFolderExists = true
-			fetchedIDs, err := dstClient.FetchMessageIDSet(ctx, dstFolder)
-			if err != nil {
-				dstErr = err
-				return
-			}
-			dstMessageIDs = fetchedIDs
-		})
-
-		wg.Wait()
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		if srcErr != nil {
-			if verbose {
-				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %v", srcFolder, srcErr)
-			}
-			continue
-		}
-		if dstErr != nil {
-			return nil, fmt.Errorf("scan destination folder %q: %w", dstFolder, dstErr)
-		}
-
-		// Diff: collect source UIDs whose Message-Id is not on dst.
-		newUIDs := make([]uint32, 0)
-		for id, uid := range srcMessageMap {
-			if _, present := dstMessageIDs[id]; !present {
-				newUIDs = append(newUIDs, uid)
-			}
-		}
-
-		if len(newUIDs) == 0 {
+			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, m.Source, idx+1, n))
 			srcTracker.Increment(1)
-			dstTracker.Increment(1)
-			continue
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew)
 		}
-		// Sort here so the planning preview prints in a stable order and
-		// the downstream UID FETCH benefits from compactable ranges.
-		slices.Sort(newUIDs)
+		return nil
+	})
 
-		srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, srcFolder, idx+1, len(mappings)))
-		dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, dstFolder, idx+1, len(mappings)))
-		srcTracker.Increment(1)
-		dstTracker.Increment(1)
+	g.Go(func() error {
+		for idx, m := range mappings {
+			if err := gCtx.Err(); err != nil {
+				return err
+			}
+			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", dstLabel, m.Destination, idx+1, n))
+			exists, err := dstClient.MailboxExists(gCtx, m.Destination)
+			switch {
+			case err != nil:
+				scans[idx].dstErr = err
+			case !exists:
+				// dstExists stays false, dstIDs stays nil — benign; folder will be created.
+			default:
+				scans[idx].dstExists = true
+				ids, err := dstClient.FetchMessageIDSet(gCtx, m.Destination)
+				if err != nil {
+					scans[idx].dstErr = err
+				} else {
+					scans[idx].dstIDs = ids
+				}
+			}
+			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, m.Destination, idx+1, n))
+			dstTracker.Increment(1)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew)
+			if scans[idx].dstErr != nil {
+				return fmt.Errorf("scan destination folder %q: %w", m.Destination, scans[idx].dstErr)
+			}
+		}
+		return nil
+	})
 
-		summary.Plans = append(summary.Plans, FolderSyncPlan{
-			SourceFolder:            srcFolder,
-			DestinationFolder:       dstFolder,
-			DestinationFolderExists: dstFolderExists,
-			NewMessages:             len(newUIDs),
-			SrcUIDs:                 newUIDs,
-		})
-		summary.TotalNew += len(newUIDs)
+	if err := g.Wait(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
 	}
 
+	summary := &SyncSummary{Plans: make([]FolderSyncPlan, 0, n)}
+	for idx := range scans {
+		if scans[idx].srcErr != nil {
+			if verbose {
+				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %v", mappings[idx].Source, scans[idx].srcErr)
+			}
+			continue
+		}
+		if plans[idx].SourceFolder == "" {
+			continue
+		}
+		summary.Plans = append(summary.Plans, plans[idx])
+	}
+	summary.TotalNew = int(totalNew.Load())
 	return summary, nil
+}
+
+// maybeDiff fires the Message-Id diff exactly once, when both the src and dst
+// sides have completed for slot idx. Returns false if only one side is done.
+// Frees srcMap and dstIDs immediately after the diff to keep peak memory
+// proportional to one folder at a time, not len(mappings).
+func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64) bool {
+	if s.done.Add(1) != 2 {
+		return false
+	}
+	// done==2 guarantees we are the only goroutine here, but mu is still
+	// required: the race detector sees srcMap/dstIDs written by the other
+	// goroutine and read here without synchronisation unless we take the lock.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.srcErr != nil || s.dstErr != nil {
+		s.srcMap, s.dstIDs = nil, nil
+		return true
+	}
+	newUIDs := make([]uint32, 0, len(s.srcMap))
+	for id, uid := range s.srcMap {
+		if _, present := s.dstIDs[id]; !present {
+			newUIDs = append(newUIDs, uid)
+		}
+	}
+	s.srcMap, s.dstIDs = nil, nil
+	if len(newUIDs) == 0 {
+		return true
+	}
+	// Sort for stable preview ordering and compactable UID FETCH ranges.
+	slices.Sort(newUIDs)
+	plans[idx] = FolderSyncPlan{
+		SourceFolder:            mappings[idx].Source,
+		DestinationFolder:       mappings[idx].Destination,
+		DestinationFolderExists: s.dstExists,
+		NewMessages:             len(newUIDs),
+		SrcUIDs:                 newUIDs,
+	}
+	totalNew.Add(int64(len(newUIDs)))
+	return true
 }
 
 // folderDelimiter inspects path and reports which of the common IMAP
