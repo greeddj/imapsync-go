@@ -110,7 +110,11 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			reason = reason[:37] + "..."
 		}
 		errPart := trackerErrorStyle.Sprintf("%d✗", errors)
-		tr.UpdateMessage(fmt.Sprintf("%s [%s %q]", base, errPart, reason))
+		// reason rendered without Sprintf %q so it reads as the original
+		// server message — no \"escaped\" quoting, no inline colour. The
+		// preceding ANSI reset from errPart hands control back to the
+		// terminal's default foreground.
+		tr.UpdateMessage(fmt.Sprintf("%s [%s] %s", base, errPart, reason))
 	}
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
