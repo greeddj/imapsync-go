@@ -271,7 +271,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	dstTracker.MarkAsDone()
 
 	// Stop and clear progress
-	pw.StopAndClear(2)
+	pw.StopAndClear()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -403,7 +403,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 		creationTracker.UpdateMessage(fmt.Sprintf("Created %d folders", createdCount))
 		creationTracker.MarkAsDone()
-		creationPW.Stop()
+		creationPW.StopAndClear()
 
 		if failedCount > 0 {
 			return fmt.Errorf("failed to create %d folders", failedCount)

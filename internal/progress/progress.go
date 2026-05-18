@@ -14,7 +14,8 @@ import (
 
 // Writer is a wrapper around progress.Writer with pre-configured settings.
 type Writer struct {
-	pw progress.Writer
+	pw          progress.Writer
+	numTrackers int
 }
 
 // getTerminalWidth returns the current terminal width, defaulting to 120 if detection fails.
@@ -96,7 +97,7 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.Style().Options.TimeInProgressPrecision = time.Millisecond
 	pw.Style().Options.TimeDonePrecision = time.Millisecond
 
-	return &Writer{pw: pw}
+	return &Writer{pw: pw, numTrackers: numTrackers}
 }
 
 // AppendTracker adds a tracker to the progress writer.
@@ -119,8 +120,10 @@ func (w *Writer) Stop() {
 	w.pw.Stop()
 }
 
-// StopAndClear stops the progress writer and clears the output.
-func (w *Writer) StopAndClear(numLines int) {
+// StopAndClear stops the progress writer and erases the rendered trackers
+// from the terminal. Line count is taken from the NewWriter argument so
+// callers never have to keep that number in sync by hand.
+func (w *Writer) StopAndClear() {
 	// Wait for final rendering
 	time.Sleep(300 * time.Millisecond)
 
@@ -129,7 +132,7 @@ func (w *Writer) StopAndClear(numLines int) {
 
 	// Clear progress output
 	fmt.Print("\r")
-	for range numLines {
+	for range w.numTrackers {
 		fmt.Print("\033[K\r")
 	}
 	fmt.Println()

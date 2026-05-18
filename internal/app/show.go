@@ -88,7 +88,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 
 	groupErr := g.Wait()
 
-	pw.StopAndClear(2)
+	pw.StopAndClear()
 
 	defer func() {
 		if srcRes.cli != nil {
