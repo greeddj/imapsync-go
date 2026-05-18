@@ -35,32 +35,37 @@ var messageIDHeaderSection = &imap.BodySectionName{
 // messages as read.
 var fullBodyPeekSection = &imap.BodySectionName{Peek: true}
 
-// FetchMessageMap returns Message-Id → UID for every message in folder.
+// FetchMessageMap returns Message-Id → UID for every message in folder, plus
+// the sum of RFC822.SIZE across all messages.
 //
-// One pass over the folder yields both pieces. Messages without a usable
+// One pass over the folder yields all three pieces. Messages without a usable
 // Message-Id are counted and reported once via the progress writer — without
 // that header the diff has no key to match on, so they cannot be tracked
-// across servers and will be silently skipped.
+// across servers and will be silently skipped. The folder-wide size total is
+// used by callers (sync preview) to estimate transfer volume; messages without
+// a Message-Id still contribute to the total because they exist on the wire.
 //
 // The returned map is suitable both as the source side of a Message-Id diff
 // and (with UIDs ignored) as the destination side; callers that only need
 // the keys can use FetchMessageIDSet for a slightly thinner allocation.
-func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string]uint32, error) {
+func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string]uint32, uint64, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
 	var (
 		ids          map[string]uint32
+		totalSize    uint64
 		missingCount int
 	)
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		ids = nil
+		totalSize = 0
 		missingCount = 0
 		mbox, err := c.selectIfNeeded(cli, folder)
 		if err != nil {
@@ -91,13 +96,16 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		seqset.AddRange(1, total)
 		messages := make(chan *imap.Message, messageChanBuffer)
 		done := make(chan error, 1)
-		items := []imap.FetchItem{messageIDHeaderSection.FetchItem(), imap.FetchUid}
+		// RFC822.SIZE is part of the same FETCH so the size total comes
+		// free with the diff scan — no extra round-trip per folder.
+		items := []imap.FetchItem{messageIDHeaderSection.FetchItem(), imap.FetchUid, imap.FetchRFC822Size}
 		go func() { done <- cli.Fetch(seqset, items, messages) }()
 
 		for msg := range messages {
 			if ctx.Err() != nil {
 				continue
 			}
+			totalSize += uint64(msg.Size)
 			id := readMessageIDHeader(msg)
 			if id == "" {
 				missingCount++
@@ -119,21 +127,21 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return ids, nil
+	return ids, totalSize, nil
 }
 
 // FetchMessageIDSet returns the set of Message-Ids in folder, dropping the
 // UIDs. Convenience wrapper around FetchMessageMap for the destination side
 // of a sync where UIDs are irrelevant.
 func (c *Client) FetchMessageIDSet(ctx context.Context, folder string) (map[string]struct{}, error) {
-	m, err := c.FetchMessageMap(ctx, folder)
+	m, _, err := c.FetchMessageMap(ctx, folder)
 	if err != nil {
 		return nil, err
 	}

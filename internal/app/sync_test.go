@@ -844,14 +844,17 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		}
 		plans := make([]FolderSyncPlan, 1)
 		var totalNew atomic.Int64
+		var totalNewSize atomic.Uint64
 
 		s := &folderScan{
-			srcMap: map[string]uint32{"a@x": 1, "b@x": 2},
-			dstIDs: map[string]struct{}{"b@x": {}},
+			srcMap:         map[string]uint32{"a@x": 1, "b@x": 2},
+			dstIDs:         map[string]struct{}{"b@x": {}},
+			srcFolderSize:  2000, // 2 messages summed to 2000 bytes
+			srcFolderCount: 2,
 		}
 
 		// First call: only one side arrived — must not diff yet.
-		if maybeDiff(s, 0, mappings, plans, &totalNew) {
+		if maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned true on first call, want false")
 		}
 		if s.srcMap == nil || s.dstIDs == nil {
@@ -859,7 +862,7 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		}
 
 		// Second call: both sides arrived — diff fires.
-		if !maybeDiff(s, 0, mappings, plans, &totalNew) {
+		if !maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned false on second call, want true")
 		}
 		if s.srcMap != nil {
@@ -875,6 +878,13 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		if totalNew.Load() != 1 {
 			t.Errorf("totalNew=%d, want 1", totalNew.Load())
 		}
+		// 1 new of 2 total at 2000 bytes → 1000 bytes estimated.
+		if got := totalNewSize.Load(); got != 1000 {
+			t.Errorf("totalNewSize=%d, want 1000 (2000 × 1/2)", got)
+		}
+		if plans[0].NewSize != 1000 {
+			t.Errorf("plans[0].NewSize=%d, want 1000", plans[0].NewSize)
+		}
 	})
 
 	t.Run("srcErr_freesMaps", func(t *testing.T) {
@@ -884,6 +894,7 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		}
 		plans := make([]FolderSyncPlan, 1)
 		var totalNew atomic.Int64
+		var totalNewSize atomic.Uint64
 
 		s := &folderScan{
 			srcErr: fmt.Errorf("src scan failed"),
@@ -892,13 +903,13 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		}
 
 		// First call: one side arrived — no diff yet.
-		if maybeDiff(s, 0, mappings, plans, &totalNew) {
+		if maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned true on first call, want false")
 		}
 
 		// Second call: both sides arrived — error branch must free maps and
 		// leave the plan empty.
-		if !maybeDiff(s, 0, mappings, plans, &totalNew) {
+		if !maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned false on second call, want true")
 		}
 		if s.srcMap != nil {
@@ -922,6 +933,7 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		}
 		plans := make([]FolderSyncPlan, 1)
 		var totalNew atomic.Int64
+		var totalNewSize atomic.Uint64
 
 		s := &folderScan{
 			dstErr: fmt.Errorf("dst scan failed"),
@@ -930,13 +942,13 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 		}
 
 		// First call: one side arrived — no diff yet.
-		if maybeDiff(s, 0, mappings, plans, &totalNew) {
+		if maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned true on first call, want false")
 		}
 
 		// Second call: both sides arrived — dstErr branch must free maps and
 		// leave the plan empty.
-		if !maybeDiff(s, 0, mappings, plans, &totalNew) {
+		if !maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned false on second call, want true")
 		}
 		if s.srcMap != nil {

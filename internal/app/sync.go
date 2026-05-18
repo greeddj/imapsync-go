@@ -35,13 +35,21 @@ type FolderSyncPlan struct {
 	DestinationFolder       string
 	SrcUIDs                 []uint32
 	NewMessages             int
+	NewSize                 uint64
 	DestinationFolderExists bool
 }
 
-// SyncSummary aggregates the per-folder plans along with total message counts.
+// SyncSummary aggregates the per-folder plans along with total message counts
+// and an estimated total byte volume.
+//
+// TotalNewSize is approximate: it scales the source folder's full RFC822.SIZE
+// total by the new-to-total message ratio (NewMessages / SourceMessages). The
+// exact size would require an extra UID FETCH per new UID, which is not worth
+// the round-trips for what is only a preview number.
 type SyncSummary struct {
-	Plans    []FolderSyncPlan
-	TotalNew int
+	Plans        []FolderSyncPlan
+	TotalNew     int
+	TotalNewSize uint64
 }
 
 // ActionSync copies messages between IMAP servers according to the provided configuration.
@@ -288,7 +296,8 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
 				}
 				if plan.NewMessages > 0 {
-					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
+					fmt.Printf("• %s → %s will copy %d messages (≈ %s)\n",
+						plan.SourceFolder, plan.DestinationFolder, plan.NewMessages, utils.FormatSize(plan.NewSize))
 					if verbose {
 						// Dumping every UID before the confirm-prompt
 						// drowns the user in screens of integers — a
@@ -316,7 +325,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					fmt.Printf("• %s\n", folder)
 				}
 			}
-			fmt.Printf("\n📨 Total new messages to sync: %d\n", summary.TotalNew)
+			fmt.Printf("\n📨 Total new messages to sync: %d (≈ %s)\n", summary.TotalNew, utils.FormatSize(summary.TotalNewSize))
 
 			if !autoConfirm {
 				if err := ctx.Err(); err != nil {
@@ -496,14 +505,19 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 // folderScan holds the per-slot results from the parallel src and dst scans.
 // done is incremented by each side; when it reaches 2, maybeDiff fires.
 // Pointer fields precede non-pointer fields to minimise the GC scan range.
+//
+// srcFolderSize and srcFolderCount are recorded before srcMap is freed so the
+// proportional size estimate in maybeDiff can run after the diff.
 type folderScan struct {
-	srcMap    map[string]uint32
-	dstIDs    map[string]struct{}
-	srcErr    error
-	dstErr    error
-	dstExists bool
-	mu        sync.Mutex
-	done      atomic.Int32
+	srcMap         map[string]uint32
+	dstIDs         map[string]struct{}
+	srcErr         error
+	dstErr         error
+	srcFolderSize  uint64
+	srcFolderCount int
+	dstExists      bool
+	mu             sync.Mutex
+	done           atomic.Int32
 }
 
 func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, pw *progress.Writer, srcLabel, dstLabel string, verbose bool) (*SyncSummary, error) {
@@ -518,6 +532,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 	scans := make([]folderScan, n)
 	plans := make([]FolderSyncPlan, n)
 	var totalNew atomic.Int64
+	var totalNewSize atomic.Uint64
 
 	// errgroup.WithContext: if either goroutine returns a non-nil error,
 	// gCtx is cancelled, which causes the other goroutine's next gCtx.Err()
@@ -530,15 +545,17 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				return err
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, m.Source, idx+1, n))
-			mp, err := srcClient.FetchMessageMap(gCtx, m.Source)
+			mp, size, err := srcClient.FetchMessageMap(gCtx, m.Source)
 			if err != nil {
 				scans[idx].srcErr = err
 			} else {
 				scans[idx].srcMap = mp
+				scans[idx].srcFolderSize = size
+				scans[idx].srcFolderCount = len(mp)
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, m.Source, idx+1, n))
 			srcTracker.Increment(1)
-			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize)
 		}
 		return nil
 	})
@@ -566,7 +583,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			}
 			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, m.Destination, idx+1, n))
 			dstTracker.Increment(1)
-			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize)
 			if scans[idx].dstErr != nil {
 				return fmt.Errorf("scan destination folder %q: %w", m.Destination, scans[idx].dstErr)
 			}
@@ -595,6 +612,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 		summary.Plans = append(summary.Plans, plans[idx])
 	}
 	summary.TotalNew = int(totalNew.Load())
+	summary.TotalNewSize = totalNewSize.Load()
 	return summary, nil
 }
 
@@ -602,7 +620,12 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 // sides have completed for slot idx. Returns false if only one side is done.
 // Frees srcMap and dstIDs immediately after the diff to keep peak memory
 // proportional to one folder at a time, not len(mappings).
-func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64) bool {
+//
+// NewSize is estimated as srcFolderSize × newCount / srcFolderCount — the
+// exact size would require an extra UID FETCH RFC822.SIZE for each new UID
+// before the user has even confirmed, which is too eager. The proportion is
+// good enough for the preview header.
+func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64) bool {
 	if s.done.Add(1) != 2 {
 		return false
 	}
@@ -627,14 +650,20 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	}
 	// Sort for stable preview ordering and compactable UID FETCH ranges.
 	slices.Sort(newUIDs)
+	var newSize uint64
+	if s.srcFolderCount > 0 {
+		newSize = uint64(float64(s.srcFolderSize) * float64(len(newUIDs)) / float64(s.srcFolderCount))
+	}
 	plans[idx] = FolderSyncPlan{
 		SourceFolder:            mappings[idx].Source,
 		DestinationFolder:       mappings[idx].Destination,
 		DestinationFolderExists: s.dstExists,
 		NewMessages:             len(newUIDs),
+		NewSize:                 newSize,
 		SrcUIDs:                 newUIDs,
 	}
 	totalNew.Add(int64(len(newUIDs)))
+	totalNewSize.Add(newSize)
 	return true
 }
 

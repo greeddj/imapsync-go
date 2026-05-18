@@ -141,7 +141,7 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
 	c.verbose = true
 
-	result, err := c.FetchMessageMap(context.Background(), "INBOX")
+	result, totalSize, err := c.FetchMessageMap(context.Background(), "INBOX")
 	if err != nil {
 		t.Fatalf("FetchMessageMap: %v", err)
 	}
@@ -150,6 +150,9 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 	}
 	if _, ok := result["ok@host"]; !ok {
 		t.Errorf("expected key ok@host in map, got %v", result)
+	}
+	if totalSize == 0 {
+		t.Error("totalSize = 0, want > 0 — RFC822.SIZE not aggregated from fake server response")
 	}
 
 	var foundLog bool
@@ -252,18 +255,18 @@ func fetchTwoMessagesHandler(srv *fakeServer) func(net.Conn) {
 }
 
 // writeFetchResponses emits two IMAP FETCH responses:
-//   - message 1 with Message-Id: <ok@host>
-//   - message 2 with an empty Message-Id header
+//   - message 1 with Message-Id: <ok@host> and RFC822.SIZE 1024
+//   - message 2 with an empty Message-Id header and RFC822.SIZE 512
 func writeFetchResponses(conn net.Conn) {
 	hdr1 := "Message-Id: <ok@host>\r\n\r\n"
 	_, _ = fmt.Fprintf(conn,
-		"* 1 FETCH (UID 1 BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
+		"* 1 FETCH (UID 1 RFC822.SIZE 1024 BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
 		len(hdr1), hdr1,
 	)
 
 	hdr2 := "\r\n"
 	_, _ = fmt.Fprintf(conn,
-		"* 2 FETCH (UID 2 BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
+		"* 2 FETCH (UID 2 RFC822.SIZE 512 BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
 		len(hdr2), hdr2,
 	)
 }

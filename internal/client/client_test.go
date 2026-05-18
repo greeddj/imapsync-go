@@ -330,7 +330,7 @@ func Test_Cancel_interruptsBlockingCall(t *testing.T) {
 	type result struct{ err error }
 	ch := make(chan result, 1)
 	go func() {
-		_, err := c.FetchMessageMap(context.Background(), "INBOX")
+		_, _, err := c.FetchMessageMap(context.Background(), "INBOX")
 		ch <- result{err}
 	}()
 
