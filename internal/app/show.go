@@ -29,7 +29,10 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 	pw.Start()
 	defer pw.Stop()
 
-	pw.Log("Loading configuration...")
+	// No pw.Log before AppendTracker: go-pretty's redraw cycle counts
+	// only tracker rows when computing how far cursor-up needs to go,
+	// so a log line emitted in the first render leaves the topmost
+	// tracker un-erased on the next tick and StopAndClear can't reach it.
 	cfg, err := config.New(c)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
