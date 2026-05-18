@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 )
@@ -31,9 +32,14 @@ func Version(version, commit, date, builtBy string) string {
 	}
 }
 
-// latestTag fetches the latest release tag from GitHub.
+// latestTag fetches the latest release tag from GitHub. Skipped entirely when
+// IMAPSYNC_OFFLINE or CI is set — a surprise outbound HTTPS call on every
+// --version is bad UX in air-gapped or rate-limited environments.
 func latestTag() string {
-	client := &http.Client{Timeout: time.Second}
+	if os.Getenv("IMAPSYNC_OFFLINE") != "" || os.Getenv("CI") != "" {
+		return defaultVersion
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, latestVersionURL, http.NoBody)
 	if err != nil {
 		return defaultVersion
