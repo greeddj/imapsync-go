@@ -9,6 +9,15 @@ import (
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
+	"github.com/jedib0t/go-pretty/v6/text"
+)
+
+// Tracker-line glyph palette. go-pretty does not intercept inline ANSI in the
+// tracker Message, so colouring the counters here just works.
+var (
+	trackerSyncedStyle = text.Colors{text.FgGreen}
+	trackerTotalStyle  = text.Colors{text.FgHiBlack}
+	trackerErrorStyle  = text.Colors{text.FgRed}
 )
 
 // syncWorker pairs one source and one destination connection. Workers are
@@ -86,8 +95,10 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	var lastErrMsg string
 
 	updateTrackerMsg := func() {
-		base := fmt.Sprintf("%d/%d (%d↑/%d) %s → %s",
-			planIdx+1, planCount, synced, p.NewMessages, p.SourceFolder, p.DestinationFolder)
+		syncedPart := trackerSyncedStyle.Sprintf("%d↑", synced)
+		totalPart := trackerTotalStyle.Sprintf("Σ%d", p.NewMessages)
+		base := fmt.Sprintf("%d/%d (%s %s) %s → %s",
+			planIdx+1, planCount, syncedPart, totalPart, p.SourceFolder, p.DestinationFolder)
 		if errors == 0 {
 			tr.UpdateMessage(base)
 			return
@@ -98,7 +109,8 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		if len(reason) > 40 {
 			reason = reason[:37] + "..."
 		}
-		tr.UpdateMessage(fmt.Sprintf("%s [%d✗ %q]", base, errors, reason))
+		errPart := trackerErrorStyle.Sprintf("%d✗", errors)
+		tr.UpdateMessage(fmt.Sprintf("%s [%s %q]", base, errPart, reason))
 	}
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
