@@ -12,5 +12,18 @@ func Show() *cli.Command {
 		Name:   "show",
 		Usage:  "show IMAP dirs in source and destination servers",
 		Action: app.ActionShow,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "verbose",
+				Aliases: []string{"V"},
+				Sources: cli.EnvVars("IMAPSYNC_VERBOSE"),
+			},
+			&cli.BoolFlag{
+				Name:    "quiet",
+				Aliases: []string{"q"},
+				Usage:   "suppress progress bars so output is pipe-friendly",
+				Sources: cli.EnvVars("IMAPSYNC_QUIET"),
+			},
+		},
 	}
 }

@@ -22,7 +22,10 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	pw := progress.NewWriter(2, false)
+	verbose := c.Bool("verbose")
+	quiet := c.Bool("quiet")
+
+	pw := progress.NewWriter(2, quiet)
 	pw.Start()
 	defer pw.Stop()
 
@@ -48,7 +51,7 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 	}
 	loadAccount := func(ctx context.Context, label string, creds config.Credentials, tr *progress.Tracker) (accountResult, error) {
 		tr.UpdateMessage(fmt.Sprintf("[%s] Connecting...", label))
-		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, client.Options{UseTLS: true})
+		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, client.Options{UseTLS: true, Verbose: verbose})
 		if err != nil {
 			tr.MarkAsErrored()
 			return accountResult{}, fmt.Errorf("[%s] connect: %w", label, err)
