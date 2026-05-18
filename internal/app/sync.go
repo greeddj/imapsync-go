@@ -25,9 +25,7 @@ import (
 const verboseUIDLimit = 20
 
 // traceTracker writes a one-line diagnostic to stderr when IMAPSYNC_TRACE is
-// set. Used to surface duplicate Tracker allocations for the same plan — a
-// symptom of the "two render lines for one INBOX" regression under network
-// flap where multiple Tracker objects end up attached to the same writer.
+// set, to surface duplicate Tracker allocations for the same plan.
 func traceTracker(site, message string) {
 	if os.Getenv("IMAPSYNC_TRACE") == "" {
 		return

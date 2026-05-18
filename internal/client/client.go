@@ -36,7 +36,6 @@ const (
 	defaultDialTimeout = 30 * time.Second
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
 	uidFetchBatchSize = 500
-	// tcpKeepAlivePeriod is the idle interval before the first keepalive probe.
 	tcpKeepAlivePeriod = 30 * time.Second
 )
 

@@ -209,6 +209,21 @@ safe, but it has two known limitations:
   them. If you suspect this, do the sync in a single pass and avoid re-running
   it against the same destination.
 
+## Known issues
+
+### Ctrl+C may not exit immediately during a network disruption
+
+During a sync, if the network connection drops mid-transfer, pressing Ctrl+C
+may take up to a few minutes to fully cancel. The underlying IMAP client cannot
+interrupt a transfer that is waiting on a server response that never arrives
+(because the server is unreachable). TCP keepalive will eventually detect the
+dead connection — typically within a few minutes on macOS and Linux — and the
+program will exit cleanly once that happens.
+
+If you need to abort immediately, press Ctrl+\ instead. This dumps all
+goroutine stacks to stderr and exits right away; it is the escape hatch for
+when the program appears stuck.
+
 ## License
 
 MIT
