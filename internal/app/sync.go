@@ -667,7 +667,33 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client,
 		}
 	}
 
-	return expanded, nil
+	// A parent mapping's subfolder expansion can collide with an explicit
+	// mapping for that same subfolder; without dedup the plan ends up with
+	// duplicate entries that scan and copy the folder twice.
+	out, dropped := dedupeMappings(expanded)
+	if verbose && !quiet {
+		for _, m := range dropped {
+			fmt.Printf("  ℹ️  Mapping %q skipped — already covered by a parent mapping's expansion\n", m.Source)
+		}
+	}
+	return out, nil
+}
+
+// dedupeMappings keeps the first occurrence of each Source. The second return
+// value lists every dropped entry so callers can surface them under verbose
+// without coupling the dedup to a logger.
+func dedupeMappings(in []config.DirectoryMapping) (out, dropped []config.DirectoryMapping) {
+	out = make([]config.DirectoryMapping, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, m := range in {
+		if _, ok := seen[m.Source]; ok {
+			dropped = append(dropped, m)
+			continue
+		}
+		seen[m.Source] = struct{}{}
+		out = append(out, m)
+	}
+	return out, dropped
 }
 
 // getSubfolders returns all subfolders of a given folder
