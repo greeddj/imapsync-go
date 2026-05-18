@@ -114,7 +114,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		// server message — no \"escaped\" quoting, no inline colour. The
 		// preceding ANSI reset from errPart hands control back to the
 		// terminal's default foreground.
-		tr.UpdateMessage(fmt.Sprintf("%s [%s] %s", base, errPart, reason))
+		tr.UpdateMessage(fmt.Sprintf("%s (%s %s)", base, errPart, reason))
 	}
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
