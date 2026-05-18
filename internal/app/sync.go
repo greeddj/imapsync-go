@@ -15,6 +15,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
 
@@ -104,29 +105,43 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	srcClient, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
-	if err != nil {
-		return fmt.Errorf("source connection failed: %w", err)
-	}
-	defer func() {
-		_ = srcClient.Logout()
-	}()
-	srcClient.SetPrefix(cfg.Src.Label)
 
-	if err := ctx.Err(); err != nil {
-		srcClient.Cancel()
-		return err
-	}
-	dstClient, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
-	if err != nil {
-		return fmt.Errorf("destination connection failed: %w", err)
-	}
+	// TLS handshake to a remote IMAP server is the dominant cost of startup;
+	// running src+dst in parallel halves time-to-first-fetch when both sides
+	// are slow (e.g. residential mail providers + commercial IMAP).
+	var srcClient, dstClient *client.Client
+	g, gCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		c, err := client.New(gCtx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
+		if err != nil {
+			return fmt.Errorf("source connection failed: %w", err)
+		}
+		c.SetPrefix(cfg.Src.Label)
+		srcClient = c
+		return nil
+	})
+	g.Go(func() error {
+		c, err := client.New(gCtx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
+		if err != nil {
+			return fmt.Errorf("destination connection failed: %w", err)
+		}
+		c.SetPrefix(cfg.Dst.Label)
+		dstClient = c
+		return nil
+	})
+	groupErr := g.Wait()
 	defer func() {
-		_ = dstClient.Logout()
+		if srcClient != nil {
+			_ = srcClient.Logout()
+		}
+		if dstClient != nil {
+			_ = dstClient.Logout()
+		}
 	}()
-	dstClient.SetPrefix(cfg.Dst.Label)
+	if groupErr != nil {
+		return groupErr
+	}
 	if err := ctx.Err(); err != nil {
-		dstClient.Cancel()
 		return err
 	}
 
