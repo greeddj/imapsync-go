@@ -1,12 +1,191 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
 )
+
+// runNewWithArgs writes content to a temp file with the given extension and
+// drives config.New through a urfave/cli/v3 Command parsed from extraArgs.
+// Returns whatever Config / error New produced.
+func runNewWithArgs(t *testing.T, ext, content string, extraArgs ...string) (*Config, error) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config"+ext)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	var (
+		gotCfg *Config
+		gotErr error
+	)
+	app := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: path},
+			&cli.IntFlag{Name: "workers", Value: 4},
+			&cli.IntFlag{Name: "bps-down"},
+			&cli.IntFlag{Name: "bps-up"},
+			&cli.IntFlag{Name: "max-connections"},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			gotCfg, gotErr = New(c)
+			return nil
+		},
+	}
+	args := append([]string{"app"}, extraArgs...)
+	if err := app.Run(context.Background(), args); err != nil {
+		t.Fatalf("app.Run: %v", err)
+	}
+	return gotCfg, gotErr
+}
+
+const validJSONConfig = `{
+  "src": {"label":"old","server":"src:993","user":"u","pass":"p"},
+  "dst": {"label":"new","server":"dst:993","user":"u","pass":"p"},
+  "rate_limit": {"down_bps":100000, "up_bps":50000, "max_connections":5}
+}`
+
+const validYAMLConfig = `src:
+  label: old
+  server: src:993
+  user: u
+  pass: p
+dst:
+  label: new
+  server: dst:993
+  user: u
+  pass: p
+rate_limit:
+  down_bps: 100000
+  up_bps: 50000
+  max_connections: 5
+`
+
+func TestNew_JSON_happyPath(t *testing.T) {
+	t.Parallel()
+	cfg, err := runNewWithArgs(t, ".json", validJSONConfig)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if cfg.Src.Server != "src:993" || cfg.Dst.Server != "dst:993" {
+		t.Errorf("servers = %s/%s", cfg.Src.Server, cfg.Dst.Server)
+	}
+	if cfg.RateLimit.DownBPS != 100000 || cfg.RateLimit.UpBPS != 50000 || cfg.RateLimit.MaxConnections != 5 {
+		t.Errorf("RateLimit = %+v", cfg.RateLimit)
+	}
+}
+
+func TestNew_YAML_happyPath(t *testing.T) {
+	t.Parallel()
+	cfg, err := runNewWithArgs(t, ".yaml", validYAMLConfig)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if cfg.Src.Server != "src:993" || cfg.Dst.Server != "dst:993" {
+		t.Errorf("servers = %s/%s", cfg.Src.Server, cfg.Dst.Server)
+	}
+}
+
+func TestNew_unknownExtensionReturnsError(t *testing.T) {
+	t.Parallel()
+	_, err := runNewWithArgs(t, ".toml", validJSONConfig)
+	if err == nil {
+		t.Fatal("New with .toml returned nil error")
+	}
+	if !strings.Contains(err.Error(), "unsupported config file format") {
+		t.Errorf("err = %v, want substring 'unsupported config file format'", err)
+	}
+}
+
+func TestNew_missingFileReturnsError(t *testing.T) {
+	t.Parallel()
+	// Manually drive New with a config flag pointing at a non-existent path —
+	// we cannot reuse runNewWithArgs because it always writes the file.
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "does-not-exist.json")
+	var gotErr error
+	app := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: missing},
+			&cli.IntFlag{Name: "workers", Value: 4},
+			&cli.IntFlag{Name: "bps-down"},
+			&cli.IntFlag{Name: "bps-up"},
+			&cli.IntFlag{Name: "max-connections"},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			_, gotErr = New(c)
+			return nil
+		},
+	}
+	if err := app.Run(context.Background(), []string{"app"}); err != nil {
+		t.Fatalf("app.Run: %v", err)
+	}
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "does not exist") {
+		t.Errorf("err = %v, want substring 'does not exist'", gotErr)
+	}
+}
+
+func TestNew_defaultLabelsAppliedWhenAbsent(t *testing.T) {
+	t.Parallel()
+	noLabels := `{
+		"src":{"server":"s:993","user":"u","pass":"p"},
+		"dst":{"server":"d:993","user":"u","pass":"p"}
+	}`
+	cfg, err := runNewWithArgs(t, ".json", noLabels)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if cfg.Src.Label != defaultSourceLabel {
+		t.Errorf("Src.Label = %q, want %q", cfg.Src.Label, defaultSourceLabel)
+	}
+	if cfg.Dst.Label != defaultDestLabel {
+		t.Errorf("Dst.Label = %q, want %q", cfg.Dst.Label, defaultDestLabel)
+	}
+}
+
+func TestNew_CLIOverridesConfigBPSDown(t *testing.T) {
+	t.Parallel()
+	cfg, err := runNewWithArgs(t, ".json", validJSONConfig, "--bps-down=200000")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if cfg.RateLimit.DownBPS != 200000 {
+		t.Errorf("DownBPS = %d, want 200000 (CLI override of config 100000)", cfg.RateLimit.DownBPS)
+	}
+}
+
+// TestNew_CLIZeroDoesNotOverride pins the documented "0 = unset" semantic:
+// passing --bps-up=0 (or omitting it) must leave the config value intact.
+func TestNew_CLIZeroDoesNotOverride(t *testing.T) {
+	t.Parallel()
+	cfg, err := runNewWithArgs(t, ".json", validJSONConfig, "--bps-up=0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if cfg.RateLimit.UpBPS != 50000 {
+		t.Errorf("UpBPS = %d, want 50000 (config value preserved when CLI=0)", cfg.RateLimit.UpBPS)
+	}
+}
+
+func TestNew_workersClamped(t *testing.T) {
+	t.Parallel()
+	cfg, err := runNewWithArgs(t, ".json", validJSONConfig, "--workers=99")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if cfg.Workers != maxWorkers {
+		t.Errorf("Workers = %d, want %d (clamped to maxWorkers)", cfg.Workers, maxWorkers)
+	}
+}
 
 func TestValidate(t *testing.T) {
 	valid := Credentials{
