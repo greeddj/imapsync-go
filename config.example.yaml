@@ -15,8 +15,8 @@ map:
     dst: INBOX
   - src: Sent
     dst: Sent
-  - src: Archive
-    dst: Archive
+  - src: Archive.2023
+    dst: Archive/2023
 
 # Optional throttle. Zero / omitted means unlimited.
 # For Gmail accounts, set both to 300000 to stay safely under the
