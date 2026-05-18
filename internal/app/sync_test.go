@@ -2,10 +2,112 @@ package app
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/greeddj/imapsync-go/internal/config"
+	"github.com/greeddj/imapsync-go/internal/ratelimit"
 )
+
+func TestBuildProviderWarning_noKnownProvider_returnsEmpty(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Src:     config.Credentials{Server: "mail.privatehost.example:993"},
+		Dst:     config.Credentials{Server: "imap.otherhost.example:993"},
+		Workers: 4,
+	}
+	got := buildProviderWarning(cfg, nil, nil)
+	if got != "" {
+		t.Errorf("buildProviderWarning for unknown servers = %q, want empty", got)
+	}
+}
+
+func TestBuildProviderWarning_gmailSrc_recommendsBPS(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Src:     config.Credentials{Server: "imap.gmail.com:993"},
+		Dst:     config.Credentials{Server: "mail.privatehost.example:993"},
+		Workers: 4,
+	}
+	got := buildProviderWarning(cfg, nil, nil)
+	if !strings.Contains(got, "Gmail") {
+		t.Errorf("warning missing provider name: %q", got)
+	}
+	if !strings.Contains(got, "max simultaneous connections: 15") {
+		t.Errorf("warning missing connection cap: %q", got)
+	}
+	// Limiter is nil → recommend a concrete --bps-down value (300000 from
+	// the Gmail provider profile).
+	if !strings.Contains(got, "--bps-down 300000") {
+		t.Errorf("warning missing bps-down recommendation: %q", got)
+	}
+}
+
+func TestBuildProviderWarning_gmailDst_withLimiter_omitsRecommendation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Src:     config.Credentials{Server: "mail.privatehost.example:993"},
+		Dst:     config.Credentials{Server: "imap.gmail.com:993"},
+		Workers: 4,
+	}
+	// A non-nil limiter signals "user already configured throttle" — the
+	// warning must not nag with another recommendation.
+	dstLim := ratelimit.NewLimiter(300_000)
+	got := buildProviderWarning(cfg, nil, dstLim)
+	if strings.Contains(got, "no rate limit set") {
+		t.Errorf("warning suggests rate limit even though dstLim is configured: %q", got)
+	}
+}
+
+func TestBuildProviderWarning_workersOverProviderCap_addsHint(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Src:     config.Credentials{Server: "imap.gmail.com:993"},
+		Dst:     config.Credentials{Server: "mail.privatehost.example:993"},
+		Workers: 20,
+	}
+	got := buildProviderWarning(cfg, nil, nil)
+	if !strings.Contains(got, "may exceed") {
+		t.Errorf("warning missing workers-exceed hint: %q", got)
+	}
+}
+
+func TestFolderDelimiter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		path      string
+		server    string
+		wantDelim string
+		wantOK    bool
+	}{
+		{name: "flatPathNoServer", path: "INBOX", server: "", wantDelim: "none", wantOK: true},
+		{name: "flatPathWithServer", path: "INBOX", server: "/", wantDelim: "none", wantOK: true},
+		{name: "slashMatches", path: "Archive/2023", server: "/", wantDelim: "/", wantOK: true},
+		{name: "slashMismatchOnDot", path: "Archive/2023", server: ".", wantDelim: "/", wantOK: false},
+		{name: "dotMatches", path: "Archive.2023", server: ".", wantDelim: ".", wantOK: true},
+		{name: "dotMismatchOnSlash", path: "Archive.2023", server: "/", wantDelim: ".", wantOK: false},
+		{name: "backslashMatches", path: `Archive\2023`, server: `\`, wantDelim: `\`, wantOK: true},
+		{name: "backslashMismatchOnSlash", path: `Archive\2023`, server: "/", wantDelim: `\`, wantOK: false},
+		{name: "noServerMeansAnyOK", path: "Archive/2023", server: "", wantDelim: "/", wantOK: true},
+		{name: "firstDelimWins", path: "a/b.c", server: "/", wantDelim: "/", wantOK: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gotDelim, gotOK := folderDelimiter(tt.path, tt.server)
+			if gotDelim != tt.wantDelim || gotOK != tt.wantOK {
+				t.Errorf("folderDelimiter(%q, %q) = (%q, %v), want (%q, %v)",
+					tt.path, tt.server, gotDelim, gotOK, tt.wantDelim, tt.wantOK)
+			}
+		})
+	}
+}
 
 func TestComputeEffectiveWorkers(t *testing.T) {
 	t.Parallel()
