@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/progress"
@@ -109,6 +110,16 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.Style().Options.TimeDonePrecision = time.Millisecond
 
 	return &Writer{pw: pw, numTrackers: numTrackers}
+}
+
+// SetOutputWriter redirects rendered output to out.
+func (w *Writer) SetOutputWriter(out io.Writer) { w.pw.SetOutputWriter(out) }
+
+// WaitForRenderDone spins until the render goroutine finishes its final pass.
+func (w *Writer) WaitForRenderDone() {
+	for w.pw.IsRenderInProgress() {
+		runtime.Gosched()
+	}
 }
 
 // AppendTracker adds a tracker to the progress writer.

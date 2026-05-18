@@ -33,6 +33,11 @@ If something is hard to test, it must be either tested at integration level or d
 - **`AppendMessage` mid-APPEND transient retry** — the streaming-literal design (`msg.GetBody(...)` handed straight to `cli.Append`, no `io.ReadAll`) means the literal has been partially consumed before a mid-APPEND error is detected. There is nothing to retry: the literal stream is exhausted. Idempotency is recovered by the next sync run's Message-Id diff. This path is architecturally untestable in isolation without a mock that simulates a partial-write failure mid-literal, which would not test real go-imap behaviour.
 - **`safeCall` post-reconnect `isCancelled()` branch** — exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
 
+### `internal/app` deliberate exclusions (added with B.1a fake-server suite)
+
+- **`ActionSync`, `ActionShow`** — top-level urfave/cli action entry points; require a fully running config and live IMAP connections. Tested implicitly through their sub-functions (`buildSyncPlan`, `expandMappingsWithSubfolders`, `runFolderSync`, `newSyncWorkerPool`), each at 80–100% line coverage.
+- **`printAccountInfo`** — go-pretty table renderer hitting `os.Stdout` directly. A meaningful test requires either a refactor to take `io.Writer` (out of scope for B.1a) or stdout capture; neither buys coverage of real behaviour because the function is a thin layout wrapper.
+
 If the tester finds an untested branch that does not match an existing exclusion, the choice is:
 
 1. Add a test (preferred).

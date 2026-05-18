@@ -1,11 +1,16 @@
 package app
 
 import (
+	"bufio"
+	"context"
+	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/greeddj/imapsync-go/internal/config"
+	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
 )
 
@@ -73,6 +78,21 @@ func TestBuildProviderWarning_workersOverProviderCap_addsHint(t *testing.T) {
 	got := buildProviderWarning(cfg, nil, nil)
 	if !strings.Contains(got, "may exceed") {
 		t.Errorf("warning missing workers-exceed hint: %q", got)
+	}
+}
+
+func TestBuildProviderWarning_gmailDst_nilLimiter_recommendsBPSUp(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Src:     config.Credentials{Server: "mail.privatehost.example:993"},
+		Dst:     config.Credentials{Server: "imap.gmail.com:993"},
+		Workers: 4,
+	}
+	// nil limiter for dst → the isUpload=true branch sets flag to "--bps-up".
+	got := buildProviderWarning(cfg, nil, nil)
+	if !strings.Contains(got, "--bps-up") {
+		t.Errorf("warning missing --bps-up recommendation: %q", got)
 	}
 }
 
@@ -210,5 +230,601 @@ func TestDedupeMappings_parentExpandsBeforeExplicitChild(t *testing.T) {
 	}
 	if len(dropped) != 2 {
 		t.Errorf("len(dropped)=%d, want 2, got %+v", len(dropped), dropped)
+	}
+}
+
+// makePlanPW creates the progress objects required by buildSyncPlan. quiet=true
+// suppresses all terminal output during tests.
+func makePlanPW() (*progress.Writer, *progress.Tracker, *progress.Tracker) {
+	pw := progress.NewWriter(1, true)
+	srcTr := progress.NewTracker("src", 10)
+	dstTr := progress.NewTracker("dst", 10)
+	return pw, srcTr, dstTr
+}
+
+// Test_buildSyncPlan_emptySrc_returnsNoPlans asserts the "already in sync"
+// short-circuit: when src has zero messages, the plan list is empty.
+func Test_buildSyncPlan_emptySrc_returnsNoPlans(t *testing.T) {
+	// Not t.Parallel() — per-connection handler state is shared with the
+	// fakeServer acceptLoop, and parallel tests would race on connHandlerIdx.
+
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
+
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+	if len(summary.Plans) != 0 {
+		t.Errorf("Plans=%d, want 0", len(summary.Plans))
+	}
+	if summary.TotalNew != 0 {
+		t.Errorf("TotalNew=%d, want 0", summary.TotalNew)
+	}
+}
+
+// Test_buildSyncPlan_messageIdDiff_correct asserts the Message-Id diff: src
+// has a@x, b@x, c@x at UIDs 1–3; dst has only b@x → plan must contain UIDs
+// 1 and 3 (sorted), NewMessages==2, DestinationFolderExists==true.
+func Test_buildSyncPlan_messageIdDiff_correct(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	srcMsgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {
+			{uid: 1, msgID: "a@x"},
+			{uid: 2, msgID: "b@x"},
+			{uid: 3, msgID: "c@x"},
+		},
+	}
+	dstMsgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {
+			{uid: 1, msgID: "b@x"},
+		},
+	}
+
+	srcSrv.addConnHandler(msgIDFetchHandler(srcSrv, []string{"INBOX"}, srcMsgs))
+	dstSrv.addConnHandler(msgIDFetchHandler(dstSrv, []string{"INBOX"}, dstMsgs))
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
+
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+	if len(summary.Plans) != 1 {
+		t.Fatalf("Plans=%d, want 1", len(summary.Plans))
+	}
+	plan := summary.Plans[0]
+	if plan.NewMessages != 2 {
+		t.Errorf("NewMessages=%d, want 2", plan.NewMessages)
+	}
+	if !plan.DestinationFolderExists {
+		t.Error("DestinationFolderExists=false, want true")
+	}
+	want := []uint32{1, 3}
+	if !slices.Equal(plan.SrcUIDs, want) {
+		t.Errorf("SrcUIDs=%v, want %v", plan.SrcUIDs, want)
+	}
+	if summary.TotalNew != 2 {
+		t.Errorf("TotalNew=%d, want 2", summary.TotalNew)
+	}
+}
+
+// Test_buildSyncPlan_dstMissing_setsDestinationFolderExistsFalse asserts that
+// when the destination folder is absent from the mailbox cache, the plan sets
+// DestinationFolderExists=false and no FETCH is issued on the dst side.
+func Test_buildSyncPlan_dstMissing_setsDestinationFolderExistsFalse(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	srcMsgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {{uid: 1, msgID: "only@x"}},
+	}
+	srcSrv.addConnHandler(msgIDFetchHandler(srcSrv, []string{"INBOX"}, srcMsgs))
+
+	// dst LIST returns no mailboxes → INBOX not in cache → MailboxExists=false.
+	dstSrv.addConnHandler(emptyListHandler(dstSrv))
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
+
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+	if len(summary.Plans) != 1 {
+		t.Fatalf("Plans=%d, want 1", len(summary.Plans))
+	}
+	plan := summary.Plans[0]
+	if plan.DestinationFolderExists {
+		t.Error("DestinationFolderExists=true, want false")
+	}
+	if plan.NewMessages != 1 {
+		t.Errorf("NewMessages=%d, want 1", plan.NewMessages)
+	}
+	if dstSrv.callCount("FETCH") != 0 {
+		t.Errorf("dst FETCH count=%d, want 0", dstSrv.callCount("FETCH"))
+	}
+	if dstSrv.callCount("UID FETCH") != 0 {
+		t.Errorf("dst UID FETCH count=%d, want 0", dstSrv.callCount("UID FETCH"))
+	}
+}
+
+// Test_buildSyncPlan_dstErrorIsFatal asserts that a non-transient error from
+// the destination EXAMINE causes buildSyncPlan to return an error wrapping
+// "scan destination folder".
+func Test_buildSyncPlan_dstErrorIsFatal(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	srcMsgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {{uid: 1, msgID: "msg@x"}},
+	}
+	srcSrv.addConnHandler(msgIDFetchHandler(srcSrv, []string{"INBOX"}, srcMsgs))
+
+	// dst has INBOX in cache but EXAMINE returns BAD → FetchMessageMap fails.
+	dstSrv.addConnHandler(badExamineHandler(dstSrv))
+
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
+
+	_, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "scan destination folder") {
+		t.Errorf("error %q does not contain %q", err.Error(), "scan destination folder")
+	}
+}
+
+// Test_buildSyncPlan_srcErrorContinues_dstFineSkipsMapping asserts that a
+// source-side EXAMINE error causes that mapping to be skipped (not fatal),
+// while subsequent mappings are still planned.
+func Test_buildSyncPlan_srcErrorContinues_dstFineSkipsMapping(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	srcMsgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {{uid: 1, msgID: "ok@x"}},
+	}
+	srcSrv.addConnHandler(noOnMissingFetchHandler(srcSrv, []string{"INBOX", "Missing"}, srcMsgs))
+	dstC := newAppClient(t, dstSrv, "dst")
+	srcC := newAppClient(t, srcSrv, "src")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{
+		{Source: "Missing", Destination: "Missing"},
+		{Source: "INBOX", Destination: "INBOX"},
+	}
+
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err != nil {
+		t.Fatalf("buildSyncPlan returned error: %v", err)
+	}
+	if len(summary.Plans) != 1 {
+		t.Fatalf("Plans=%d, want 1 (only INBOX plan)", len(summary.Plans))
+	}
+	if summary.Plans[0].SourceFolder != "INBOX" {
+		t.Errorf("plan source=%q, want INBOX", summary.Plans[0].SourceFolder)
+	}
+}
+
+// Test_buildSyncPlan_srcErrorVerboseLogging asserts that the verbose pw.Log
+// call for a source-side scan error is reached when verbose=true.
+func Test_buildSyncPlan_srcErrorVerboseLogging(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+
+	srcMsgs := map[string][]struct {
+		msgID string
+		uid   uint32
+	}{
+		"INBOX": {{uid: 1, msgID: "ok@x"}},
+	}
+	srcSrv.addConnHandler(noOnMissingFetchHandler(srcSrv, []string{"INBOX", "Missing"}, srcMsgs))
+	dstC := newAppClient(t, dstSrv, "dst")
+	srcC := newAppClient(t, srcSrv, "src")
+
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{
+		{Source: "Missing", Destination: "Missing"},
+		{Source: "INBOX", Destination: "INBOX"},
+	}
+
+	// verbose=true exercises the pw.Log("⚠️ Failed to fetch source folder...")
+	// branch for the "Missing" folder error.
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", true)
+	if err != nil {
+		t.Fatalf("buildSyncPlan returned error: %v", err)
+	}
+	if len(summary.Plans) != 1 {
+		t.Fatalf("Plans=%d, want 1", len(summary.Plans))
+	}
+}
+
+// Test_expandMappingsWithSubfolders_addsChildrenAndDedups asserts that
+// subfolders in the mailbox cache are appended and that a later explicit
+// mapping for the same source is deduplicated in favour of the expansion.
+func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
+	srcSrv := newFakeServer(t)
+
+	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"jira", "jira/DEVOPS", "jira/SCD"}))
+
+	srcC := newAppClient(t, srcSrv, "src")
+
+	delimiter := srcC.GetDelimiter() // "/"
+
+	mappings1 := []config.DirectoryMapping{{Source: "jira", Destination: "jira"}}
+	got1, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings1, delimiter, delimiter, false, true)
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders run1: %v", err)
+	}
+	if len(got1) != 3 {
+		t.Fatalf("run1 len=%d, want 3, got %v", len(got1), got1)
+	}
+	srcs1 := make([]string, len(got1))
+	for i, m := range got1 {
+		srcs1[i] = m.Source
+	}
+	slices.Sort(srcs1)
+	if !slices.Equal(srcs1, []string{"jira", "jira/DEVOPS", "jira/SCD"}) {
+		t.Errorf("run1 sources=%v, want [jira jira/DEVOPS jira/SCD]", srcs1)
+	}
+
+	mappings2 := []config.DirectoryMapping{
+		{Source: "jira", Destination: "jira"},
+		{Source: "jira/DEVOPS", Destination: "DEVOPS"},
+	}
+	got2, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings2, delimiter, delimiter, false, true)
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders run2: %v", err)
+	}
+	if len(got2) != 3 {
+		t.Fatalf("run2 len=%d, want 3, got %v", len(got2), got2)
+	}
+	// The first occurrence of jira/DEVOPS is from the parent expansion, whose
+	// destination is jira/DEVOPS (not the explicit DEVOPS).
+	var devopsMapping config.DirectoryMapping
+	for _, m := range got2 {
+		if m.Source == "jira/DEVOPS" {
+			devopsMapping = m
+			break
+		}
+	}
+	if devopsMapping.Destination != "jira/DEVOPS" {
+		t.Errorf("jira/DEVOPS destination=%q, want jira/DEVOPS (first occurrence wins)", devopsMapping.Destination)
+	}
+}
+
+// --- per-test connection handler helpers ---
+
+// emptyListHandler serves a LIST that returns no mailboxes. Used to simulate
+// a dst where the target folder does not yet exist.
+func emptyListHandler(srv *fakeServer) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			srv.mu.Lock()
+			srv.counts[verb]++
+			srv.mu.Unlock()
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	}
+}
+
+// badExamineHandler serves LIST with INBOX (so the cache has it) but responds
+// to EXAMINE with a BAD error. Used to simulate a fatal dst scan error.
+func badExamineHandler(srv *fakeServer) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			srv.mu.Lock()
+			srv.counts[verb]++
+			srv.mu.Unlock()
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" INBOX\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "EXAMINE", "SELECT":
+				_, _ = fmt.Fprintf(conn, "%s BAD internal error\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	}
+}
+
+// noOnMissingFetchHandler returns a handler that sends NO for EXAMINE on the
+// "Missing" folder and normal responses for every other folder.
+func noOnMissingFetchHandler(srv *fakeServer, mailboxes []string, msgs map[string][]struct {
+	msgID string
+	uid   uint32
+}) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		var selectedFolder string
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			arg := ""
+			if len(parts) == 3 {
+				arg = parts[2]
+			}
+			srv.mu.Lock()
+			srv.counts[verb]++
+			srv.mu.Unlock()
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				for _, mb := range mailboxes {
+					_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" %s\r\n", mb)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "EXAMINE", "SELECT":
+				folder := strings.Trim(arg, `"`)
+				if folder == "Missing" {
+					_, _ = fmt.Fprintf(conn, "%s NO Mailbox does not exist\r\n", tag)
+					continue
+				}
+				selectedFolder = folder
+				n := len(msgs[folder])
+				_, _ = fmt.Fprintf(conn, "* %d EXISTS\r\n* 0 RECENT\r\n", n)
+				_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, verb)
+			case "FETCH":
+				for i, m := range msgs[selectedFolder] {
+					hdr := imapMsgIDHeader(m.msgID)
+					_, _ = fmt.Fprintf(conn,
+						"* %d FETCH (UID %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
+						i+1, m.uid, len(hdr), hdr,
+					)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK FETCH completed\r\n", tag)
+			case "UID":
+				srv.mu.Lock()
+				srv.counts["UID FETCH"]++
+				srv.mu.Unlock()
+				_, _ = fmt.Fprintf(conn, "%s OK UID FETCH completed\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	}
+}
+
+// customListHandler returns a handler that serves the given mailboxes in the
+// LIST response and normal responses for everything else. Used to prime the
+// mailbox cache with specific folder names (e.g. for subfolder expansion tests).
+func customListHandler(srv *fakeServer, mailboxes []string) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tag, verb := parts[0], strings.ToUpper(parts[1])
+			srv.mu.Lock()
+			srv.counts[verb]++
+			srv.mu.Unlock()
+			switch verb {
+			case "LOGIN":
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case "LIST":
+				for _, mb := range mailboxes {
+					_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" %s\r\n", mb)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
+			case "LOGOUT":
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	}
+}
+
+// Test_expandMappingsWithSubfolders_verboseLogging asserts that the verbose
+// path in expandMappingsWithSubfolders runs without error and produces the
+// correct deduplication result.
+func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
+
+	srcC := newAppClient(t, srcSrv, "src")
+	delimiter := srcC.GetDelimiter()
+
+	// Explicit INBOX/Sub mapping will be deduped (expansion wins). The verbose +
+	// !quiet path exercises the fmt.Printf calls for found-subfolder and dropped.
+	mappings := []config.DirectoryMapping{
+		{Source: "INBOX", Destination: "INBOX"},
+		{Source: "INBOX/Sub", Destination: "INBOX/Sub"},
+	}
+	got, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings, delimiter, delimiter, true, false)
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2 (INBOX + INBOX/Sub), got %v", len(got), got)
+	}
+}
+
+// Test_expandMappingsWithSubfolders_canceledContext asserts that a pre-canceled
+// context causes expandMappingsWithSubfolders to return an error immediately.
+func Test_expandMappingsWithSubfolders_canceledContext(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	srcC := newAppClient(t, srcSrv, "src")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := expandMappingsWithSubfolders(ctx, srcC, []config.DirectoryMapping{
+		{Source: "INBOX", Destination: "INBOX"},
+	}, "/", "/", false, true)
+	if err == nil {
+		t.Fatal("expected error from canceled context, got nil")
+	}
+}
+
+// Test_buildSyncPlan_canceledContext asserts that a pre-canceled context causes
+// buildSyncPlan to return an error immediately without scanning any folders.
+func Test_buildSyncPlan_canceledContext(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	dstSrv := newFakeServer(t)
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	pw, srcTr, dstTr := makePlanPW()
+	_, err := buildSyncPlan(ctx, srcC, dstC, []config.DirectoryMapping{
+		{Source: "INBOX", Destination: "INBOX"},
+	}, srcTr, dstTr, pw, "src", "dst", false)
+	if err == nil {
+		t.Fatal("expected error from canceled context, got nil")
+	}
+}
+
+// Test_expandMappingsWithSubfolders_emptyDelimiters covers the else-branches
+// for relativePath and dstPath when srcDelimiter and dstDelimiter are "".
+// listSubfoldersFromCache falls back to the client's cached "/" delimiter, so
+// INBOX/Sub is found. With empty dstDelimiter the destination is the parent
+// mapping's destination (not expanded).
+func Test_expandMappingsWithSubfolders_emptyDelimiters(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	// Include a real subfolder so listSubfoldersFromCache (using "/") finds it.
+	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
+	srcC := newAppClient(t, srcSrv, "src")
+
+	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "TARGET"}}
+	// srcDelimiter="" → else branch: relativePath = TrimPrefix(subfolder, mapping.Source)
+	// dstDelimiter="" → else branch: dstPath = mapping.Destination
+	got, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings, "", "", false, true)
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2 (INBOX + INBOX/Sub), got %v", len(got), got)
+	}
+	if got[1].Destination != "TARGET" {
+		t.Errorf("INBOX/Sub destination=%q, want TARGET", got[1].Destination)
+	}
+}
+
+// Test_expandMappingsWithSubfolders_delimiterConversion covers the
+// srcDelimiter != dstDelimiter path that rewrites the subfolder relative path
+// before building the destination folder name.
+func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"jira", "jira/DEVOPS"}))
+	srcC := newAppClient(t, srcSrv, "src")
+
+	mappings := []config.DirectoryMapping{{Source: "jira", Destination: "jira"}}
+	// srcDelimiter="/", dstDelimiter="." → ReplaceAll("/", ".") in relative path.
+	got, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings, "/", ".", false, true)
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2, got %v", len(got), got)
+	}
+	// The subfolder jira/DEVOPS has relative path "DEVOPS"; after conversion
+	// (no "/" in "DEVOPS" to replace) the dst is "jira.DEVOPS".
+	if got[1].Destination != "jira.DEVOPS" {
+		t.Errorf("jira/DEVOPS destination=%q, want jira.DEVOPS", got[1].Destination)
 	}
 }
