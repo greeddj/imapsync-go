@@ -122,7 +122,9 @@ func printAccountInfo(title, server, user string, mailboxes []*client.MailboxInf
 	headerTable.SetOutputMirror(os.Stdout)
 	headerTable.Style().Options.DrawBorder = false
 	headerTable.Style().Options.SeparateColumns = false
-	headerTable.SetTitle(title)
+	// Bold + bright cyan matches the tracker palette and visually breaks
+	// up two adjacent borderless tables without adding layout.
+	headerTable.SetTitle(text.Colors{text.Bold, text.FgHiCyan}.Sprint(title))
 
 	headerTable.AppendRows([]table.Row{
 		{"Server", server},
