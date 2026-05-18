@@ -285,6 +285,37 @@ func newClientWithFake(t *testing.T, srv *fakeServer) *Client {
 	return c
 }
 
+// stallingLoginHandler returns a per-connection handler that sends the IMAP
+// greeting but never replies to LOGIN, causing go-imap to block until the
+// connection is terminated by Cancel().
+func stallingLoginHandler(srv *fakeServer) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			verb := strings.ToUpper(parts[1])
+			srv.mu.Lock()
+			srv.counts[verb]++
+			srv.mu.Unlock()
+			if verb == "LOGIN" {
+				// Never reply — block until the connection is closed.
+				b := make([]byte, 1)
+				_, _ = conn.Read(b)
+				return
+			}
+		}
+	}
+}
+
 // buildTestIMAPMessage constructs a minimal *imap.Message suitable for
 // passing to AppendMessage. The body section key must be the resp() form of
 // fullBodyPeekSection (Peek=false, empty BodyPartName) because go-imap always

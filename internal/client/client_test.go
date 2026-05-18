@@ -398,6 +398,141 @@ func Test_withCancel_stopBeforeContextCancels(t *testing.T) {
 	// the watcher goroutine leaked and held a reference preventing GC.
 }
 
+// Test_newDialer_setsTCPKeepalive asserts that newDialer returns a dialer with
+// KeepAlive set to tcpKeepAlivePeriod and Timeout set to the provided value.
+func Test_newDialer_setsTCPKeepalive(t *testing.T) {
+	t.Parallel()
+
+	d := newDialer(5 * time.Second)
+	if d.KeepAlive != tcpKeepAlivePeriod {
+		t.Errorf("KeepAlive = %v, want %v", d.KeepAlive, tcpKeepAlivePeriod)
+	}
+	if d.Timeout != 5*time.Second {
+		t.Errorf("Timeout = %v, want %v", d.Timeout, 5*time.Second)
+	}
+}
+
+// Test_connectAndLogin_CancelInterruptsLogin asserts that calling Cancel() on a
+// client whose fake server accepted the TCP connection and sent the IMAP banner
+// but never replied to LOGIN causes connectAndLogin to return within 100ms with
+// a non-nil error.
+func Test_connectAndLogin_CancelInterruptsLogin(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(stallingLoginHandler(srv))
+
+	c := &Client{
+		serverAddr:  srv.ln.Addr().String(),
+		username:    "user",
+		password:    "pass",
+		dialTimeout: 5 * time.Second,
+		folderLocks: make(map[string]*sync.Mutex),
+		cancelCh:    make(chan struct{}),
+	}
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	t.Cleanup(func() { c.Cancel(); _ = c.Logout() })
+
+	ch := make(chan error, 1)
+	go func() {
+		ch <- c.connectAndLogin(context.Background())
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	c.Cancel()
+
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		if err == nil {
+			t.Error("connectAndLogin returned nil, want non-nil error after Cancel")
+		}
+	case <-timer.C:
+		t.Error("connectAndLogin did not return within 100ms after Cancel")
+	}
+}
+
+// Test_safeCall_CancelDuringReconnectLogin asserts the user-visible Ctrl+C path:
+// when the first fn call returns io.EOF (forcing a reconnect) and the
+// reconnect's LOGIN stalls, calling Cancel() causes safeCall to return within
+// 100ms with a non-nil error.
+//
+// The stalling handler is registered after the initial connection is established
+// so that the initial connectAndLogin consumes the default handler, and only the
+// reconnect attempt hits the stalling handler.
+func Test_safeCall_CancelDuringReconnectLogin(t *testing.T) {
+	srv := newFakeServer(t)
+
+	c := newClientWithFake(t, srv)
+	c.reconnectDur = 0
+	c.backoff = 0
+
+	srv.addConnHandler(stallingLoginHandler(srv))
+
+	orig := sleepCtx
+	sleepCtx = func(_ context.Context, d time.Duration) error { return nil }
+	t.Cleanup(func() { sleepCtx = orig })
+
+	ch := make(chan error, 1)
+	go func() {
+		ch <- c.safeCall(func(_ *imapclient.Client) error {
+			return io.EOF
+		})
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	c.Cancel()
+
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		if err == nil {
+			t.Error("safeCall returned nil, want non-nil error after Cancel during reconnect LOGIN")
+		}
+	case <-timer.C:
+		t.Error("safeCall did not return within 100ms after Cancel during reconnect LOGIN")
+	}
+}
+
+// Test_New_initialLoginInterruptibleByContextCancel asserts that passing a
+// context that is cancelled mid-LOGIN to client.New causes it to return within
+// 100ms with a non-nil error.
+func Test_New_initialLoginInterruptibleByContextCancel(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(stallingLoginHandler(srv))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan error, 1)
+	go func() {
+		_, err := New(ctx, srv.ln.Addr().String(), "user", "pass", Options{
+			DialTimeout: 5 * time.Second,
+		})
+		ch <- err
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		if err == nil {
+			t.Error("New returned nil, want non-nil error after context cancel during LOGIN")
+		}
+	case <-timer.C:
+		t.Error("New did not return within 100ms after context cancel during LOGIN")
+	}
+}
+
 // --- per-connection handler helpers ---
 
 // connHandlerWithLoginReply returns a handler that sends the greeting, replies

@@ -36,6 +36,8 @@ const (
 	defaultDialTimeout = 30 * time.Second
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
 	uidFetchBatchSize = 500
+	// tcpKeepAlivePeriod is the idle interval before the first keepalive probe.
+	tcpKeepAlivePeriod = 30 * time.Second
 )
 
 // ProgressWriter is a minimal interface for progress tracking and logging.
@@ -130,6 +132,15 @@ func (c *Client) folderLock(path string) *sync.Mutex {
 	return lock
 }
 
+// newDialer builds the *net.Dialer used by Client. 30 s idle before the first
+// keepalive probe; dead-peer detection then falls within the OS-default
+// keepalive envelope (typically several minutes on macOS/Linux) — fast enough
+// that a Wi-Fi flap doesn't strand the sync indefinitely, slow enough to not
+// break legitimate long fetches.
+func newDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{Timeout: timeout, KeepAlive: tcpKeepAlivePeriod}
+}
+
 // New establishes a connection and logs into the IMAP server.
 //
 // ctx is used only for the initial dial and login; once Client is returned,
@@ -159,7 +170,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	}
 
 	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
-		nd := &net.Dialer{Timeout: c.dialTimeout}
+		nd := newDialer(c.dialTimeout)
 		var (
 			conn net.Conn
 			err  error
@@ -349,6 +360,9 @@ var sleepCtx = realSleepCtx
 
 // connectAndLogin establishes a new IMAP connection and authenticates the user.
 func (c *Client) connectAndLogin(ctx context.Context) error {
+	stop := c.withCancel(ctx)
+	defer stop()
+
 	conn, err := c.dialFn(ctx, c.serverAddr)
 	if err != nil {
 		return err
@@ -360,12 +374,17 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 		return err
 	}
 
+	// Store cli before Login so Cancel() can Terminate the underlying
+	// connection mid-LOGIN — without this, a half-open TCP after a Wi-Fi
+	// flap leaves Login blocked until the kernel times the socket out.
+	c.c.Store(cli)
+
 	if err := cli.Login(c.username, c.password); err != nil {
 		_ = cli.Logout()
+		c.c.Store(nil)
 		return err
 	}
 
-	c.c.Store(cli)
 	return nil
 }
 
