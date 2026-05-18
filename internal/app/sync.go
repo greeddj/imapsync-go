@@ -264,7 +264,12 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			fmt.Printf("📤 Messages to be copied to destination:\n")
 			foldersToCreate := make([]string, 0, len(summary.Plans))
 			for _, plan := range summary.Plans {
-				foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
+				// Preview only the folders we will actually create — the
+				// real creation loop below filters the same way, so showing
+				// already-existing folders here just misleads the user.
+				if !plan.DestinationFolderExists {
+					foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
+				}
 				if plan.NewMessages > 0 {
 					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
 					if verbose {
