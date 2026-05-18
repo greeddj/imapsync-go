@@ -359,24 +359,23 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	// Pre-creation MUST stay a pre-stage: each worker holds its own mailbox
 	// cache, so a worker-side CreateMailbox would race against other workers'
 	// stale caches.
-	if len(activePlans) > 0 {
+	foldersToCreate := make(map[string]bool)
+	for _, plan := range activePlans {
+		if !plan.DestinationFolderExists {
+			foldersToCreate[plan.DestinationFolder] = true
+		}
+	}
+
+	if len(foldersToCreate) > 0 {
 		if !quiet {
 			fmt.Println("\n📁 Creating destination folders...")
 		}
 
 		creationPW := progress.NewWriter(1, quiet)
 		creationPW.Start()
-		creationTracker := progress.NewTracker("Creating folders", int64(len(activePlans)))
+		creationTracker := progress.NewTracker("Creating folders", int64(len(foldersToCreate)))
 		creationPW.AppendTracker(creationTracker)
 
-		foldersToCreate := make(map[string]bool)
-		for _, plan := range activePlans {
-			if !plan.DestinationFolderExists {
-				foldersToCreate[plan.DestinationFolder] = true
-			}
-		}
-
-		creationTracker.UpdateTotal(int64(len(foldersToCreate)))
 		createdCount := 0
 		failedCount := 0
 
