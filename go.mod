@@ -6,6 +6,7 @@ require (
 	github.com/emersion/go-imap v1.2.1
 	github.com/jedib0t/go-pretty/v6 v6.7.10
 	github.com/urfave/cli/v3 v3.8.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.42.0
 	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -18,7 +19,6 @@ require (
 	github.com/mattn/go-runewidth v0.0.23 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260428171046-76f71b9afea0 // indirect
 	golang.org/x/text v0.36.0 // indirect
