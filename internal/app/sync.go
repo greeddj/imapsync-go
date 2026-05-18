@@ -19,6 +19,10 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// verboseUIDLimit caps the per-plan UID dump in --verbose preview so a
+// large plan (tens of thousands of UIDs) doesn't bury the confirm prompt.
+const verboseUIDLimit = 20
+
 // FolderSyncPlan describes how a single source folder should be copied to its
 // destination.
 //
@@ -288,8 +292,20 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				if plan.NewMessages > 0 {
 					fmt.Printf("• %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
 					if verbose {
-						for _, uid := range plan.SrcUIDs {
+						// Dumping every UID before the confirm-prompt
+						// drowns the user in screens of integers — a
+						// 10k-message plan turned the prompt invisible.
+						// Show a sample and a count.
+						n := len(plan.SrcUIDs)
+						limit := n
+						if limit > verboseUIDLimit {
+							limit = verboseUIDLimit
+						}
+						for _, uid := range plan.SrcUIDs[:limit] {
 							fmt.Printf("  • UID %d\n", uid)
+						}
+						if n > verboseUIDLimit {
+							fmt.Printf("  • … and %d more\n", n-verboseUIDLimit)
 						}
 						fmt.Println()
 					}
