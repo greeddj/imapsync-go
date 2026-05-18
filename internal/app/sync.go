@@ -390,20 +390,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		fmt.Println("\n📥 Syncing messages...")
 	}
 
-	// Cap parallelism by --workers, --max-connections, and number of plans.
-	// Each worker holds one src + one dst connection for the whole sync, so
-	// the number of open IMAP sessions per side equals effectiveWorkers + 1
-	// (the "+1" is the planning client we already opened).
-	effectiveWorkers := cfg.Workers
-	if maxConn := cfg.RateLimit.MaxConnections; maxConn > 0 && maxConn < effectiveWorkers {
-		effectiveWorkers = maxConn
-	}
-	if effectiveWorkers > len(activePlans) {
-		effectiveWorkers = len(activePlans)
-	}
-	if effectiveWorkers < 1 {
-		effectiveWorkers = 1
-	}
+	effectiveWorkers := computeEffectiveWorkers(cfg.Workers, cfg.RateLimit.MaxConnections, len(activePlans))
 
 	workers, err := newSyncWorkerPool(ctx, cfg, srcOpts, dstOpts, effectiveWorkers)
 	if err != nil {
@@ -682,6 +669,24 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client,
 		}
 	}
 	return out, nil
+}
+
+// computeEffectiveWorkers caps the worker count by both the configured cap
+// and the number of plans actually scheduled. maxConn is the per-side IMAP
+// connection budget; the planning client is still open when workers start,
+// so we reserve one slot for it (maxConn-1). Returns at least 1.
+func computeEffectiveWorkers(workers, maxConn, planCount int) int {
+	eff := workers
+	if maxConn > 0 && maxConn-1 < eff {
+		eff = maxConn - 1
+	}
+	if eff > planCount {
+		eff = planCount
+	}
+	if eff < 1 {
+		eff = 1
+	}
+	return eff
 }
 
 // dedupeMappings keeps the first occurrence of each Source. The second return
