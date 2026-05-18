@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/commands"
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/helpers"
+	appkg "github.com/greeddj/imapsync-go/internal/app"
 
 	"github.com/urfave/cli/v3"
 )
@@ -59,8 +61,17 @@ func run() int {
 	defer stop()
 
 	if err := app.Run(ctx, os.Args); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+		switch {
+		case errors.Is(err, context.Canceled):
+			fmt.Fprintln(os.Stderr, "Cancelled.")
+			return 130
+		case errors.Is(err, appkg.ErrSilentExit):
+			// ActionSync has already printed a human-friendly summary.
+			return 1
+		default:
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
 	}
 	return 0
 }

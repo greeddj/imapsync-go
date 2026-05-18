@@ -60,7 +60,6 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	}
 	cfg, err := config.New(c)
 	if err != nil {
-		fmt.Printf("Config error: %v\n", err)
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -93,7 +92,6 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 			{Source: srcFolder, Destination: dstFolder},
 		}
 	case srcFolder != "" || dstFolder != "":
-		fmt.Println("both --src-folder and --dest-folder must be specified")
 		return errors.New("both --src-folder and --dest-folder must be specified")
 	default:
 		if len(cfg.Map) == 0 {
@@ -486,7 +484,9 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 	if totalErrorsN > 0 {
 		fmt.Printf("❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSyncedN, totalErrorsN)
-		return fmt.Errorf("sync completed with %d errors", totalErrorsN)
+		// Friendly summary already printed; signal non-zero exit without
+		// asking main to repeat the same information through stderr.
+		return ErrSilentExit
 	}
 
 	fmt.Println("✨ Sync completed successfully. ✨")
