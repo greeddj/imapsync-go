@@ -1,6 +1,6 @@
 ---
 name: coverage-audit
-description: Apply when auditing test coverage on changed packages. Used by the `tester` agent. Encodes the project's stance: branch and invariant coverage matter more than total %, deliberate exclusions must be recorded with reasoning.
+description: "Apply when auditing test coverage on changed packages. Used by the `tester` agent. Encodes the project's stance: branch and invariant coverage matter more than total %, deliberate exclusions must be recorded with reasoning."
 ---
 
 # Coverage audit

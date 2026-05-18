@@ -1,5 +1,5 @@
 ---
-description: Build local OCI image (runs `just oci`). Args: `[executor] [tag]`, defaults `podman local`.
+description: "Build local OCI image (runs `just oci`). Args: `[executor] [tag]`, defaults `podman local`."
 allowed-tools: Bash(just oci:*)
 ---
 
