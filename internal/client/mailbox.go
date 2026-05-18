@@ -216,8 +216,13 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 		mbox.Messages = status.Messages
 		if status.Messages > 0 {
 			size, err := c.getFolderSize(ctx, mbox.Name)
-			if err == nil {
+			switch {
+			case err == nil:
 				mbox.Size = size
+			case ctx.Err() != nil:
+				// canceled — outer loop will bail
+			case c.verbose:
+				c.log("[%s] failed to size %s: %v", c.prefix, mbox.Name, err)
 			}
 		}
 
