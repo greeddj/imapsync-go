@@ -237,16 +237,29 @@ func (c *Client) getFolderSize(ctx context.Context, folder string) (uint64, erro
 	var totalSize uint64
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		totalSize = 0
-		mbox, err := cli.Select(folder, true)
+		mbox, err := c.selectIfNeeded(cli, folder)
 		if err != nil {
 			return err
 		}
-		if mbox.Messages == 0 {
+		// selectIfNeeded returns nil when the folder is already selected
+		// on this connection — fall back to STATUS for the count, same as
+		// FetchMessageMap does.
+		var total uint32
+		if mbox != nil {
+			total = mbox.Messages
+		} else {
+			st, serr := cli.Status(folder, []imap.StatusItem{imap.StatusMessages})
+			if serr != nil {
+				return serr
+			}
+			total = st.Messages
+		}
+		if total == 0 {
 			return nil
 		}
 
 		seqset := new(imap.SeqSet)
-		seqset.AddRange(1, mbox.Messages)
+		seqset.AddRange(1, total)
 
 		messages := make(chan *imap.Message, messageChanBuffer)
 		done := make(chan error, 1)
