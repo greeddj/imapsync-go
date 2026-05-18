@@ -355,22 +355,17 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 				creationPW.Stop()
 				return ctx.Err()
 			case err != nil:
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "Mailbox exists") {
-					if verbose {
-						creationPW.Log("Folder %s already exists", folder)
-					}
-					createdCount++
-				} else {
-					creationPW.Log("Failed to create folder %q: %v", folder, err)
-					failedCount++
-				}
+				creationPW.Log("Failed to create folder %q: %v", folder, err)
+				failedCount++
 			case created:
 				if verbose {
 					creationPW.Log("Created folder %q", folder)
 				}
 				createdCount++
 			default:
+				if verbose {
+					creationPW.Log("Folder %s already exists", folder)
+				}
 				createdCount++
 			}
 

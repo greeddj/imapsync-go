@@ -75,6 +75,14 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
+		// Another client (or our own stale cache) created the folder
+		// between hasMailbox() and Create(). Treat as idempotent success
+		// — but still refresh the cache so subsequent lookups skip the
+		// LIST round-trip.
+		if isAlreadyExistsErr(err) {
+			c.addMailboxToCache(name)
+			return false, nil
+		}
 		return false, fmt.Errorf("[%s] failed to create mailbox %s: %w", c.prefix, name, err)
 	}
 	c.addMailboxToCache(name)
@@ -106,7 +114,7 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 			err = c.safeCall(func(cli *imapclient.Client) error {
 				return cli.Create(parentPath)
 			})
-			if err != nil {
+			if err != nil && !isAlreadyExistsErr(err) {
 				lock.Unlock()
 				return fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, err)
 			}

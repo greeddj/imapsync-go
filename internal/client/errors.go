@@ -97,3 +97,14 @@ func classifyError(err error) ErrClass {
 func isRetryable(err error) bool {
 	return classifyError(err) == ClassTransient
 }
+
+// isAlreadyExistsErr matches the two phrasings IMAP servers use to refuse a
+// CREATE for a mailbox that already exists. Confined to this package so the
+// app layer does not have to grep server text — see go-style.md.
+func isAlreadyExistsErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "mailbox exists")
+}

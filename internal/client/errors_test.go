@@ -48,6 +48,30 @@ func TestClassifyError(t *testing.T) {
 	}
 }
 
+func TestIsAlreadyExistsErr(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		err  error
+		name string
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "lowercaseAlreadyExists", err: errors.New("CREATE failed: mailbox already exists"), want: true},
+		{name: "mixedCaseAlreadyExists", err: errors.New("Folder Already Exists"), want: true},
+		{name: "dovecotMailboxExists", err: errors.New("NO Mailbox exists"), want: true},
+		{name: "unrelated", err: errors.New("permission denied"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isAlreadyExistsErr(tt.err); got != tt.want {
+				t.Errorf("isAlreadyExistsErr(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsRetryable(t *testing.T) {
 	t.Parallel()
 
