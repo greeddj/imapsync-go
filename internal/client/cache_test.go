@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// newTestClient builds a Client with the bare minimum needed to exercise the
-// cache helpers — no real IMAP connection.
 func newTestClient() *Client {
 	c := &Client{
 		folderLocks: make(map[string]*sync.Mutex),

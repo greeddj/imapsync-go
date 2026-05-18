@@ -23,6 +23,16 @@ If something is hard to test, it must be either tested at integration level or d
 - `goreleaser` output (delegated to goreleaser).
 - The `urfave/cli/v3` flag parsing wiring in `cmd/imapsync-go/main.go` (declarative; failure mode is a CLI parse error from the library).
 
+### `internal/client` deliberate exclusions (added with P3.1 fake-server suite)
+
+- **`client.New` full constructor** — covered transitively by every fake-server test through `connectAndLogin`. The TLS dial path is delegated to stdlib and covered at integration level.
+- **`Client.SetPrefix`, `Client.GetDelimiter`** — trivial one-liners; observable in all fake-server tests that set a delimiter.
+- **`Client.SetProgressTracker`** — symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
+- **`realSleepCtx`** — production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
+- **`Client.getFolderSize`** — requires the fake server to emit `RFC822.SIZE` in FETCH responses, which it currently does not. Used only by `show`; observable in smoke tests.
+- **`AppendMessage` mid-APPEND transient retry** — the streaming-literal design (`msg.GetBody(...)` handed straight to `cli.Append`, no `io.ReadAll`) means the literal has been partially consumed before a mid-APPEND error is detected. There is nothing to retry: the literal stream is exhausted. Idempotency is recovered by the next sync run's Message-Id diff. This path is architecturally untestable in isolation without a mock that simulates a partial-write failure mid-literal, which would not test real go-imap behaviour.
+- **`safeCall` post-reconnect `isCancelled()` branch** — exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
+
 If the tester finds an untested branch that does not match an existing exclusion, the choice is:
 
 1. Add a test (preferred).

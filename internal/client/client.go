@@ -328,9 +328,9 @@ func (c *Client) log(format string, args ...any) {
 	}
 }
 
-// sleepCtx sleeps for d, returning early with ctx.Err() if the context is
+// realSleepCtx sleeps for d, returning early with ctx.Err() if the context is
 // cancelled. d <= 0 returns nil immediately.
-func sleepCtx(ctx context.Context, d time.Duration) error {
+func realSleepCtx(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
 	}
@@ -343,6 +343,9 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 		return nil
 	}
 }
+
+// indirection so tests can observe / fast-forward the reconnect backoff without sleeping.
+var sleepCtx = realSleepCtx
 
 // connectAndLogin establishes a new IMAP connection and authenticates the user.
 func (c *Client) connectAndLogin(ctx context.Context) error {
