@@ -83,6 +83,23 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	// lastUpdate throttles the per-message message-string update — it lives
 	// on the worker goroutine, so an unsynchronized time.Time is fine.
 	var lastUpdate time.Time
+	var lastErrMsg string
+
+	updateTrackerMsg := func() {
+		if errors == 0 {
+			tr.UpdateMessage(fmt.Sprintf("%d/%d (%d↑/%d) %s → %s",
+				planIdx+1, planCount, synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
+			return
+		}
+		// Trim the inline reason so a long server message doesn't wrap
+		// the tracker line and break the rendered bar.
+		reason := lastErrMsg
+		if len(reason) > 40 {
+			reason = reason[:37] + "..."
+		}
+		tr.UpdateMessage(fmt.Sprintf("%d/%d (%d↑ %d✗ %q) %s → %s",
+			planIdx+1, planCount, synced, errors, reason, p.SourceFolder, p.DestinationFolder))
+	}
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
 		if err := w.dst.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
@@ -90,15 +107,26 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 				return ctx.Err()
 			}
 			errors++
-			pw.Log("Failed to append message to %s: %v", p.DestinationFolder, err)
+			lastErrMsg = err.Error()
+			// Without --verbose we never persist per-message failures to
+			// the log writer: at high error rates that floods the screen
+			// with hundreds of lines and scrolls the progress bars out.
+			// Operators still see the counter and the last reason via the
+			// tracker line below.
+			if verbose {
+				pw.Log("Failed to append message to %s: %v", p.DestinationFolder, err)
+			}
+			if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
+				lastUpdate = now
+				updateTrackerMsg()
+			}
 			return nil
 		}
 		synced++
 		tr.Increment(1)
 		if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
 			lastUpdate = now
-			tr.UpdateMessage(fmt.Sprintf("%d/%d (%d/%d) %s → %s",
-				planIdx+1, planCount, synced, p.NewMessages, p.SourceFolder, p.DestinationFolder))
+			updateTrackerMsg()
 		}
 		if verbose {
 			pw.Log("Synced %d/%d to %s, processed msg id %s",
