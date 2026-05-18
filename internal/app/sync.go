@@ -439,9 +439,9 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	defer syncPW.Stop()
 
 	trackers := make([]*progress.Tracker, len(activePlans))
-	for i := range activePlans {
+	for i, plan := range activePlans {
 		trackers[i] = progress.NewTracker(
-			fmt.Sprintf("%d/%d Waiting...", i+1, len(activePlans)),
+			fmt.Sprintf("%d/%d Waiting: %s → %s", i+1, len(activePlans), plan.SourceFolder, plan.DestinationFolder),
 			100,
 		)
 		syncPW.AppendTracker(trackers[i])
