@@ -45,7 +45,6 @@ curl -LO https://github.com/greeddj/imapsync-go/releases/latest/download/imapsyn
 tar xzf imapsync-go_<version>_Linux_x86_64.tar.gz
 chmod +x imapsync-go
 sudo mv imapsync-go /usr/local/bin/
-sudo xattr -rd com.apple.quarantine /usr/local/bin/imapsync-go
 ```
 
 ## Usage
@@ -141,22 +140,24 @@ sync -w 4
 
 - `-c, --config` - Path to configuration file (default: `config.json`)
 
+**Show command:**
+
+- `-V, --verbose` - Show additional detail (env: `IMAPSYNC_VERBOSE`)
+- `-q, --quiet` - Suppress progress bars; output is plain text suitable for piping (env: `IMAPSYNC_QUIET`)
+
 **Sync command:**
 
-- `-s, --src-folder` - Source folder (overrides config)
-- `-d, --dest-folder` - Destination folder (overrides config)
-- `-w, --workers` - Number of parallel workers (default: 4, max: 10)
-- `-y, --confirm` - Auto-confirm without prompt
-- `-V, --verbose` - Enable verbose output
-- `-q, --quiet` - Suppress non-error output
-- `--bps-down` - Max bytes/sec read from the source server (0 = unlimited)
-- `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited)
-- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = workers)
+- `-s, --src-folder` - Source folder (overrides config) (env: `IMAPSYNC_SOURCE_FOLDER`)
+- `-d, --dest-folder` - Destination folder (overrides config) (env: `IMAPSYNC_DESTINATION_FOLDER`)
+- `-w, --workers` - Number of parallel workers (default: 4, max: 10) (env: `IMAPSYNC_WORKERS`)
+- `-y, --confirm, --yes` - Auto-confirm without prompt (env: `IMAPSYNC_CONFIRM`)
+- `-V, --verbose` - Enable verbose output (env: `IMAPSYNC_VERBOSE`)
+- `-q, --quiet` - Suppress non-error output (env: `IMAPSYNC_QUIET`)
+- `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
+- `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`)
+- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = no cap). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
 
-The same values can be set in config under a `rate_limit` block (`down_bps`,
-`up_bps`, `max_connections`) and via env vars `IMAPSYNC_BPS_DOWN`,
-`IMAPSYNC_BPS_UP`, `IMAPSYNC_MAX_CONNECTIONS`. Flags win over config when
-both are set.
+The same `bps-down`, `bps-up`, and `max-connections` values can be set in config under a `rate_limit` block (`down_bps`, `up_bps`, `max_connections`). CLI flags take precedence when both are set.
 
 ## Provider quotas (Gmail)
 
@@ -175,12 +176,21 @@ imapsync-go sync \
   --bps-down 300000 \
   --bps-up 300000 \
   --max-connections 10 \
-  -w 4
+  -w 9
 ```
+
+`--max-connections 10` reserves one slot for the planning client, leaving 9
+slots for workers. `-w 9` matches that ceiling; setting `-w` higher than
+`maxConn−1` is harmless — the cap is enforced automatically.
 
 The defaults (no throttle) match `imapsync`'s default behaviour — they're
 appropriate for self-hosted IMAP servers on a LAN, not for big-provider
 mailboxes.
+
+## Notes
+
+- **Ctrl-C** exits with code 130 and prints `Cancelled.` — this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
+- **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default.
 
 ## Idempotency caveats
 

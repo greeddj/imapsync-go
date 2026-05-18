@@ -343,9 +343,7 @@ func appendHandler(srv *fakeServer) func(net.Conn) {
 			case "LOGIN":
 				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
 			case "APPEND":
-				// Send continuation request for the literal body.
 				_, _ = fmt.Fprintf(conn, "+ Ready for literal data\r\n")
-				// Consume the body line sent by go-imap, then reply OK.
 				bodyLine, _ := reader.ReadString('\n')
 				_ = bodyLine
 				_, _ = fmt.Fprintf(conn, "%s OK APPEND completed\r\n", tag)

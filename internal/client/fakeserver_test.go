@@ -109,7 +109,6 @@ func (s *fakeServer) handle(conn net.Conn) {
 			continue
 		}
 
-		// Every client line starts with a tag, then the command, then args.
 		parts := strings.SplitN(line, " ", 3)
 		if len(parts) < 2 {
 			_, _ = fmt.Fprintf(conn, "* BAD parse error\r\n")
