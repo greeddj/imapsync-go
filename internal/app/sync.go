@@ -316,10 +316,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 						// 10k-message plan turned the prompt invisible.
 						// Show a sample and a count.
 						n := len(plan.SrcUIDs)
-						limit := n
-						if limit > verboseUIDLimit {
-							limit = verboseUIDLimit
-						}
+						limit := min(n, verboseUIDLimit)
 						for _, uid := range plan.SrcUIDs[:limit] {
 							fmt.Printf("  • UID %d\n", uid)
 						}

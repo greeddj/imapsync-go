@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -230,11 +231,8 @@ func Test_reconnect_throttledBackoff(t *testing.T) {
 	}
 
 	var foundThrottle bool
-	for _, d := range recorded {
-		if d == throttledBackoff {
-			foundThrottle = true
-			break
-		}
+	if slices.Contains(recorded, throttledBackoff) {
+		foundThrottle = true
 	}
 	if !foundThrottle {
 		t.Errorf("throttledBackoff (%s) not recorded in sleepCtx calls: %v", throttledBackoff, recorded)
@@ -389,8 +387,7 @@ func Test_withCancel_stopBeforeContextCancels(t *testing.T) {
 	t.Parallel()
 
 	c := &Client{cancelCh: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	stop := c.withCancel(ctx)
 	stop()

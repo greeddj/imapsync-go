@@ -49,7 +49,7 @@ func (p *syncWorkerPool) close() {
 func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts client.Options, n int) (*syncWorkerPool, error) {
 	pool := &syncWorkerPool{all: make([]*syncWorker, 0, n)}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := ctx.Err(); err != nil {
 			pool.close()
 			return nil, err

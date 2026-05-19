@@ -35,10 +35,7 @@ func NewLimiter(bps int) *rate.Limiter {
 	if bps <= 0 {
 		return nil
 	}
-	burst := bps
-	if burst < minBurst {
-		burst = minBurst
-	}
+	burst := max(bps, minBurst)
 	return rate.NewLimiter(rate.Limit(bps), burst)
 }
 
@@ -84,10 +81,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 func waitN(ctx context.Context, lim *rate.Limiter, n int) error {
 	burst := lim.Burst()
 	for n > 0 {
-		chunk := n
-		if chunk > burst {
-			chunk = burst
-		}
+		chunk := min(n, burst)
 		if err := lim.WaitN(ctx, chunk); err != nil {
 			return err
 		}

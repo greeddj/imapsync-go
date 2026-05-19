@@ -35,7 +35,7 @@ const (
 	// defaultDialTimeout is the maximum time spent on a single TCP/TLS dial.
 	defaultDialTimeout = 30 * time.Second
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
-	uidFetchBatchSize = 500
+	uidFetchBatchSize  = 500
 	tcpKeepAlivePeriod = 30 * time.Second
 )
 

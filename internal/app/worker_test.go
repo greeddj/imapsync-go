@@ -360,7 +360,6 @@ func Test_runFolderSync_persistentLogOnlyUnderVerbose(t *testing.T) {
 		{verbose: false, want: false},
 		{verbose: true, want: true},
 	} {
-		tc := tc
 		t.Run(fmt.Sprintf("verbose=%v", tc.verbose), func(t *testing.T) {
 			t.Parallel()
 
