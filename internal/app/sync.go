@@ -122,10 +122,25 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	case srcFolder != "" || dstFolder != "":
 		return errors.New("both --src-folder and --dest-folder must be specified")
 	default:
-		if len(cfg.Map) == 0 {
-			return errors.New("no folder mappings in config")
+		if len(cfg.Map) > 0 {
+			mappings = cfg.Map
+		} else {
+			// dynamically build the mappings from the source folders
+			c, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
+			if err != nil {
+				return fmt.Errorf("source connection failed: %w", err)
+			}
+			mailboxes, err := c.ListMailboxes(ctx)
+			if err != nil {
+				return fmt.Errorf("source connection list mailbox failed: %w", err)
+			}
+			for _, mb := range mailboxes {
+				mappings = append(mappings, config.DirectoryMapping{
+					Source:      mb.Name,
+					Destination: mb.Name,
+				})
+			}
 		}
-		mappings = cfg.Map
 	}
 
 	if !quiet && verbose {

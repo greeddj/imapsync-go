@@ -102,6 +102,12 @@ map:
     dst: Sent Items
 ```
 
+> **Note:** The `map` section is optional. If omitted, `imapsync-go`
+> automatically connects to the source server, lists all mailboxes, and
+> builds a 1:1 mapping of every source folder to the same-named destination
+> folder. You can also use `--src-folder` / `--dest-folder` to sync a single
+> folder without a config file `map` section.
+
 ### Authentication
 
 The `auth` field in `src` or `dst` blocks is optional and specifies the authentication mechanism:
@@ -119,10 +125,10 @@ export IMAPSYNC_CONFIG="/Users/$(whoami)/.imapsync/prod_config.json"
 # Show available folders
 imapsync-go show
 
-# Sync all configured folders
+# Sync all folders (from config map or auto-discovered from source)
 imapsync-go sync -w 4
 
-# Sync specific folder
+# Sync a single folder
 imapsync-go sync -s INBOX -d INBOX
 imapsync-go sync -s 'Test.[some_group].box' -d 'Test/some_group/box'
 
