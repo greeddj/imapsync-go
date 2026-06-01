@@ -93,8 +93,18 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	// all upload traffic. Either may be nil ("unlimited").
 	srcReadLim := ratelimit.NewLimiter(cfg.RateLimit.DownBPS)
 	dstWriteLim := ratelimit.NewLimiter(cfg.RateLimit.UpBPS)
-	srcOpts := client.Options{UseTLS: true, Verbose: verbose, ReadLimiter: srcReadLim}
-	dstOpts := client.Options{UseTLS: true, Verbose: verbose, WriteLimiter: dstWriteLim}
+	srcOpts := client.Options{
+		UseTLS:      true,
+		Auth:        cfg.Src.Auth,
+		Verbose:     verbose,
+		ReadLimiter: srcReadLim,
+	}
+	dstOpts := client.Options{
+		UseTLS:       true,
+		Auth:         cfg.Dst.Auth,
+		Verbose:      verbose,
+		WriteLimiter: dstWriteLim,
+	}
 
 	if !quiet {
 		if w := buildProviderWarning(cfg, srcReadLim, dstWriteLim); w != "" {

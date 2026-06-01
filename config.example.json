@@ -3,13 +3,15 @@
     "label": "old",
     "server": "mail.oldhost.com:993",
     "user": "user@oldhost.com",
-    "pass": "password"
+    "pass": "password",
+    "auth": "login"
   },
   "dst": {
     "label": "new",
     "server": "imap.newhost.com:993",
     "user": "user@newhost.com",
-    "pass": "password"
+    "pass": "password",
+    "auth": "login"
   },
   "map": [
     {

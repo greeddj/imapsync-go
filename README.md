@@ -61,17 +61,19 @@ Create a configuration file (`config.json` or `config.yaml`):
     "label": "Source",
     "server": "imap.source.com:993",
     "user": "user@source.com",
-    "pass": "password"
+    "pass": "password",
+    "auth": "login"
   },
   "dst": {
     "label": "Destination",
     "server": "imap.dest.com:993",
     "user": "user@dest.com",
-    "pass": "password"
+    "pass": "password",
+    "auth": "cram-md5"
   },
   "map": [
-    {"src": "INBOX", "dst": "INBOX"},
-    {"src": "Sent", "dst": "Sent Items"}
+    { "src": "INBOX", "dst": "INBOX" },
+    { "src": "Sent", "dst": "Sent Items" }
   ]
 }
 ```
@@ -84,12 +86,14 @@ src:
   server: imap.source.com:993
   user: user@source.com
   pass: password
+  auth: login
 
 dst:
   label: Destination
   server: imap.dest.com:993
   user: user@dest.com
   pass: password
+  auth: cram-md5
 
 map:
   - src: INBOX
@@ -97,6 +101,15 @@ map:
   - src: Sent
     dst: Sent Items
 ```
+
+### Authentication
+
+The `auth` field in `src` or `dst` blocks is optional and specifies the authentication mechanism:
+
+- `login` (default): Standard IMAP LOGIN authentication.
+- `cram-md5`: CRAM-MD5 Challenge-Response authentication.
+
+If omitted or set to an empty string, `login` is used.
 
 ### Running with Homebrew
 

@@ -61,6 +61,7 @@ type Credentials struct {
 	Server string `json:"server" yaml:"server"` // Server address (host:port)
 	User   string `json:"user"   yaml:"user"`   // Username
 	Pass   string `json:"pass"   yaml:"pass"`   // Password
+	Auth   string `json:"auth"   yaml:"auth"`   // [ "", "login", "cram-md5" ] Default is login ("").
 }
 
 // DirectoryMapping holds source and destination folder names.
