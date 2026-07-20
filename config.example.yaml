@@ -3,12 +3,14 @@ src:
   server: mail.oldhost.com:993
   user: user@oldhost.com
   pass: password
+  auth: login # optional ( login | cram-md5 )
 
 dst:
   label: new
   server: imap.newhost.com:993
   user: user@newhost.com
   pass: password
+  auth: login # optional ( login | cram-md5 )
 
 map:
   - src: INBOX

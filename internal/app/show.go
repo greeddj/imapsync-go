@@ -56,7 +56,11 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 	}
 	loadAccount := func(ctx context.Context, label string, creds config.Credentials, tr *progress.Tracker) (accountResult, error) {
 		tr.UpdateMessage(fmt.Sprintf("[%s] Connecting...", label))
-		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, client.Options{UseTLS: true, Verbose: verbose})
+		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, client.Options{
+			UseTLS:  true,
+			Auth:    creds.Auth,
+			Verbose: verbose,
+		})
 		if err != nil {
 			tr.MarkAsErrored()
 			return accountResult{}, fmt.Errorf("[%s] connect: %w", label, err)

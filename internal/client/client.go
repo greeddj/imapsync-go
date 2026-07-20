@@ -3,10 +3,14 @@ package client
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,6 +69,7 @@ type Options struct {
 	WriteLimiter *rate.Limiter
 	DialTimeout  time.Duration
 	UseTLS       bool
+	Auth         string
 	Verbose      bool
 }
 
@@ -106,6 +111,7 @@ type Client struct {
 	folderLocksMu  sync.Mutex
 	cancelled      atomic.Bool
 	useTLS         bool
+	auth           string
 	verbose        bool
 }
 
@@ -155,6 +161,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	c := &Client{
 		serverAddr:   addr,
 		useTLS:       opts.UseTLS,
+		auth:         opts.Auth,
 		tlsConfig:    opts.TLSConfig,
 		username:     username,
 		password:     password,
@@ -378,10 +385,25 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	// flap leaves Login blocked until the kernel times the socket out.
 	c.c.Store(cli)
 
-	if err := cli.Login(c.username, c.password); err != nil {
-		_ = cli.Logout()
-		c.c.Store(nil)
-		return err
+	switch strings.ToLower(c.auth) {
+	case "cram-md5":
+		auth := &cramMD5Auth{
+			username: c.username,
+			password: c.password,
+		}
+
+		if err := cli.Authenticate(auth); err != nil {
+			_ = cli.Logout()
+			c.c.Store(nil)
+		}
+
+	default:
+		if err := cli.Login(c.username, c.password); err != nil {
+			_ = cli.Logout()
+			c.c.Store(nil)
+			return err
+		}
+
 	}
 
 	return nil
@@ -499,4 +521,29 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 		return errors.New("imap client not connected after reconnect")
 	}
 	return fn(cli)
+}
+
+// cramMD5Auth implements the Auth interface for CRAM-MD5 authentication.
+type cramMD5Auth struct {
+	username string
+	password string
+}
+
+// Start returns the CRAM-MD5 mechanism
+func (a *cramMD5Auth) Start() (mech string, ir []byte, err error) {
+	return "CRAM-MD5", nil, nil
+}
+
+// Next returns the response to the CRAM-MD5 challenge.
+func (a *cramMD5Auth) Next(challenge []byte) (response []byte, err error) {
+	if len(challenge) == 0 {
+		return nil, errors.New("empty challenge received")
+	}
+
+	mac := hmac.New(md5.New, []byte(a.password))
+	mac.Write(challenge)
+	digest := hex.EncodeToString(mac.Sum(nil))
+
+	respStr := a.username + " " + digest
+	return []byte(respStr), nil
 }
