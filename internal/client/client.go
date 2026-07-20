@@ -67,9 +67,9 @@ type Options struct {
 	TLSConfig    *tls.Config
 	ReadLimiter  *rate.Limiter
 	WriteLimiter *rate.Limiter
+	Auth         string
 	DialTimeout  time.Duration
 	UseTLS       bool
-	Auth         string
 	Verbose      bool
 }
 
@@ -96,22 +96,22 @@ type Client struct {
 	selectedFolder atomic.Pointer[string]
 	pw             atomic.Pointer[progressWriterRef]
 	tracker        atomic.Pointer[progressTrackerRef]
-	delimiter      string
+	username       string
 	prefix         string
 	password       string
-	username       string
+	delimiter      string
 	serverAddr     string
+	auth           string
 	mailboxCache   mailboxCache
-	dialTimeout    time.Duration
-	reconnectDur   time.Duration
-	backoff        time.Duration
 	connGen        atomic.Uint64
+	backoff        time.Duration
+	reconnectDur   time.Duration
+	dialTimeout    time.Duration
 	mailboxCacheMu sync.RWMutex
 	mu             sync.Mutex
 	folderLocksMu  sync.Mutex
 	cancelled      atomic.Bool
 	useTLS         bool
-	auth           string
 	verbose        bool
 }
 
