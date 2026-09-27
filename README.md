@@ -1,5 +1,9 @@
 # imapsync-go
 
+[![CI](https://github.com/greeddj/imapsync-go/actions/workflows/ci.yml/badge.svg)](https://github.com/greeddj/imapsync-go/actions/workflows/ci.yml)
+[![Release](https://github.com/greeddj/imapsync-go/actions/workflows/release.yml/badge.svg)](https://github.com/greeddj/imapsync-go/actions/workflows/release.yml)
+[![codecov](https://codecov.io/gh/greeddj/imapsync-go/graph/badge.svg)](https://codecov.io/gh/greeddj/imapsync-go)
+
 `imapsync-go` is a lightweight Go CLI that mirrors folders between two IMAP accounts. It builds a sync plan from message IDs, streams mail bodies directly between servers.
 
 > **Note:** This project was created in collaboration with the Claude Code.

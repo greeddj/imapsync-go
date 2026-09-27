@@ -12,6 +12,8 @@ permissions:
 jobs:
   tests_and_checks:
     uses: ./.github/workflows/ci.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   release:
     name: Release
