@@ -22,6 +22,10 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
+	if err := rejectPositionalArgs(c); err != nil {
+		return err
+	}
+
 	verbose := c.Bool("verbose")
 	quiet := c.Bool("quiet")
 

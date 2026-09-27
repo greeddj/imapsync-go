@@ -68,6 +68,10 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
+	if err := rejectPositionalArgs(c); err != nil {
+		return err
+	}
+
 	srcFolder := c.String("src-folder")
 	dstFolder := c.String("dest-folder")
 	quiet := c.Bool("quiet")
