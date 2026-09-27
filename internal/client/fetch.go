@@ -21,11 +21,9 @@ import (
 // pulls From/To/Cc/Bcc/Subject/Date/References/InReplyTo, which we don't
 // need for the planning diff.
 var messageIDHeaderSection = &imap.BodySectionName{
-	BodyPartName: imap.BodyPartName{
-		Specifier: imap.HeaderSpecifier,
-		Fields:    []string{"Message-Id"},
-	},
-	Peek: true,
+	Specifier: imap.HeaderSpecifier,
+	Fields:    []string{"Message-Id"},
+	Peek:      true,
 }
 
 // fullBodyPeekSection requests the entire RFC822 body without flipping the

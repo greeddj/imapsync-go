@@ -92,7 +92,7 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 - Workers are clamped to `[1, 10]` in `config.New` — anything out of range falls back to `1`.
 - Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it.
 - `client.New(ctx, addr, user, pass, Options{...})` — keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation.
-- Dependencies are vendored under `vendor/`. Build with whatever the host Go provides; the module pins `go 1.26`.
+- Dependencies are vendored under `vendor/`. The module requires Go 1.27.1 or newer; an older host toolchain is refused unless `GOTOOLCHAIN` is left on `auto` to fetch one.
 
 ## Multi-agent workflow
 

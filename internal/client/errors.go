@@ -54,8 +54,7 @@ func classifyError(err error) ErrClass {
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return ClassTransient
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
+	if _, ok := errors.AsType[net.Error](err); ok {
 		return ClassTransient
 	}
 
