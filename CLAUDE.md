@@ -13,11 +13,13 @@ The project uses [`just`](https://github.com/casey/just) as its task runner. The
 - `just run` — `check` + `lint` + `test`, then `go run -race ./cmd/imapsync-go/main.go`
 - `just build` — produces `dist/imapsync-go` (CGO disabled, trimpath, version metadata injected via `-ldflags -X main.{Version,Commit,Date,BuiltBy}`)
 - `just build_linux` — Linux/amd64 cross-build
-- `just oci [executor=podman] [tag=local]` — builds a Linux binary then a container image from `Dockerfile`
+- `just oci [executor=podman] [tag=local]` - cross-builds the Linux binary, stages it under `dist/oci/linux/amd64/dist/`, then builds a `linux/amd64` image from `Dockerfile` with `dist/oci` as the build context
 
 `fieldalignment` is enforced; if it complains about a struct, reorder fields rather than disabling the check.
 
 Releases are produced by `goreleaser` (`.goreleaser.yml`) — do not hand-edit `dist/`.
+
+The container image is built from the per-platform tree `dockers_v2` assembles: each binary lands at `<goos>/<goarch>/dist/imapsync-go` in the build context, following the `dist/` prefix in the build's `binary:` value, and `Dockerfile` resolves it through `ARG TARGETPLATFORM`. `just oci` reproduces the same layout under `dist/oci`. `.goreleaser.yml`, `Dockerfile` and the Justfile `oci` target share that path shape; moving one requires moving the other two. Multi-platform images are assembled in the publish phase, so on a tagged release `--skip=publish` skips the image entirely; `goreleaser release --snapshot` still builds them locally, which is how to build one by hand.
 
 ## Architecture
 

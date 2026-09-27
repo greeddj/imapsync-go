@@ -44,6 +44,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 - Config format is extension-driven (`.json` / `.yaml` / `.yml`). Add new fields to both example files.
 - Deps are vendored. After `go.mod` changes, `just deps` (which runs `mod tidy && mod vendor`) is mandatory.
 - Releases are produced by `goreleaser`. Do not hand-edit `dist/`.
+- The container build context is a per-platform tree (`<goos>/<goarch>/dist/imapsync-go`). `dockers_v2` in `.goreleaser.yml`, the `ARG TARGETPLATFORM` copy in `Dockerfile`, and the staging step in the Justfile `oci` target must agree on it. `latest` is emitted only when the git tag carries no prerelease part - `.Prerelease` is read from the tag, not from `.Version`, so a local snapshot still tags `latest`.
 
 ## When in doubt
 

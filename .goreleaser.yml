@@ -1,7 +1,4 @@
-before:
-  hooks:
-    - go mod tidy
-    - go test ./...
+version: 2
 
 builds:
   - id: imapsync-go
@@ -54,51 +51,24 @@ changelog:
       - Merge pull request
       - Merge branch
 
-dockers:
-  - id: amd64
+dockers_v2:
+  - id: imapsync-go
     ids:
       - imapsync-go
-    goos: linux
-    goarch: amd64
-    image_templates:
-      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-amd64"
-      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-amd64"
     dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-
-  - id: arm64
-    ids:
-      - imapsync-go
-    goos: linux
-    goarch: arm64
-    image_templates:
-      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-arm64"
-      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-arm64"
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-
-docker_manifests:
-  - name_template: "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-amd64"
-      - "ghcr.io/greeddj/{{ .ProjectName }}:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/greeddj/{{ .ProjectName }}:latest"
-    image_templates:
-      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-amd64"
-      - "ghcr.io/greeddj/{{ .ProjectName }}:latest-arm64"
+    images:
+      - "ghcr.io/greeddj/{{ .ProjectName }}"
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
 
 homebrew_casks:
   - name: imapsync-go
@@ -108,15 +78,19 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: https://github.com/greeddj/imapsync-go
     description: "IMAP to IMAP synchronization tool"
-    license: MIT
     binaries:
       - dist/imapsync-go
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/dist/imapsync-go"]
-          end
+    skip_upload: auto
+    caveats: |
+      These builds are not Apple-notarized, so this cask clears the macOS
+      quarantine attribute from the binary it installs. That skips a Gatekeeper
+      check on your behalf.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/dist/imapsync-go"]
+        end
+      end
 
 release:
   github:

@@ -24,16 +24,24 @@ brew tap greeddj/tap
 brew install imapsync-go
 ```
 
+Requires Homebrew 6.0.13 or newer: the cask uses the `postflight_steps` install-step
+DSL, and an older Homebrew fails to load it rather than failing to install it.
+
 ### Docker
 
 Pull the image from GitHub Container Registry:
 
 ```bash
-# Latest version
+# Latest stable release
 podman pull ghcr.io/greeddj/imapsync-go:latest
-# or
-podman pull ghcr.io/greeddj/imapsync-go:1.0.0
+# or a specific version
+podman pull ghcr.io/greeddj/imapsync-go:1.2.0
 ```
+
+`:latest` moves only on stable releases. A prerelease is published under its
+version tag alone. `:<version>` and `:latest` are multi-architecture manifests;
+per-architecture tags such as `:1.2.0-amd64` and `:latest-arm64` are no longer
+published.
 
 ### Binary Release
 
@@ -43,9 +51,12 @@ Download pre-built binaries from [GitHub Releases](https://github.com/greeddj/im
 # Example for Linux amd64
 curl -LO https://github.com/greeddj/imapsync-go/releases/latest/download/imapsync-go_<version>_Linux_x86_64.tar.gz
 tar xzf imapsync-go_<version>_Linux_x86_64.tar.gz
-chmod +x imapsync-go
-sudo mv imapsync-go /usr/local/bin/
+chmod +x dist/imapsync-go
+sudo mv dist/imapsync-go /usr/local/bin/
 ```
+
+The archive carries the binary under `dist/`, beside `LICENSE`, `README.md` and
+the two example configs.
 
 ## Usage
 
