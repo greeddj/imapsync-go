@@ -85,12 +85,12 @@ homebrew_casks:
       These builds are not Apple-notarized, so this cask clears the macOS
       quarantine attribute from the binary it installs. That skips a Gatekeeper
       check on your behalf.
-    custom_block: |
-      postflight_steps do
-        on_macos do
-          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/dist/imapsync-go"]
-        end
-      end
+    hooks:
+      post:
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dist/imapsync-go"]
+          end
 
 release:
   github:
