@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -58,17 +59,7 @@ func run() int {
 		},
 	}
 
-	// user invokes Ctrl+\ when the program appears hung; the dump shows which
-	// goroutine is blocked and where.
-	sigquit := make(chan os.Signal, 1)
-	signal.Notify(sigquit, syscall.SIGQUIT)
-	go func() {
-		for range sigquit {
-			buf := make([]byte, 1<<20)
-			n := runtime.Stack(buf, true)
-			os.Stderr.Write(buf[:n]) //nolint:errcheck
-		}
-	}()
+	installQuitDump(os.Stderr, os.Exit)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -87,4 +78,27 @@ func run() int {
 		}
 	}
 	return 0
+}
+
+// exitQuit is 128 + SIGQUIT, matching the 130 that Ctrl-C returns.
+const exitQuit = 131
+
+// installQuitDump makes Ctrl+\ the escape hatch for a hung program: it writes
+// every goroutine stack to w, then exits, because a hang may never return to run.
+func installQuitDump(w io.Writer, exit func(int)) (stop func()) {
+	sigquit := make(chan os.Signal, 1)
+	signal.Notify(sigquit, syscall.SIGQUIT)
+	go func() {
+		if _, ok := <-sigquit; !ok {
+			return
+		}
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		_, _ = w.Write(buf[:n])
+		exit(exitQuit)
+	}()
+	return func() {
+		signal.Stop(sigquit)
+		close(sigquit)
+	}
 }

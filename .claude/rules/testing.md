@@ -70,7 +70,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 
 ### Deliberate exclusions in `cmd/imapsync-go`
 
-- **`main` and `run` in `cmd/imapsync-go/main.go`** - the signal-to-context wiring, the exit-code mapping and `os.Exit` need a subprocess and real signals. The tests in `cmd/imapsync-go/commands` cover the command tree.
+- **`main` and `run` in `cmd/imapsync-go/main.go`** - the signal-to-context wiring, the exit-code mapping and `os.Exit` need a subprocess and real signals. The tests in `cmd/imapsync-go/commands` cover the command tree. A test sends SIGQUIT to its own process to cover `installQuitDump`, with an injected exit function.
 - **`helpers.latestTag`** - the function makes a live call to the GitHub API. The tests skip it through `IMAPSYNC_OFFLINE` or `CI`. The tests cover only the offline return and the `Version` format.
 
 If the tester finds an untested branch that does not match an existing exclusion, the choice is:
