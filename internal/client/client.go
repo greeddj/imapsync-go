@@ -395,6 +395,7 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 		if err := cli.Authenticate(auth); err != nil {
 			_ = cli.Logout()
 			c.c.Store(nil)
+			return err
 		}
 
 	default:

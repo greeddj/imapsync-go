@@ -3,8 +3,14 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+
 	"net"
+
 	"strings"
 	"sync"
 	"testing"
@@ -326,4 +332,151 @@ func buildTestIMAPMessage() *imap.Message {
 	msg.Body[section] = strings.NewReader("From: test@example.com\r\nSubject: hi\r\n\r\nHello\r\n")
 	msg.Envelope = &imap.Envelope{MessageId: "test-id@example.com"}
 	return msg
+}
+
+// newDisconnectedClient creates a *Client wired to srv but does not connect, so
+// tests can drive connectAndLogin themselves. The client is cancelled when the
+// test ends.
+func newDisconnectedClient(t *testing.T, srv *fakeServer) *Client {
+	t.Helper()
+
+	c := &Client{
+		serverAddr:  srv.ln.Addr().String(),
+		username:    "user",
+		password:    "pass",
+		backoff:     initialBackoff,
+		dialTimeout: 5 * time.Second,
+		folderLocks: make(map[string]*sync.Mutex),
+		cancelCh:    make(chan struct{}),
+	}
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+	return c
+}
+
+// command is one parsed IMAP command line as seen by a scripted handler. arg
+// is everything after the verb.
+type command struct {
+	tag  string
+	verb string
+	arg  string
+}
+
+// record counts cmd under its verb and captures the mailbox argument of the
+// verbs that carry one. A UID command is also counted as "UID <SUBVERB>".
+func (s *fakeServer) record(cmd command) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.counts[cmd.verb]++
+	switch cmd.verb {
+	case "SELECT", "EXAMINE", "CREATE", "STATUS", "APPEND":
+		s.names[cmd.verb] = append(s.names[cmd.verb], firstArg(cmd.arg))
+	case "UID":
+		sub, _, _ := strings.Cut(cmd.arg, " ")
+		s.counts["UID "+strings.ToUpper(sub)]++
+	}
+}
+
+// bump counts a synthetic event that has no IMAP verb of its own.
+func (s *fakeServer) bump(event string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.counts[event]++
+}
+
+// firstArg returns the first argument of arg, unquoting it when quoted.
+func firstArg(arg string) string {
+	if rest, ok := strings.CutPrefix(arg, `"`); ok {
+		if name, _, found := strings.Cut(rest, `"`); found {
+			return name
+		}
+	}
+	name, _, _ := strings.Cut(arg, " ")
+	return name
+}
+
+// writeLine sends one CRLF-terminated line to conn.
+func writeLine(conn net.Conn, format string, args ...any) {
+	_, _ = fmt.Fprintf(conn, format+"\r\n", args...)
+}
+
+// serveCommands sends greeting, then feeds each parsed command to fn until fn
+// returns false or the connection ends. fn gets the reader to consume literals.
+func serveCommands(srv *fakeServer, conn net.Conn, greeting string, fn func(rd *bufio.Reader, cmd command) bool) {
+	defer func() { _ = conn.Close() }()
+
+	writeLine(conn, "%s", greeting)
+
+	rd := bufio.NewReader(conn)
+	for {
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			return
+		}
+		parts := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		cmd := command{tag: parts[0], verb: strings.ToUpper(parts[1])}
+		if len(parts) == 3 {
+			cmd.arg = parts[2]
+		}
+		srv.record(cmd)
+		if !fn(rd, cmd) {
+			return
+		}
+	}
+}
+
+const (
+
+	// cramMD5Challenge is the example challenge from RFC 2195.
+	cramMD5Challenge = "<1896.697170952@postoffice.reston.mci.net>"
+)
+
+// cramMD5Handler accepts only a CRAM-MD5 exchange whose digest matches the one it
+// computes for user and pass, and counts it as "CRAM-MD5 VERIFIED". It serves
+// LIST afterwards.
+func cramMD5Handler(srv *fakeServer, user, pass string) func(net.Conn) {
+	return func(conn net.Conn) {
+		greeting := "* OK [CAPABILITY IMAP4rev1 AUTH=CRAM-MD5] fake ready"
+		serveCommands(srv, conn, greeting, func(rd *bufio.Reader, cmd command) bool {
+			switch cmd.verb {
+			case "AUTHENTICATE":
+				writeLine(conn, "+ %s", base64.StdEncoding.EncodeToString([]byte(cramMD5Challenge)))
+				line, err := rd.ReadString('\n')
+				if err != nil {
+					return false
+				}
+				got, decodeErr := base64.StdEncoding.DecodeString(strings.TrimSpace(line))
+
+				mac := hmac.New(md5.New, []byte(pass))
+				mac.Write([]byte(cramMD5Challenge))
+				want := user + " " + hex.EncodeToString(mac.Sum(nil))
+
+				if decodeErr != nil || string(got) != want {
+					writeLine(conn, "%s NO [AUTHENTICATIONFAILED] Authentication failed", cmd.tag)
+					return true
+				}
+				srv.bump("CRAM-MD5 VERIFIED")
+				writeLine(conn, "%s OK AUTHENTICATE completed", cmd.tag)
+			case "LIST":
+				writeLine(conn, `* LIST (\HasNoChildren) "/" INBOX`)
+				writeLine(conn, "%s OK LIST completed", cmd.tag)
+			case "LOGOUT":
+				writeLine(conn, "* BYE Logging out")
+				writeLine(conn, "%s OK LOGOUT completed", cmd.tag)
+				return false
+			default:
+				writeLine(conn, "%s OK %s completed", cmd.tag, cmd.verb)
+			}
+			return true
+		})
+	}
 }

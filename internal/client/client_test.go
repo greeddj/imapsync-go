@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+
 	"slices"
 	"strings"
 	"sync"
@@ -381,8 +382,7 @@ func Test_Logout_nilClient(t *testing.T) {
 }
 
 // Test_withCancel_stopBeforeContextCancels asserts that calling the stop
-// function before the context is cancelled does not block and the watcher
-// goroutine exits cleanly (no goroutine leak).
+// function before the context is cancelled does not block or panic.
 func Test_withCancel_stopBeforeContextCancels(t *testing.T) {
 	t.Parallel()
 
@@ -391,8 +391,6 @@ func Test_withCancel_stopBeforeContextCancels(t *testing.T) {
 
 	stop := c.withCancel(ctx)
 	stop()
-	// No assertion beyond "does not block or panic". The test would hang if
-	// the watcher goroutine leaked and held a reference preventing GC.
 }
 
 // Test_newDialer_setsTCPKeepalive asserts that newDialer returns a dialer with
@@ -528,6 +526,158 @@ func Test_New_initialLoginInterruptibleByContextCancel(t *testing.T) {
 	case <-timer.C:
 		t.Error("New did not return within 100ms after context cancel during LOGIN")
 	}
+}
+
+// Test_connectAndLogin_cramMD5Refused asserts that a refused AUTHENTICATE
+// surfaces the server's error, leaves no connection behind and sends no LOGIN.
+func Test_connectAndLogin_cramMD5Refused(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(cramMD5Handler(srv, "user", "server-side-secret"))
+
+	c := newDisconnectedClient(t, srv)
+	c.auth = "cram-md5"
+
+	err := c.connectAndLogin(t.Context())
+	if err == nil {
+		t.Fatal("connectAndLogin returned nil, want the authentication error")
+	}
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassPermanent)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c still holds a connection after a failed AUTHENTICATE")
+	}
+	if got := srv.callCount("AUTHENTICATE"); got != 1 {
+		t.Errorf("AUTHENTICATE count = %d, want 1", got)
+	}
+	if got := srv.callCount("LOGIN"); got != 0 {
+		t.Errorf("LOGIN count = %d, want 0 (CRAM-MD5 must not fall back to LOGIN)", got)
+	}
+	if got := srv.callCount("LOGOUT"); got != 1 {
+		t.Errorf("LOGOUT count = %d, want 1 (failed session is closed)", got)
+	}
+}
+
+// Test_New_cramMD5Refused asserts that New reports the authentication error
+// itself, not the follow-up failure of loading the mailbox list on a client
+// that has no connection.
+func Test_New_cramMD5Refused(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(cramMD5Handler(srv, "user", "server-side-secret"))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{
+		Auth:        "cram-md5",
+		DialTimeout: 5 * time.Second,
+	})
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the authentication error")
+	}
+	if c != nil {
+		t.Error("New returned a non-nil client alongside the error")
+	}
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassPermanent)
+	}
+	if strings.Contains(err.Error(), "failed to load mailbox list") {
+		t.Errorf("error %q comes from the mailbox cache load, want the authentication error", err)
+	}
+	if got := srv.callCount("LIST"); got != 0 {
+		t.Errorf("LIST count = %d, want 0", got)
+	}
+}
+
+// Test_New_cramMD5Succeeds asserts that the CRAM-MD5 digest sent by the client
+// matches the one the server computes on its own, for any letter case of the
+// configured mechanism.
+func Test_New_cramMD5Succeeds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		auth string
+	}{
+		{name: "lower case mechanism", auth: "cram-md5"},
+		{name: "upper case mechanism", auth: "CRAM-MD5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(cramMD5Handler(srv, "user", "pass"))
+
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{
+				Auth:        tt.auth,
+				DialTimeout: 5 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if got := srv.callCount("CRAM-MD5 VERIFIED"); got != 1 {
+				t.Errorf("verified digests = %d, want 1", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 0 {
+				t.Errorf("LOGIN count = %d, want 0", got)
+			}
+			if got := srv.callCount("LIST"); got != 1 {
+				t.Errorf("LIST count = %d, want 1 (mailbox cache load after authentication)", got)
+			}
+		})
+	}
+}
+
+// Test_cramMD5Auth covers the SASL client the CRAM-MD5 login hands to go-imap.
+func Test_cramMD5Auth(t *testing.T) {
+	t.Parallel()
+
+	a := &cramMD5Auth{username: "tim", password: "tanstaaftanstaaf"}
+
+	t.Run("start names the mechanism and sends no initial response", func(t *testing.T) {
+		t.Parallel()
+
+		mech, ir, err := a.Start()
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if mech != "CRAM-MD5" {
+			t.Errorf("mechanism = %q, want CRAM-MD5", mech)
+		}
+		if ir != nil {
+			t.Errorf("initial response = %q, want nil", ir)
+		}
+	})
+
+	t.Run("next rejects an empty challenge", func(t *testing.T) {
+		t.Parallel()
+
+		for name, challenge := range map[string][]byte{"nil": nil, "empty": {}} {
+			if resp, err := a.Next(challenge); err == nil {
+				t.Errorf("Next(%s challenge) = %q, want an error", name, resp)
+			}
+		}
+	})
+
+	t.Run("next answers the RFC 2195 example", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := a.Next([]byte(cramMD5Challenge))
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if want := "tim b913a602c7eda7a495b4e6e7334d3890"; string(got) != want {
+			t.Errorf("Next = %q, want %q", got, want)
+		}
+	})
 }
 
 // --- per-connection handler helpers ---
