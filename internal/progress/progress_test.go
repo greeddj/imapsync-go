@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -56,5 +57,38 @@ func TestWriter_StopAndClear_whenQuiet_writesNothingToStdout(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Errorf("quiet StopAndClear wrote %q to stdout, want nothing", buf.String())
+	}
+}
+
+func TestWriter_Stop_whenCalledRightAfterStart_endsTheRenderGoroutine(t *testing.T) {
+	t.Parallel()
+
+	for i := range 500 {
+		w := NewWriter(1, true)
+		w.Start()
+		w.Stop()
+
+		// Give a render goroutine that missed the stop a chance to start looping.
+		for range 4 {
+			runtime.Gosched()
+		}
+		if w.pw.IsRenderInProgress() {
+			t.Fatalf("iteration %d: render loop still running after Stop returned", i)
+		}
+	}
+}
+
+func TestWriter_Stop_isSafeBeforeStartAndWhenRepeated(t *testing.T) {
+	t.Parallel()
+
+	w := NewWriter(1, true)
+	w.Stop()
+
+	w.Start()
+	w.StopAndClear()
+	w.Stop()
+
+	if w.pw.IsRenderInProgress() {
+		t.Error("render loop still running after StopAndClear and Stop")
 	}
 }

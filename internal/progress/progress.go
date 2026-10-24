@@ -17,6 +17,7 @@ import (
 type Writer struct {
 	pw          progress.Writer
 	out         io.Writer
+	rendered    chan struct{}
 	numTrackers int
 	quiet       bool
 }
@@ -140,12 +141,31 @@ func (w *Writer) Log(msg string, args ...any) {
 
 // Start begins rendering the progress bars in a goroutine.
 func (w *Writer) Start() {
-	go w.pw.Render()
+	w.rendered = make(chan struct{})
+	go func() {
+		defer close(w.rendered)
+		w.pw.Render()
+	}()
 }
 
-// Stop stops the progress writer without clearing.
+// Stop stops the progress writer without clearing. It returns once the render
+// goroutine has exited, and it is safe to call more than once.
 func (w *Writer) Stop() {
-	w.pw.Stop()
+	if w.rendered == nil {
+		return
+	}
+	// go-pretty creates its stop context inside Render, so a Stop that lands
+	// before Render starts is lost and the loop would run forever. Repeat it.
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		w.pw.Stop()
+		select {
+		case <-w.rendered:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // StopAndClear stops the progress writer and erases the rendered trackers
@@ -155,7 +175,7 @@ func (w *Writer) StopAndClear() {
 	// Quiet mode rendered nothing, so there is nothing to wait for or erase;
 	// cursor escapes here would corrupt piped output and earlier lines.
 	if w.quiet {
-		w.pw.Stop()
+		w.Stop()
 		return
 	}
 
@@ -163,7 +183,7 @@ func (w *Writer) StopAndClear() {
 	time.Sleep(300 * time.Millisecond)
 
 	// Stop the writer
-	w.pw.Stop()
+	w.Stop()
 
 	// After Stop, the cursor sits on a blank line one below the last
 	// rendered tracker. Go up numTrackers times, erasing each tracker
