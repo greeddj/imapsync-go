@@ -10,15 +10,11 @@ import (
 
 // mailboxCache holds the result of a single LIST "" "*" call so that the
 // many existence checks we do during sync planning don't each cost a
-// round-trip. The set lives for the life of the Client; callers add to it
-// after CreateMailbox and invalidate it whenever they suspect drift.
-//
-// loaded distinguishes "the cache is empty because the account has no
-// mailboxes" from "we never asked yet".
+// round-trip. New loads it before returning the Client and CreateMailbox
+// adds to it, so readers never see an unloaded cache.
 type mailboxCache struct {
 	folders   map[string]struct{}
 	delimiter string
-	loaded    bool
 }
 
 // loadMailboxCache populates the cache via a single LIST "" "*". The
@@ -59,43 +55,22 @@ func (c *Client) loadMailboxCache(_ context.Context) error {
 	c.mailboxCacheMu.Lock()
 	c.mailboxCache.folders = folders
 	c.mailboxCache.delimiter = delim
-	c.mailboxCache.loaded = true
 	c.mailboxCacheMu.Unlock()
 	return nil
 }
 
-// ensureMailboxCache loads the cache lazily. Most callers don't need the
-// extra round-trip when the cache is already populated.
-func (c *Client) ensureMailboxCache(ctx context.Context) error {
-	c.mailboxCacheMu.RLock()
-	loaded := c.mailboxCache.loaded
-	c.mailboxCacheMu.RUnlock()
-	if loaded {
-		return nil
-	}
-	return c.loadMailboxCache(ctx)
-}
-
 // hasMailbox reports whether name exists, consulting the cache.
-func (c *Client) hasMailbox(ctx context.Context, name string) (bool, error) {
-	if err := c.ensureMailboxCache(ctx); err != nil {
-		return false, err
-	}
+func (c *Client) hasMailbox(name string) bool {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
 	_, ok := c.mailboxCache.folders[name]
-	return ok, nil
+	return ok
 }
 
-// addMailboxToCache records a freshly created mailbox. No-op if the cache
-// has been invalidated and not yet reloaded — the next ensureMailboxCache
-// will pick up the server-side state.
+// addMailboxToCache records a freshly created mailbox.
 func (c *Client) addMailboxToCache(name string) {
 	c.mailboxCacheMu.Lock()
 	defer c.mailboxCacheMu.Unlock()
-	if !c.mailboxCache.loaded {
-		return
-	}
 	if c.mailboxCache.folders == nil {
 		c.mailboxCache.folders = make(map[string]struct{})
 	}
@@ -105,10 +80,7 @@ func (c *Client) addMailboxToCache(name string) {
 // listSubfoldersFromCache returns mailboxes that look like children of parent.
 // "Children" means the cached name starts with parent+delimiter. Unlike a
 // LIST pattern this does not require a server round-trip.
-func (c *Client) listSubfoldersFromCache(ctx context.Context, parent, delimiter string) ([]string, error) {
-	if err := c.ensureMailboxCache(ctx); err != nil {
-		return nil, err
-	}
+func (c *Client) listSubfoldersFromCache(parent, delimiter string) []string {
 	if delimiter == "" {
 		delimiter = c.delimiter
 	}
@@ -124,5 +96,5 @@ func (c *Client) listSubfoldersFromCache(ctx context.Context, parent, delimiter 
 			out = append(out, name)
 		}
 	}
-	return out, nil
+	return out
 }

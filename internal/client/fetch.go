@@ -233,9 +233,6 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if cbErr != nil {
-			return cbErr
-		}
 
 		end := min(start+uidFetchBatchSize, len(uids))
 		batch := uids[start:end]

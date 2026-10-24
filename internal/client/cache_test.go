@@ -20,16 +20,14 @@ func TestMailboxCacheLookup(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}, "Sent": {}, "Archive/2025": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	for _, name := range []string{"INBOX", "Sent", "Archive/2025"} {
-		ok, err := c.hasMailbox(t.Context(), name)
-		if err != nil || !ok {
-			t.Errorf("hasMailbox(%q) = %v,%v", name, ok, err)
+		if !c.hasMailbox(name) {
+			t.Errorf("hasMailbox(%q) = false, want true", name)
 		}
 	}
-	if ok, _ := c.hasMailbox(t.Context(), "missing"); ok {
+	if c.hasMailbox("missing") {
 		t.Error("hasMailbox(missing) = true")
 	}
 }
@@ -38,16 +36,14 @@ func TestAddMailboxToCache(t *testing.T) {
 	t.Parallel()
 
 	c := newTestClient()
-	// Adding before load is a no-op — the next ensureMailboxCache will fetch
-	// authoritative data and we don't want to half-populate the set.
+	// An account with no mailboxes leaves a nil set; the first add creates it.
 	c.addMailboxToCache("X")
-	if len(c.mailboxCache.folders) != 0 {
-		t.Errorf("addMailboxToCache before load populated cache: %v", c.mailboxCache.folders)
+	if _, ok := c.mailboxCache.folders["X"]; !ok {
+		t.Errorf("addMailboxToCache on an empty cache did not insert: %v", c.mailboxCache.folders)
 	}
 
 	c.mailboxCache = mailboxCache{
 		folders: map[string]struct{}{"A": {}},
-		loaded:  true,
 	}
 	c.addMailboxToCache("B")
 	if _, ok := c.mailboxCache.folders["B"]; !ok {
@@ -71,13 +67,9 @@ func TestListSubfoldersFromCache(t *testing.T) {
 			"Archive2024":        {}, // also a sibling of Archive, not a child
 		},
 		delimiter: "/",
-		loaded:    true,
 	}
 
-	got, err := c.listSubfoldersFromCache(t.Context(), "Archive", "")
-	if err != nil {
-		t.Fatalf("listSubfoldersFromCache: %v", err)
-	}
+	got := c.listSubfoldersFromCache("Archive", "")
 	slices.Sort(got)
 	want := []string{"Archive/2024", "Archive/2025", "Archive/2025/Q1"}
 	if !slices.Equal(got, want) {
@@ -85,7 +77,7 @@ func TestListSubfoldersFromCache(t *testing.T) {
 	}
 
 	// Folder with no children.
-	got2, _ := c.listSubfoldersFromCache(t.Context(), "Inbox", "")
+	got2 := c.listSubfoldersFromCache("Inbox", "")
 	if len(got2) != 0 {
 		t.Errorf("Inbox subfolders = %v, want []", got2)
 	}

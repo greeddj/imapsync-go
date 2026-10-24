@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -449,7 +450,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		createdCount := 0
 		failedCount := 0
 
-		for folder := range foldersToCreate {
+		// Sorted, so a parent path is created before its children and the log
+		// order is stable.
+		for _, folder := range slices.Sorted(maps.Keys(foldersToCreate)) {
 			if err := ctx.Err(); err != nil {
 				creationPW.Stop()
 				return err
@@ -767,16 +770,10 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		// Add the original mapping
 		expanded = append(expanded, mapping)
 
-		// Get subfolders for this source folder
+		// The listing reads the mailbox cache, so it fails only when ctx ends.
 		subfolders, err := getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if verbose && !quiet {
-				_, _ = fmt.Fprintf(out, "  ⚠️  Failed to get subfolders for %s: %v\n", mapping.Source, err)
-			}
-			continue
+			return nil, err
 		}
 
 		// Add mapping for each subfolder

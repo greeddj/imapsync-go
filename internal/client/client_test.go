@@ -324,7 +324,6 @@ func Test_Cancel_interruptsBlockingCall(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	type result struct{ err error }

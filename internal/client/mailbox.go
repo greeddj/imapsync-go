@@ -27,7 +27,7 @@ func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	return c.hasMailbox(ctx, name)
+	return c.hasMailbox(name), nil
 }
 
 // CreateMailbox ensures the destination folder (and any missing parents) exist
@@ -45,14 +45,7 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	existed, err := c.hasMailbox(ctx, name)
-	if err != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		return false, err
-	}
-	if existed {
+	if c.hasMailbox(name) {
 		return false, nil
 	}
 
@@ -69,7 +62,7 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 
-	err = c.safeCall(func(cli *imapclient.Client) error {
+	err := c.safeCall(func(cli *imapclient.Client) error {
 		return cli.Create(name)
 	})
 	if err != nil {
@@ -104,15 +97,9 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 		lock := c.folderLock(parentPath)
 		lock.Lock()
 
-		exists, err := c.hasMailbox(ctx, parentPath)
-		if err != nil {
-			lock.Unlock()
-			return fmt.Errorf("[%s] failed to check parent folder %s: %w", c.prefix, parentPath, err)
-		}
-
-		if !exists {
+		if !c.hasMailbox(parentPath) {
 			c.log("[%s] Creating parent folder: %s", c.prefix, parentPath)
-			err = c.safeCall(func(cli *imapclient.Client) error {
+			err := c.safeCall(func(cli *imapclient.Client) error {
 				return cli.Create(parentPath)
 			})
 			if err != nil && !isAlreadyExistsErr(err) {
@@ -152,7 +139,7 @@ func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) (
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return c.listSubfoldersFromCache(ctx, folder, delimiter)
+	return c.listSubfoldersFromCache(folder, delimiter), nil
 }
 
 // ListMailboxes fetches all folders plus lightweight statistics for each.

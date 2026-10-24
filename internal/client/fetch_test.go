@@ -104,7 +104,6 @@ func Test_StreamMessagesByUIDs_batchesAt500(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	uids := make([]uint32, 1001)
@@ -486,7 +485,6 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	var logged []string
@@ -532,7 +530,6 @@ func Test_FetchMessageIDSet_returnsIDsWithoutUIDs(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	result, err := c.FetchMessageIDSet(context.Background(), "INBOX")

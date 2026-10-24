@@ -53,8 +53,6 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
   - `createParentFolders`, at the top of the loop;
   - `ListMailboxes`, after the LIST;
   - `getFolderSize`, after success.
-- **`StreamMessagesByUIDs` `cbErr` check at the top of the batch loop** - unreachable code, not untested code. The check after each batch returns `cbErr` before the next batch starts, so the top check never sees a non-nil value.
-- **`createParentFolders` `hasMailbox` error branch** - unreachable code, not untested code. `client.New` loads the mailbox cache and no code resets it, so `hasMailbox` never returns an error.
 
 ### Deliberate exclusions in `internal/app`
 
@@ -65,8 +63,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
   - `runSync`, after the connect errgroup;
   - `runSync`, after the scan progress writer stops;
   - `runSync`, at the top of the dispatch loop;
-  - `expandMappingsWithSubfolders`, in the per-mapping loop and the per-subfolder loop.
-- **`expandMappingsWithSubfolders` non-context `getSubfolders` error branch** - unreachable code, not untested code. `client.New` always loads the mailbox cache, so `getSubfolders` fails only when the context ends.
+  - `expandMappingsWithSubfolders`, in the per-mapping loop, after `getSubfolders` and in the per-subfolder loop.
 
 ### Deliberate exclusions in `cmd/imapsync-go`
 

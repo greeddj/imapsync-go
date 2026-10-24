@@ -25,7 +25,6 @@ func Test_CreateMailbox_walksParents(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	created, err := c.CreateMailbox(context.Background(), "A/B/C")
@@ -64,7 +63,6 @@ func Test_CreateMailbox_idempotent(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"X": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	created, err := c.CreateMailbox(context.Background(), "X")
@@ -92,7 +90,6 @@ func Test_MailboxExists_cachedHit(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}, "Sent": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	ok, err := c.MailboxExists(context.Background(), "INBOX")
@@ -117,7 +114,6 @@ func Test_MailboxExists_miss(t *testing.T) {
 	c.mailboxCache = mailboxCache{
 		folders:   map[string]struct{}{"INBOX": {}},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	ok, err := c.MailboxExists(context.Background(), "DoesNotExist")
@@ -145,7 +141,6 @@ func Test_ListSubfolders_fromCache(t *testing.T) {
 			"INBOX":        {},
 		},
 		delimiter: "/",
-		loaded:    true,
 	}
 
 	got, err := c.ListSubfolders(context.Background(), "Archive", "/")
@@ -160,9 +155,8 @@ func Test_ListSubfolders_fromCache(t *testing.T) {
 	}
 }
 
-// Test_loadMailboxCache_populatesDelimiter asserts that when the cache is not
-// yet loaded, ensureMailboxCache issues a LIST and populates the cache
-// including the hierarchy delimiter from the server response.
+// Test_loadMailboxCache_populatesDelimiter asserts that one LIST fills the
+// cache, including the hierarchy delimiter from the server response.
 func Test_loadMailboxCache_populatesDelimiter(t *testing.T) {
 	t.Parallel()
 
@@ -170,18 +164,17 @@ func Test_loadMailboxCache_populatesDelimiter(t *testing.T) {
 	srv.addConnHandler(listDelimiterHandler(srv))
 
 	c := newClientWithFake(t, srv)
-	ok, err := c.hasMailbox(context.Background(), "INBOX")
-	if err != nil {
-		t.Fatalf("hasMailbox: %v", err)
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("loadMailboxCache: %v", err)
 	}
-	if !ok {
+	if !c.hasMailbox("INBOX") {
 		t.Error("hasMailbox(INBOX) = false after cache load, want true")
 	}
 	if c.mailboxCache.delimiter != "/" {
 		t.Errorf("delimiter = %q, want /", c.mailboxCache.delimiter)
 	}
-	if got := srv.callCount("LIST"); got < 1 {
-		t.Errorf("LIST count = %d, want ≥ 1", got)
+	if got := srv.callCount("LIST"); got != 1 {
+		t.Errorf("LIST count = %d, want 1", got)
 	}
 }
 
@@ -293,7 +286,6 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 			c.mailboxCache = mailboxCache{
 				folders:   map[string]struct{}{},
 				delimiter: "/",
-				loaded:    true,
 			}
 
 			created, err := c.CreateMailbox(t.Context(), tt.target)
@@ -326,36 +318,13 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 	}
 }
 
-// Test_CreateMailbox_whenListRefused asserts that a mailbox cache that cannot
-// be loaded stops CreateMailbox before it sends any CREATE.
-func Test_CreateMailbox_whenListRefused(t *testing.T) {
-	t.Parallel()
-
-	srv, c := newScriptedClient(t, &mailboxScript{listRefused: true})
-	c.delimiter = "/"
-
-	created, err := c.CreateMailbox(t.Context(), "A/B")
-	if err == nil {
-		t.Fatal("CreateMailbox returned nil error, want the LIST failure")
-	}
-	if created {
-		t.Error("created = true, want false")
-	}
-	if got := srv.callCount("LIST"); got != 1 {
-		t.Errorf("LIST count = %d, want 1", got)
-	}
-	if got := srv.callCount("CREATE"); got != 0 {
-		t.Errorf("CREATE count = %d, want 0", got)
-	}
-}
-
 // Test_CreateMailbox_whenContextCanceled asserts that an already canceled
 // context is reported as such and nothing reaches the server.
 func Test_CreateMailbox_whenContextCanceled(t *testing.T) {
 	t.Parallel()
 
 	srv, c := newScriptedClient(t, &mailboxScript{})
-	c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/", loaded: true}
+	c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -383,7 +352,6 @@ func Test_CreateMailbox_whenContextExpiresInFlight(t *testing.T) {
 		target      string
 		wantCreates []string
 	}{
-		{name: "mailbox list is pending", hold: newStall(verbIs("LIST")), target: "Archive"},
 		{name: "parent CREATE is pending", hold: newStall(verbOn("CREATE", "A")), target: "A/B", wantCreates: []string{"A"}},
 		{name: "target CREATE is pending", hold: newStall(verbOn("CREATE", "Archive")), target: "Archive", wantCreates: []string{"Archive"}},
 	}

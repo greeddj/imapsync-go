@@ -2214,21 +2214,14 @@ func TestRunSync_When_NestedFoldersAreNew_Then_EachPathIsCreatedOnceParentFirst(
 		t.Fatalf("runSync: %v", err)
 	}
 
-	// Creation order follows map iteration. A child may precede its mapped parent,
-	// so the walk down creates the parent first. No path may be created twice.
-	creates := dst.capturedNames("CREATE")
-	if len(creates) != children+1 {
-		t.Errorf("dst saw %d CREATE commands, want %d: %v", len(creates), children+1, creates)
+	// Folders are created in sorted order: each parent before its children, and
+	// no path twice.
+	want := []string{"Mail"}
+	for i := range children {
+		want = append(want, fmt.Sprintf("Mail/S%02d", i))
 	}
-	created := make(map[string]bool, len(creates))
-	for _, name := range creates {
-		if created[name] {
-			t.Errorf("CREATE %q was sent twice", name)
-		}
-		created[name] = true
-		if i := strings.LastIndex(name, "/"); i >= 0 && !created[name[:i]] {
-			t.Errorf("CREATE %q came before its parent %q", name, name[:i])
-		}
+	if creates := dst.capturedNames("CREATE"); !slices.Equal(creates, want) {
+		t.Errorf("CREATE names = %v, want %v", creates, want)
 	}
 	assertIDs(t, "dst Mail", dst.folderMsgIDs("Mail"), "w@x")
 	for i := range children {
