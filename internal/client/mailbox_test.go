@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Test_CreateMailbox_walksParents asserts that CreateMailbox creates every
@@ -995,5 +996,30 @@ func appendHandler(srv *fakeServer) func(net.Conn) {
 				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
 			}
 		}
+	}
+}
+
+func Test_MailboxNames_returnsCachedNamesSorted(t *testing.T) {
+	t.Parallel()
+
+	script := &mailboxScript{folders: []scriptFolder{{name: "Sent"}, {name: "INBOX"}, {name: "Archive/2024"}}}
+	srv := newFakeServer(t)
+	srv.addConnHandler(script.handler(srv))
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	got := c.MailboxNames()
+
+	if want := []string{"Archive/2024", "INBOX", "Sent"}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %v, want %v", got, want)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1 (the cache load in New)", n)
 	}
 }

@@ -1690,6 +1690,19 @@ func TestRunSync_When_NoMappingsConfigured_Then_EverySourceFolderIsSynced(t *tes
 	assertIDs(t, "dst Sent", dst.folderMsgIDs("Sent"), "m2@x")
 	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Sent")
 	assertReadOnly(t, "source", src)
+
+	// Folder names come from the planning session's cache: the source opens no
+	// session the destination does not, sends no STATUS, and closes them all.
+	srcLogins, dstLogins := src.callCount("LOGIN"), dst.callCount("LOGIN")
+	if srcLogins != dstLogins {
+		t.Errorf("source LOGIN count = %d, destination = %d, want equal", srcLogins, dstLogins)
+	}
+	if got := src.callCount("LOGOUT"); got != srcLogins {
+		t.Errorf("source LOGOUT count = %d, want %d (one per session)", got, srcLogins)
+	}
+	if got := src.callCount("STATUS"); got != 0 {
+		t.Errorf("source STATUS count = %d, want 0", got)
+	}
 }
 
 func TestRunSync_When_SourceHasSubfolders_Then_TheyAreCopiedToMatchingPaths(t *testing.T) {
@@ -2267,23 +2280,6 @@ func TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting(t *testing.T) {
 			assertContainsNone(t, out.String(), e2ePassword)
 		})
 	}
-}
-
-func TestRunSync_When_ListingSourceFoldersFails_Then_NothingIsWritten(t *testing.T) {
-	t.Parallel()
-
-	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
-	src.addConnHandler(listFailsAfterConnectHandler(src, "INBOX"))
-	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
-	opts := e2eOptions(&syncBuffer{}, "")
-	opts.autoConfirm = true
-
-	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
-
-	if err == nil || !strings.Contains(err.Error(), "source connection list mailbox failed") {
-		t.Fatalf("error = %v, want %q", err, "source connection list mailbox failed")
-	}
-	assertNoLogin(t, dst)
 }
 
 func TestActionSync_When_ContextAlreadyCanceled_Then_ReturnsBeforeReadingConfig(t *testing.T) {

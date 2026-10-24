@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/emersion/go-imap"
@@ -126,6 +127,19 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 	}
 
 	return nil
+}
+
+// MailboxNames returns every mailbox name in the cache, sorted. New loads the
+// cache, so this costs no round-trip.
+func (c *Client) MailboxNames() []string {
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	names := make([]string, 0, len(c.mailboxCache.folders))
+	for name := range c.mailboxCache.folders {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // ListSubfolders returns subfolders of folder, derived from the cached

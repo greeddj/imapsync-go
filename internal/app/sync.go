@@ -166,26 +166,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		}
 	case opts.srcFolder != "" || opts.dstFolder != "":
 		return errors.New("both --src-folder and --dest-folder must be specified")
-	default:
-		if len(cfg.Map) > 0 {
-			mappings = cfg.Map
-		} else {
-			// dynamically build the mappings from the source folders
-			lister, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
-			if err != nil {
-				return fmt.Errorf("source connection failed: %w", err)
-			}
-			mailboxes, err := lister.ListMailboxes(ctx)
-			if err != nil {
-				return fmt.Errorf("source connection list mailbox failed: %w", err)
-			}
-			for _, mb := range mailboxes {
-				mappings = append(mappings, config.DirectoryMapping{
-					Source:      mb.Name,
-					Destination: mb.Name,
-				})
-			}
-		}
+	case len(cfg.Map) > 0:
+		mappings = cfg.Map
 	}
 
 	if !quiet && verbose {
@@ -233,6 +215,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	// No mapping from flags or config: mirror every source folder. The names
+	// come from the planning client's mailbox cache, so no extra session opens.
+	if len(mappings) == 0 {
+		for _, name := range srcClient.MailboxNames() {
+			mappings = append(mappings, config.DirectoryMapping{Source: name, Destination: name})
+		}
 	}
 
 	// Check delimiters
