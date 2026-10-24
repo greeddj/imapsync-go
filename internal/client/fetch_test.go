@@ -8,9 +8,9 @@ import (
 	"io"
 	"net"
 	"slices"
-
+	"strconv"
 	"strings"
-
+	"sync"
 	"testing"
 	"time"
 
@@ -802,5 +802,295 @@ func Test_StreamMessagesByUIDs_When_CallbackRuns_Then_WatchdogSpanIsClosedInside
 				t.Error("the watchdog tripped on a healthy stream")
 			}
 		})
+	}
+}
+
+// uidFetchLog records the UIDs each UID FETCH asked for, one entry per command.
+type uidFetchLog struct {
+	requests [][]uint32
+	mu       sync.Mutex
+}
+
+func (l *uidFetchLog) record(uids []uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.requests = append(l.requests, uids)
+}
+
+func (l *uidFetchLog) all() [][]uint32 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.requests)
+}
+
+func isUIDFetch(cmd command) bool {
+	return cmd.verb == "UID" && strings.HasPrefix(strings.ToUpper(cmd.arg), "FETCH")
+}
+
+// requestedUIDs expands the UID set of a UID FETCH command.
+func requestedUIDs(cmd command) []uint32 {
+	fields := strings.Fields(cmd.arg)
+	if len(fields) < 2 {
+		return nil
+	}
+	set, err := imap.ParseSeqSet(fields[1])
+	if err != nil {
+		return nil
+	}
+	var uids []uint32
+	for _, r := range set.Set {
+		for uid := r.Start; uid <= r.Stop; uid++ {
+			uids = append(uids, uid)
+		}
+	}
+	return uids
+}
+
+// writeUIDMessage sends one FETCH response that carries the full body of uid.
+func writeUIDMessage(conn net.Conn, uid uint32) {
+	body := "Subject: uid " + strconv.FormatUint(uint64(uid), 10) + "\r\n\r\nbody\r\n"
+	writeLine(conn, "* %d FETCH (UID %d BODY[] {%d}\r\n%s)", uid, uid, len(body), body)
+}
+
+// answerUIDFetch is an interceptHandler hook that answers each UID FETCH with the
+// messages send picks for the requested UIDs, then the tagged OK.
+func answerUIDFetch(log *uidFetchLog, send func(requested []uint32) []uint32) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		log.record(requested)
+		for _, uid := range send(requested) {
+			writeUIDMessage(conn, uid)
+		}
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}
+}
+
+// cutUIDFetch sends the first sent requested messages and never the tagged OK, then hangs up if hangUp is set, else waits for the client to close.
+func cutUIDFetch(log *uidFetchLog, sent int, hangUp bool) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		log.record(requested)
+		for _, uid := range requested[:min(sent, len(requested))] {
+			writeUIDMessage(conn, uid)
+		}
+		if !hangUp {
+			_, _ = rd.ReadByte()
+		}
+		return true, false
+	}
+}
+
+func requestedAsSent(requested []uint32) []uint32 { return requested }
+
+// Test_StreamMessagesByUIDs_When_TransientErrorAfterPartialBatch_Then_RetryFetchesOnlyUndeliveredUIDs
+// asserts that a retried batch asks for the UIDs not yet handed to the callback,
+// so no message reaches it twice.
+func Test_StreamMessagesByUIDs_When_TransientErrorAfterPartialBatch_Then_RetryFetchesOnlyUndeliveredUIDs(t *testing.T) {
+	t.Parallel()
+
+	const (
+		total = 5
+		sent  = 2
+	)
+	tests := []struct {
+		name   string
+		idle   time.Duration
+		hangUp bool
+	}{
+		{name: "server goes silent and the watchdog trips", idle: tripLimit},
+		{name: "server drops the socket", idle: holdLimit, hangUp: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fetches := new(uidFetchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, cutUIDFetch(fetches, sent, tt.hangUp)))
+			srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+			c := newWatchedClient(t, srv, tt.idle)
+			first := c.idle.Load()
+			// The session after the reconnect must not trip on a slow runner.
+			c.idleDur = holdLimit
+
+			uids := make([]uint32, total)
+			for i := range uids {
+				uids[i] = uint32(i + 1)
+			}
+			var got []uint32
+			err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+				return c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg Message) error {
+					got = append(got, msg.m.Uid)
+					return nil
+				})
+			})
+			if err != nil {
+				t.Fatalf("StreamMessagesByUIDs: %v, want success after the retry", err)
+			}
+
+			if !slices.Equal(got, uids) {
+				t.Errorf("callback got UIDs %v, want each of %v exactly once", got, uids)
+			}
+			want := [][]uint32{uids, uids[sent:]}
+			if gotSets := fetches.all(); !slices.EqualFunc(gotSets, want, slices.Equal) {
+				t.Errorf("UID FETCH asked for %v, want %v (the retry asks only for the rest)", gotSets, want)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2 (one fresh session for the retry)", got)
+			}
+			if first.tripped() == tt.hangUp {
+				t.Errorf("first session tripped = %v, want %v", first.tripped(), !tt.hangUp)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_TransientErrorAfterEveryMessage_Then_RetrySendsNoCommand
+// asserts that a batch fully handed over before the error is not selected or
+// fetched again on the new session.
+func Test_StreamMessagesByUIDs_When_TransientErrorAfterEveryMessage_Then_RetrySendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	const total = 5
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, cutUIDFetch(fetches, total, false)))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, tripLimit)
+	first := c.idle.Load()
+	c.idleDur = holdLimit
+
+	uids := make([]uint32, total)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	var got []uint32
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg Message) error {
+			got = append(got, msg.m.Uid)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success after the retry", err)
+	}
+
+	if !slices.Equal(got, uids) {
+		t.Errorf("callback got UIDs %v, want each of %v exactly once", got, uids)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1 (nothing left to fetch on the retry)", got)
+	}
+	if got := srv.callCount("EXAMINE") + srv.callCount("SELECT"); got != 1 {
+		t.Errorf("EXAMINE+SELECT count = %d, want 1 (the new session never selects)", got)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the retry still repairs the session)", got)
+	}
+	if !first.tripped() {
+		t.Error("the first session's watchdog did not trip")
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_ServerRepeatsAUID_Then_CallbackRunsOnce asserts
+// that a second FETCH response for a UID already handed over is dropped.
+func Test_StreamMessagesByUIDs_When_ServerRepeatsAUID_Then_CallbackRunsOnce(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, func([]uint32) []uint32 {
+		return []uint32{1, 2, 2, 3}
+	})))
+	c := newClientWithFake(t, srv)
+
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1, 2, 3}, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	if want := []uint32{1, 2, 3}; !slices.Equal(got, want) {
+		t.Errorf("callback got UIDs %v, want %v (UID 2 once)", got, want)
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageStillDelivered
+// asserts that a FETCH response without a body does not hide the later response
+// that carries it.
+func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageStillDelivered(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		writeUIDMessage(conn, 1)
+		writeLine(conn, `* 2 FETCH (UID 2 FLAGS (\Seen))`)
+		writeUIDMessage(conn, 2)
+		writeUIDMessage(conn, 3)
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	withBody := make(map[uint32]int)
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1, 2, 3}, func(msg Message) error {
+		if msg.m.GetBody(fullBodyPeekSection) != nil {
+			withBody[msg.m.Uid]++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	for _, uid := range []uint32{1, 2, 3} {
+		if got := withBody[uid]; got != 1 {
+			t.Errorf("UID %d reached the callback with its body %d times, want 1", uid, got)
+		}
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered
+// asserts that the delivered state of one batch does not leak into the next.
+func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newClientWithFake(t, srv)
+
+	uids := make([]uint32, uidFetchBatchSize+1)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	if !slices.Equal(got, uids) {
+		t.Errorf("callback ran %d times, want %d, once per UID in order", len(got), len(uids))
+	}
+	want := [][]uint32{uids[:uidFetchBatchSize], uids[uidFetchBatchSize:]}
+	if gotSets := fetches.all(); !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH batches = %d, want %d (500 + 1)", len(gotSets), len(want))
 	}
 }

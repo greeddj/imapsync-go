@@ -234,13 +234,14 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 		return nil
 	}
 
-	// Sorted UIDs help imap.SeqSet collapse runs into ranges instead of
-	// emitting "1,2,3,4..." over the wire.
+	// Sorted so imap.SeqSet collapses runs into ranges, and so the retry
+	// bookkeeping can binary-search each batch.
 	uids = slices.Clone(uids)
 	slices.Sort(uids)
 
 	c.log("[%s] Streaming %d messages from %s", c.prefix, len(uids), folder)
 
+	delivered := make([]bool, min(len(uids), uidFetchBatchSize))
 	var cbErr error
 	for start := 0; start < len(uids); start += uidFetchBatchSize {
 		if err := ctx.Err(); err != nil {
@@ -249,18 +250,27 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 
 		end := min(start+uidFetchBatchSize, len(uids))
 		batch := uids[start:end]
+		seen := delivered[:len(batch)]
+		clear(seen)
 
 		err := c.safeCall(func(cli *imapclient.Client) error {
+			// A retry re-fetches only UIDs whose body was not yet handed to
+			// onMessage, so the destination gets no duplicate APPEND.
+			uidSet := new(imap.SeqSet)
+			for i, uid := range batch {
+				if !seen[i] {
+					uidSet.AddNum(uid)
+				}
+			}
+			if uidSet.Empty() {
+				return nil
+			}
 			// selectIfNeeded short-circuits when the folder is already
 			// selected on this connection. After a reconnect inside this
 			// safeCall, the generation flip has cleared selectedFolder so
 			// we re-Select here.
 			if _, err := c.selectIfNeeded(cli, folder); err != nil {
 				return fmt.Errorf("[%s] select folder %s: %w", c.prefix, folder, err)
-			}
-			uidSet := new(imap.SeqSet)
-			for _, uid := range batch {
-				uidSet.AddNum(uid)
 			}
 			messages := make(chan *imap.Message, messageChanBuffer)
 			batchDone := make(chan error, 1)
@@ -274,11 +284,21 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 				if ctx.Err() != nil || cbErr != nil {
 					continue
 				}
+				i, found := slices.BinarySearch(batch, msg.Uid)
+				if !found || seen[i] {
+					continue
+				}
+				// Only a response with the body can become an APPEND, so only it
+				// marks the UID. Read before onMessage, which may consume the body.
+				hasBody := msg.GetBody(fullBodyPeekSection) != nil
 				// onMessage is our own work, usually an APPEND. At a batch
 				// tail the source is done and silent, so that time must not count.
 				w.end()
 				e := onMessage(Message{m: msg})
 				w.begin()
+				if hasBody {
+					seen[i] = true
+				}
 				if e != nil {
 					cbErr = e
 				}

@@ -35,7 +35,7 @@ internal/app/show.go            — show orchestration: ActionShow reads flags a
 internal/app/worker.go          — syncWorker pool + runFolderSync helper consumed by sync.go
 internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect, generation-aware Select
 internal/client/watchdog.go     - idleConn: inactivity watchdog for commands in flight
-internal/client/fetch.go        — single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH)
+internal/client/fetch.go        - single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH, a retry fetches only the UIDs not yet delivered)
 internal/client/mailbox.go      — MailboxExists / ListSubfolders / CreateMailbox via the cache
 internal/client/cache.go        — per-Client mailboxCache (one LIST "" "*"), a created mailbox is added to it
 internal/client/append.go       — AppendMessage streaming the literal directly from the fetched body
@@ -94,6 +94,7 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 - Each connection has one timer, and `Close` stops it. Without an open span the timer does not run. A timer that is pending when a span ends fires once, finds no span and stops.
 - `selectIfNeeded(cli, folder)` short-circuits when the folder is already selected on this connection. Reconnect bumps `connGen` and clears `selectedFolder`, so the cached path is never wrong after a session flip. **Use it instead of `cli.Select` directly** — `StreamMessagesByUIDs` saves one round-trip per 500-message batch this way.
 - `StreamMessagesByUIDs` batches `UID FETCH` in chunks of `uidFetchBatchSize = 500` to avoid IMAP "Too long argument" errors. Don't unbatch.
+- A retry of a `StreamMessagesByUIDs` batch (after a transient error, through `safeCall`) fetches only the UIDs whose body `onMessage` did not receive. If `onMessage` received all of them, the retry sends no SELECT or FETCH command. The code does not deliver a second response with the body for the same UID. So a retry creates no duplicate APPEND on the destination. A response without a body does not mark its UID.
 - Folder creation uses a per-path `sync.Mutex` (`folderLocks` map) to make concurrent `CreateMailbox` calls for nested paths race-free; parents are created walking down the hierarchy.
 - `c.pw` and `c.tracker` are `atomic.Pointer[progressWriterRef|progressTrackerRef]`. Read via `c.progressWriter()` / `c.progressTracker()`; do not access the fields directly.
 - go-imap writes every read error to stderr, including the error that each `Terminate` causes. `connectAndLogin` calls `muteErrorLog`, which sends that log to `io.Discard` unless `--verbose` is set. The function changes the output of the existing `*log.Logger` with `SetOutput`, because the reader goroutine already runs and a field write would race.
