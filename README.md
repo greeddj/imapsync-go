@@ -259,6 +259,16 @@ If you need to abort immediately, press Ctrl+\ instead. This dumps all
 goroutine stacks to stderr and exits right away; it is the escape hatch for
 when the program appears stuck.
 
+### Limits during connection and exit
+
+These limits apply to the connection steps and to the exit of the program:
+
+- During the greeting, the login and the mailbox list, Ctrl+C stops the program at once.
+- If a server accepts a connection but sends no greeting, the connection attempt fails after 30 seconds.
+- When the program exits, it waits a maximum of 2 seconds for each connection to log out.
+
+A transfer in progress still follows the entry above.
+
 ## License
 
 MIT

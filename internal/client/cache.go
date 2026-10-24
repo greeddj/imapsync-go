@@ -17,14 +17,16 @@ type mailboxCache struct {
 	delimiter string
 }
 
-// loadMailboxCache populates the cache via a single LIST "" "*". The
-// hierarchy delimiter is captured from the first reply, replacing the older
-// dedicated refreshDelimiter call.
-//
-// loadMailboxCache is safe to call concurrently — the inner safeCall
-// serializes the IMAP traffic on c.mu, and the cache mutation is guarded
-// by c.mailboxCacheMu.
-func (c *Client) loadMailboxCache(_ context.Context) error {
+// loadMailboxCache fills the mailbox cache and the hierarchy delimiter from one
+// LIST "" "*".
+func (c *Client) loadMailboxCache(ctx context.Context) error {
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	folders := make(map[string]struct{})
 	delim := ""
 
@@ -46,6 +48,12 @@ func (c *Client) loadMailboxCache(_ context.Context) error {
 		return nil
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if delim == "" {

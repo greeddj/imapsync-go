@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -715,6 +716,52 @@ func interceptHandler(srv *fakeServer, intercept func(conn net.Conn, rd *bufio.R
 			return true
 		})
 	}
+}
+
+// silentHandler accepts a connection and never writes, so the client waits for a
+// greeting. accepted closes on arrival, closed closes when the client hangs up.
+func silentHandler(accepted, closed chan<- struct{}) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+
+		close(accepted)
+		_, _ = conn.Read(make([]byte, 1))
+		close(closed)
+	}
+}
+
+// holdHandler writes greeting, then keeps the connection open until the client
+// hangs up. closed closes at that moment.
+func holdHandler(greeting string, closed chan<- struct{}) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+
+		writeLine(conn, "%s", greeting)
+		_, _ = io.Copy(io.Discard, conn)
+		close(closed)
+	}
+}
+
+// retainDialed keeps every connection c dials reachable until the test ends. Without
+// it the finalizer of an unreachable connection closes a socket the code under test leaked.
+func retainDialed(t *testing.T, c *Client) {
+	t.Helper()
+
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	dial := c.dialFn
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, addr)
+		if err == nil {
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+		return conn, err
+	}
+	t.Cleanup(func() { runtime.KeepAlive(conns) })
 }
 
 // stall goes silent on the first command match accepts, so the client blocks

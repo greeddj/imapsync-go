@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"slices"
 	"strings"
@@ -407,46 +408,31 @@ func Test_newDialer_setsTCPKeepalive(t *testing.T) {
 	}
 }
 
-// Test_connectAndLogin_CancelInterruptsLogin asserts that calling Cancel() on a
-// client whose fake server accepted the TCP connection and sent the IMAP banner
-// but never replied to LOGIN causes connectAndLogin to return within 100ms with
-// a non-nil error.
 func Test_connectAndLogin_CancelInterruptsLogin(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeServer(t)
-	srv.addConnHandler(stallingLoginHandler(srv))
+	st := newStall(verbIs("LOGIN"))
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
+	c := newDisconnectedClient(t, srv)
 
-	c := &Client{
-		serverAddr:  srv.ln.Addr().String(),
-		username:    "user",
-		password:    "pass",
-		dialTimeout: 5 * time.Second,
-		folderLocks: make(map[string]*sync.Mutex),
-		cancelCh:    make(chan struct{}),
-	}
-	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-	}
-	t.Cleanup(func() { c.Cancel(); _ = c.Logout() })
-
-	ch := make(chan error, 1)
+	errc := make(chan error, 1)
 	go func() {
-		ch <- c.connectAndLogin(context.Background())
+		errc <- c.connectAndLogin(context.Background())
 	}()
 
-	time.Sleep(10 * time.Millisecond)
+	awaitSignal(t, st.reached, "the server to receive LOGIN")
 	c.Cancel()
 
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case err := <-ch:
-		if err == nil {
-			t.Error("connectAndLogin returned nil, want non-nil error after Cancel")
-		}
-	case <-timer.C:
-		t.Error("connectAndLogin did not return within 100ms after Cancel")
+	err := awaitError(t, errc, "connectAndLogin")
+	if err == nil {
+		t.Error("connectAndLogin returned nil, want non-nil error after Cancel")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("connectAndLogin error = %v, want context.Canceled", err)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c still holds a connection after the login was cancelled")
 	}
 }
 
@@ -493,38 +479,33 @@ func Test_safeCall_CancelDuringReconnectLogin(t *testing.T) {
 	}
 }
 
-// Test_New_initialLoginInterruptibleByContextCancel asserts that passing a
-// context that is cancelled mid-LOGIN to client.New causes it to return within
-// 100ms with a non-nil error.
 func Test_New_initialLoginInterruptibleByContextCancel(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeServer(t)
-	srv.addConnHandler(stallingLoginHandler(srv))
+	st := newStall(verbIs("LOGIN"))
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	ch := make(chan error, 1)
+	errc := make(chan error, 1)
 	go func() {
 		_, err := New(ctx, srv.ln.Addr().String(), "user", "pass", Options{
 			DialTimeout: 5 * time.Second,
 		})
-		ch <- err
+		errc <- err
 	}()
 
-	time.Sleep(10 * time.Millisecond)
+	awaitSignal(t, st.reached, "the server to receive LOGIN")
 	cancel()
 
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case err := <-ch:
-		if err == nil {
-			t.Error("New returned nil, want non-nil error after context cancel during LOGIN")
-		}
-	case <-timer.C:
-		t.Error("New did not return within 100ms after context cancel during LOGIN")
+	err := awaitError(t, errc, "New")
+	if err == nil {
+		t.Error("New returned nil, want non-nil error after context cancel during LOGIN")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("New error = %v, want context.Canceled", err)
 	}
 }
 
@@ -959,5 +940,597 @@ func Test_safeCall_When_ServerClosesMidCommand_Then_ReconnectsAndRetries(t *test
 	}
 	if got := srv.callCount("EXAMINE"); got != 2 {
 		t.Errorf("EXAMINE count = %d, want 2 (the dropped command is retried)", got)
+	}
+}
+
+func Test_New_When_ServerNeverGreets_Then_ContextCancelReturns(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	accepted, closed := make(chan struct{}), make(chan struct{})
+	srv.addConnHandler(silentHandler(accepted, closed))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var got *Client
+	errc := make(chan error, 1)
+	go func() {
+		var err error
+		// The long dial timeout keeps the greeting timer from being what ends the wait.
+		got, err = New(ctx, srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: time.Minute})
+		errc <- err
+	}()
+
+	awaitSignal(t, accepted, "the server to accept the connection")
+	cancel()
+
+	err := awaitError(t, errc, "New")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("New error = %v, want context.Canceled", err)
+	}
+	if got != nil {
+		got.Cancel()
+		t.Error("New returned a client alongside the error")
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+}
+
+func Test_New_When_ServerNeverGreets_Then_FailsAfterDialTimeout(t *testing.T) {
+	t.Parallel()
+
+	const dialTimeout = 200 * time.Millisecond
+
+	srv := newFakeServer(t)
+	accepted, closed := make(chan struct{}), make(chan struct{})
+	srv.addConnHandler(silentHandler(accepted, closed))
+
+	var got *Client
+	errc := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		var err error
+		got, err = New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: dialTimeout})
+		errc <- err
+	}()
+
+	err := awaitError(t, errc, "New")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("New error = %v, want os.ErrDeadlineExceeded", err)
+	}
+	if class := classifyError(err); class != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s so a reconnect retries it", err, class, ClassTransient)
+	}
+	if elapsed < dialTimeout {
+		t.Errorf("New failed after %s, want at least the dial timeout %s", elapsed, dialTimeout)
+	}
+	if got != nil {
+		got.Cancel()
+		t.Error("New returned a client alongside the error")
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+}
+
+// Test_New_When_CapabilityProbeStalls_Then_FailsAfterDialTimeout pins the greeting
+// bound to a timer: the greeting has no capability list, so go-imap probes
+// CAPABILITY, which a connection deadline would not survive.
+func Test_New_When_CapabilityProbeStalls_Then_FailsAfterDialTimeout(t *testing.T) {
+	t.Parallel()
+
+	const dialTimeout = 200 * time.Millisecond
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("CAPABILITY"))
+	srv.addConnHandler(func(conn net.Conn) {
+		serveCommands(srv, conn, "* OK fake ready", func(rd *bufio.Reader, cmd command) bool {
+			_, keep := st.intercept(conn, rd, cmd)
+			return keep
+		})
+	})
+
+	var got *Client
+	errc := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		var err error
+		got, err = New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: dialTimeout})
+		errc <- err
+	}()
+
+	err := awaitError(t, errc, "New")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("New error = %v, want os.ErrDeadlineExceeded", err)
+	}
+	if class := classifyError(err); class != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s so a reconnect retries it", err, class, ClassTransient)
+	}
+	if elapsed < dialTimeout {
+		t.Errorf("New failed after %s, want at least the dial timeout %s", elapsed, dialTimeout)
+	}
+	if got != nil {
+		got.Cancel()
+		t.Error("New returned a client alongside the error")
+	}
+	awaitSignal(t, st.reached, "the server to receive CAPABILITY")
+}
+
+func Test_safeCall_When_ReconnectGreetingStalls_Then_CancelReturns(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+
+	accepted, closed := make(chan struct{}), make(chan struct{})
+	srv.addConnHandler(silentHandler(accepted, closed))
+	c.reconnectDur = 0
+	c.backoff = 0
+	// The long dial timeout keeps the greeting timer from being what ends the wait.
+	c.dialTimeout = time.Minute
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.safeCall(func(*imapclient.Client) error { return io.EOF })
+	}()
+
+	awaitSignal(t, accepted, "the reconnect to reach the server")
+	c.Cancel()
+
+	if err := awaitError(t, errc, "safeCall"); !errors.Is(err, context.Canceled) {
+		t.Errorf("safeCall error = %v, want context.Canceled", err)
+	}
+	awaitSignal(t, closed, "the client to close the reconnect socket")
+}
+
+func Test_connectAndLogin_When_CancelledBeforeSessionStored_Then_ReturnsCanceled(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("LOGIN"))
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
+	c := newDisconnectedClient(t, srv)
+
+	c.Cancel()
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(context.Background())
+	}()
+
+	if err := awaitError(t, errc, "connectAndLogin"); !errors.Is(err, context.Canceled) {
+		t.Errorf("connectAndLogin error = %v, want context.Canceled", err)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c holds a connection after a login that never started")
+	}
+	if got := srv.callCount("LOGIN"); got != 0 {
+		t.Errorf("LOGIN count = %d, want 0 (a cancelled client must not log in)", got)
+	}
+}
+
+func Test_Logout_When_ServerStallsLogout_Then_ReturnsWithinBound(t *testing.T) {
+	t.Parallel()
+
+	const bound = 100 * time.Millisecond
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("LOGOUT"))
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
+	c := newClientWithFake(t, srv)
+	c.logoutDur = bound
+
+	errc := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		errc <- c.Logout()
+	}()
+
+	err := awaitError(t, errc, "Logout")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, errLogoutTimeout) {
+		t.Errorf("Logout error = %v, want errLogoutTimeout", err)
+	}
+	if elapsed < bound {
+		t.Errorf("Logout returned after %s, want at least the bound %s", elapsed, bound)
+	}
+	awaitSignal(t, st.reached, "the server to receive LOGOUT")
+}
+
+func Test_reconnect_When_OldSessionStallsLogout_Then_ReconnectsWithinBound(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("LOGOUT"))
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
+	c := newClientWithFake(t, srv)
+	c.logoutDur = 100 * time.Millisecond
+	c.reconnectDur = 0
+	c.backoff = 0
+
+	calls := 0
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.safeCall(func(*imapclient.Client) error {
+			calls++
+			if calls == 1 {
+				return io.EOF
+			}
+			return nil
+		})
+	}()
+
+	if err := awaitError(t, errc, "safeCall"); err != nil {
+		t.Fatalf("safeCall error = %v, want nil after a reconnect", err)
+	}
+	awaitSignal(t, st.reached, "the server to receive LOGOUT")
+
+	if calls != 2 {
+		t.Errorf("fn called %d times, want 2", calls)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the old session is replaced)", got)
+	}
+}
+
+func Test_connectAndLogin_When_LoginRefusedAndLogoutStalls_Then_ReturnsAuthError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("LOGOUT"))
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb == "LOGIN" {
+			writeLine(conn, "%s NO [AUTHENTICATIONFAILED] Authentication failed", cmd.tag)
+			return true, true
+		}
+		return st.intercept(conn, rd, cmd)
+	}))
+	c := newDisconnectedClient(t, srv)
+	c.logoutDur = 100 * time.Millisecond
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(t.Context())
+	}()
+
+	err := awaitError(t, errc, "connectAndLogin")
+	awaitSignal(t, st.reached, "the server to receive LOGOUT")
+
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassPermanent)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c still holds a connection after a refused LOGIN")
+	}
+}
+
+func Test_Logout_When_ServerReplies_Then_ReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	c.logoutDur = time.Minute
+
+	if err := c.Logout(); err != nil {
+		t.Errorf("Logout error = %v, want nil", err)
+	}
+	if got := srv.callCount("LOGOUT"); got != 1 {
+		t.Errorf("LOGOUT count = %d, want 1", got)
+	}
+}
+
+// go-imap closes the socket only on BYE, so Logout must close it itself.
+func Test_Logout_When_ServerAnswersWithoutBye_Then_ClosesSocket(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	closed := make(chan struct{})
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LOGOUT" {
+			return false, true
+		}
+		writeLine(conn, "%s OK LOGOUT completed", cmd.tag)
+		_, _ = io.Copy(io.Discard, rd)
+		close(closed)
+		return true, false
+	}))
+	c := newDisconnectedClient(t, srv)
+	retainDialed(t, c)
+	// The long bound keeps the logout timer from being what closes the socket.
+	c.logoutDur = time.Minute
+
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("connectAndLogin: %v", err)
+	}
+
+	if err := c.Logout(); err != nil {
+		t.Errorf("Logout error = %v, want nil", err)
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+}
+
+// Test_connectAndLogin_When_GreetingIsBye_Then_ClosesSocket covers the session
+// go-imap already marks as logged out, whose LOGOUT never reaches the wire.
+func Test_connectAndLogin_When_GreetingIsBye_Then_ClosesSocket(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	closed := make(chan struct{})
+	srv.addConnHandler(holdHandler("* BYE server shutting down", closed))
+	c := newDisconnectedClient(t, srv)
+	retainDialed(t, c)
+	// The long bound keeps the logout timer from being what closes the socket.
+	c.logoutDur = time.Minute
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(t.Context())
+	}()
+
+	if err := awaitError(t, errc, "connectAndLogin"); err == nil {
+		t.Error("connectAndLogin returned nil error after a BYE greeting")
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c holds a connection after a BYE greeting")
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+}
+
+func Test_New_When_ServerClosesBeforeGreeting_Then_ErrorWrapsEOF(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(func(conn net.Conn) { _ = conn.Close() })
+
+	var got *Client
+	errc := make(chan error, 1)
+	go func() {
+		var err error
+		// The long dial timeout keeps the greeting timer from being what ends the wait.
+		got, err = New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: time.Minute})
+		errc <- err
+	}()
+
+	err := awaitError(t, errc, "New")
+	if err == nil {
+		got.Cancel()
+		t.Fatal("New returned nil error, want the greeting failure")
+	}
+
+	if !strings.HasPrefix(err.Error(), "imap greeting: ") {
+		t.Errorf("New error = %q, want the imap greeting prefix", err)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("New error = %v, want it to wrap io.EOF", err)
+	}
+	if class := classifyError(err); class != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s so a reconnect retries it", err, class, ClassTransient)
+	}
+	if got != nil {
+		got.Cancel()
+		t.Error("New returned a client alongside the error")
+	}
+}
+
+func Test_connectAndLogin_When_GreetingIsRefused_Then_ClosesSocketAndWrapsError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	closed := make(chan struct{})
+	// go-imap accepts only OK, PREAUTH and BYE as a greeting status.
+	srv.addConnHandler(holdHandler("* NO try again later", closed))
+	c := newDisconnectedClient(t, srv)
+	retainDialed(t, c)
+	// The long dial timeout keeps the greeting timer from being what ends the wait.
+	c.dialTimeout = time.Minute
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(t.Context())
+	}()
+
+	err := awaitError(t, errc, "connectAndLogin")
+	if err == nil {
+		t.Fatal("connectAndLogin returned nil error, want the greeting failure")
+	}
+
+	if !strings.HasPrefix(err.Error(), "imap greeting: ") {
+		t.Errorf("connectAndLogin error = %q, want the imap greeting prefix", err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("connectAndLogin error = %v, want a refusal that is neither a cancellation nor a timeout", err)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c holds a connection after a refused greeting")
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+}
+
+func Test_connectAndLogin_When_DialTimeoutIsZero_Then_GreetingHasNoTimer(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
+	serve := interceptHandler(srv, func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+		return false, true
+	})
+	srv.addConnHandler(func(conn net.Conn) {
+		<-gate
+		serve(conn)
+	})
+	c := newDisconnectedClient(t, srv)
+	c.dialTimeout = 0
+
+	dial, dialed := c.dialFn, make(chan struct{})
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		defer close(dialed)
+		return dial(ctx, addr)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(t.Context())
+	}()
+
+	awaitSignal(t, dialed, "the client to dial")
+	// Hold the greeting back and yield, so a timer armed despite the zero timeout fires first.
+	for range 100 {
+		runtime.Gosched()
+	}
+	release()
+
+	if err := awaitError(t, errc, "connectAndLogin"); err != nil {
+		t.Fatalf("connectAndLogin: %v", err)
+	}
+	if c.c.Load() == nil {
+		t.Error("c.c is nil after a successful login")
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1", got)
+	}
+}
+
+func Test_greet_When_ContextEndsDuringCapabilityProbe_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("CAPABILITY"))
+	srv.addConnHandler(func(conn net.Conn) {
+		serveCommands(srv, conn, "* OK fake ready", func(rd *bufio.Reader, cmd command) bool {
+			_, keep := st.intercept(conn, rd, cmd)
+			return keep
+		})
+	})
+	c := newDisconnectedClient(t, srv)
+	// The long dial timeout keeps the greeting timer from being what ends the wait.
+	c.dialTimeout = time.Minute
+
+	conn, err := c.dialFn(t.Context(), c.serverAddr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var got *imapclient.Client
+	errc := make(chan error, 1)
+	go func() {
+		var err error
+		// go-imap ignores a failed CAPABILITY probe, so only the context tells the caller.
+		got, err = c.greet(ctx, conn)
+		errc <- err
+	}()
+
+	awaitSignal(t, st.reached, "the server to receive CAPABILITY")
+	cancel()
+
+	if err := awaitError(t, errc, "greet"); !errors.Is(err, context.Canceled) {
+		t.Errorf("greet error = %v, want context.Canceled", err)
+	}
+	if got != nil {
+		t.Error("greet returned a client alongside the error")
+	}
+}
+
+func Test_connectAndLogin_When_CancelledBeforeSessionStored_Then_ClosesSocket(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	closed := make(chan struct{})
+	srv.addConnHandler(holdHandler(scriptedGreeting, closed))
+	c := newDisconnectedClient(t, srv)
+	retainDialed(t, c)
+
+	c.Cancel()
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(context.Background())
+	}()
+
+	if err := awaitError(t, errc, "connectAndLogin"); !errors.Is(err, context.Canceled) {
+		t.Errorf("connectAndLogin error = %v, want context.Canceled", err)
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+}
+
+func Test_connectAndLogin_When_ContextExpiresDuringLogin_Then_ReturnsItsError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("LOGIN"))
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
+	c := newDisconnectedClient(t, srv)
+
+	ctx := newFiredContext(t.Context())
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.connectAndLogin(ctx)
+	}()
+
+	awaitSignal(t, st.reached, "the server to receive LOGIN")
+	ctx.fire()
+
+	err := awaitError(t, errc, "connectAndLogin")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("connectAndLogin error = %v, want %v, not the context.Canceled of a cancelled client", err, context.DeadlineExceeded)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c still holds a connection after the login was cut short")
+	}
+}
+
+func Test_New_When_LoginSucceeds_Then_LogoutIsBounded(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if c.logoutDur != logoutTimeout {
+		t.Errorf("logoutDur = %s, want %s so a silent server cannot hold Logout", c.logoutDur, logoutTimeout)
+	}
+}
+
+func Test_New_When_ContextEndsAfterReturn_Then_ClientStaysUsable(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	c, err := New(ctx, srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	cancel()
+	// Yield so an AfterFunc callback that New failed to unregister gets to run.
+	for range 100 {
+		runtime.Gosched()
+	}
+
+	if c.isCancelled() {
+		t.Fatal("client cancelled by a context that ended after New returned")
+	}
+	if err := c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }); err != nil {
+		t.Errorf("NOOP after the context ended: %v, want nil", err)
 	}
 }

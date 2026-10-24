@@ -46,13 +46,15 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
   - `Test_AppendMessage_repairsConnectionAfterServerLogout` covers the reconnect after a failed APPEND;
   - `Test_AppendMessage_whenContextExpiresMidAppend` covers a context that ends mid-APPEND.
 - **`safeCall` post-reconnect `isCancelled()` branch** — exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
-- **`connectAndLogin` `imapclient.New` failure branch** (the `conn.Close(); return err` branch after the greeting read in `connectAndLogin`) - the branch runs only when the server accepts the TCP connection but closes it before it sends the IMAP greeting. The branch has no imapsync logic. A test of it checks the go-imap greeting-read error handling, which the library owns. The `stallingLoginHandler` test already covers the normal greeting path. A handler that closes the connection in silence adds no coverage of imapsync code.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
   - `StreamMessagesByUIDs`, at the top of the second and later batches;
   - `CreateMailbox`, after the parent walk;
   - `createParentFolders`, at the top of the loop;
   - `ListMailboxes`, after the LIST;
   - `getFolderSize`, after success.
+- **`greet` tie between the context and the timer** - the context and `dialTimeout` can end at the same moment. Both events close the connection, so they race. Both resulting errors describe the failure correctly. No deterministic test can reach the tie. Two tests cover the separate causes:
+  - `Test_New_When_ServerNeverGreets_Then_ContextCancelReturns` covers the context;
+  - `Test_New_When_ServerNeverGreets_Then_FailsAfterDialTimeout` covers the timer.
 
 ### Deliberate exclusions in `internal/app`
 

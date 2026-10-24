@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,7 +42,12 @@ const (
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
 	uidFetchBatchSize  = 500
 	tcpKeepAlivePeriod = 30 * time.Second
+	// logoutTimeout bounds the wait for the LOGOUT reply. LOGOUT is the last
+	// command of a session, so closing the socket early loses nothing.
+	logoutTimeout = 2 * time.Second
 )
+
+var errLogoutTimeout = errors.New("imap logout: no reply from server")
 
 // ProgressWriter is a minimal interface for progress tracking and logging.
 // This avoids circular dependency with the progress package.
@@ -100,6 +106,7 @@ type Client struct {
 	backoff        time.Duration
 	reconnectDur   time.Duration
 	dialTimeout    time.Duration
+	logoutDur      time.Duration
 	mailboxCacheMu sync.RWMutex
 	mu             sync.Mutex
 	folderLocksMu  sync.Mutex
@@ -139,12 +146,9 @@ func newDialer(timeout time.Duration) *net.Dialer {
 	return &net.Dialer{Timeout: timeout, KeepAlive: tcpKeepAlivePeriod}
 }
 
-// New establishes a connection and logs into the IMAP server.
-//
-// ctx is used only for the initial dial and login; once Client is returned,
-// reconnects are driven by the internal cancellation channel (closed by
-// Cancel) so that long-running consumers do not need to keep the original
-// context alive.
+// New logs in to the IMAP server. ctx bounds the dial, greeting, login and first
+// mailbox list. Afterwards reconnects stop on Cancel, so callers need not keep
+// ctx alive.
 func New(ctx context.Context, addr, username, password string, opts Options) (*Client, error) {
 	timeout := opts.DialTimeout
 	if timeout == 0 {
@@ -161,6 +165,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 		backoff:      initialBackoff,
 		reconnectDur: reconnectInterval,
 		dialTimeout:  timeout,
+		logoutDur:    logoutTimeout,
 		verbose:      opts.Verbose,
 		folderLocks:  make(map[string]*sync.Mutex),
 		readLimiter:  opts.ReadLimiter,
@@ -267,13 +272,31 @@ func (c *Client) progressTracker() ProgressTracker {
 // GetDelimiter returns the cached hierarchy delimiter for this server.
 func (c *Client) GetDelimiter() string { return c.delimiter }
 
-// Logout terminates the IMAP session.
+// Logout ends the IMAP session. It closes the socket and returns an error when
+// the server does not answer LOGOUT within logoutTimeout.
 func (c *Client) Logout() error {
 	cli := c.c.Load()
 	if cli == nil {
 		return nil
 	}
-	return cli.Logout()
+	return c.logout(cli)
+}
+
+// logout bypasses safeCall so it never reconnects. The timer decides the error
+// because go-imap reports a closed socket as success. Terminate always runs
+// because go-imap closes only on BYE.
+func (c *Client) logout(cli *imapclient.Client) error {
+	defer func() { _ = cli.Terminate() }()
+
+	if c.logoutDur <= 0 {
+		return cli.Logout()
+	}
+	t := time.AfterFunc(c.logoutDur, func() { _ = cli.Terminate() })
+	err := cli.Logout()
+	if !t.Stop() {
+		return fmt.Errorf("%w within %s", errLogoutTimeout, c.logoutDur)
+	}
+	return err
 }
 
 // Cancel marks the client as canceled and terminates the underlying connection.
@@ -357,9 +380,8 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 		return err
 	}
 
-	cli, err := imapclient.New(conn)
+	cli, err := c.greet(ctx, conn)
 	if err != nil {
-		_ = conn.Close()
 		return err
 	}
 
@@ -367,6 +389,14 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	// connection mid-LOGIN — without this, a half-open TCP after a Wi-Fi
 	// flap leaves Login blocked until the kernel times the socket out.
 	c.c.Store(cli)
+
+	// Cancel sets cancelled before loading c.c; storing first and checking second
+	// guarantees one side sees the other, so an early Cancel cannot leave Login blocked.
+	if cerr := c.cancelErr(ctx); cerr != nil {
+		_ = cli.Terminate()
+		c.c.Store(nil)
+		return cerr
+	}
 
 	switch strings.ToLower(c.auth) {
 	case "cram-md5":
@@ -376,21 +406,70 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 		}
 
 		if err := cli.Authenticate(auth); err != nil {
-			_ = cli.Logout()
-			c.c.Store(nil)
-			return err
+			return c.abortSession(ctx, cli, err)
 		}
 
 	default:
 		if err := cli.Login(c.username, c.password); err != nil {
-			_ = cli.Logout()
-			c.c.Store(nil)
-			return err
+			return c.abortSession(ctx, cli, err)
 		}
 
 	}
 
 	return nil
+}
+
+// greet replaces a bare imapclient.New, which waits forever when the server
+// accepts the connection but never sends a greeting.
+func (c *Client) greet(ctx context.Context, conn net.Conn) (*imapclient.Client, error) {
+	var timer *time.Timer
+	if c.dialTimeout > 0 {
+		// Closing from a timer instead of conn.SetDeadline: go-imap's implicit
+		// CAPABILITY probe clears the deadline.
+		timer = time.AfterFunc(c.dialTimeout, func() { _ = conn.Close() })
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+
+	cli, err := imapclient.New(conn)
+
+	// go-imap ignores the error of its CAPABILITY probe, so err alone cannot
+	// tell a closed connection from a good one.
+	ctxFired := !stop()
+	timeFired := timer != nil && !timer.Stop()
+	if err == nil && !ctxFired && !timeFired {
+		return cli, nil
+	}
+
+	_ = conn.Close()
+	switch {
+	case ctx.Err() != nil:
+		return nil, ctx.Err()
+	case timeFired:
+		return nil, fmt.Errorf("imap greeting: none within %s: %w", c.dialTimeout, os.ErrDeadlineExceeded)
+	default:
+		return nil, fmt.Errorf("imap greeting: %w", err)
+	}
+}
+
+func (c *Client) cancelErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.isCancelled() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// abortSession prefers the cancellation error over authErr, so Ctrl-C during
+// LOGIN exits as Cancelled and not as an authentication failure.
+func (c *Client) abortSession(ctx context.Context, cli *imapclient.Client, authErr error) error {
+	_ = c.logout(cli)
+	c.c.Store(nil)
+	if cerr := c.cancelErr(ctx); cerr != nil {
+		return cerr
+	}
+	return authErr
 }
 
 // reconnect tears down and rebuilds the underlying IMAP session with backoff.
@@ -417,7 +496,7 @@ func (c *Client) reconnect() error {
 	}
 
 	if cli := c.c.Load(); cli != nil {
-		_ = cli.Logout()
+		_ = c.logout(cli)
 		c.c.Store(nil)
 	}
 	// Anything held about the previous connection's state — selected folder,
