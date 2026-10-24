@@ -267,13 +267,19 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 			items := []imap.FetchItem{imap.FetchEnvelope, fullBodyPeekSection.FetchItem()}
 			go func() { batchDone <- cli.UidFetch(uidSet, items, messages) }()
 
+			w := c.idle.Load()
 			for msg := range messages {
 				// Once cancelled or the callback errored, just drain so the
 				// producer goroutine can exit and we don't leak it.
 				if ctx.Err() != nil || cbErr != nil {
 					continue
 				}
-				if e := onMessage(Message{m: msg}); e != nil {
+				// onMessage is our own work, usually an APPEND. At a batch
+				// tail the source is done and silent, so that time must not count.
+				w.end()
+				e := onMessage(Message{m: msg})
+				w.begin()
+				if e != nil {
 					cbErr = e
 				}
 			}

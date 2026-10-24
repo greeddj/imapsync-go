@@ -853,3 +853,99 @@ func awaitError(t *testing.T, errc <-chan error, what string) error {
 		return nil
 	}
 }
+
+const (
+	// tripLimit is an idle limit that a test expects to see expire.
+	tripLimit = 100 * time.Millisecond
+	// holdLimit is an idle limit that must not expire during a test: stimulus
+	// gaps stay within a tenth of it and observation windows span several.
+	holdLimit = 250 * time.Millisecond
+)
+
+// newWatchedClient connects a client whose watchdog trips after idle. Backoff is
+// zero and reconnectDur stays zero, so a reconnect never sleeps.
+func newWatchedClient(t *testing.T, srv *fakeServer, idle time.Duration) *Client {
+	t.Helper()
+
+	c := newDisconnectedClient(t, srv)
+	c.idleDur = idle
+	c.backoff = 0
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("newWatchedClient connectAndLogin: %v", err)
+	}
+	return c
+}
+
+// serveNormally is an interceptHandler hook that leaves every command to the
+// default answers.
+func serveNormally(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return false, true
+}
+
+// endedSignal runs handler and closes ended once it returns. With a stall or an
+// idle handler that happens when the client hangs up on the connection.
+func endedSignal(handler func(net.Conn), ended chan<- struct{}) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer close(ended)
+		handler(conn)
+	}
+}
+
+// readAppendLiteral sends the continuation request and drains the literal with
+// its CRLF. It reports false when the client hangs up first; fits stall.before.
+func readAppendLiteral(conn net.Conn, rd *bufio.Reader, cmd command) bool {
+	size, ok := literalSize(cmd.arg)
+	if !ok {
+		return false
+	}
+	writeLine(conn, "+ Ready for literal data")
+	if _, err := io.CopyN(io.Discard, rd, size); err != nil {
+		return false
+	}
+	_, err := rd.ReadString('\n')
+	return err == nil
+}
+
+// trickle writes s one byte at a time, gap apart. It reports false when a write
+// fails.
+func trickle(conn net.Conn, s string, gap time.Duration) bool {
+	for i := range len(s) {
+		if _, err := conn.Write([]byte{s[i]}); err != nil {
+			return false
+		}
+		time.Sleep(gap)
+	}
+	return true
+}
+
+// stayOpen fails the test when ch closes within d.
+func stayOpen(t *testing.T, ch <-chan struct{}, d time.Duration, what string) {
+	t.Helper()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		t.Fatalf("%s within %s", what, d)
+	case <-timer.C:
+	}
+}
+
+// awaitCall runs call in a goroutine and returns its error. A server stall then
+// fails the test after a few seconds instead of hanging it.
+func awaitCall(t *testing.T, what string, call func() error) error {
+	t.Helper()
+
+	errc := make(chan error, 1)
+	go func() { errc <- call() }()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-errc:
+		return err
+	case <-timer.C:
+		t.Fatalf("%s still blocked 5s into a server stall", what)
+		return nil
+	}
+}

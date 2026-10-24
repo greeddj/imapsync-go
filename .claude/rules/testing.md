@@ -55,6 +55,16 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`greet` tie between the context and the timer** - the context and `dialTimeout` can end at the same moment. Both events close the connection, so they race. Both resulting errors describe the failure correctly. No deterministic test can reach the tie. Two tests cover the separate causes:
   - `Test_New_When_ServerNeverGreets_Then_ContextCancelReturns` covers the context;
   - `Test_New_When_ServerNeverGreets_Then_FailsAfterDialTimeout` covers the timer.
+- **`idleConn` ordering choices** - each of these four orderings closes a window of a few instructions against a concurrent timer callback:
+  - `Read` and `Write` stamp the last activity before they count themselves busy;
+  - `begin` stamps before it counts the span;
+  - `fire` uses `CompareAndSwap` to move the state from open to tripped;
+  - `connectAndLogin` stores `c.idle` before `c.c`.
+
+  A deterministic test needs a production hook between two atomic operations. The reason is the same as for the `safeCall` post-reconnect `isCancelled()` branch. The tests cover the behaviour on both sides of each ordering.
+- **`AppendMessage` with a server that is silent between the `{N}` line and the `+` continuation** - go-imap blocks the caller on `<-w.continues`, and a closed socket does not release it. A test of this window would hang. The cause is the same as in the Known limitation in `CLAUDE.md`. Two nearby paths have tests:
+  - `Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAndRepairs` covers a server that is silent after the literal;
+  - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` covers a server that stops reading the literal.
 
 ### Deliberate exclusions in `internal/app`
 

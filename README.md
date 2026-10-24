@@ -259,15 +259,19 @@ If you need to abort immediately, press Ctrl+\ instead. This dumps all
 goroutine stacks to stderr and exits right away; it is the escape hatch for
 when the program appears stuck.
 
-### Limits during connection and exit
+### Limits during connection, commands and exit
 
-These limits apply to the connection steps and to the exit of the program:
+These limits apply to the connection steps, to the commands and to the exit of the program:
 
 - During the greeting, the login and the mailbox list, Ctrl+C stops the program at once.
 - If a server accepts a connection but sends no greeting, the connection attempt fails after 30 seconds.
+- If no data moves for 5 minutes during the login, the connection attempt fails.
+- During a command, the program watches for data in both directions. If no data moves for 5 minutes, the program closes the connection and connects again. Then it sends the command one more time.
+- If the program closes the connection during the upload of a message, it does not send that message again. The next run copies it.
+- A transfer that moves data has no time limit. The program does not close a connection that is idle between commands.
 - When the program exits, it logs out all connections at the same time. A `sync` waits a maximum of 4 seconds for this, and a `show` waits a maximum of 2 seconds.
 
-A transfer in progress still follows the entry above.
+The 5-minute limit does not change the Ctrl+C entry above.
 
 ## License
 

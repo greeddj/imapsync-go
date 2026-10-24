@@ -33,7 +33,8 @@ cmd/imapsync-go/commands/       — thin subcommand definitions (sync, show); th
 internal/app/sync.go            — sync orchestration: ActionSync reads flags and config, runSync connects, builds the plan, confirms, dispatches to worker pool
 internal/app/show.go            — show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table
 internal/app/worker.go          — syncWorker pool + runFolderSync helper consumed by sync.go
-internal/client/client.go       - go-imap wrapper: Options, dial+TLS+rate-limit wiring, bounded greeting and logout, reconnect, generation-aware Select
+internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect, generation-aware Select
+internal/client/watchdog.go     - idleConn: inactivity watchdog for commands in flight
 internal/client/fetch.go        — single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH)
 internal/client/mailbox.go      — MailboxExists / ListSubfolders / CreateMailbox via the cache
 internal/client/cache.go        — per-Client mailboxCache (one LIST "" "*"), a created mailbox is added to it
@@ -42,7 +43,7 @@ internal/client/errors.go       — classifyError: Transient / Permanent / Throt
 internal/client/provider.go     — DetectProvider, used by sync.go to print quota warnings
 internal/config/                — JSON+YAML config loader (extension-driven), validation
 internal/progress/              — go-pretty progress writer/tracker abstraction (interfaces consumed by client)
-internal/ratelimit/             — net.Conn wrapper applying golang.org/x/time/rate at the dialer
+internal/ratelimit/             - net.Conn wrapper applying golang.org/x/time/rate, installed by guardConn
 internal/utils/                 — `AskConfirm(ctx, in *bufio.Reader, out io.Writer, prompt)` and friends
 ```
 
@@ -64,9 +65,9 @@ The sync flow is **plan, confirm, execute** — not stream-as-you-go:
 
 Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; re-running on a partially completed sync is safe and resumes.
 
-### 3. Connection resilience (`internal/client/client.go`)
+### 3. Connection resilience (`internal/client/client.go`, `internal/client/watchdog.go`)
 
-- `safeCall(fn)` wraps every IMAP op. Errors are routed through `classifyError`: only `ClassTransient` triggers a reconnect-and-retry; `ClassThrottled` and `ClassPermanent` are surfaced to the caller. Add new IMAP operations through `safeCall` rather than calling `c.Client` methods directly.
+- `safeCall(fn)` wraps every IMAP op. Errors are routed through `classifyError`: only `ClassTransient` triggers a reconnect-and-retry; `ClassThrottled` and `ClassPermanent` are surfaced to the caller. Add new IMAP operations through `safeCall` rather than calling `c.Client` methods directly. `safeCall` runs each attempt of `fn` through `call`, which also opens one watchdog span.
 - `Reconnect` enforces a minimum interval (`reconnectInterval = 10s`), exponential backoff up to `maxReconnectAttempts = 5`, and a longer cool-down (`throttledBackoff = 5m`) when the previous attempt got `ClassThrottled`.
 - All `time.Sleep` calls in the reconnect path go through `sleepCtx`, which bails out on the internal cancel channel (closed by `Cancel()`) — Ctrl-C aborts immediately instead of waiting for the backoff to elapse.
 - `Cancel` + `withCancel(ctx)` bridge `context.Context` to the underlying `*client.Client`: when the context is canceled, the connection is `Terminate()`d so blocked IMAP calls return immediately. `withCancel` registers `Cancel` through `context.AfterFunc`. After the returned stop function runs, a later cancellation does not change the client. Every long-running public method on `Client` should call `defer c.withCancel(ctx)()` and check `ctx.Err()` after each blocking step. `connectAndLogin` also does this and stores the unauthenticated `cli` in `c.c` before calling `Login` so `Cancel()` can `Terminate()` a stalled LOGIN.
@@ -75,18 +76,40 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 - TCP keepalive is enabled at the dialer (`tcpKeepAlivePeriod = 30s` idle interval, via `newDialer`) so half-open sockets after a Wi-Fi flap are detected within the OS-default keepalive envelope rather than hanging indefinitely.
 - `connectAndLogin` calls `greet(ctx, conn)` in place of a bare `imapclient.New`. `greet` closes the connection when `ctx` ends, or when the greeting does not arrive within `dialTimeout` (default `defaultDialTimeout = 30s`). The limit also covers the CAPABILITY probe that go-imap sends when the greeting has no capability list. A timer closes the socket, not `conn.SetDeadline`, because that probe clears connection deadlines. The timeout error wraps `os.ErrDeadlineExceeded`, so `classifyError` returns `ClassTransient` and `reconnect` retries it. `greet` wraps all other failures with the prefix `imap greeting:`.
 - `logout(cli)` sends LOGOUT and waits a maximum of `logoutTimeout = 2s`. Each Client stores this limit as `logoutDur`, and a zero value means no limit (test fixtures only). If the server does not answer, `logout` terminates the connection and returns an error that wraps `errLogoutTimeout`. `logout` always closes the socket before it returns, because go-imap closes the socket only when the server sends BYE. `logout` does not use `safeCall`, so a logout never triggers a reconnect. `Logout()`, `reconnect` (when it discards the old session under `c.mu`) and the cleanup after a failed LOGIN or AUTHENTICATE call `logout`.
+- `idleConn` (`internal/client/watchdog.go`) is the inactivity watchdog for commands in flight. `idleTimeout = 5 * time.Minute` is its limit. Each Client stores the limit as `idleDur`, and `New` sets it. A zero value turns the watchdog off (test fixtures only), like `logoutDur`. No config field or CLI flag sets the limit.
+- `connectAndLogin` calls `guardConn` after `dialFn` and before `greet`. `guardConn` wraps the dialed transport in `idleConn`. When a limiter is set, it then wraps the result in `ratelimit.Conn`. So the watchdog is the innermost wrapper, and a wait for rate-limit tokens does not run inside it. `dialFn` only dials TCP or TLS.
+- `c.idle` holds the watchdog of the session in `c.c`. `connectAndLogin` stores `c.idle` before `c.c`, so a reader that sees the new session also sees its watchdog. `call` loads `c.idle` again on each attempt, so a retry after a reconnect uses the new watchdog.
+- A span is the time while a command is in flight. The watchdog counts only time inside a span. `safeCall` runs each attempt of `fn` through `call`, which opens one span. `AppendMessage` opens one span around `cli.Append`. `connectAndLogin` opens one span around LOGIN or AUTHENTICATE, for the first connect and for each reconnect. A go-imap call outside `safeCall` must open its own span.
+- The watchdog does not cover the greeting or LOGOUT. The greeting keeps its `dialTimeout` limit, and LOGOUT keeps `logoutTimeout`.
+- The watchdog closes the transport when all these conditions are true:
+  - a span is open;
+  - at least one `Read` or `Write` is blocked on the transport;
+  - no byte moved in either direction for `idleDur`.
+- Any byte in either direction resets the idle time to zero. The watchdog limits inactivity, not total time, so a transfer that moves bytes is never cut. A session that is idle between commands is never closed.
+- When the watchdog trips, the pending call fails. `idleErr` wraps its error with `errIdleTimeout` (`no data from server`) and `os.ErrDeadlineExceeded`, so `classifyError` returns `ClassTransient`. `safeCall` then reconnects and retries once, inside the `reconnectInterval`, `maxReconnectAttempts` and backoff limits. Example error text: `imap: connection closed: no data from server within 5m0s: i/o timeout`.
+- A LOGIN that gets no reply during a reconnect trips too, so `reconnect` never holds `c.mu` without a limit. `AppendMessage` returns the error and repairs the connection (existing behaviour). The next run copies that message through the Message-Id diff.
+- A trip never calls `Cancel` and never sets the cancelled flag. Each cancellation check runs before the error handling. So Ctrl-C returns `context.Canceled`, also after a trip.
+- `StreamMessagesByUIDs` ends the span while `onMessage` runs, because that time is our own work (usually the destination APPEND). At the end of a batch the source is done and silent. Code that runs caller work inside a `safeCall` closure must also end the span, and open it again after. A wait for read tokens runs outside `idleConn`, so it never counts.
+- Accepted edge: the watchdog cannot see a wait for write tokens. If one literal write (up to 32 KiB) waits `idleTimeout` or more for tokens, the watchdog trips. This needs an upload limit below about 110 bytes per second for each worker that uploads at the same time. The limiter is shared between the workers.
+- Each connection has one timer, and `Close` stops it. Without an open span the timer does not run. A timer that is pending when a span ends fires once, finds no span and stops.
 - `selectIfNeeded(cli, folder)` short-circuits when the folder is already selected on this connection. Reconnect bumps `connGen` and clears `selectedFolder`, so the cached path is never wrong after a session flip. **Use it instead of `cli.Select` directly** — `StreamMessagesByUIDs` saves one round-trip per 500-message batch this way.
 - `StreamMessagesByUIDs` batches `UID FETCH` in chunks of `uidFetchBatchSize = 500` to avoid IMAP "Too long argument" errors. Don't unbatch.
 - Folder creation uses a per-path `sync.Mutex` (`folderLocks` map) to make concurrent `CreateMailbox` calls for nested paths race-free; parents are created walking down the hierarchy.
 - `c.pw` and `c.tracker` are `atomic.Pointer[progressWriterRef|progressTrackerRef]`. Read via `c.progressWriter()` / `c.progressTracker()`; do not access the fields directly.
 - go-imap writes every read error to stderr, including the error that each `Terminate` causes. `connectAndLogin` calls `muteErrorLog`, which sends that log to `io.Discard` unless `--verbose` is set. The function changes the output of the existing `*log.Logger` with `SetOutput`, because the reader goroutine already runs and a field write would race.
 
-**Known limitation — Ctrl+C blocked inside a literal write.** When the network dies mid-APPEND or mid-FETCH, `Cancel()` / `Terminate()` closes the underlying TCP socket but does not unblock the goroutine blocked on `<-w.continues` at `vendor/github.com/emersion/go-imap/write.go:158`. That channel is part of the go-imap literal-continuation protocol: the client sends `{N}\r\n` and waits for the server's `+ continue` signal before sending the literal bytes. Closing the socket makes the server unreachable, so the `+ continue` never arrives and the channel receive never unblocks. TCP keepalive (`tcpKeepAlivePeriod = 30s` idle interval) is the only current backstop: the OS will close the socket after the keepalive probe envelope expires (several minutes on macOS/Linux), at which point the blocked goroutine returns an error. Only the one worker inside the in-flight operation is affected; other workers continue normally. Users can press Ctrl+\ (SIGQUIT) to get an immediate goroutine dump and exit. A proper fix requires either patching `writeLiteral` in the vendored go-imap to `select` on a done channel alongside the `continues` receive, or migrating to go-imap v2.
+**Known limitation - Ctrl+C blocked inside a literal write.** go-imap sends a synchronizing literal in two steps. First the client sends `{N}\r\n`. Then it waits on `<-w.continues` (`vendor/github.com/emersion/go-imap/write.go:158`) for the `+` reply of the server. Only the response handlers of the reader goroutine send on that channel.
+
+If the socket closes before the server sends `+` or a tagged reply, the reader goroutine ends and the wait never ends. These events close the socket: `Cancel()` / `Terminate()`, TCP keepalive expiry (`tcpKeepAlivePeriod = 30s` idle interval, several minutes on macOS and Linux) and a watchdog trip. The goroutine that writes the literal stays blocked until the process exits.
+
+The watchdog does not change this limitation. It closes the socket in this window, but a closed socket does not release the wait. Only the worker inside the in-flight operation is affected, and other workers continue.
+
+Users can press Ctrl+\ (SIGQUIT) to get an immediate goroutine dump and exit. A fix needs one of two changes. The first patches `writeLiteral` in the vendored go-imap, to `select` on a done channel with the `continues` receive. The second moves to go-imap v2.
 
 ### 4. Rate limiting (`internal/ratelimit`)
 
 - `ratelimit.NewLimiter(bps)` returns `nil` when `bps <= 0` — the caller's nil-check is the "unlimited" signal.
-- `ratelimit.New(net.Conn, read, write *rate.Limiter)` wraps a connection so reads and writes block until tokens are available. The wrapper is installed inside `client.Client.dialFn` after a successful dial, so go-imap is unaware of throttling.
+- `ratelimit.New(net.Conn, read, write *rate.Limiter)` wraps a connection so reads and writes block until tokens are available. `guardConn` installs the wrapper in `connectAndLogin`, after `dialFn` returns and outside `idleConn`. So go-imap is unaware of throttling, and the watchdog never counts a wait for read tokens (see Section 3).
 - One limiter per direction is shared across every `Client` that talks to the same side (one `srcReadLim` for all source workers, one `dstWriteLim` for all destination workers). That makes the BPS budget a global cap, not per-connection.
 
 ### 5. Body fetch semantics

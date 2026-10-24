@@ -1536,6 +1536,534 @@ func Test_New_When_ContextEndsAfterReturn_Then_ClientStaysUsable(t *testing.T) {
 	}
 }
 
+func Test_safeCall_When_ServerStopsAnswering_Then_WatchdogReconnectsAndRetries(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	examine := newStall(verbIs("EXAMINE"))
+	hungUp := make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, examine.intercept), hungUp))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newWatchedClient(t, srv, tripLimit)
+	first := c.idle.Load()
+
+	start := time.Now()
+	err := awaitCall(t, "FetchMessageMap", func() error {
+		_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v, want success after the watchdog reconnect", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed < tripLimit {
+		t.Errorf("FetchMessageMap returned after %s, want at least the %s limit", elapsed, tripLimit)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session after the trip)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the stalled command is retried)", got)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	if !first.tripped() {
+		t.Error("the first session's watchdog did not trip")
+	}
+	if second := c.idle.Load(); second == first || second.tripped() {
+		t.Error("the retry did not run on a fresh, untripped watchdog")
+	}
+	awaitSignal(t, hungUp, "the client to close the stalled connection")
+}
+
+func Test_safeCall_When_ReplyTricklesWithinLimit_Then_WatchdogDoesNotCut(t *testing.T) {
+	t.Parallel()
+
+	const gap = holdLimit / 10
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "EXAMINE" {
+			return false, true
+		}
+		return true, trickle(conn, cmd.tag+" OK [READ-ONLY] EXAMINE completed\r\n", gap)
+	}))
+	c := newWatchedClient(t, srv, holdLimit)
+
+	start := time.Now()
+	if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+		t.Fatalf("FetchMessageMap: %v, want the trickled reply to complete", err)
+	}
+	if elapsed := time.Since(start); elapsed < 3*holdLimit {
+		t.Fatalf("the reply took %s, want a trickle of at least 3 limits", elapsed)
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (no reconnect while bytes keep arriving)", got)
+	}
+	if c.idle.Load().tripped() {
+		t.Error("the watchdog tripped on a reply that kept moving")
+	}
+}
+
+func Test_Client_When_IdleBetweenCommands_Then_WatchdogDoesNotClose(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	hungUp := make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, serveNormally), hungUp))
+	c := newWatchedClient(t, srv, holdLimit)
+
+	stayOpen(t, hungUp, 3*holdLimit+holdLimit/2, "the client closed an idle session")
+	if err := c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }); err != nil {
+		t.Fatalf("safeCall after the idle period: %v", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (the idle session is reused)", got)
+	}
+	if got := srv.callCount("NOOP"); got != 1 {
+		t.Errorf("NOOP count = %d, want 1", got)
+	}
+}
+
+func Test_safeCall_When_ReconnectLoginStalls_Then_WatchdogTripsAndNextAttemptSucceeds(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	login := newStall(verbIs("LOGIN"))
+	hungUp := make(chan struct{})
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	srv.addConnHandler(endedSignal(interceptHandler(srv, login.intercept), hungUp))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newWatchedClient(t, srv, tripLimit)
+
+	calls := 0
+	err := awaitCall(t, "safeCall", func() error {
+		return c.safeCall(func(*imapclient.Client) error {
+			calls++
+			if calls == 1 {
+				return io.EOF
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("safeCall: %v, want success on the third connection", err)
+	}
+	if calls != 2 {
+		t.Errorf("fn ran %d times, want 2", calls)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3 (initial, stalled, healthy)", got)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	awaitSignal(t, hungUp, "the client to close the connection whose LOGIN stalled")
+}
+
+func Test_connectAndLogin_When_AuthenticationStalls_Then_WatchdogFailsTransiently(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		auth    string
+		stalled string
+	}{
+		{name: "LOGIN gets no reply", stalled: "LOGIN"},
+		{name: "CRAM-MD5 gets no challenge", auth: "cram-md5", stalled: "AUTHENTICATE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			stuck := newStall(verbIs(tt.stalled))
+			hungUp := make(chan struct{})
+			srv.addConnHandler(endedSignal(interceptHandler(srv, stuck.intercept), hungUp))
+			c := newDisconnectedClient(t, srv)
+			c.idleDur = tripLimit
+			c.auth = tt.auth
+
+			err := awaitCall(t, "connectAndLogin", func() error {
+				return c.connectAndLogin(t.Context())
+			})
+			if !errors.Is(err, errIdleTimeout) {
+				t.Errorf("connectAndLogin error = %v, want it to wrap errIdleTimeout", err)
+			}
+			if got := classifyError(err); got != ClassTransient {
+				t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+			}
+			if c.c.Load() != nil {
+				t.Error("c.c still holds a connection after the stalled authentication")
+			}
+			awaitSignal(t, hungUp, "the client to close the connection")
+		})
+	}
+}
+
+func Test_FetchMessageMap_When_CancelledDuringStall_Then_ReturnsCanceledNotIdleTimeout(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	examine := newStall(verbIs("EXAMINE"))
+	srv.addConnHandler(interceptHandler(srv, examine.intercept))
+	c := newWatchedClient(t, srv, time.Minute)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := c.FetchMessageMap(ctx, "INBOX")
+		errc <- err
+	}()
+	awaitSignal(t, examine.reached, "the server to receive EXAMINE")
+	cancel()
+
+	err := awaitError(t, errc, "FetchMessageMap")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, errIdleTimeout) {
+		t.Errorf("error = %v, a cancellation must not read as an idle timeout", err)
+	}
+	if c.idle.Load().tripped() {
+		t.Error("the watchdog tripped on a cancellation")
+	}
+}
+
+func Test_FetchMessageMap_When_CancelledDuringReconnectAfterTrip_Then_ReturnsCanceledNotIdleTimeout(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	examine := newStall(verbIs("EXAMINE"))
+	login := newStall(verbIs("LOGIN"))
+	srv.addConnHandler(interceptHandler(srv, examine.intercept))
+	srv.addConnHandler(interceptHandler(srv, login.intercept))
+	c := newWatchedClient(t, srv, tripLimit)
+	// The connection the reconnect dials must not trip, so only Ctrl-C ends its LOGIN.
+	c.idleDur = time.Minute
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := c.FetchMessageMap(ctx, "INBOX")
+		errc <- err
+	}()
+	awaitSignal(t, login.reached, "the reconnect LOGIN to reach the server")
+	cancel()
+
+	err := awaitError(t, errc, "FetchMessageMap")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, errIdleTimeout) {
+		t.Errorf("error = %v, a cancellation must not read as an idle timeout", err)
+	}
+	if !c.isCancelled() {
+		t.Error("isCancelled() = false after the context ended")
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (initial and the stalled reconnect)", got)
+	}
+}
+
+func Test_safeCall_When_ReadRateLimitWaitExceedsIdleLimit_Then_WatchdogDoesNotTrip(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newDisconnectedClient(t, srv)
+	c.idleDur = holdLimit
+	c.backoff = 0
+	// Unlimited while connecting; the burst must stay above zero because waitN chunks by it.
+	lim := rate.NewLimiter(rate.Inf, 64)
+	c.readLimiter = lim
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("connectAndLogin: %v", err)
+	}
+
+	// 20 B/s makes the reply of a NOOP (about 26 bytes) wait over a second for tokens.
+	lim.SetLimit(rate.Limit(20))
+	if !lim.AllowN(time.Now(), lim.Burst()) {
+		t.Fatal("could not drain the token bucket")
+	}
+
+	start := time.Now()
+	if err := c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }); err != nil {
+		t.Fatalf("safeCall: %v, want the throttled reply to complete", err)
+	}
+	if elapsed := time.Since(start); elapsed < 3*holdLimit {
+		t.Errorf("the reply took %s, want a rate-limit wait of at least 3 limits", elapsed)
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (a token wait is not server silence)", got)
+	}
+	if c.idle.Load().tripped() {
+		t.Error("the watchdog tripped during a rate-limit wait")
+	}
+}
+
+func Test_New_When_Built_Then_WatchdogUsesIdleTimeout(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts Options
+	}{
+		{name: "without rate limits", opts: Options{DialTimeout: 5 * time.Second}},
+		{name: "with rate limits", opts: Options{
+			DialTimeout:  5 * time.Second,
+			ReadLimiter:  rate.NewLimiter(rate.Inf, 1<<20),
+			WriteLimiter: rate.NewLimiter(rate.Inf, 1<<20),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", tt.opts)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if c.idleDur != idleTimeout {
+				t.Errorf("idleDur = %s, want %s", c.idleDur, idleTimeout)
+			}
+			if c.idle.Load() == nil {
+				t.Error("no watchdog is armed on the session")
+			}
+		})
+	}
+}
+
+func Test_newClientWithFake_When_IdleDurIsZero_Then_NoWatchdogAndClientWorks(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+
+	if c.idle.Load() != nil {
+		t.Error("a zero idleDur still produced a watchdog")
+	}
+	if err := c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }); err != nil {
+		t.Fatalf("safeCall without a watchdog: %v", err)
+	}
+}
+
+func Test_safeCall_When_RetryAfterWatchdogReconnectStalls_Then_FailsAfterOneRetry(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	firstStall := newStall(verbIs("NOOP"))
+	secondStall := newStall(verbIs("NOOP"))
+	firstHungUp := make(chan struct{})
+	secondHungUp := make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, firstStall.intercept), firstHungUp))
+	srv.addConnHandler(endedSignal(interceptHandler(srv, secondStall.intercept), secondHungUp))
+	c := newWatchedClient(t, srv, tripLimit)
+	first := c.idle.Load()
+
+	calls := 0
+	err := awaitCall(t, "safeCall", func() error {
+		return c.safeCall(func(cli *imapclient.Client) error {
+			calls++
+			return cli.Noop()
+		})
+	})
+	if err == nil {
+		t.Fatal("safeCall returned nil, want the idle timeout of the retry")
+	}
+	if !errors.Is(err, errIdleTimeout) {
+		t.Errorf("error = %v, want it to wrap errIdleTimeout", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, a watchdog trip must not read as a cancellation", err)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	if calls != 2 {
+		t.Errorf("fn ran %d times, want 2 (the call and exactly one retry)", calls)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one reconnect, no third attempt)", got)
+	}
+	if got := srv.callCount("NOOP"); got != 2 {
+		t.Errorf("NOOP count = %d, want 2 (the stalled command is seen once per connection)", got)
+	}
+	if second := c.idle.Load(); second == first || !second.tripped() {
+		t.Error("the retry did not run under the watchdog of the fresh session")
+	}
+	awaitSignal(t, firstHungUp, "the client to close the first stalled connection")
+	awaitSignal(t, secondHungUp, "the client to close the second stalled connection")
+}
+
+func Test_safeCall_When_EveryReconnectLoginStalls_Then_WatchdogGivesUpAfterMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	hungUp := make([]chan struct{}, maxReconnectAttempts)
+	for i := range hungUp {
+		hungUp[i] = make(chan struct{})
+		login := newStall(verbIs("LOGIN"))
+		srv.addConnHandler(endedSignal(interceptHandler(srv, login.intercept), hungUp[i]))
+	}
+	c := newWatchedClient(t, srv, tripLimit)
+
+	calls := 0
+	err := awaitCall(t, "safeCall", func() error {
+		return c.safeCall(func(*imapclient.Client) error {
+			calls++
+			return io.EOF
+		})
+	})
+	if err == nil {
+		t.Fatal("safeCall returned nil, want the reconnect failure")
+	}
+	if !errors.Is(err, errIdleTimeout) {
+		t.Errorf("error = %v, want it to wrap errIdleTimeout", err)
+	}
+	if !strings.Contains(err.Error(), "failed to reconnect after retries") {
+		t.Errorf("error = %v, want the reconnect give-up message", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	if calls != 1 {
+		t.Errorf("fn ran %d times, want 1 (a failed reconnect leaves nothing to retry on)", calls)
+	}
+	if got := srv.callCount("LOGIN"); got != 1+maxReconnectAttempts {
+		t.Errorf("LOGIN count = %d, want %d (initial plus every reconnect attempt)", got, 1+maxReconnectAttempts)
+	}
+	for i, ch := range hungUp {
+		awaitSignal(t, ch, fmt.Sprintf("the client to close the connection of reconnect attempt %d", i+1))
+	}
+	if !c.mu.TryLock() {
+		t.Fatal("c.mu is still held after the reconnect gave up")
+	}
+	c.mu.Unlock()
+}
+
+func Test_safeCall_When_CancelledAfterWatchdogTrip_Then_ReturnsCanceledWithoutReconnect(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	noop := newStall(verbIs("NOOP"))
+	srv.addConnHandler(interceptHandler(srv, noop.intercept))
+	c := newWatchedClient(t, srv, tripLimit)
+	w := c.idle.Load()
+
+	calls := 0
+	err := awaitCall(t, "safeCall", func() error {
+		return c.safeCall(func(cli *imapclient.Client) error {
+			calls++
+			err := cli.Noop()
+			// The watchdog has cut the connection by now; Ctrl-C lands before safeCall looks at the error.
+			c.Cancel()
+			return err
+		})
+	})
+	if !w.tripped() {
+		t.Fatal("the watchdog did not trip, so the test did not reach the trip-then-cancel order")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, errIdleTimeout) {
+		t.Errorf("error = %v, a cancellation must win over the idle timeout", err)
+	}
+	if calls != 1 {
+		t.Errorf("fn ran %d times, want 1 (no retry after Ctrl-C)", calls)
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (no reconnect after Ctrl-C)", got)
+	}
+}
+
+func Test_Client_When_OperationReturns_Then_NoWatchdogSpanStaysOpen(t *testing.T) {
+	t.Parallel()
+
+	normal := func(srv *fakeServer) func(net.Conn) { return interceptHandler(srv, serveNormally) }
+	tests := []struct {
+		handler func(srv *fakeServer) func(net.Conn)
+		run     func(c *Client) error
+		name    string
+		wantErr bool
+	}{
+		{
+			name:    "safeCall succeeds",
+			handler: normal,
+			run:     func(c *Client) error { return c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }) },
+		},
+		{
+			name:    "safeCall fails permanently",
+			handler: normal,
+			run: func(c *Client) error {
+				return c.safeCall(func(*imapclient.Client) error { return errors.New("refused") })
+			},
+			wantErr: true,
+		},
+		{
+			name:    "FetchMessageMap succeeds",
+			handler: normal,
+			run: func(c *Client) error {
+				_, _, err := c.FetchMessageMap(context.Background(), "INBOX")
+				return err
+			},
+		},
+		{
+			name:    "AppendMessage accepted",
+			handler: func(srv *fakeServer) func(net.Conn) { return appendOutcomeHandler(srv, "OK APPEND completed") },
+			run: func(c *Client) error {
+				return c.AppendMessage(context.Background(), "INBOX", buildTestIMAPMessage())
+			},
+		},
+		{
+			name:    "AppendMessage refused",
+			handler: func(srv *fakeServer) func(net.Conn) { return appendOutcomeHandler(srv, "NO [OVERQUOTA] mailbox full") },
+			run: func(c *Client) error {
+				return c.AppendMessage(context.Background(), "INBOX", buildTestIMAPMessage())
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(tt.handler(srv))
+			c := newWatchedClient(t, srv, holdLimit)
+			w := c.idle.Load()
+
+			if err := tt.run(c); (err != nil) != tt.wantErr {
+				t.Fatalf("operation error = %v, want an error: %t", err, tt.wantErr)
+			}
+			if got := w.active.Load(); got != 0 {
+				t.Errorf("open spans after the operation = %d, want 0 (an idle session would trip)", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 1 {
+				t.Errorf("LOGIN count = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func Test_New_ErrorLogFollowsVerbose(t *testing.T) {
 	t.Parallel()
 

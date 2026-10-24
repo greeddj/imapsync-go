@@ -47,6 +47,9 @@ const (
 	// logoutTimeout bounds the wait for the LOGOUT reply. LOGOUT is the last
 	// command of a session, so closing the socket early loses nothing.
 	logoutTimeout = 2 * time.Second
+	// idleTimeout bounds a command's wait on a silent server. Generous: a server
+	// may think for minutes after a large APPEND, and moving bytes never trip it.
+	idleTimeout = 5 * time.Minute
 )
 
 var errLogoutTimeout = errors.New("imap logout: no reply from server")
@@ -94,6 +97,7 @@ type Client struct {
 	folderLocks    map[string]*sync.Mutex
 	cancelCh       chan struct{}
 	c              atomic.Pointer[imapclient.Client]
+	idle           atomic.Pointer[idleConn]
 	selectedFolder atomic.Pointer[string]
 	pw             atomic.Pointer[progressWriterRef]
 	tracker        atomic.Pointer[progressTrackerRef]
@@ -109,6 +113,7 @@ type Client struct {
 	reconnectDur   time.Duration
 	dialTimeout    time.Duration
 	logoutDur      time.Duration
+	idleDur        time.Duration
 	mailboxCacheMu sync.RWMutex
 	mu             sync.Mutex
 	folderLocksMu  sync.Mutex
@@ -168,6 +173,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 		reconnectDur: reconnectInterval,
 		dialTimeout:  timeout,
 		logoutDur:    logoutTimeout,
+		idleDur:      idleTimeout,
 		verbose:      opts.Verbose,
 		folderLocks:  make(map[string]*sync.Mutex),
 		readLimiter:  opts.ReadLimiter,
@@ -189,9 +195,6 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 		}
 		if err != nil {
 			return nil, err
-		}
-		if c.readLimiter != nil || c.writeLimiter != nil {
-			conn = ratelimit.New(conn, c.readLimiter, c.writeLimiter)
 		}
 		return conn, nil
 	}
@@ -381,12 +384,16 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	conn, w := c.guardConn(conn)
 
 	cli, err := c.greet(ctx, conn)
 	if err != nil {
 		return err
 	}
 	c.muteErrorLog(cli)
+
+	// Stored before cli so a reader that sees the new cli also sees its watchdog.
+	c.idle.Store(w)
 
 	// Store cli before Login so Cancel() can Terminate the underlying
 	// connection mid-LOGIN — without this, a half-open TCP after a Wi-Fi
@@ -401,25 +408,36 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 		return cerr
 	}
 
+	w.begin()
 	switch strings.ToLower(c.auth) {
 	case "cram-md5":
-		auth := &cramMD5Auth{
+		err = cli.Authenticate(&cramMD5Auth{
 			username: c.username,
 			password: c.password,
-		}
-
-		if err := cli.Authenticate(auth); err != nil {
-			return c.abortSession(ctx, cli, err)
-		}
-
+		})
 	default:
-		if err := cli.Login(c.username, c.password); err != nil {
-			return c.abortSession(ctx, cli, err)
-		}
-
+		err = cli.Login(c.username, c.password)
+	}
+	w.end()
+	if err = w.idleErr(err); err != nil {
+		return c.abortSession(ctx, cli, err)
 	}
 
 	return nil
+}
+
+// guardConn keeps the watchdog innermost, so rate-limit token waits never run
+// inside it. The watchdog is nil when idleDur is zero.
+func (c *Client) guardConn(conn net.Conn) (net.Conn, *idleConn) {
+	var w *idleConn
+	if c.idleDur > 0 {
+		w = newIdleConn(conn, c.idleDur)
+		conn = w
+	}
+	if c.readLimiter != nil || c.writeLimiter != nil {
+		conn = ratelimit.New(conn, c.readLimiter, c.writeLimiter)
+	}
+	return conn, w
 }
 
 // greet replaces a bare imapclient.New, which waits forever when the server
@@ -577,7 +595,7 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 		return errors.New("imap client not connected")
 	}
 
-	err := fn(cli)
+	err := c.call(cli, fn)
 	if err == nil {
 		return nil
 	}
@@ -598,7 +616,17 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 	if cli == nil {
 		return errors.New("imap client not connected after reconnect")
 	}
-	return fn(cli)
+	return c.call(cli, fn)
+}
+
+// call runs one attempt of fn inside a watchdog span. It loads the watchdog on
+// every attempt so a retry after a reconnect uses the fresh session's.
+func (c *Client) call(cli *imapclient.Client, fn func(*imapclient.Client) error) error {
+	w := c.idle.Load()
+	w.begin()
+	err := fn(cli)
+	w.end()
+	return w.idleErr(err)
 }
 
 // cramMD5Auth implements the Auth interface for CRAM-MD5 authentication.

@@ -8,10 +8,14 @@ import (
 	"io"
 	"net"
 	"slices"
+
 	"strings"
+
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap"
+	imapclient "github.com/emersion/go-imap/client"
 )
 
 func TestParseMessageID(t *testing.T) {
@@ -639,6 +643,163 @@ func TestMessage_MessageID(t *testing.T) {
 			t.Parallel()
 			if got := tt.msg.MessageID(); got != tt.want {
 				t.Errorf("MessageID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip asserts
+// that time spent in onMessage, our own work, is never counted as server silence.
+func Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		messages int
+	}{
+		// The server has sent the tagged OK and is silent while the callback runs.
+		{name: "at the batch tail", messages: 1},
+		// More messages than the channel and go-imap's reader can hold, so the
+		// reader stops consuming while the first callback runs.
+		{name: "in the middle of a batch", messages: messageChanBuffer + 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			script := &mailboxScript{
+				folders:     []scriptFolder{{name: "INBOX", sizes: make([]uint32, tt.messages)}},
+				uidMessages: tt.messages,
+			}
+			srv := newFakeServer(t)
+			srv.addConnHandler(script.handler(srv))
+			c := newWatchedClient(t, srv, holdLimit)
+
+			uids := make([]uint32, tt.messages)
+			for i := range uids {
+				uids[i] = uint32(i + 1)
+			}
+			delivered := 0
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(Message) error {
+				delivered++
+				if delivered == 1 {
+					time.Sleep(3*holdLimit + holdLimit/2)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("StreamMessagesByUIDs: %v", err)
+			}
+			if delivered != tt.messages {
+				t.Errorf("callback ran %d times, want %d", delivered, tt.messages)
+			}
+			if c.idle.Load().tripped() {
+				t.Error("the watchdog tripped while the callback ran")
+			}
+
+			if err := c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }); err != nil {
+				t.Fatalf("safeCall after the stream: %v", err)
+			}
+			if got := srv.callCount("LOGIN"); got != 1 {
+				t.Errorf("LOGIN count = %d, want 1 (the source session survived the slow callback)", got)
+			}
+		})
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_ServerSilentBeforeFirstMessage_Then_WatchdogRepairsAndStreamCompletes(t *testing.T) {
+	t.Parallel()
+
+	fetch := newStall(verbIs("UID"))
+	hungUp := make(chan struct{})
+	script := &mailboxScript{uidMessages: 1}
+	srv := newFakeServer(t)
+	srv.addConnHandler(endedSignal(interceptHandler(srv, fetch.intercept), hungUp))
+	srv.addConnHandler(script.handler(srv))
+	c := newWatchedClient(t, srv, tripLimit)
+	first := c.idle.Load()
+	// The reconnect dials the session whose callback must stay outside any span.
+	c.idleDur = holdLimit
+
+	delivered := 0
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1}, func(Message) error {
+			delivered++
+			time.Sleep(3*holdLimit + holdLimit/2)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success after the watchdog reconnect", err)
+	}
+	if delivered != 1 {
+		t.Errorf("callback ran %d times, want 1", delivered)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session after the trip)", got)
+	}
+	if got := srv.callCount("UID FETCH"); got != 2 {
+		t.Errorf("UID FETCH count = %d, want 2 (the stalled batch is retried)", got)
+	}
+	if !first.tripped() {
+		t.Error("the first session's watchdog did not trip")
+	}
+	if second := c.idle.Load(); second == first || second.tripped() {
+		t.Error("the slow callback ran on a stale or tripped watchdog")
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	awaitSignal(t, hungUp, "the client to close the stalled connection")
+}
+
+// onMessage runs outside any span and every span must close again; an unbalanced
+// count leaves the watchdog dead or armed on an idle session.
+func Test_StreamMessagesByUIDs_When_CallbackRuns_Then_WatchdogSpanIsClosedInsideAndBalancedAfter(t *testing.T) {
+	t.Parallel()
+
+	errCallback := errors.New("callback refused the message")
+	tests := []struct {
+		err  error
+		name string
+	}{
+		{name: "callback succeeds"},
+		{name: "callback fails", err: errCallback},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const messages = 3
+			script := &mailboxScript{uidMessages: messages}
+			srv := newFakeServer(t)
+			srv.addConnHandler(script.handler(srv))
+			c := newWatchedClient(t, srv, holdLimit)
+			w := c.idle.Load()
+
+			calls := 0
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1, 2, 3}, func(Message) error {
+				calls++
+				if got := w.active.Load(); got != 0 {
+					t.Errorf("open spans inside callback %d = %d, want 0", calls, got)
+				}
+				return tt.err
+			})
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("StreamMessagesByUIDs error = %v, want %v", err, tt.err)
+			}
+			wantCalls := messages
+			if tt.err != nil {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Errorf("callback ran %d times, want %d", calls, wantCalls)
+			}
+			if got := w.active.Load(); got != 0 {
+				t.Errorf("open spans after the stream = %d, want 0", got)
+			}
+			if w.tripped() {
+				t.Error("the watchdog tripped on a healthy stream")
 			}
 		})
 	}

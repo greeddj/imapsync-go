@@ -49,7 +49,11 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 		date = env.Date
 	}
 	flags := []string{imap.SeenFlag}
-	if err := cli.Append(folder, flags, date, body); err != nil {
+	w := c.idle.Load()
+	w.begin()
+	err := cli.Append(folder, flags, date, body)
+	w.end()
+	if err = w.idleErr(err); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

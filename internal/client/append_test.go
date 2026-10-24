@@ -257,3 +257,119 @@ func Test_AppendMessage_whenEnvelopeMissing(t *testing.T) {
 		t.Errorf("APPEND count = %d, want 1", got)
 	}
 }
+
+// Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAndRepairs
+// asserts that an APPEND whose tagged reply never comes fails as a transient
+// idle timeout, and that the repair leaves a session the next APPEND can use.
+func Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAndRepairs(t *testing.T) {
+	t.Parallel()
+
+	hold := newStall(verbIs("APPEND"))
+	hold.before = readAppendLiteral
+	hungUp := make(chan struct{})
+	srv := newFakeServer(t)
+	srv.addConnHandler(endedSignal(interceptHandler(srv, hold.intercept), hungUp))
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newWatchedClient(t, srv, tripLimit)
+	genBefore := c.connGen.Load()
+
+	err := awaitCall(t, "AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	})
+	if err == nil {
+		t.Fatal("first AppendMessage returned nil, want the idle timeout")
+	}
+	if !errors.Is(err, errIdleTimeout) {
+		t.Errorf("error = %v, want it to wrap errIdleTimeout", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, a watchdog trip must not read as a cancellation", err)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the failed APPEND repaired the connection)", got)
+	}
+	if got := c.connGen.Load(); got != genBefore+1 {
+		t.Errorf("connGen = %d, want %d", got, genBefore+1)
+	}
+	awaitSignal(t, hungUp, "the client to close the stalled connection")
+
+	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {
+		t.Fatalf("second AppendMessage: %v, want success on the repaired session", err)
+	}
+	if got := srv.callCount("APPEND"); got != 2 {
+		t.Errorf("APPEND count = %d, want 2 (one per connection)", got)
+	}
+}
+
+// zeroLiteral is a literal of n zero bytes that is never held in memory.
+type zeroLiteral struct{ n, read int }
+
+func (l *zeroLiteral) Len() int { return l.n }
+
+func (l *zeroLiteral) Read(p []byte) (int, error) {
+	if l.read >= l.n {
+		return 0, io.EOF
+	}
+	n := min(len(p), l.n-l.read)
+	clear(p[:n])
+	l.read += n
+	return n, nil
+}
+
+// Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs
+// asserts that a literal write blocked on a server that stopped reading ends as
+// an idle timeout, as a dead network does mid-upload.
+func Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs(t *testing.T) {
+	t.Parallel()
+
+	// More than any loopback socket buffer holds, so the write must block.
+	const literalSize = 64 << 20
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "APPEND" {
+			return false, true
+		}
+		writeLine(conn, "+ Ready for literal data")
+		<-release
+		return true, false
+	}))
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newWatchedClient(t, srv, tripLimit)
+	genBefore := c.connGen.Load()
+
+	huge := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
+	huge.Body[&imap.BodySectionName{}] = &zeroLiteral{n: literalSize}
+	huge.Envelope = &imap.Envelope{MessageId: "huge-id@example.com"}
+
+	err := awaitCall(t, "AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", Message{m: huge})
+	})
+	if !errors.Is(err, errIdleTimeout) {
+		t.Fatalf("error = %v, want it to wrap errIdleTimeout", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
+	if got := c.connGen.Load(); got != genBefore+1 {
+		t.Errorf("connGen = %d, want %d (the failed APPEND repaired the connection)", got, genBefore+1)
+	}
+
+	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {
+		t.Fatalf("second AppendMessage: %v, want success on the repaired session", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2", got)
+	}
+}
