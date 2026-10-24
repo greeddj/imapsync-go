@@ -36,7 +36,7 @@ internal/app/worker.go          — syncWorker pool + runFolderSync helper consu
 internal/client/client.go       — go-imap wrapper: Options, dial+TLS+rate-limit wiring, reconnect, generation-aware Select
 internal/client/fetch.go        — single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH)
 internal/client/mailbox.go      — MailboxExists / ListSubfolders / CreateMailbox via the cache
-internal/client/cache.go        — per-Client mailboxCache (one LIST "" "*"), invalidated on Create
+internal/client/cache.go        — per-Client mailboxCache (one LIST "" "*"), a created mailbox is added to it
 internal/client/append.go       — AppendMessage streaming the literal directly from the fetched body
 internal/client/errors.go       — classifyError: Transient / Permanent / Throttled
 internal/client/provider.go     — DetectProvider, used by sync.go to print quota warnings
@@ -93,7 +93,7 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 ## Conventions
 
 - Configuration format is detected from the file extension: `.json` / `.yaml` / `.yml` (see `internal/config/config.New`). The CLI accepts either; sample files are `config.example.json` / `config.example.yaml`.
-- Workers are clamped to `[1, 10]` in `config.New` — anything out of range falls back to `1`.
+- Workers are clamped to `[1, 10]` in `config.New`. A value out of range changes to the nearest limit.
 - Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it.
 - `client.New(ctx, addr, user, pass, Options{...})` — keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation.
 - Dependencies are vendored under `vendor/`. The module requires Go 1.27.3 or newer; an older host toolchain is refused unless `GOTOOLCHAIN` is left on `auto` to fetch one.

@@ -18,7 +18,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 4. **`AppendMessage` streams the literal** — `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. Transient mid-APPEND failures are tolerated because the next run re-diffs.
 5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch — servers reject longer arg lists.
 6. **`selectIfNeeded` over `cli.Select`.** Generation-aware caching saves a round-trip per batch and is invalidated correctly on reconnect.
-7. **Mailbox cache populated by one `LIST "" "*"` per Client.** Invalidated on `CreateMailbox`. Do not re-LIST eagerly.
+7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
 
 ## Connection resilience
 
@@ -35,7 +35,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 
 ## Concurrency
 
-- Workers are clamped `[1, 10]` in `config.New`. Out-of-range falls back to 1. Do not surface this as a runtime panic.
+- Workers are clamped `[1, 10]` in `config.New`. A value out of range changes to the nearest limit. Do not surface this as a runtime panic.
 - Folder creation uses per-path `sync.Mutex` from `Client.folderLocks`. Do not replace with a global mutex — concurrent creates of unrelated paths must not serialise.
 - The worker pool is **persistent**: each worker owns one src + one dst `Client` for the whole sync. Do not reconnect per plan.
 
