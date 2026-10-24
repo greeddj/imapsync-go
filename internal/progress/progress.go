@@ -16,7 +16,9 @@ import (
 // Writer is a wrapper around progress.Writer with pre-configured settings.
 type Writer struct {
 	pw          progress.Writer
+	out         io.Writer
 	numTrackers int
+	quiet       bool
 }
 
 // getTerminalWidth returns the current terminal width, defaulting to 120 if detection fails.
@@ -31,11 +33,11 @@ func getTerminalWidth() int {
 func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw := progress.NewWriter()
 	pw.SetAutoStop(false)
+	var out io.Writer = os.Stdout
 	if quiet {
-		pw.SetOutputWriter(io.Discard)
-	} else {
-		pw.SetOutputWriter(os.Stdout)
+		out = io.Discard
 	}
+	pw.SetOutputWriter(out)
 
 	// Calculate optimal lengths based on terminal width.
 	//
@@ -109,11 +111,15 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.Style().Options.TimeInProgressPrecision = time.Millisecond
 	pw.Style().Options.TimeDonePrecision = time.Millisecond
 
-	return &Writer{pw: pw, numTrackers: numTrackers}
+	return &Writer{pw: pw, out: out, numTrackers: numTrackers, quiet: quiet}
 }
 
-// SetOutputWriter redirects rendered output to out.
-func (w *Writer) SetOutputWriter(out io.Writer) { w.pw.SetOutputWriter(out) }
+// SetOutputWriter redirects rendered output, and the escapes StopAndClear
+// writes, to out.
+func (w *Writer) SetOutputWriter(out io.Writer) {
+	w.out = out
+	w.pw.SetOutputWriter(out)
+}
 
 // WaitForRenderDone spins until the render goroutine finishes its final pass.
 func (w *Writer) WaitForRenderDone() {
@@ -146,6 +152,13 @@ func (w *Writer) Stop() {
 // from the terminal. Line count is taken from the NewWriter argument so
 // callers never have to keep that number in sync by hand.
 func (w *Writer) StopAndClear() {
+	// Quiet mode rendered nothing, so there is nothing to wait for or erase;
+	// cursor escapes here would corrupt piped output and earlier lines.
+	if w.quiet {
+		w.pw.Stop()
+		return
+	}
+
 	// Wait for final rendering
 	time.Sleep(300 * time.Millisecond)
 
@@ -157,9 +170,9 @@ func (w *Writer) StopAndClear() {
 	// line as we pass, then return to column 0 of the topmost erased
 	// row so the next caller-printed line starts there cleanly.
 	for range w.numTrackers {
-		fmt.Print("\033[A\033[K")
+		_, _ = fmt.Fprint(w.out, "\033[A\033[K")
 	}
-	fmt.Print("\r")
+	_, _ = fmt.Fprint(w.out, "\r")
 }
 
 // NewTracker creates a new tracker with the given message and total.
