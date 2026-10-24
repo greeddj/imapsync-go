@@ -33,6 +33,19 @@ var messageIDHeaderSection = &imap.BodySectionName{
 // messages as read.
 var fullBodyPeekSection = &imap.BodySectionName{Peek: true}
 
+// Message is one message fetched by StreamMessagesByUIDs. It hides the go-imap
+// type so internal/app never handles *imap.* values directly.
+type Message struct{ m *imap.Message }
+
+// MessageID returns the envelope Message-Id, or "" when the server sent no
+// envelope.
+func (m Message) MessageID() string {
+	if m.m == nil || m.m.Envelope == nil {
+		return ""
+	}
+	return m.m.Envelope.MessageId
+}
+
 // FetchMessageMap returns Message-Id → UID for every message in folder, plus
 // the sum of RFC822.SIZE across all messages.
 //
@@ -210,7 +223,7 @@ func trimAngleBrackets(id string) string {
 // If onMessage returns an error, the channel from the in-flight batch is
 // drained (so the producer goroutine exits cleanly) and the error is
 // returned without scheduling further batches.
-func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids []uint32, onMessage func(*imap.Message) error) error {
+func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -260,7 +273,7 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 				if ctx.Err() != nil || cbErr != nil {
 					continue
 				}
-				if e := onMessage(msg); e != nil {
+				if e := onMessage(Message{m: msg}); e != nil {
 					cbErr = e
 				}
 			}

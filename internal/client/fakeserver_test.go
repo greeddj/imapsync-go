@@ -322,16 +322,16 @@ func stallingLoginHandler(srv *fakeServer) func(net.Conn) {
 	}
 }
 
-// buildTestIMAPMessage constructs a minimal *imap.Message suitable for
+// buildTestIMAPMessage constructs a minimal Message suitable for
 // passing to AppendMessage. The body section key must be the resp() form of
 // fullBodyPeekSection (Peek=false, empty BodyPartName) because go-imap always
 // stores server-returned body sections without the PEEK flag.
-func buildTestIMAPMessage() *imap.Message {
+func buildTestIMAPMessage() Message {
 	section := &imap.BodySectionName{} // Peek=false matches fullBodyPeekSection.resp()
 	msg := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
 	msg.Body[section] = strings.NewReader("From: test@example.com\r\nSubject: hi\r\n\r\nHello\r\n")
 	msg.Envelope = &imap.Envelope{MessageId: "test-id@example.com"}
-	return msg
+	return Message{m: msg}
 }
 
 // newDisconnectedClient creates a *Client wired to srv but does not connect, so

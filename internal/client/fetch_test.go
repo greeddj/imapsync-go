@@ -111,7 +111,7 @@ func Test_StreamMessagesByUIDs_batchesAt500(t *testing.T) {
 		uids[i] = uint32(i + 1)
 	}
 
-	err := c.StreamMessagesByUIDs(context.Background(), "INBOX", uids, func(_ *imap.Message) error {
+	err := c.StreamMessagesByUIDs(context.Background(), "INBOX", uids, func(_ Message) error {
 		return nil
 	})
 	if err != nil {
@@ -260,7 +260,7 @@ func Test_StreamMessagesByUIDs_returnsWithoutFetching(t *testing.T) {
 			}
 
 			calls := 0
-			err := c.StreamMessagesByUIDs(ctx, "INBOX", tt.uids, func(*imap.Message) error {
+			err := c.StreamMessagesByUIDs(ctx, "INBOX", tt.uids, func(Message) error {
 				calls++
 				return nil
 			})
@@ -296,8 +296,8 @@ func Test_StreamMessagesByUIDs_deliversMessages(t *testing.T) {
 		gotUIDs []uint32
 		bodies  []string
 	)
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg *imap.Message) error {
-		lit := msg.GetBody(fullBodyPeekSection)
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg Message) error {
+		lit := msg.m.GetBody(fullBodyPeekSection)
 		if lit == nil {
 			return errors.New("message has no body section")
 		}
@@ -305,7 +305,7 @@ func Test_StreamMessagesByUIDs_deliversMessages(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		gotUIDs = append(gotUIDs, msg.Uid)
+		gotUIDs = append(gotUIDs, msg.m.Uid)
 		bodies = append(bodies, string(body))
 		return nil
 	})
@@ -353,7 +353,7 @@ func Test_StreamMessagesByUIDs_callbackErrorStopsFurtherBatches(t *testing.T) {
 
 	errStop := errors.New("callback refused the message")
 	calls := 0
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(*imap.Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(Message) error {
 		calls++
 		return errStop
 	})
@@ -403,7 +403,7 @@ func Test_StreamMessagesByUIDs_whenServerRefuses(t *testing.T) {
 			srv, c := newScriptedClient(t, tt.script)
 
 			calls := 0
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1}, func(*imap.Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1}, func(Message) error {
 				calls++
 				return nil
 			})
@@ -450,7 +450,7 @@ func Test_StreamMessagesByUIDs_whenContextExpiresMidBatch(t *testing.T) {
 	calls := 0
 	errc := make(chan error, 1)
 	go func() {
-		errc <- c.StreamMessagesByUIDs(ctx, "INBOX", uids, func(*imap.Message) error {
+		errc <- c.StreamMessagesByUIDs(ctx, "INBOX", uids, func(Message) error {
 			calls++
 			ctx.fire()
 			return nil
@@ -618,4 +618,28 @@ func writeFetchResponses(conn net.Conn) {
 		"* 2 FETCH (UID 2 RFC822.SIZE 512 BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
 		len(hdr2), hdr2,
 	)
+}
+
+func TestMessage_MessageID(t *testing.T) {
+	t.Parallel()
+
+	withEnvelope := imap.NewMessage(1, nil)
+	withEnvelope.Envelope = &imap.Envelope{MessageId: "<a@x>"}
+	tests := []struct {
+		msg  Message
+		name string
+		want string
+	}{
+		{name: "zero value", msg: Message{}},
+		{name: "server sent no envelope", msg: Message{m: imap.NewMessage(1, nil)}},
+		{name: "envelope present", msg: Message{m: withEnvelope}, want: "<a@x>"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.msg.MessageID(); got != tt.want {
+				t.Errorf("MessageID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }

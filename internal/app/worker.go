@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/emersion/go-imap"
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
@@ -117,7 +116,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		tr.UpdateMessage(fmt.Sprintf("%s (%s %s)", base, errPart, reason))
 	}
 
-	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg *imap.Message) error {
+	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg client.Message) error {
 		if err := w.dst.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -146,7 +145,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		}
 		if verbose {
 			pw.Log("Synced %d/%d to %s, processed msg id %s",
-				synced, p.NewMessages, p.DestinationFolder, msg.Envelope.MessageId)
+				synced, p.NewMessages, p.DestinationFolder, msg.MessageID())
 		}
 		// AppendMessage that completed in flight after ctx cancel must not
 		// continue iterating; the next message would race with Cancel() racing

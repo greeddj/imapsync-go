@@ -21,7 +21,7 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		message      func() *imap.Message
+		message      func() Message
 		wantErrIs    error
 		name         string
 		wantErrText  string
@@ -31,9 +31,14 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 	}{
 		{
 			name: "message has no body section",
-			message: func() *imap.Message {
-				return imap.NewMessage(1, []imap.FetchItem{imap.FetchEnvelope})
+			message: func() Message {
+				return Message{m: imap.NewMessage(1, []imap.FetchItem{imap.FetchEnvelope})}
 			},
+			wantErrText: "no body",
+		},
+		{
+			name:        "zero message",
+			message:     func() Message { return Message{} },
 			wantErrText: "no body",
 		},
 		{
@@ -232,5 +237,23 @@ func Test_AppendMessage_whenContextExpiresMidAppend(t *testing.T) {
 	}
 	if got := srv.callCount("LOGIN"); got != 1 {
 		t.Errorf("LOGIN count = %d, want 1", got)
+	}
+}
+
+func Test_AppendMessage_whenEnvelopeMissing(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(appendHandler(srv))
+	c := newClientWithFake(t, srv)
+	c.verbose = true // the success log reads the Message-Id as well
+
+	msg := buildTestIMAPMessage()
+	msg.m.Envelope = nil
+	if err := c.AppendMessage(t.Context(), "INBOX", msg); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count = %d, want 1", got)
 	}
 }
