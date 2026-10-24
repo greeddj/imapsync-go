@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"runtime"
@@ -1532,5 +1533,41 @@ func Test_New_When_ContextEndsAfterReturn_Then_ClientStaysUsable(t *testing.T) {
 	}
 	if err := c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() }); err != nil {
 		t.Errorf("NOOP after the context ended: %v, want nil", err)
+	}
+}
+
+func Test_New_ErrorLogFollowsVerbose(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		want    io.Writer
+		name    string
+		verbose bool
+	}{
+		{name: "quiet session discards go-imap error lines", want: io.Discard},
+		{name: "verbose session keeps them on stderr", verbose: true, want: os.Stderr},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second, Verbose: tt.verbose})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			l, ok := c.c.Load().ErrorLog.(*log.Logger)
+			if !ok {
+				t.Fatalf("ErrorLog is %T, want *log.Logger", c.c.Load().ErrorLog)
+			}
+			if got := l.Writer(); got != tt.want {
+				t.Errorf("ErrorLog writer = %T, want %T", got, tt.want)
+			}
+		})
 	}
 }

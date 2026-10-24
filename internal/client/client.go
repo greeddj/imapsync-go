@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -384,6 +386,7 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.muteErrorLog(cli)
 
 	// Store cli before Login so Cancel() can Terminate the underlying
 	// connection mid-LOGIN — without this, a half-open TCP after a Wi-Fi
@@ -448,6 +451,18 @@ func (c *Client) greet(ctx context.Context, conn net.Conn) (*imapclient.Client, 
 		return nil, fmt.Errorf("imap greeting: none within %s: %w", c.dialTimeout, os.ErrDeadlineExceeded)
 	default:
 		return nil, fmt.Errorf("imap greeting: %w", err)
+	}
+}
+
+// muteErrorLog keeps go-imap's read-error lines, which every Terminate causes,
+// off stderr unless verbose. SetOutput locks the logger, so the running reader
+// goroutine does not race.
+func (c *Client) muteErrorLog(cli *imapclient.Client) {
+	if c.verbose {
+		return
+	}
+	if l, ok := cli.ErrorLog.(*log.Logger); ok {
+		l.SetOutput(io.Discard)
 	}
 }
 
