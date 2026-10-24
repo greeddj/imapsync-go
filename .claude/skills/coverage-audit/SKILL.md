@@ -46,7 +46,7 @@ Format for proposing an exclusion to the architect:
 Symbol: internal/<pkg>.<func>
 Branch: <which branch>
 Why not tested at unit level: <one sentence>
-Suggested CLAUDE.md note: "Deliberate test exclusion — <branch> is …, exercised via <integration-mechanism-or-nothing>"
+Suggested `.claude/rules/testing.md` note: "Deliberate test exclusion - <branch> is …, exercised via <integration-mechanism-or-nothing>"
 ```
 
 The architect decides whether to accept and where to record.

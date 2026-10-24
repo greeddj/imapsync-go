@@ -59,7 +59,7 @@ When `developer` reports back:
 
 When `tester` reports back:
 
-- For each gap they identified: decide between "add a test" (back to developer) and "deliberate exclusion" (back to tech-writer to record in CLAUDE.md).
+- For each gap they identified: decide between "add a test" (back to developer) and "deliberate exclusion" (back to tech-writer to record in `.claude/rules/testing.md`).
 - Pre-existing test failures are not the developer's problem unless they were caused by this change. Investigate.
 
 When `security` reports back:

@@ -6,7 +6,7 @@ Authoritative description of how `architect`, `developer`, `tester`, `security` 
 
 - **architect** (opus) — gatekeeper, planner, reviewer of architecture. Sole entry point for non-trivial changes. May reject. Delegates to others.
 - **developer** (sonnet) — implements what architect specifies; writes code + comments + unit tests; runs targeted `just lint` / `just test` on changed packages.
-- **tester** (sonnet) — runs full test suite, audits coverage, identifies missing cases, marks deliberate exclusions in `CLAUDE.md`.
+- **tester** (sonnet) - runs full test suite, audits coverage, identifies missing cases, marks deliberate exclusions in [testing.md](testing.md).
 - **security** (opus) — CVE / dependency audit; static review of attack surface (auth, parsing, network, file I/O, command exec); reasons about combined risk that a single-file review would miss.
 - **tech-writer** (sonnet) — verifies comments match the project rule "default to no comments, only WHY-comments"; refreshes `CLAUDE.md` and `README.md` when behaviour changed.
 
@@ -28,7 +28,7 @@ Step by step:
 3. **developer** implements, writes WHY-comments only (see [go-style.md](go-style.md)), adds unit tests, runs `just lint` and `just test` on the changed packages, and reports a structured diff + test summary to `architect`.
 4. **architect** reviews the diff against the original brief. Either sends a correction back to `developer` or proceeds.
 5. **architect** writes a test brief for `tester` (which packages to focus on, which edge cases to verify, which invariants must be exercised).
-6. **tester** runs the full suite, computes coverage on changed packages, lists gaps. For each gap: either propose a new test (and write it) or recommend that `CLAUDE.md` records the deliberate exclusion with a reason. Reports back to `architect`.
+6. **tester** runs the full suite, computes coverage on changed packages, lists gaps. For each gap: either propose a new test (and write it) or recommend that [testing.md](testing.md) records the deliberate exclusion with a reason. Reports back to `architect`.
 7. **architect** routes failures back to `developer`, then back through `tester`, until clean.
 8. **architect** calls `security`. Security audits the diff, the surrounding subsystem, and the combination of changes for new attack surface (see [security.md](security.md)). Findings go back to `architect`.
 9. **architect** loops `developer`/`tester` again if security flagged anything.
