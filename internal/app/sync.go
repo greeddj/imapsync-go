@@ -156,6 +156,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if w := buildProviderWarning(cfg, srcReadLim, dstWriteLim); w != "" {
 			_, _ = fmt.Fprint(out, w)
 		}
+		if w := buildUploadLimitWarning(cfg.RateLimit.UpBPS, cfg.Workers); w != "" {
+			_, _ = fmt.Fprint(out, w)
+		}
 	}
 
 	var mappings []config.DirectoryMapping
@@ -919,4 +922,19 @@ func buildProviderWarning(cfg *config.Config, srcReadLim, dstWriteLim *rate.Limi
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+// buildUploadLimitWarning flags an upload limit so low that one literal write
+// can wait out the idle watchdog. Empty when the limit is unset or high enough.
+func buildUploadLimitWarning(upBPS, workers int) string {
+	if upBPS <= 0 {
+		return ""
+	}
+	minBPS := client.MinUploadBPS(workers)
+	if upBPS >= minBPS {
+		return ""
+	}
+	return fmt.Sprintf("\n⚠️  Upload limit %d bytes/s is below %d bytes/s for %d workers.\n"+
+		"   An upload can wait so long for its share that the idle watchdog closes the connection.\n"+
+		"   Raise --bps-up or lower --workers.\n\n", upBPS, minBPS, workers)
 }

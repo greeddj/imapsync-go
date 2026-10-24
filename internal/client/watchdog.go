@@ -11,6 +11,18 @@ import (
 
 var errIdleTimeout = errors.New("no data from server")
 
+// maxLiteralWrite bounds one write of an APPEND literal: go-imap copies the
+// literal with io.Copy, whose buffer is 32 KiB.
+const maxLiteralWrite = 32 << 10
+
+// MinUploadBPS returns the lowest shared upload limit at which each of
+// uploaders can finish one literal write within idleTimeout. Below it the
+// watchdog can close an upload that waits for write tokens.
+func MinUploadBPS(uploaders int) int {
+	secs := int(idleTimeout / time.Second)
+	return (max(uploaders, 1)*maxLiteralWrite + secs - 1) / secs
+}
+
 const (
 	idleOpen int32 = iota
 	idleClosed

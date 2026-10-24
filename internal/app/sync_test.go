@@ -2427,3 +2427,51 @@ func TestRunSync_When_TransferIsLimited_Then_WorkersShareOneBudgetPerDirection(t
 		})
 	}
 }
+
+func TestBuildUploadLimitWarning(t *testing.T) {
+	t.Parallel()
+
+	floor := client.MinUploadBPS(4)
+	tests := []struct {
+		name  string
+		upBPS int
+		warn  bool
+	}{
+		{name: "no upload limit", upBPS: 0},
+		{name: "limit at the floor", upBPS: floor},
+		{name: "limit one below the floor", upBPS: floor - 1, warn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := buildUploadLimitWarning(tt.upBPS, 4)
+			if !tt.warn {
+				if got != "" {
+					t.Errorf("warning = %q, want none", got)
+				}
+				return
+			}
+			assertContainsAll(t, got,
+				fmt.Sprintf("Upload limit %d bytes/s is below %d bytes/s for 4 workers", tt.upBPS, floor),
+				"Raise --bps-up or lower --workers")
+		})
+	}
+}
+
+func TestRunSync_When_UploadLimitIsTooLow_Then_WarnsBeforeTheSync(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	cfg := e2eConfig(src, dst, 2, mapping("INBOX", "INBOX"))
+	cfg.RateLimit.UpBPS = 50
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertContainsAll(t, out.String(), "Upload limit 50 bytes/s is below", "All folders already synced!")
+}

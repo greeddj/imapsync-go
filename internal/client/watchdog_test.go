@@ -371,3 +371,28 @@ func Test_idleConn_When_ActivityRestartsIdleClock_Then_TripWaitsFullLimitAfterIt
 		})
 	}
 }
+
+func TestMinUploadBPS(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		uploaders int
+		want      int
+	}{
+		{uploaders: 0, want: 110},
+		{uploaders: 1, want: 110},
+		{uploaders: 10, want: 1093},
+	}
+	for _, tt := range tests {
+		got := MinUploadBPS(tt.uploaders)
+		if got != tt.want {
+			t.Errorf("MinUploadBPS(%d) = %d, want %d", tt.uploaders, got, tt.want)
+		}
+		// At the returned limit each uploader's share moves one literal write
+		// within the idle limit.
+		share := float64(got) / float64(max(tt.uploaders, 1))
+		if wait := time.Duration(float64(maxLiteralWrite) / share * float64(time.Second)); wait > idleTimeout {
+			t.Errorf("MinUploadBPS(%d) = %d leaves a %s wait for one write, want at most %s", tt.uploaders, got, wait, idleTimeout)
+		}
+	}
+}
