@@ -2099,3 +2099,59 @@ func Test_New_ErrorLogFollowsVerbose(t *testing.T) {
 		})
 	}
 }
+
+func Test_safeCall_When_WatchdogTrips_Then_LogsWhyItReconnects(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	examine := newStall(verbIs("EXAMINE"))
+	srv.addConnHandler(interceptHandler(srv, examine.intercept))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newWatchedClient(t, srv, tripLimit)
+	c.SetPrefix("src")
+	var (
+		mu    sync.Mutex
+		lines []string
+	)
+	c.SetProgressWriter(&logCapture{fn: func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, s)
+	}})
+
+	err := awaitCall(t, "FetchMessageMap", func() error {
+		_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v, want success after the watchdog reconnect", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := fmt.Sprintf("[src] No data from server for %s, reconnecting", tripLimit)
+	if !slices.Contains(lines, want) {
+		t.Errorf("log lines = %q, want them to include %q", lines, want)
+	}
+}
+
+func Test_noteIdleTrip_When_ErrorIsNotATrip_Then_LogsNothing(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{prefix: "src"}
+	var lines []string
+	c.SetProgressWriter(&logCapture{fn: func(s string) { lines = append(lines, s) }})
+	c.noteIdleTrip(errors.New("imap: connection closed"))
+	if len(lines) != 0 {
+		t.Errorf("log lines = %q, want none for an error the watchdog did not cause", lines)
+	}
+
+	tr := &recordingTracker{}
+	c.SetProgressWriter(nil)
+	c.SetProgressTracker(tr)
+	c.idleDur = time.Minute
+	c.noteIdleTrip(fmt.Errorf("read: %w", errIdleTimeout))
+	if want := []string{"[src] No data from server for 1m0s, reconnecting"}; !slices.Equal(tr.messages, want) {
+		t.Errorf("tracker messages = %q, want %q", tr.messages, want)
+	}
+}

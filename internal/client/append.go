@@ -63,6 +63,7 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 		// one server-side disconnect cascades into "Not logged in" for
 		// every remaining message in the folder.
 		if isRetryable(err) && !c.isCancelled() {
+			c.noteIdleTrip(err)
 			_ = c.reconnect()
 		}
 		return fmt.Errorf("[%s] append: %w", c.prefix, err)

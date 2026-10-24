@@ -606,6 +606,7 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 		return err
 	}
 
+	c.noteIdleTrip(err)
 	if rerr := c.reconnect(); rerr != nil {
 		return rerr
 	}
@@ -617,6 +618,23 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 		return errors.New("imap client not connected after reconnect")
 	}
 	return c.call(cli, fn)
+}
+
+// noteIdleTrip logs why a reconnect follows a watchdog trip; the reconnect
+// messages alone do not say. Unlike log it ignores verbose, because a trip is
+// rare and worth a line.
+func (c *Client) noteIdleTrip(err error) {
+	if !errors.Is(err, errIdleTimeout) {
+		return
+	}
+	msg := fmt.Sprintf("[%s] No data from server for %s, reconnecting", c.prefix, c.idleDur)
+	if pw := c.progressWriter(); pw != nil {
+		pw.Log("%s", msg)
+		return
+	}
+	if t := c.progressTracker(); t != nil {
+		t.UpdateMessage(msg)
+	}
 }
 
 // call runs one attempt of fn inside a watchdog span. It loads the watchdog on
