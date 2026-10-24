@@ -203,14 +203,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		return nil
 	})
 	groupErr := g.Wait()
-	defer func() {
-		if srcClient != nil {
-			_ = srcClient.Logout()
-		}
-		if dstClient != nil {
-			_ = dstClient.Logout()
-		}
-	}()
+	defer func() { logoutAll(srcClient, dstClient) }()
 	if groupErr != nil {
 		return groupErr
 	}

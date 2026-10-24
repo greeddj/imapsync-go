@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
@@ -469,5 +470,74 @@ func badUIDFetchHandler(srv *fakeServer) func(net.Conn) {
 				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
 			}
 		}
+	}
+}
+
+// holdLogoutHandler answers LOGOUT only after every one of n connections has
+// sent it, so logouts that run one at a time never get a reply.
+func holdLogoutHandler(srv *fakeServer, n int, mu *sync.Mutex, arrived *int, release chan struct{}) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
+		sc := bufio.NewScanner(conn)
+		for sc.Scan() {
+			tag, verb, arg := splitCommand(sc.Text())
+			srv.recordCommand(verb, arg)
+			switch verb {
+			case "LIST":
+				_, _ = fmt.Fprintf(conn, "* LIST (\\HasNoChildren) \"/\" INBOX\r\n%s OK LIST completed\r\n", tag)
+			case "LOGOUT":
+				mu.Lock()
+				*arrived++
+				if *arrived == n {
+					close(release)
+				}
+				mu.Unlock()
+				<-release
+				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
+			}
+		}
+	}
+}
+
+func TestLogoutAll_When_ServersHoldLogout_Then_ClientsLogOutTogether(t *testing.T) {
+	t.Parallel()
+
+	const n = 4
+	srv := newFakeServer(t)
+	var (
+		mu      sync.Mutex
+		arrived int
+	)
+	release := make(chan struct{})
+	for range n {
+		srv.addConnHandler(holdLogoutHandler(srv, n, &mu, &arrived, release))
+	}
+	clients := make([]*client.Client, 0, n+1)
+	for i := range n {
+		clients = append(clients, newAppClient(t, srv, fmt.Sprintf("c%d", i)))
+	}
+	clients = append(clients, nil)
+
+	done := make(chan struct{})
+	go func() {
+		logoutAll(clients...)
+		close(done)
+	}()
+
+	// One logout limit is 2s. Logouts in turn would hold the first LOGOUT for
+	// that long; together they finish as soon as the server releases them.
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatal("logoutAll still running after one logout limit: the logouts ran one at a time")
+	}
+	if got := srv.callCount("LOGOUT"); got != n {
+		t.Errorf("LOGOUT count = %d, want %d", got, n)
 	}
 }

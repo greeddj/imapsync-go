@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/greeddj/imapsync-go/internal/client"
@@ -36,10 +37,23 @@ type syncWorkerPool struct {
 }
 
 func (p *syncWorkerPool) close() {
+	clients := make([]*client.Client, 0, 2*len(p.all))
 	for _, w := range p.all {
-		_ = w.src.Logout()
-		_ = w.dst.Logout()
+		clients = append(clients, w.src, w.dst)
 	}
+	logoutAll(clients...)
+}
+
+// logoutAll logs the clients out at the same time, so a silent server costs
+// one logout limit in total, not one per client. Nil entries are skipped.
+func logoutAll(clients ...*client.Client) {
+	var wg sync.WaitGroup
+	for _, c := range clients {
+		if c != nil {
+			wg.Go(func() { _ = c.Logout() })
+		}
+	}
+	wg.Wait()
 }
 
 // newSyncWorkerPool constructs n workers up-front. If any single worker fails
@@ -62,7 +76,7 @@ func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts
 
 		d, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
 		if err != nil {
-			_ = s.Logout()
+			pool.all = append(pool.all, &syncWorker{src: s})
 			pool.close()
 			return nil, fmt.Errorf("worker %d destination connect: %w", i+1, err)
 		}

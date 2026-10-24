@@ -122,14 +122,7 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 
 	pw.StopAndClear()
 
-	defer func() {
-		if srcRes.cli != nil {
-			_ = srcRes.cli.Logout()
-		}
-		if dstRes.cli != nil {
-			_ = dstRes.cli.Logout()
-		}
-	}()
+	defer func() { logoutAll(srcRes.cli, dstRes.cli) }()
 
 	if err := ctx.Err(); err != nil {
 		return err

@@ -265,7 +265,7 @@ These limits apply to the connection steps and to the exit of the program:
 
 - During the greeting, the login and the mailbox list, Ctrl+C stops the program at once.
 - If a server accepts a connection but sends no greeting, the connection attempt fails after 30 seconds.
-- When the program exits, it waits a maximum of 2 seconds for each connection to log out.
+- When the program exits, it logs out all connections at the same time. A `sync` waits a maximum of 4 seconds for this, and a `show` waits a maximum of 2 seconds.
 
 A transfer in progress still follows the entry above.
 
