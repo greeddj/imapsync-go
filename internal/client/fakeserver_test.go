@@ -8,9 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-
+	"io"
 	"net"
-
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -435,7 +435,7 @@ func serveCommands(srv *fakeServer, conn net.Conn, greeting string, fn func(rd *
 }
 
 const (
-
+	scriptedGreeting = "* OK [CAPABILITY IMAP4rev1] fake ready"
 	// cramMD5Challenge is the example challenge from RFC 2195.
 	cramMD5Challenge = "<1896.697170952@postoffice.reston.mci.net>"
 )
@@ -478,5 +478,331 @@ func cramMD5Handler(srv *fakeServer, user, pass string) func(net.Conn) {
 			}
 			return true
 		})
+	}
+}
+
+// scriptFolder is one mailbox of a mailboxScript; each entry of sizes is the
+// RFC822.SIZE of one message.
+type scriptFolder struct {
+	name  string
+	sizes []uint32
+}
+
+// mailboxScript describes the answers of a handler built by handler. A refusal
+// knob turns the command into a tagged NO that classifyError does not retry.
+type mailboxScript struct {
+	statusRefused   map[string]bool   // by folder
+	examineRefused  map[string]bool   // by folder
+	createReplies   map[string]string // folder -> reply after the tag; empty means OK
+	folders         []scriptFolder
+	uidMessages     int // messages returned for each UID FETCH
+	listRefused     bool
+	uidFetchRefused bool
+}
+
+func (m *mailboxScript) folder(name string) *scriptFolder {
+	for i := range m.folders {
+		if m.folders[i].name == name {
+			return &m.folders[i]
+		}
+	}
+	return nil
+}
+
+// handler serves LIST, STATUS, SELECT/EXAMINE, FETCH, UID FETCH and CREATE from
+// the script. UID FETCH returns up to uidMessages messages from the lowest
+// requested UID.
+func (m *mailboxScript) handler(srv *fakeServer) func(net.Conn) {
+	return func(conn net.Conn) {
+		var selected string
+		serveCommands(srv, conn, scriptedGreeting, func(_ *bufio.Reader, cmd command) bool {
+			first := firstArg(cmd.arg)
+			switch cmd.verb {
+			case "LIST":
+				if m.listRefused {
+					writeLine(conn, "%s NO [UNAVAILABLE] list refused", cmd.tag)
+					break
+				}
+				for _, f := range m.folders {
+					writeLine(conn, `* LIST (\HasNoChildren) "/" "%s"`, f.name)
+				}
+				writeLine(conn, "%s OK LIST completed", cmd.tag)
+			case "STATUS":
+				if m.statusRefused[first] {
+					writeLine(conn, "%s NO [CANNOT] status refused", cmd.tag)
+					break
+				}
+				count := 0
+				if f := m.folder(first); f != nil {
+					count = len(f.sizes)
+				}
+				writeLine(conn, `* STATUS "%s" (MESSAGES %d)`, first, count)
+				writeLine(conn, "%s OK STATUS completed", cmd.tag)
+			case "SELECT", "EXAMINE":
+				if m.examineRefused[first] {
+					writeLine(conn, "%s NO [CANNOT] examine refused", cmd.tag)
+					break
+				}
+				selected = first
+				count := 0
+				if f := m.folder(first); f != nil {
+					count = len(f.sizes)
+				}
+				writeLine(conn, "* %d EXISTS", count)
+				writeLine(conn, "* 0 RECENT")
+				writeLine(conn, "%s OK [READ-ONLY] %s completed", cmd.tag, cmd.verb)
+			case "FETCH":
+				set, err := imap.ParseSeqSet(first)
+				if err != nil {
+					writeLine(conn, "%s BAD %v", cmd.tag, err)
+					break
+				}
+				if f := m.folder(selected); f != nil {
+					for i, size := range f.sizes {
+						if seq := uint32(i + 1); set.Contains(seq) {
+							writeLine(conn, "* %d FETCH (RFC822.SIZE %d)", seq, size)
+						}
+					}
+				}
+				writeLine(conn, "%s OK FETCH completed", cmd.tag)
+			case "UID":
+				m.serveUID(conn, cmd)
+			case "CREATE":
+				if reply := m.createReplies[first]; reply != "" {
+					writeLine(conn, "%s %s", cmd.tag, reply)
+					break
+				}
+				writeLine(conn, "%s OK CREATE completed", cmd.tag)
+			case "LOGOUT":
+				writeLine(conn, "* BYE Logging out")
+				writeLine(conn, "%s OK LOGOUT completed", cmd.tag)
+				return false
+			default:
+				writeLine(conn, "%s OK %s completed", cmd.tag, cmd.verb)
+			}
+			return true
+		})
+	}
+}
+
+func (m *mailboxScript) serveUID(conn net.Conn, cmd command) {
+	fields := strings.Fields(cmd.arg)
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "FETCH") {
+		writeLine(conn, "%s OK UID completed", cmd.tag)
+		return
+	}
+	if m.uidFetchRefused {
+		writeLine(conn, "%s NO [UNAVAILABLE] fetch refused", cmd.tag)
+		return
+	}
+	set, err := imap.ParseSeqSet(fields[1])
+	if err != nil || len(set.Set) == 0 {
+		writeLine(conn, "%s BAD bad uid set", cmd.tag)
+		return
+	}
+	first := set.Set[0].Start
+	for i := range m.uidMessages {
+		uid := first + uint32(i)
+		if !set.Contains(uid) {
+			break
+		}
+		body := "Subject: uid " + strconv.FormatUint(uint64(uid), 10) + "\r\n\r\nbody\r\n"
+		writeLine(conn, "* %d FETCH (UID %d BODY[] {%d}\r\n%s)", uid, uid, len(body), body)
+	}
+	writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+}
+
+// newScriptedClient starts a fake server whose first connection follows script
+// and returns it with a connected client.
+func newScriptedClient(t *testing.T, script *mailboxScript) (*fakeServer, *Client) {
+	t.Helper()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(script.handler(srv))
+	return srv, newClientWithFake(t, srv)
+}
+
+// literalSize extracts N from the trailing "{N}" of an APPEND line.
+func literalSize(arg string) (int64, bool) {
+	open := strings.LastIndexByte(arg, '{')
+	end := strings.LastIndexByte(arg, '}')
+	if open < 0 || end < open {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSuffix(arg[open+1:end], "+"), 10, 64)
+	return n, err == nil
+}
+
+// appendOutcomeHandler drains the whole APPEND literal before sending appendReply.
+// Replying earlier would race go-imap's literal writer.
+func appendOutcomeHandler(srv *fakeServer, appendReply string) func(net.Conn) {
+	return func(conn net.Conn) {
+		serveCommands(srv, conn, scriptedGreeting, func(rd *bufio.Reader, cmd command) bool {
+			switch cmd.verb {
+			case "APPEND":
+				size, ok := literalSize(cmd.arg)
+				if !ok {
+					writeLine(conn, "%s BAD no literal", cmd.tag)
+					return true
+				}
+				writeLine(conn, "+ Ready for literal data")
+				if _, err := io.CopyN(io.Discard, rd, size); err != nil {
+					return false
+				}
+				if _, err := rd.ReadString('\n'); err != nil {
+					return false
+				}
+				writeLine(conn, "%s %s", cmd.tag, appendReply)
+			case "LOGOUT":
+				writeLine(conn, "* BYE Logging out")
+				writeLine(conn, "%s OK LOGOUT completed", cmd.tag)
+				return false
+			default:
+				writeLine(conn, "%s OK %s completed", cmd.tag, cmd.verb)
+			}
+			return true
+		})
+	}
+}
+
+// byeAfterLoginHandler accepts LOGIN, then sends BYE and closes once release is
+// closed. The gate keeps the BYE from racing the client reading the LOGIN reply.
+func byeAfterLoginHandler(srv *fakeServer, release <-chan struct{}) func(net.Conn) {
+	return func(conn net.Conn) {
+		serveCommands(srv, conn, scriptedGreeting, func(_ *bufio.Reader, cmd command) bool {
+			if cmd.verb != "LOGIN" {
+				writeLine(conn, "%s OK %s completed", cmd.tag, cmd.verb)
+				return true
+			}
+			writeLine(conn, "%s OK LOGIN completed", cmd.tag)
+			<-release
+			writeLine(conn, "* BYE server shutting down")
+			return false
+		})
+	}
+}
+
+// interceptHandler answers common commands like a one-message server. intercept
+// sees each command first: handled=true skips the default answer, keep=false
+// ends the connection.
+func interceptHandler(srv *fakeServer, intercept func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool)) func(net.Conn) {
+	return func(conn net.Conn) {
+		serveCommands(srv, conn, scriptedGreeting, func(rd *bufio.Reader, cmd command) bool {
+			if handled, keep := intercept(conn, rd, cmd); handled {
+				return keep
+			}
+			switch cmd.verb {
+			case "LIST":
+				writeLine(conn, `* LIST (\HasNoChildren) "/" "INBOX"`)
+				writeLine(conn, "%s OK LIST completed", cmd.tag)
+			case "STATUS":
+				writeLine(conn, `* STATUS "%s" (MESSAGES 1)`, firstArg(cmd.arg))
+				writeLine(conn, "%s OK STATUS completed", cmd.tag)
+			case "SELECT", "EXAMINE":
+				writeLine(conn, "* 1 EXISTS")
+				writeLine(conn, "* 0 RECENT")
+				writeLine(conn, "%s OK [READ-ONLY] %s completed", cmd.tag, cmd.verb)
+			case "FETCH":
+				writeLine(conn, "* 1 FETCH (RFC822.SIZE 10)")
+				writeLine(conn, "%s OK FETCH completed", cmd.tag)
+			case "LOGOUT":
+				writeLine(conn, "* BYE Logging out")
+				writeLine(conn, "%s OK LOGOUT completed", cmd.tag)
+				return false
+			default:
+				writeLine(conn, "%s OK %s completed", cmd.tag, cmd.verb)
+			}
+			return true
+		})
+	}
+}
+
+// stall goes silent on the first command match accepts, so the client blocks
+// until Cancel or a canceled context closes its connection.
+type stall struct {
+	match   func(cmd command) bool
+	before  func(conn net.Conn, rd *bufio.Reader, cmd command) bool
+	reached chan struct{}
+	once    sync.Once
+}
+
+func newStall(match func(cmd command) bool) *stall {
+	return &stall{match: match, reached: make(chan struct{})}
+}
+
+func (s *stall) intercept(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+	if !s.match(cmd) {
+		return false, true
+	}
+	if s.before != nil && !s.before(conn, rd, cmd) {
+		return true, false
+	}
+	s.once.Do(func() { close(s.reached) })
+	_, _ = rd.ReadByte()
+	return true, false
+}
+
+// firedContext expires with context.DeadlineExceeded when fire is called. That
+// differs from the context.Canceled safeCall returns after Cancel, so a test can
+// tell which guard answered.
+type firedContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newFiredContext(parent context.Context) *firedContext {
+	return &firedContext{Context: parent, done: make(chan struct{})}
+}
+
+func (c *firedContext) Done() <-chan struct{} { return c.done }
+
+func (c *firedContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *firedContext) fire() { c.once.Do(func() { close(c.done) }) }
+
+// verbIs matches commands with the given verb.
+func verbIs(verb string) func(command) bool {
+	return func(cmd command) bool { return cmd.verb == verb }
+}
+
+// verbOn matches commands with the given verb whose first argument is name.
+func verbOn(verb, name string) func(command) bool {
+	return func(cmd command) bool { return cmd.verb == verb && firstArg(cmd.arg) == name }
+}
+
+// awaitSignal fails the test when ch stays open for too long.
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// awaitError returns what errc delivers, failing the test when the call is
+// still blocked after a few seconds.
+func awaitError(t *testing.T, errc <-chan error, what string) error {
+	t.Helper()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-errc:
+		return err
+	case <-timer.C:
+		t.Fatalf("%s still blocked 5s after the context ended", what)
+		return nil
 	}
 }

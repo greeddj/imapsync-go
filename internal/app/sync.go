@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -31,6 +33,16 @@ func traceTracker(site, message string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[trace] tracker created: site=%s message=%q\n", site, message)
+}
+
+// newProgressWriter builds a progress writer that renders to out unless quiet
+// silences it.
+func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Writer {
+	pw := progress.NewWriter(numTrackers, quiet)
+	if !quiet {
+		pw.SetOutputWriter(out)
+	}
+	return pw
 }
 
 // FolderSyncPlan describes how a single source folder should be copied to its
@@ -62,6 +74,19 @@ type SyncSummary struct {
 	TotalNewSize uint64
 }
 
+// syncOptions carries what runSync needs besides the config. clientOpts holds
+// the shared transport settings; runSync adds the per-side fields.
+type syncOptions struct {
+	out         io.Writer
+	in          io.Reader
+	srcFolder   string
+	dstFolder   string
+	clientOpts  client.Options
+	quiet       bool
+	verbose     bool
+	autoConfirm bool
+}
+
 // ActionSync copies messages between IMAP servers according to the provided configuration.
 func ActionSync(ctx context.Context, c *cli.Command) error {
 	if err := ctx.Err(); err != nil {
@@ -72,24 +97,40 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	srcFolder := c.String("src-folder")
-	dstFolder := c.String("dest-folder")
-	quiet := c.Bool("quiet")
-	verbose := c.Bool("verbose")
-	autoConfirm := c.Bool("confirm")
-	if !quiet && verbose {
-		fmt.Println("Fetching config...")
+	opts := syncOptions{
+		out:         os.Stdout,
+		in:          os.Stdin,
+		srcFolder:   c.String("src-folder"),
+		dstFolder:   c.String("dest-folder"),
+		clientOpts:  client.Options{UseTLS: true},
+		quiet:       c.Bool("quiet"),
+		verbose:     c.Bool("verbose"),
+		autoConfirm: c.Bool("confirm"),
+	}
+	if !opts.quiet && opts.verbose {
+		_, _ = fmt.Fprintln(opts.out, "Fetching config...")
 	}
 	cfg, err := config.New(c)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
+
+	return runSync(ctx, cfg, opts)
+}
+
+func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	quiet, verbose, autoConfirm := opts.quiet, opts.verbose, opts.autoConfirm
+	out := opts.out
+	// One reader for every prompt: a reader per prompt would buffer past the
+	// first answer and lose the rest of piped input.
+	in := bufio.NewReader(opts.in)
+
 	if !quiet && verbose {
-		fmt.Printf("Starting sync with %d workers\n", cfg.Workers)
+		_, _ = fmt.Fprintf(out, "Starting sync with %d workers\n", cfg.Workers)
 	}
 
 	// Rate-limit budgets are shared across every Client that talks to the
@@ -97,44 +138,40 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	// all upload traffic. Either may be nil ("unlimited").
 	srcReadLim := ratelimit.NewLimiter(cfg.RateLimit.DownBPS)
 	dstWriteLim := ratelimit.NewLimiter(cfg.RateLimit.UpBPS)
-	srcOpts := client.Options{
-		UseTLS:      true,
-		Auth:        cfg.Src.Auth,
-		Verbose:     verbose,
-		ReadLimiter: srcReadLim,
-	}
-	dstOpts := client.Options{
-		UseTLS:       true,
-		Auth:         cfg.Dst.Auth,
-		Verbose:      verbose,
-		WriteLimiter: dstWriteLim,
-	}
+	srcOpts := opts.clientOpts
+	srcOpts.Auth = cfg.Src.Auth
+	srcOpts.Verbose = verbose
+	srcOpts.ReadLimiter = srcReadLim
+	dstOpts := opts.clientOpts
+	dstOpts.Auth = cfg.Dst.Auth
+	dstOpts.Verbose = verbose
+	dstOpts.WriteLimiter = dstWriteLim
 
 	if !quiet {
 		if w := buildProviderWarning(cfg, srcReadLim, dstWriteLim); w != "" {
-			fmt.Print(w)
+			_, _ = fmt.Fprint(out, w)
 		}
 	}
 
 	var mappings []config.DirectoryMapping
 
 	switch {
-	case srcFolder != "" && dstFolder != "":
+	case opts.srcFolder != "" && opts.dstFolder != "":
 		mappings = []config.DirectoryMapping{
-			{Source: srcFolder, Destination: dstFolder},
+			{Source: opts.srcFolder, Destination: opts.dstFolder},
 		}
-	case srcFolder != "" || dstFolder != "":
+	case opts.srcFolder != "" || opts.dstFolder != "":
 		return errors.New("both --src-folder and --dest-folder must be specified")
 	default:
 		if len(cfg.Map) > 0 {
 			mappings = cfg.Map
 		} else {
 			// dynamically build the mappings from the source folders
-			c, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
+			lister, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
 			if err != nil {
 				return fmt.Errorf("source connection failed: %w", err)
 			}
-			mailboxes, err := c.ListMailboxes(ctx)
+			mailboxes, err := lister.ListMailboxes(ctx)
 			if err != nil {
 				return fmt.Errorf("source connection list mailbox failed: %w", err)
 			}
@@ -148,7 +185,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	}
 
 	if !quiet && verbose {
-		fmt.Println("Connecting to servers...")
+		_, _ = fmt.Fprintln(out, "Connecting to servers...")
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -199,9 +236,9 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	dstDelimiter := dstClient.GetDelimiter()
 
 	if !quiet && verbose {
-		fmt.Printf("📁 Server delimiters:\n")
-		fmt.Printf("  Source [%s]: %q\n", cfg.Src.Label, srcDelimiter)
-		fmt.Printf("  Destination [%s]: %q\n\n", cfg.Dst.Label, dstDelimiter)
+		_, _ = fmt.Fprintf(out, "📁 Server delimiters:\n")
+		_, _ = fmt.Fprintf(out, "  Source [%s]: %q\n", cfg.Src.Label, srcDelimiter)
+		_, _ = fmt.Fprintf(out, "  Destination [%s]: %q\n\n", cfg.Dst.Label, dstDelimiter)
 	}
 
 	// Validate folder paths compatibility with server delimiters
@@ -233,21 +270,21 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	}
 
 	if needsFix {
-		fmt.Printf("⚠️  Folder path delimiter mismatch detected:\n")
+		_, _ = fmt.Fprintf(out, "⚠️  Folder path delimiter mismatch detected:\n")
 		for _, err := range validationErrors {
-			fmt.Printf("  • %s\n", err)
+			_, _ = fmt.Fprintf(out, "  • %s\n", err)
 		}
-		fmt.Println()
+		_, _ = fmt.Fprintln(out)
 
 		var shouldFix bool
 		if autoConfirm {
 			shouldFix = true
-			fmt.Println("✅ Auto-confirming delimiter fix...")
+			_, _ = fmt.Fprintln(out, "✅ Auto-confirming delimiter fix...")
 		} else {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			confirmed, err := utils.AskConfirm(ctx, "🔧 Fix folder delimiters to match server configuration?")
+			confirmed, err := utils.AskConfirm(ctx, in, out, "🔧 Fix folder delimiters to match server configuration?")
 			if err != nil {
 				return err
 			}
@@ -260,39 +297,39 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					if oldDelim, _ := folderDelimiter(mappings[i].Source, srcDelimiter); oldDelim != "none" && oldDelim != srcDelimiter {
 						oldPath := mappings[i].Source
 						mappings[i].Source = strings.ReplaceAll(mappings[i].Source, oldDelim, srcDelimiter)
-						fmt.Printf("  ✓ Fixed source: %q → %q\n", oldPath, mappings[i].Source)
+						_, _ = fmt.Fprintf(out, "  ✓ Fixed source: %q → %q\n", oldPath, mappings[i].Source)
 					}
 				}
 				if dstDelimiter != "" {
 					if oldDelim, _ := folderDelimiter(mappings[i].Destination, dstDelimiter); oldDelim != "none" && oldDelim != dstDelimiter {
 						oldPath := mappings[i].Destination
 						mappings[i].Destination = strings.ReplaceAll(mappings[i].Destination, oldDelim, dstDelimiter)
-						fmt.Printf("  ✓ Fixed destination: %q → %q\n", oldPath, mappings[i].Destination)
+						_, _ = fmt.Fprintf(out, "  ✓ Fixed destination: %q → %q\n", oldPath, mappings[i].Destination)
 					}
 				}
 			}
 		} else {
-			fmt.Println()
-			fmt.Println("⚠️ Please note if delimiter is not corresponding to the server configuration, the folder structure may not be correctly interpreted.")
+			_, _ = fmt.Fprintln(out)
+			_, _ = fmt.Fprintln(out, "⚠️ Please note if delimiter is not corresponding to the server configuration, the folder structure may not be correctly interpreted.")
 		}
-		fmt.Println()
+		_, _ = fmt.Fprintln(out)
 	}
 
 	// Expand mappings to include subfolders
 	if !quiet && verbose {
-		fmt.Println("Checking for subfolders...")
+		_, _ = fmt.Fprintln(out, "Checking for subfolders...")
 	}
-	expandedMappings, err := expandMappingsWithSubfolders(ctx, srcClient, mappings, srcDelimiter, dstDelimiter, verbose, quiet)
+	expandedMappings, err := expandMappingsWithSubfolders(ctx, out, srcClient, mappings, srcDelimiter, dstDelimiter, verbose, quiet)
 	if err != nil {
 		return fmt.Errorf("failed to expand mappings: %w", err)
 	}
 	if len(expandedMappings) > len(mappings) && !quiet && verbose {
-		fmt.Printf("📂 Found %d subfolders, total folders to sync: %d\n", len(expandedMappings)-len(mappings), len(expandedMappings))
+		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expandedMappings)-len(mappings), len(expandedMappings))
 	}
 	mappings = expandedMappings
 
 	// Setup progress writer for scanning phase
-	pw := progress.NewWriter(2, quiet)
+	pw := newProgressWriter(2, quiet, out)
 	pw.Start()
 
 	// Create trackers for source and destination scanning
@@ -327,7 +364,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 	if summary.TotalNew > 0 {
 		if !quiet {
-			fmt.Printf("📤 Messages to be copied to destination:\n")
+			_, _ = fmt.Fprintf(out, "📤 Messages to be copied to destination:\n")
 			foldersToCreate := make([]string, 0, len(summary.Plans))
 			for _, plan := range summary.Plans {
 				// Preview only the folders we will actually create — the
@@ -337,7 +374,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 					foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
 				}
 				if plan.NewMessages > 0 {
-					fmt.Printf("• %s → %s will copy %d messages (≈ %s)\n",
+					_, _ = fmt.Fprintf(out, "• %s → %s will copy %d messages (≈ %s)\n",
 						plan.SourceFolder, plan.DestinationFolder, plan.NewMessages, utils.FormatSize(plan.NewSize))
 					if verbose {
 						// Dumping every UID before the confirm-prompt
@@ -347,41 +384,41 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 						n := len(plan.SrcUIDs)
 						limit := min(n, verboseUIDLimit)
 						for _, uid := range plan.SrcUIDs[:limit] {
-							fmt.Printf("  • UID %d\n", uid)
+							_, _ = fmt.Fprintf(out, "  • UID %d\n", uid)
 						}
 						if n > verboseUIDLimit {
-							fmt.Printf("  • … and %d more\n", n-verboseUIDLimit)
+							_, _ = fmt.Fprintf(out, "  • … and %d more\n", n-verboseUIDLimit)
 						}
-						fmt.Println()
+						_, _ = fmt.Fprintln(out)
 					}
 				}
 			}
 
 			if len(foldersToCreate) > 0 {
-				fmt.Printf("\n🗂️ Folders to be created on destination:\n")
+				_, _ = fmt.Fprintf(out, "\n🗂️ Folders to be created on destination:\n")
 				for _, folder := range foldersToCreate {
-					fmt.Printf("• %s\n", folder)
+					_, _ = fmt.Fprintf(out, "• %s\n", folder)
 				}
 			}
-			fmt.Printf("\n📨 Total new messages to sync: %d (≈ %s)\n", summary.TotalNew, utils.FormatSize(summary.TotalNewSize))
+			_, _ = fmt.Fprintf(out, "\n📨 Total new messages to sync: %d (≈ %s)\n", summary.TotalNew, utils.FormatSize(summary.TotalNewSize))
 
 			if !autoConfirm {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				confirmed, err := utils.AskConfirm(ctx, "✍️ Proceed with synchronization?")
+				confirmed, err := utils.AskConfirm(ctx, in, out, "✍️ Proceed with synchronization?")
 				if err != nil {
 					return err
 				}
 				if !confirmed {
-					fmt.Println("❌ Sync canceled by user")
+					_, _ = fmt.Fprintln(out, "❌ Sync canceled by user")
 					return nil
 				}
 			}
 		}
 	} else {
 		if !quiet {
-			fmt.Println("✅ All folders already synced!")
+			_, _ = fmt.Fprintln(out, "✅ All folders already synced!")
 		}
 		return nil
 	}
@@ -406,10 +443,10 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 
 	if len(foldersToCreate) > 0 {
 		if !quiet {
-			fmt.Println("\n📁 Creating destination folders...")
+			_, _ = fmt.Fprintln(out, "\n📁 Creating destination folders...")
 		}
 
-		creationPW := progress.NewWriter(1, quiet)
+		creationPW := newProgressWriter(1, quiet, out)
 		creationPW.Start()
 		creationTracker := progress.NewTracker("Creating folders", int64(len(foldersToCreate)))
 		traceTracker("folder-create", creationTracker.Message)
@@ -458,7 +495,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	}
 
 	if !quiet {
-		fmt.Println("\n📥 Syncing messages...")
+		_, _ = fmt.Fprintln(out, "\n📥 Syncing messages...")
 	}
 
 	effectiveWorkers := computeEffectiveWorkers(cfg.Workers, cfg.RateLimit.MaxConnections, len(activePlans))
@@ -473,7 +510,7 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	// up front. Reusing the writer across all plans replaces the older
 	// "writer-per-chunk" approach that produced visible flicker and forced
 	// a 100ms sleep between chunks.
-	syncPW := progress.NewWriter(len(activePlans), quiet)
+	syncPW := newProgressWriter(len(activePlans), quiet, out)
 	syncPW.Start()
 	defer syncPW.Stop()
 
@@ -531,13 +568,13 @@ func ActionSync(ctx context.Context, c *cli.Command) error {
 	totalErrorsN := int(totalErrors.Load())
 
 	if totalErrorsN > 0 {
-		fmt.Printf("❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSyncedN, totalErrorsN)
+		_, _ = fmt.Fprintf(out, "❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSyncedN, totalErrorsN)
 		// Friendly summary already printed; signal non-zero exit without
 		// asking main to repeat the same information through stderr.
 		return ErrSilentExit
 	}
 
-	fmt.Println("✨ Sync completed successfully. ✨")
+	_, _ = fmt.Fprintln(out, "✨ Sync completed successfully. ✨")
 	return nil
 }
 
@@ -723,7 +760,7 @@ func folderDelimiter(path, serverDelimiter string) (detected string, ok bool) {
 }
 
 // expandMappingsWithSubfolders expands each mapping to include all subfolders
-func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client, mappings []config.DirectoryMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]config.DirectoryMapping, error) {
+func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient *client.Client, mappings []config.DirectoryMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]config.DirectoryMapping, error) {
 	expanded := make([]config.DirectoryMapping, 0, len(mappings))
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -743,7 +780,7 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client,
 				return nil, ctx.Err()
 			}
 			if verbose && !quiet {
-				fmt.Printf("  ⚠️  Failed to get subfolders for %s: %v\n", mapping.Source, err)
+				_, _ = fmt.Fprintf(out, "  ⚠️  Failed to get subfolders for %s: %v\n", mapping.Source, err)
 			}
 			continue
 		}
@@ -779,7 +816,7 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client,
 			})
 
 			if verbose && !quiet {
-				fmt.Printf("  📁 Found subfolder: %s → %s\n", subfolder, dstPath)
+				_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", subfolder, dstPath)
 			}
 		}
 	}
@@ -787,13 +824,13 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient *client.Client,
 	// A parent mapping's subfolder expansion can collide with an explicit
 	// mapping for that same subfolder; without dedup the plan ends up with
 	// duplicate entries that scan and copy the folder twice.
-	out, dropped := dedupeMappings(expanded)
+	deduped, dropped := dedupeMappings(expanded)
 	if verbose && !quiet {
 		for _, m := range dropped {
-			fmt.Printf("  ℹ️  Mapping %q skipped — already covered by a parent mapping's expansion\n", m.Source)
+			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped \u2014 already covered by a parent mapping's expansion\n", m.Source)
 		}
 	}
-	return out, nil
+	return deduped, nil
 }
 
 // computeEffectiveWorkers caps the worker count by both the configured cap

@@ -3,18 +3,27 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
+	"github.com/urfave/cli/v3"
 )
 
 func TestBuildProviderWarning_noKnownProvider_returnsEmpty(t *testing.T) {
@@ -490,7 +499,7 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 	delimiter := srcC.GetDelimiter() // "/"
 
 	mappings1 := []config.DirectoryMapping{{Source: "jira", Destination: "jira"}}
-	got1, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings1, delimiter, delimiter, false, true)
+	got1, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings1, delimiter, delimiter, false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders run1: %v", err)
 	}
@@ -510,7 +519,7 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 		{Source: "jira", Destination: "jira"},
 		{Source: "jira/DEVOPS", Destination: "DEVOPS"},
 	}
-	got2, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings2, delimiter, delimiter, false, true)
+	got2, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings2, delimiter, delimiter, false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders run2: %v", err)
 	}
@@ -721,8 +730,8 @@ func customListHandler(srv *fakeServer, mailboxes []string) func(net.Conn) {
 }
 
 // Test_expandMappingsWithSubfolders_verboseLogging asserts that the verbose
-// path in expandMappingsWithSubfolders runs without error and produces the
-// correct deduplication result.
+// path in expandMappingsWithSubfolders produces the correct deduplication
+// result and writes the found-subfolder and skipped-mapping lines.
 func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
@@ -731,17 +740,24 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	delimiter := srcC.GetDelimiter()
 
 	// Explicit INBOX/Sub mapping will be deduped (expansion wins). The verbose +
-	// !quiet path exercises the fmt.Printf calls for found-subfolder and dropped.
+	// !quiet path writes the found-subfolder and dropped-mapping lines.
 	mappings := []config.DirectoryMapping{
 		{Source: "INBOX", Destination: "INBOX"},
 		{Source: "INBOX/Sub", Destination: "INBOX/Sub"},
 	}
-	got, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings, delimiter, delimiter, true, false)
+	var out strings.Builder
+	got, err := expandMappingsWithSubfolders(context.Background(), &out, srcC, mappings, delimiter, delimiter, true, false)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("len=%d, want 2 (INBOX + INBOX/Sub), got %v", len(got), got)
+	}
+	if want := "Found subfolder: INBOX/Sub"; !strings.Contains(out.String(), want) {
+		t.Errorf("output %q does not contain %q", out.String(), want)
+	}
+	if want := "Mapping \"INBOX/Sub\" skipped \u2014 already covered by a parent mapping's expansion"; !strings.Contains(out.String(), want) {
+		t.Errorf("output %q does not contain %q", out.String(), want)
 	}
 }
 
@@ -754,7 +770,7 @@ func Test_expandMappingsWithSubfolders_canceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := expandMappingsWithSubfolders(ctx, srcC, []config.DirectoryMapping{
+	_, err := expandMappingsWithSubfolders(ctx, io.Discard, srcC, []config.DirectoryMapping{
 		{Source: "INBOX", Destination: "INBOX"},
 	}, "/", "/", false, true)
 	if err == nil {
@@ -796,7 +812,7 @@ func Test_expandMappingsWithSubfolders_emptyDelimiters(t *testing.T) {
 	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "TARGET"}}
 	// srcDelimiter="" → else branch: relativePath = TrimPrefix(subfolder, mapping.Source)
 	// dstDelimiter="" → else branch: dstPath = mapping.Destination
-	got, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings, "", "", false, true)
+	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings, "", "", false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
@@ -818,7 +834,7 @@ func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
 
 	mappings := []config.DirectoryMapping{{Source: "jira", Destination: "jira"}}
 	// srcDelimiter="/", dstDelimiter="." → ReplaceAll("/", ".") in relative path.
-	got, err := expandMappingsWithSubfolders(context.Background(), srcC, mappings, "/", ".", false, true)
+	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings, "/", ".", false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
@@ -1264,5 +1280,1113 @@ func Test_buildSyncPlan_orderPreserved(t *testing.T) {
 		if summary.Plans[i].SourceFolder != m.Source {
 			t.Errorf("Plans[%d].SourceFolder=%q, want %q", i, summary.Plans[i].SourceFolder, m.Source)
 		}
+	}
+}
+
+// --- runSync and ActionSync end to end, against store-backed servers ---
+
+const (
+	e2eTimeout  = 10 * time.Second
+	e2ePassword = "hunter2-secret"
+)
+
+// e2eContext bounds a test run so a protocol bug fails fast instead of hanging.
+func e2eContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), e2eTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func e2eConfig(src, dst *fakeServer, workers int, mappings ...config.DirectoryMapping) *config.Config {
+	return &config.Config{
+		Src:     config.Credentials{Label: "src", Server: src.ln.Addr().String(), User: "alice", Pass: e2ePassword},
+		Dst:     config.Credentials{Label: "dst", Server: dst.ln.Addr().String(), User: "bob", Pass: e2ePassword},
+		Map:     mappings,
+		Workers: workers,
+	}
+}
+
+// e2eOptions aims runSync at plain-TCP servers. input feeds the prompts; an
+// empty input makes any unexpected prompt fail with EOF instead of hanging.
+func e2eOptions(out io.Writer, input string) syncOptions {
+	return syncOptions{
+		out:        out,
+		in:         strings.NewReader(input),
+		clientOpts: client.Options{UseTLS: false, DialTimeout: 5 * time.Second},
+	}
+}
+
+func mapping(src, dst string) config.DirectoryMapping {
+	return config.DirectoryMapping{Source: src, Destination: dst}
+}
+
+func fakeMsgs(ids ...string) []fakeMsg {
+	msgs := make([]fakeMsg, len(ids))
+	for i, id := range ids {
+		msgs[i] = fakeMsg{msgID: id}
+	}
+	return msgs
+}
+
+func assertContainsAll(t *testing.T, got string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not contain %q\noutput: %q", want, got)
+		}
+	}
+}
+
+func assertContainsNone(t *testing.T, got string, unwanted ...string) {
+	t.Helper()
+	for _, bad := range unwanted {
+		if strings.Contains(got, bad) {
+			t.Errorf("output contains %q\noutput: %q", bad, got)
+		}
+	}
+}
+
+func assertIDs(t *testing.T, what string, got []string, want ...string) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Errorf("%s = %v, want %v", what, got, want)
+	}
+}
+
+// assertReadOnly checks that the server never saw a command that changes mail
+// or flags, and never opened a mailbox read-write.
+func assertReadOnly(t *testing.T, name string, srv *fakeServer) {
+	t.Helper()
+	for _, verb := range []string{"APPEND", "CREATE", "STORE", "UID STORE", "EXPUNGE", "DELETE", "RENAME", "SELECT"} {
+		if n := srv.callCount(verb); n != 0 {
+			t.Errorf("%s saw %d %s commands, want 0", name, n, verb)
+		}
+	}
+	if n := srv.seenMutatingFetches(); n != 0 {
+		t.Errorf("%s saw %d fetches that set \\Seen, want 0", name, n)
+	}
+}
+
+func assertNoLogin(t *testing.T, servers ...*fakeServer) {
+	t.Helper()
+	for i, srv := range servers {
+		if n := srv.callCount("LOGIN"); n != 0 {
+			t.Errorf("server %d saw %d LOGIN commands, want 0", i, n)
+		}
+	}
+}
+
+func TestRunSync_When_AutoConfirmed_Then_CopiesMissingMessages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		rateLimit config.RateLimit
+	}{
+		{name: "without rate limits"},
+		{name: "with shared rate limiters", rateLimit: config.RateLimit{DownBPS: 50_000_000, UpBPS: 50_000_000}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX": fakeMsgs("m1@x", "m2@x"),
+				"Work":  fakeMsgs("m3@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			cfg := e2eConfig(src, dst, 2, mapping("INBOX", "INBOX"), mapping("Work", "Work"))
+			cfg.RateLimit = tt.rateLimit
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x")
+			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m3@x")
+			assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), "m2@x")
+			assertIDs(t, "dst APPENDs to Work", dst.appended("Work"), "m3@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work")
+			assertContainsAll(t, out.String(),
+				"Messages to be copied to destination",
+				"Folders to be created on destination",
+				"Total new messages to sync: 2",
+				"Sync completed successfully",
+			)
+			assertContainsNone(t, out.String(), e2ePassword)
+			assertReadOnly(t, "source", src)
+			if n := dst.callCount("SELECT"); n != 0 {
+				t.Errorf("destination saw %d read-write SELECTs, want 0", n)
+			}
+			if n := dst.seenMutatingFetches(); n != 0 {
+				t.Errorf("destination saw %d fetches that set Seen, want 0", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_RunTwice_Then_SecondRunWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x", "m2@x"),
+		"Work":  fakeMsgs("m3@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	cfg := e2eConfig(src, dst, 2, mapping("INBOX", "INBOX"), mapping("Work", "Work"))
+
+	first := e2eOptions(&syncBuffer{}, "")
+	first.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, first); err != nil {
+		t.Fatalf("first runSync: %v", err)
+	}
+	appends, creates := dst.callCount("APPEND"), dst.callCount("CREATE")
+	if appends != 2 || creates != 1 {
+		t.Fatalf("first run did %d APPEND and %d CREATE, want 2 and 1", appends, creates)
+	}
+
+	out := &syncBuffer{}
+	second := e2eOptions(out, "")
+	second.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, second); err != nil {
+		t.Fatalf("second runSync: %v", err)
+	}
+
+	assertContainsAll(t, out.String(), "All folders already synced!")
+	if n := dst.callCount("APPEND"); n != appends {
+		t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+	}
+	if n := dst.callCount("CREATE"); n != creates {
+		t.Errorf("CREATE count went from %d to %d on the second run", creates, n)
+	}
+}
+
+func TestRunSync_When_ConfirmationAnswered_Then_WritesOnlyAfterYes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		input      string
+		wantErrIs  error
+		wantOutput []string
+		wantCopied bool
+		wantErr    bool
+	}{
+		{
+			name:       "declined",
+			input:      "n\n",
+			wantOutput: []string{"Proceed with synchronization? [y/N]", "Sync canceled by user"},
+		},
+		{
+			name:       "accepted",
+			input:      "y\n",
+			wantOutput: []string{"Proceed with synchronization? [y/N]", "Sync completed successfully"},
+			wantCopied: true,
+		},
+		{
+			name:       "input ends before an answer",
+			input:      "",
+			wantOutput: []string{"Proceed with synchronization? [y/N]"},
+			wantErr:    true,
+			wantErrIs:  io.EOF,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+			out := &syncBuffer{}
+
+			err := runSync(e2eContext(t), cfg, e2eOptions(out, tt.input))
+
+			switch {
+			case tt.wantErr && err == nil:
+				t.Fatal("runSync returned nil, want an error")
+			case !tt.wantErr && err != nil:
+				t.Fatalf("runSync: %v", err)
+			case tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs):
+				t.Errorf("error %v does not wrap %v", err, tt.wantErrIs)
+			}
+			assertContainsAll(t, out.String(), tt.wantOutput...)
+
+			if tt.wantCopied {
+				assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+				return
+			}
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands before a yes, want 0", n)
+			}
+			if n := dst.callCount("CREATE"); n != 0 {
+				t.Errorf("dst saw %d CREATE commands before a yes, want 0", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_DelimitersDiffer_Then_PathIsRewrittenAfterConfirmation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		input       string
+		wantOutput  []string
+		notOutput   []string
+		wantFolder  string
+		wantCreates []string
+		autoConfirm bool
+	}{
+		{
+			name:        "auto confirm rewrites the destination path",
+			autoConfirm: true,
+			wantOutput:  []string{"Folder path delimiter mismatch detected", "Auto-confirming delimiter fix", "Fixed destination"},
+			wantFolder:  "Archive.2024",
+			wantCreates: []string{"Archive", "Archive.2024"},
+		},
+		{
+			name:  "both prompts are answered from one input stream",
+			input: "y\ny\n",
+			wantOutput: []string{
+				"Fix folder delimiters to match server configuration? [y/N]",
+				"Proceed with synchronization? [y/N]",
+				"Fixed destination",
+			},
+			wantFolder:  "Archive.2024",
+			wantCreates: []string{"Archive", "Archive.2024"},
+		},
+		{
+			name:        "declined fix keeps the path and warns",
+			input:       "n\ny\n",
+			wantOutput:  []string{"Please note if delimiter", "Proceed with synchronization? [y/N]"},
+			notOutput:   []string{"Fixed destination"},
+			wantFolder:  "Archive/2024",
+			wantCreates: []string{"Archive/2024"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")})
+			// The destination needs a folder to report its "." delimiter.
+			dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("Archive/2024", "Archive/2024"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, tt.input)
+			opts.autoConfirm = tt.autoConfirm
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+
+			assertContainsAll(t, out.String(), tt.wantOutput...)
+			assertContainsNone(t, out.String(), tt.notOutput...)
+			assertIDs(t, "dst "+tt.wantFolder, dst.folderMsgIDs(tt.wantFolder), "m1@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantCreates...)
+		})
+	}
+}
+
+func TestRunSync_When_InputEndsAtDelimiterPrompt_Then_ReturnsReadErrorBeforeAnyWrite(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("Archive/2024", "Archive/2024"))
+	out := &syncBuffer{}
+
+	err := runSync(e2eContext(t), cfg, e2eOptions(out, ""))
+
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("error = %v, want it to wrap io.EOF", err)
+	}
+	assertContainsAll(t, out.String(), "Fix folder delimiters to match server configuration? [y/N]")
+	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d CREATE or APPEND commands, want 0", n)
+	}
+}
+
+func TestRunSync_When_OnlyOneFolderFlagGiven_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		srcFolder string
+		dstFolder string
+	}{
+		{name: "source folder without destination folder", srcFolder: "INBOX"},
+		{name: "destination folder without source folder", dstFolder: "INBOX"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+			opts := e2eOptions(&syncBuffer{}, "")
+			opts.autoConfirm = true
+			opts.srcFolder, opts.dstFolder = tt.srcFolder, tt.dstFolder
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if err == nil || !strings.Contains(err.Error(), "both --src-folder and --dest-folder must be specified") {
+				t.Fatalf("error = %v, want the folder-pairing refusal", err)
+			}
+			assertNoLogin(t, src, dst)
+		})
+	}
+}
+
+func TestRunSync_When_BothFolderFlagsGiven_Then_TheyReplaceConfiguredMappings(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Work":  fakeMsgs("m2@x"),
+		"Extra": fakeMsgs("m3@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"), mapping("Extra", "Extra"))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+	opts.srcFolder, opts.dstFolder = "Work", "Archive"
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst Archive", dst.folderMsgIDs("Archive"), "m2@x")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"))
+	if dst.hasFolder("Extra") {
+		t.Error("dst has Extra, a folder only the configured mappings named")
+	}
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Archive")
+}
+
+func TestRunSync_When_NoMappingsConfigured_Then_EverySourceFolderIsSynced(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Sent":  fakeMsgs("m2@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 2)
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	assertIDs(t, "dst Sent", dst.folderMsgIDs("Sent"), "m2@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Sent")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceHasSubfolders_Then_TheyAreCopiedToMatchingPaths(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"Work":       fakeMsgs("m1@x"),
+		"Work/Sub":   fakeMsgs("m2@x"),
+		"Other":      fakeMsgs("m3@x"),
+		"Work/Sub/A": fakeMsgs("m4@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 2, mapping("Work", "Mail"))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst Mail", dst.folderMsgIDs("Mail"), "m1@x")
+	assertIDs(t, "dst Mail/Sub", dst.folderMsgIDs("Mail/Sub"), "m2@x")
+	assertIDs(t, "dst Mail/Sub/A", dst.folderMsgIDs("Mail/Sub/A"), "m4@x")
+	if dst.hasFolder("Other") {
+		t.Error("dst has Other, which no mapping covers")
+	}
+}
+
+func TestRunSync_When_FolderCreationRefused_Then_FailsBeforeAnyAppend(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseCreate()
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if err == nil || !strings.Contains(err.Error(), "failed to create 1 folders") {
+		t.Fatalf("error = %v, want %q", err, "failed to create 1 folders")
+	}
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	}
+}
+
+func TestRunSync_When_AppendRefused_Then_ReportsErrorsAndExitsSilently(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseAppend()
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, out.String(), "Sync completed with errors", "0 messages uploaded, 1 errors occurred")
+}
+
+func TestRunSync_When_LoginRefused_Then_NamesTheFailingSide(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		want      string
+		mappings  []config.DirectoryMapping
+		refuseSrc bool
+		refuseDst bool
+	}{
+		{
+			name:      "source login refused",
+			refuseSrc: true,
+			mappings:  []config.DirectoryMapping{mapping("INBOX", "INBOX")},
+			want:      "source connection failed",
+		},
+		{
+			name:      "destination login refused",
+			refuseDst: true,
+			mappings:  []config.DirectoryMapping{mapping("INBOX", "INBOX")},
+			want:      "destination connection failed",
+		},
+		{
+			name:      "source login refused while mappings come from the source",
+			refuseSrc: true,
+			want:      "source connection failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			if tt.refuseSrc {
+				src.refuseLogin()
+			}
+			if tt.refuseDst {
+				dst.refuseLogin()
+			}
+			cfg := e2eConfig(src, dst, 1, tt.mappings...)
+			opts := e2eOptions(&syncBuffer{}, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.want)
+			}
+			if strings.Contains(err.Error(), e2ePassword) {
+				t.Errorf("error %q leaks the password", err)
+			}
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_QuietAndConfirmed_Then_CopiesWithoutPreview(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x")
+	assertContainsNone(t, out.String(), "Messages to be copied to destination", "Total new messages to sync")
+}
+
+func TestRunSync_When_Verbose_Then_PreviewSamplesUIDsAndShowsDelimiters(t *testing.T) {
+	t.Parallel()
+
+	const total = verboseUIDLimit + 5
+	ids := make([]string, total)
+	for i := range ids {
+		ids[i] = "m" + strconv.Itoa(i+1) + "@x"
+	}
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Big": fakeMsgs(ids...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"Big": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("Big", "Big"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.verbose, opts.autoConfirm = true, true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	got := out.String()
+	if n := strings.Count(got, "  \u2022 UID "); n != verboseUIDLimit {
+		t.Errorf("preview lists %d UIDs, want %d", n, verboseUIDLimit)
+	}
+	assertContainsAll(t, got,
+		"and 5 more",
+		"Starting sync with 1 workers",
+		"Server delimiters",
+		`Source [src]: "/"`,
+		`Destination [dst]: "/"`,
+	)
+	if n := len(dst.folderMsgIDs("Big")); n != total {
+		t.Errorf("dst Big holds %d messages, want %d", n, total)
+	}
+}
+
+func TestRunSync_When_ContextAlreadyCanceled_Then_ReturnsBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	assertNoLogin(t, src, dst)
+}
+
+// syncFlags mirrors the flag names ActionSync reads; the aliases are the ones
+// the tests pass.
+func syncFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{Name: "src-folder", Aliases: []string{"s"}},
+		&cli.StringFlag{Name: "dest-folder", Aliases: []string{"d"}},
+		&cli.IntFlag{Name: "workers", Aliases: []string{"w"}, Value: 4},
+		&cli.BoolFlag{Name: "verbose", Aliases: []string{"V"}},
+		&cli.BoolFlag{Name: "quiet", Aliases: []string{"q"}},
+		&cli.BoolFlag{Name: "confirm", Aliases: []string{"y", "yes"}},
+		&cli.IntFlag{Name: "bps-down"},
+		&cli.IntFlag{Name: "bps-up"},
+		&cli.IntFlag{Name: "max-connections"},
+	}
+}
+
+// runCLIAction runs action as subcommand name under a root command that owns
+// the config flag, the same shape as cmd/imapsync-go/main.go, and returns the
+// action's own error.
+func runCLIAction(t *testing.T, action func(context.Context, *cli.Command) error, name string, flags []cli.Flag, args ...string) error {
+	t.Helper()
+
+	var got error
+	root := &cli.Command{
+		Name:            "imapsync-go",
+		HideHelpCommand: true,
+		Flags:           []cli.Flag{&cli.StringFlag{Name: "config", Aliases: []string{"c"}}},
+		Commands: []*cli.Command{{
+			Name:   name,
+			Flags:  flags,
+			Action: func(ctx context.Context, c *cli.Command) error { got = action(ctx, c); return nil },
+		}},
+	}
+	if err := root.Run(e2eContext(t), append([]string{"imapsync-go"}, args...)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return got
+}
+
+// writeJSONConfig stores a config for the given servers in a temp dir and
+// returns its path.
+func writeJSONConfig(t *testing.T, src, dst *fakeServer, mappings ...config.DirectoryMapping) string {
+	t.Helper()
+
+	cfg := e2eConfig(src, dst, 1, mappings...)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func TestActionSync_When_ServerIsNotTLS_Then_FailsWithoutSendingCredentials(t *testing.T) {
+	t.Parallel()
+
+	src, dst := newFakeServer(t), newFakeServer(t)
+	cfgPath := writeJSONConfig(t, src, dst, mapping("INBOX", "INBOX"))
+
+	err := runCLIAction(t, ActionSync, "sync", syncFlags(), "-c", cfgPath, "sync", "-y")
+
+	if err == nil || !strings.Contains(err.Error(), "tls:") {
+		t.Fatalf("error = %v, want a TLS handshake failure", err)
+	}
+	assertNoLogin(t, src, dst)
+}
+
+func TestActionSync_When_ConfigIsMissing_Then_ReportsLoadFailure(t *testing.T) {
+	t.Parallel()
+
+	missing := filepath.Join(t.TempDir(), "missing.json")
+
+	err := runCLIAction(t, ActionSync, "sync", syncFlags(), "-c", missing, "sync", "-y")
+
+	if err == nil || !strings.Contains(err.Error(), "failed to load config") {
+		t.Fatalf("error = %v, want %q", err, "failed to load config")
+	}
+}
+
+func TestRunSync_When_SourceDelimiterDiffers_Then_SourcePathIsRewritten(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, ".", map[string][]fakeMsg{"Work.Sub": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("Work/Sub", "Work/Sub"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertContainsAll(t, out.String(),
+		`Source folder "Work/Sub" uses delimiter "/", server expects "."`,
+		"Fixed source: \"Work/Sub\" \u2192 \"Work.Sub\"",
+	)
+	assertContainsNone(t, out.String(), "Fixed destination")
+	assertIDs(t, "dst Work/Sub", dst.folderMsgIDs("Work/Sub"), "m1@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work", "Work/Sub")
+	assertReadOnly(t, "source", src)
+}
+
+// cancelOnWrite cancels a context once marker is written, so a test can stop
+// runSync at an exact point instead of racing it.
+type cancelOnWrite struct {
+	*syncBuffer
+	cancel context.CancelFunc
+	marker string
+	once   sync.Once
+}
+
+func (w *cancelOnWrite) Write(p []byte) (int, error) {
+	n, err := w.syncBuffer.Write(p)
+	if strings.Contains(string(p), w.marker) {
+		w.once.Do(w.cancel)
+	}
+	return n, err
+}
+
+func TestRunSync_When_CanceledAtPhaseBoundary_Then_NothingMoreIsSent(t *testing.T) {
+	t.Parallel()
+
+	oneMessage := map[string][]fakeMsg{"Work": fakeMsgs("m1@x")}
+	tests := []struct {
+		src          map[string][]fakeMsg
+		dst          map[string][]fakeMsg
+		mapping      config.DirectoryMapping
+		name         string
+		marker       string
+		input        string
+		srcDelimiter string
+		dstDelimiter string
+		notOutput    []string
+		autoConfirm  bool
+		verbose      bool
+		wantNoLogin  bool
+	}{
+		{
+			name:         "before connecting",
+			marker:       "Connecting to servers",
+			verbose:      true,
+			autoConfirm:  true,
+			src:          oneMessage,
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mapping:      mapping("Work", "Work"),
+			srcDelimiter: "/",
+			dstDelimiter: "/",
+			wantNoLogin:  true,
+		},
+		{
+			name:         "before validating the mappings",
+			marker:       "Server delimiters",
+			verbose:      true,
+			autoConfirm:  true,
+			src:          oneMessage,
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mapping:      mapping("Work", "Work"),
+			srcDelimiter: "/",
+			dstDelimiter: "/",
+		},
+		{
+			name:         "before expanding subfolders",
+			marker:       "Checking for subfolders",
+			verbose:      true,
+			autoConfirm:  true,
+			src:          oneMessage,
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mapping:      mapping("Work", "Work"),
+			srcDelimiter: "/",
+			dstDelimiter: "/",
+		},
+		{
+			name:         "before the delimiter prompt",
+			marker:       "delimiter mismatch detected",
+			input:        "y\ny\n",
+			src:          map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")},
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mapping:      mapping("Archive/2024", "Archive/2024"),
+			srcDelimiter: "/",
+			dstDelimiter: ".",
+			notOutput:    []string{"Fix folder delimiters"},
+		},
+		{
+			name:         "before the confirmation prompt",
+			marker:       "Total new messages to sync",
+			input:        "y\n",
+			src:          oneMessage,
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mapping:      mapping("Work", "Work"),
+			srcDelimiter: "/",
+			dstDelimiter: "/",
+			notOutput:    []string{"Proceed with synchronization?"},
+		},
+		{
+			name:         "before creating folders",
+			marker:       "Creating destination folders",
+			autoConfirm:  true,
+			src:          oneMessage,
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mapping:      mapping("Work", "Work"),
+			srcDelimiter: "/",
+			dstDelimiter: "/",
+		},
+		{
+			name:         "before starting the workers",
+			marker:       "Syncing messages",
+			autoConfirm:  true,
+			src:          oneMessage,
+			dst:          map[string][]fakeMsg{"Work": nil},
+			mapping:      mapping("Work", "Work"),
+			srcDelimiter: "/",
+			dstDelimiter: "/",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, tt.srcDelimiter, tt.src)
+			dst := newStoreServer(t, tt.dstDelimiter, tt.dst)
+			ctx, cancel := context.WithCancel(e2eContext(t))
+			t.Cleanup(cancel)
+			out := &cancelOnWrite{syncBuffer: &syncBuffer{}, cancel: cancel, marker: tt.marker}
+			opts := e2eOptions(out, tt.input)
+			opts.autoConfirm, opts.verbose = tt.autoConfirm, tt.verbose
+
+			err := runSync(ctx, e2eConfig(src, dst, 1, tt.mapping), opts)
+
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			assertContainsAll(t, out.String(), tt.marker)
+			assertContainsNone(t, out.String(), tt.notOutput...)
+			if tt.wantNoLogin {
+				assertNoLogin(t, src, dst)
+			}
+			if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d CREATE or APPEND commands after the cancel, want 0", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_NestedFoldersAreNew_Then_EachPathIsCreatedOnceParentFirst(t *testing.T) {
+	t.Parallel()
+
+	const children = 12
+	folders := map[string][]fakeMsg{"Work": fakeMsgs("w@x")}
+	for i := range children {
+		folders[fmt.Sprintf("Work/S%02d", i)] = fakeMsgs(fmt.Sprintf("s%02d@x", i))
+	}
+	src := newStoreServer(t, "/", folders)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 2, mapping("Work", "Mail"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	// Creation order follows map iteration. A child may precede its mapped parent,
+	// so the walk down creates the parent first. No path may be created twice.
+	creates := dst.capturedNames("CREATE")
+	if len(creates) != children+1 {
+		t.Errorf("dst saw %d CREATE commands, want %d: %v", len(creates), children+1, creates)
+	}
+	created := make(map[string]bool, len(creates))
+	for _, name := range creates {
+		if created[name] {
+			t.Errorf("CREATE %q was sent twice", name)
+		}
+		created[name] = true
+		if i := strings.LastIndex(name, "/"); i >= 0 && !created[name[:i]] {
+			t.Errorf("CREATE %q came before its parent %q", name, name[:i])
+		}
+	}
+	assertIDs(t, "dst Mail", dst.folderMsgIDs("Mail"), "w@x")
+	for i := range children {
+		assertIDs(t, "dst child", dst.folderMsgIDs(fmt.Sprintf("Mail/S%02d", i)), fmt.Sprintf("s%02d@x", i))
+	}
+	assertContainsAll(t, out.String(), "Found 12 subfolders, total folders to sync: 13")
+}
+
+func TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		quiet       bool
+		wantWarning bool
+	}{
+		{name: "normal output", wantWarning: true},
+		{name: "quiet output", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config.Config{
+				Src:     config.Credentials{Label: "src", Server: "imap.gmail.com:993", User: "alice", Pass: e2ePassword},
+				Dst:     config.Credentials{Label: "dst", Server: "127.0.0.1:1", User: "bob", Pass: e2ePassword},
+				Workers: 1,
+			}
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.clientOpts.DialTimeout = time.Nanosecond
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+			// A lone --src-folder is refused before any dial. The nanosecond
+			// timeout keeps the test offline even if that check moves after dialing.
+			opts.srcFolder = "INBOX"
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if err == nil || !strings.Contains(err.Error(), "both --src-folder and --dest-folder must be specified") {
+				t.Fatalf("error = %v, want the folder-pairing refusal", err)
+			}
+			if !tt.wantWarning {
+				if got := out.String(); got != "" {
+					t.Errorf("output = %q, want nothing written", got)
+				}
+				return
+			}
+			assertContainsAll(t, out.String(), "Provider with known IMAP limits detected", "imap.gmail.com:993", "Gmail")
+			assertContainsNone(t, out.String(), e2ePassword)
+		})
+	}
+}
+
+func TestRunSync_When_ListingSourceFoldersFails_Then_NothingIsWritten(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	src.addConnHandler(listFailsAfterConnectHandler(src, "INBOX"))
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if err == nil || !strings.Contains(err.Error(), "source connection list mailbox failed") {
+		t.Fatalf("error = %v, want %q", err, "source connection list mailbox failed")
+	}
+	assertNoLogin(t, dst)
+}
+
+func TestActionSync_When_ContextAlreadyCanceled_Then_ReturnsBeforeReadingConfig(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := ActionSync(ctx, &cli.Command{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunSync_When_DestinationScanFails_Then_NothingIsWritten(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb == "EXAMINE" {
+			return "NO [CANNOT] examine refused", true
+		}
+		return "", false
+	}))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if err == nil || !strings.Contains(err.Error(), `scan destination folder "INBOX"`) {
+		t.Fatalf("error = %v, want the destination scan failure", err)
+	}
+	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d CREATE or APPEND commands, want 0", n)
+	}
+}
+
+func TestRunSync_When_CanceledDuringFolderCreation_Then_ReportsCancelNotCreateFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb == "CREATE" {
+			cancel()
+			return "", true
+		}
+		return "", false
+	}))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("Work", "Work")), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if strings.Contains(err.Error(), "failed to create") {
+		t.Errorf("error %q reports a creation failure for a Ctrl+C", err)
+	}
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	}
+}
+
+func TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil})
+	idle := func(string, int) (string, bool) { return "", false }
+	stallOnAppend := func(verb string, _ int) (string, bool) {
+		if verb == "APPEND" {
+			cancel()
+			return "", true
+		}
+		return "", false
+	}
+	// The first dst connection plans; the second is the only worker's.
+	dst.addConnHandler(scriptedHandler(dst, []string{"A", "B"}, idle))
+	dst.addConnHandler(scriptedHandler(dst, []string{"A", "B"}, stallOnAppend))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	assertContainsNone(t, out.String(), "Sync completed")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("dst saw %d APPEND commands, want 1 (no plan starts after the cancel)", n)
+	}
+}
+
+func TestRunSync_When_TransferIsLimited_Then_WorkersShareOneBudgetPerDirection(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bps       = 200_000
+		perFolder = 3
+		bodyLines = 640
+	)
+	tests := []struct {
+		name  string
+		limit config.RateLimit
+	}{
+		{name: "download", limit: config.RateLimit{DownBPS: bps}},
+		{name: "upload", limit: config.RateLimit{UpBPS: bps}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A bucket moves at most burst + rate x elapsed bytes: one shared bucket
+			// cannot finish before minElapsed, per-worker buckets would stay in burst.
+			filler := strings.Repeat(strings.Repeat("x", 78)+"\r\n", bodyLines)
+			msgs := func(prefix string) []fakeMsg {
+				out := make([]fakeMsg, perFolder)
+				for i := range out {
+					id := fmt.Sprintf("%s%d@x", prefix, i)
+					out[i] = fakeMsg{msgID: id, body: imapFullBody(id) + filler}
+				}
+				return out
+			}
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": msgs("a"), "B": msgs("b")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil})
+			cfg := e2eConfig(src, dst, 2, mapping("A", "A"), mapping("B", "B"))
+			cfg.RateLimit = tt.limit
+			opts := e2eOptions(&syncBuffer{}, "")
+			opts.autoConfirm = true
+			total := 2 * perFolder * (len(imapFullBody("a0@x")) + len(filler))
+			minElapsed := time.Duration(float64(total-bps) / bps * 0.8 * float64(time.Second))
+
+			start := time.Now()
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+			elapsed := time.Since(start)
+
+			if elapsed < minElapsed {
+				t.Errorf("sync took %v, want at least %v for %d bytes through one %d B/s budget", elapsed, minElapsed, total, bps)
+			}
+			if n := len(dst.folderMsgIDs("A")) + len(dst.folderMsgIDs("B")); n != 2*perFolder {
+				t.Errorf("dst holds %d messages, want %d", n, 2*perFolder)
+			}
+		})
 	}
 }

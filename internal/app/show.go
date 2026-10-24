@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/greeddj/imapsync-go/internal/client"
@@ -16,6 +17,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// showOptions carries what runShow needs besides the config. clientOpts holds
+// the shared transport settings; runShow adds the per-side fields.
+type showOptions struct {
+	out        io.Writer
+	clientOpts client.Options
+	quiet      bool
+	verbose    bool
+}
+
 // ActionShow displays information about mailboxes in source and destination IMAP accounts.
 func ActionShow(ctx context.Context, c *cli.Command) error {
 	if err := ctx.Err(); err != nil {
@@ -26,25 +36,35 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	verbose := c.Bool("verbose")
-	quiet := c.Bool("quiet")
+	opts := showOptions{
+		out:        os.Stdout,
+		clientOpts: client.Options{UseTLS: true},
+		quiet:      c.Bool("quiet"),
+		verbose:    c.Bool("verbose"),
+	}
 
-	pw := progress.NewWriter(2, quiet)
-	pw.Start()
-	defer pw.Stop()
-
-	// No pw.Log before AppendTracker: go-pretty's redraw cycle counts
-	// only tracker rows when computing how far cursor-up needs to go,
-	// so a log line emitted in the first render leaves the topmost
-	// tracker un-erased on the next tick and StopAndClear can't reach it.
 	cfg, err := config.New(c)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+
+	return runShow(ctx, cfg, opts)
+}
+
+func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	out := opts.out
+	verbose := opts.verbose
+
+	pw := newProgressWriter(2, opts.quiet, out)
+	pw.Start()
+	defer pw.Stop()
+
+	// No pw.Log before AppendTracker: go-pretty counts only tracker rows when
+	// moving the cursor up, so an early log line leaves the top tracker un-erased.
 	srcTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label), 100)
 	dstTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label), 100)
 	traceTracker("show-src", srcTracker.Message)
@@ -60,11 +80,10 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 	}
 	loadAccount := func(ctx context.Context, label string, creds config.Credentials, tr *progress.Tracker) (accountResult, error) {
 		tr.UpdateMessage(fmt.Sprintf("[%s] Connecting...", label))
-		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, client.Options{
-			UseTLS:  true,
-			Auth:    creds.Auth,
-			Verbose: verbose,
-		})
+		clientOpts := opts.clientOpts
+		clientOpts.Auth = creds.Auth
+		clientOpts.Verbose = verbose
+		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, clientOpts)
 		if err != nil {
 			tr.MarkAsErrored()
 			return accountResult{}, fmt.Errorf("[%s] connect: %w", label, err)
@@ -119,17 +138,17 @@ func ActionShow(ctx context.Context, c *cli.Command) error {
 		return groupErr
 	}
 
-	printAccountInfo("Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
-	fmt.Println()
-	printAccountInfo("Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
+	printAccountInfo(out, "Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
+	_, _ = fmt.Fprintln(out)
+	printAccountInfo(out, "Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
 
 	return nil
 }
 
 // printAccountInfo displays mailbox information in a formatted table.
-func printAccountInfo(title, server, user string, mailboxes []*client.MailboxInfo) {
+func printAccountInfo(out io.Writer, title, server, user string, mailboxes []*client.MailboxInfo) {
 	headerTable := table.NewWriter()
-	headerTable.SetOutputMirror(os.Stdout)
+	headerTable.SetOutputMirror(out)
 	headerTable.Style().Options.DrawBorder = false
 	headerTable.Style().Options.SeparateColumns = false
 	// Bold + bright cyan matches the tracker palette and visually breaks
@@ -141,14 +160,14 @@ func printAccountInfo(title, server, user string, mailboxes []*client.MailboxInf
 		{"User", user},
 	})
 	headerTable.Render()
-	fmt.Println()
+	_, _ = fmt.Fprintln(out)
 
 	if len(mailboxes) == 0 {
 		return
 	}
 
 	t := table.NewWriter()
-	t.SetOutputMirror(os.Stdout)
+	t.SetOutputMirror(out)
 	t.Style().Options.DrawBorder = false
 	t.Style().Options.SeparateColumns = false
 

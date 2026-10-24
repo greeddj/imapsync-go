@@ -57,12 +57,9 @@ type ProgressTracker interface {
 	MarkAsErrored()
 }
 
-// Options carries the optional knobs for New. Zero-value is fine for plain
-// TLS connections without throttling.
-//
-// ReadLimiter and WriteLimiter, when non-nil, are typically shared across
-// every Client that talks to the same account so that the byte budget is a
-// global cap, not a per-connection cap.
+// Options carries the optional knobs for New. The zero value dials plaintext
+// TCP: production callers must set UseTLS. Limiters shared across Clients make
+// the byte budget global, not per-connection.
 type Options struct {
 	TLSConfig    *tls.Config
 	ReadLimiter  *rate.Limiter

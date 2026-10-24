@@ -8,6 +8,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 - `internal/client` defines its own minimal `ProgressWriter` / `ProgressTracker` interfaces. It must not import `internal/progress` (which pulls in go-pretty). Same shape for any future cross-package callback: declare the interface where it is consumed, satisfy it where it is produced.
 - `internal/progress` and `internal/ratelimit` are leaves — they depend on stdlib + one external package each. Keep them that way.
 - `internal/app` orchestrates; it owns the worker pool, the plan, and the confirmation prompts. It does not reach into `*imap.*` types — that abstraction lives in `internal/client`.
+- `ActionSync` / `ActionShow` stay thin adapters that pass `client.Options{UseTLS: true}` to `runSync` / `runShow`. Only tests pass plaintext options. A config, flag or environment switch for plaintext is a security review point.
 
 ## Sync flow invariants
 

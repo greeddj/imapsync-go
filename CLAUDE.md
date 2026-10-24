@@ -30,8 +30,8 @@ Single-binary IMAP-to-IMAP sync tool. Five things to internalize before making c
 ```
 cmd/imapsync-go/main.go         — urfave/cli/v3 wiring, version flags, signal-to-context
 cmd/imapsync-go/commands/       — thin subcommand definitions (sync, show); they only declare flags and call into internal/app
-internal/app/sync.go            — sync orchestration: load config, connect, build plan, confirm, dispatch to worker pool
-internal/app/show.go            — show orchestration: parallel ListMailboxes via errgroup, formatted table
+internal/app/sync.go            — sync orchestration: ActionSync reads flags and config, runSync connects, builds the plan, confirms, dispatches to worker pool
+internal/app/show.go            — show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table
 internal/app/worker.go          — syncWorker pool + runFolderSync helper consumed by sync.go
 internal/client/client.go       — go-imap wrapper: Options, dial+TLS+rate-limit wiring, reconnect, generation-aware Select
 internal/client/fetch.go        — single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH)
@@ -43,8 +43,10 @@ internal/client/provider.go     — DetectProvider, used by sync.go to print quo
 internal/config/                — JSON+YAML config loader (extension-driven), validation
 internal/progress/              — go-pretty progress writer/tracker abstraction (interfaces consumed by client)
 internal/ratelimit/             — net.Conn wrapper applying golang.org/x/time/rate at the dialer
-internal/utils/                 — `AskConfirm` and friends
+internal/utils/                 — `AskConfirm(ctx, in *bufio.Reader, out io.Writer, prompt)` and friends
 ```
+
+`ActionSync` and `ActionShow` are thin CLI adapters. They pass `client.Options{UseTLS: true}`, `os.Stdout` and `os.Stdin` to `runSync` / `runShow`. Tests pass plaintext options, a buffer and a scripted reader to dial the fake IMAP servers. Do not add a config, flag or environment switch that disables TLS.
 
 `internal/client` defines minimal `ProgressWriter` / `ProgressTracker` interfaces it consumes; `internal/progress` implements them. Preserve this split when adding progress hooks — the alternative pulls `internal/progress` (which depends on go-pretty) into the client package.
 

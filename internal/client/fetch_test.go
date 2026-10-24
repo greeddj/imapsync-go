@@ -3,8 +3,11 @@ package client
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 
@@ -118,6 +121,355 @@ func Test_StreamMessagesByUIDs_batchesAt500(t *testing.T) {
 
 	if got := srv.callCount("UID FETCH"); got != 3 {
 		t.Errorf("UID FETCH count = %d, want 3 (batches of 500+500+1)", got)
+	}
+}
+
+// Test_readMessageIDHeader asserts which of the fetched body sections the
+// Message-Id is read from: the one matching messageIDHeaderSection first, then
+// any other non-nil section as a fallback.
+func Test_readMessageIDHeader(t *testing.T) {
+	t.Parallel()
+
+	// go-imap stores a server reply under the section name without PEEK.
+	matching := func() *imap.BodySectionName {
+		return &imap.BodySectionName{BodyPartName: imap.BodyPartName{
+			Specifier: imap.HeaderSpecifier,
+			Fields:    []string{"MESSAGE-ID"},
+		}}
+	}
+	fullBody := func() *imap.BodySectionName { return &imap.BodySectionName{} }
+	textPart := func() *imap.BodySectionName {
+		return &imap.BodySectionName{BodyPartName: imap.BodyPartName{Specifier: imap.TextSpecifier}}
+	}
+	firstPart := func() *imap.BodySectionName {
+		return &imap.BodySectionName{BodyPartName: imap.BodyPartName{Path: []int{1}}}
+	}
+	header := func(id string) imap.Literal {
+		return strings.NewReader("Message-Id: <" + id + ">\r\n\r\n")
+	}
+	noID := func() imap.Literal { return strings.NewReader("Subject: hi\r\n\r\n") }
+
+	tests := []struct {
+		sections func() map[*imap.BodySectionName]imap.Literal
+		name     string
+		want     string
+	}{
+		{
+			name: "matching section",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{matching(): header("match@host")}
+			},
+			want: "match@host",
+		},
+		{
+			name: "matching section wins over other sections",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{
+					matching(): header("match@host"),
+					fullBody(): header("other@host"),
+				}
+			},
+			want: "match@host",
+		},
+		{
+			name: "differently shaped section found by the fallback scan",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{fullBody(): header("scan@host")}
+			},
+			want: "scan@host",
+		},
+		{
+			name: "fallback scan skips nil literals",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{
+					fullBody():  nil,
+					textPart():  nil,
+					firstPart(): header("scan@host"),
+				}
+			},
+			want: "scan@host",
+		},
+		{
+			name: "only nil literals",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{fullBody(): nil, textPart(): nil}
+			},
+			want: "",
+		},
+		{
+			name: "matching section without a Message-Id",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{matching(): noID()}
+			},
+			want: "",
+		},
+		{
+			name: "scanned section without a Message-Id",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{fullBody(): noID()}
+			},
+			want: "",
+		},
+		{
+			name: "no body sections",
+			sections: func() map[*imap.BodySectionName]imap.Literal {
+				return map[*imap.BodySectionName]imap.Literal{}
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			msg := imap.NewMessage(1, nil)
+			msg.Body = tt.sections()
+			if got := readMessageIDHeader(msg); got != tt.want {
+				t.Errorf("readMessageIDHeader = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_returnsWithoutFetching asserts that an empty UID
+// list and an already canceled context both return before any EXAMINE or
+// UID FETCH is sent.
+func Test_StreamMessagesByUIDs_returnsWithoutFetching(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantErr   error
+		name      string
+		uids      []uint32
+		cancelCtx bool
+	}{
+		{name: "empty uid slice"},
+		{name: "context already canceled", uids: []uint32{1, 2}, cancelCtx: true, wantErr: context.Canceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, c := newScriptedClient(t, &mailboxScript{
+				folders:     []scriptFolder{{name: "INBOX", sizes: []uint32{1, 2}}},
+				uidMessages: 2,
+			})
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+			if tt.cancelCtx {
+				cancel()
+			}
+
+			calls := 0
+			err := c.StreamMessagesByUIDs(ctx, "INBOX", tt.uids, func(*imap.Message) error {
+				calls++
+				return nil
+			})
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("error = %v, want %v", err, tt.wantErr)
+			}
+			if calls != 0 {
+				t.Errorf("callback ran %d times, want 0", calls)
+			}
+			if got := srv.callCount("EXAMINE"); got != 0 {
+				t.Errorf("EXAMINE count = %d, want 0", got)
+			}
+			if got := srv.callCount("UID FETCH"); got != 0 {
+				t.Errorf("UID FETCH count = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_deliversMessages asserts that the callback receives
+// every fetched message with its body, in UID order, and that the caller's UID
+// slice is left untouched.
+func Test_StreamMessagesByUIDs_deliversMessages(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newScriptedClient(t, &mailboxScript{
+		folders:     []scriptFolder{{name: "INBOX", sizes: []uint32{1, 1, 1}}},
+		uidMessages: 3,
+	})
+
+	uids := []uint32{12, 10, 11}
+	var (
+		gotUIDs []uint32
+		bodies  []string
+	)
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg *imap.Message) error {
+		lit := msg.GetBody(fullBodyPeekSection)
+		if lit == nil {
+			return errors.New("message has no body section")
+		}
+		body, err := io.ReadAll(lit)
+		if err != nil {
+			return err
+		}
+		gotUIDs = append(gotUIDs, msg.Uid)
+		bodies = append(bodies, string(body))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	if want := []uint32{10, 11, 12}; !slices.Equal(gotUIDs, want) {
+		t.Errorf("delivered UIDs = %v, want %v", gotUIDs, want)
+	}
+	wantBodies := []string{
+		"Subject: uid 10\r\n\r\nbody\r\n",
+		"Subject: uid 11\r\n\r\nbody\r\n",
+		"Subject: uid 12\r\n\r\nbody\r\n",
+	}
+	if !slices.Equal(bodies, wantBodies) {
+		t.Errorf("delivered bodies = %q, want %q", bodies, wantBodies)
+	}
+	if want := []uint32{12, 10, 11}; !slices.Equal(uids, want) {
+		t.Errorf("caller UID slice = %v, want it unchanged %v", uids, want)
+	}
+	if got := srv.capturedNames("EXAMINE"); !slices.Equal(got, []string{"INBOX"}) {
+		t.Errorf("EXAMINE names = %v, want [INBOX]", got)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1", got)
+	}
+}
+
+// Test_StreamMessagesByUIDs_callbackErrorStopsFurtherBatches asserts that a
+// callback error in the first batch is returned, the batch is drained without
+// more callbacks, and no second batch is requested.
+func Test_StreamMessagesByUIDs_callbackErrorStopsFurtherBatches(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newScriptedClient(t, &mailboxScript{
+		folders:     []scriptFolder{{name: "INBOX", sizes: []uint32{1}}},
+		uidMessages: 3,
+	})
+
+	uids := make([]uint32, uidFetchBatchSize+1)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+
+	errStop := errors.New("callback refused the message")
+	calls := 0
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(*imap.Message) error {
+		calls++
+		return errStop
+	})
+	if !errors.Is(err, errStop) {
+		t.Errorf("error = %v, want %v", err, errStop)
+	}
+	if calls != 1 {
+		t.Errorf("callback ran %d times, want 1 (the rest of the batch is drained)", calls)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1 (no second batch)", got)
+	}
+}
+
+// Test_StreamMessagesByUIDs_whenServerRefuses asserts that a refused EXAMINE or
+// UID FETCH is returned with the step that failed, and is not retried.
+func Test_StreamMessagesByUIDs_whenServerRefuses(t *testing.T) {
+	t.Parallel()
+
+	inbox := []scriptFolder{{name: "INBOX", sizes: []uint32{1}}}
+	tests := []struct {
+		script       *mailboxScript
+		name         string
+		wantErr      string
+		wantExamines int
+		wantFetches  int
+	}{
+		{
+			name:         "examine refused",
+			script:       &mailboxScript{examineRefused: map[string]bool{"INBOX": true}, folders: inbox},
+			wantErr:      "select folder INBOX: examine refused",
+			wantExamines: 1,
+			wantFetches:  0,
+		},
+		{
+			name:         "uid fetch refused",
+			script:       &mailboxScript{uidFetchRefused: true, folders: inbox},
+			wantErr:      "body fetch: fetch refused",
+			wantExamines: 1,
+			wantFetches:  1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, c := newScriptedClient(t, tt.script)
+
+			calls := 0
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1}, func(*imap.Message) error {
+				calls++
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %v, want it to contain %q", err, tt.wantErr)
+			}
+			if calls != 0 {
+				t.Errorf("callback ran %d times, want 0", calls)
+			}
+			if got := srv.callCount("EXAMINE"); got != tt.wantExamines {
+				t.Errorf("EXAMINE count = %d, want %d", got, tt.wantExamines)
+			}
+			if got := srv.callCount("UID FETCH"); got != tt.wantFetches {
+				t.Errorf("UID FETCH count = %d, want %d", got, tt.wantFetches)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_whenContextExpiresMidBatch asserts that a context ending
+// in the callback returns its error and requests no further batch.
+func Test_StreamMessagesByUIDs_whenContextExpiresMidBatch(t *testing.T) {
+	t.Parallel()
+
+	hold := newStall(func(cmd command) bool {
+		return cmd.verb == "UID" && strings.HasPrefix(strings.ToUpper(cmd.arg), "FETCH")
+	})
+	hold.before = func(conn net.Conn, _ *bufio.Reader, _ command) bool {
+		const body = "Subject: uid 1\r\n\r\nbody\r\n"
+		writeLine(conn, "* 1 FETCH (UID 1 BODY[] {%d}\r\n%s)", len(body), body)
+		return true
+	}
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, hold.intercept))
+	c := newClientWithFake(t, srv)
+	genBefore := c.connGen.Load()
+
+	uids := make([]uint32, uidFetchBatchSize+1)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+
+	ctx := newFiredContext(t.Context())
+	calls := 0
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.StreamMessagesByUIDs(ctx, "INBOX", uids, func(*imap.Message) error {
+			calls++
+			ctx.fire()
+			return nil
+		})
+	}()
+
+	err := awaitError(t, errc, "StreamMessagesByUIDs")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if calls != 1 {
+		t.Errorf("callback ran %d times, want 1", calls)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1 (no second batch after the cancel)", got)
+	}
+	if got := c.connGen.Load(); got != genBefore {
+		t.Errorf("connGen = %d, want %d (a canceled client must not reconnect)", got, genBefore)
 	}
 }
 

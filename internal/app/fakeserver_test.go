@@ -2,10 +2,15 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"net"
+	"net/mail"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +26,7 @@ import (
 // handle() path serves vanilla responses when no handler is queued.
 type fakeServer struct {
 	ln             net.Listener
+	store          *mailStore
 	counts         map[string]int
 	names          map[string][]string
 	connHandlers   []func(net.Conn)
@@ -30,6 +36,13 @@ type fakeServer struct {
 
 func newFakeServer(t *testing.T) *fakeServer {
 	t.Helper()
+	return listenFakeServer(t, nil)
+}
+
+// listenFakeServer starts the accept loop. store is set before the loop
+// starts so the loop reads it without locking.
+func listenFakeServer(t *testing.T, store *mailStore) *fakeServer {
+	t.Helper()
 	lc := &net.ListenConfig{}
 	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
@@ -37,6 +50,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	}
 	s := &fakeServer{
 		ln:     ln,
+		store:  store,
 		counts: make(map[string]int),
 		names:  make(map[string][]string),
 	}
@@ -49,9 +63,9 @@ func (s *fakeServer) close() {
 	_ = s.ln.Close()
 }
 
-// addConnHandler appends a per-connection handler. The first Accept uses
-// connHandlers[0], the second uses connHandlers[1], etc. When exhausted,
-// connections fall back to handle().
+// addConnHandler queues a per-connection handler, used in Accept order. Once
+// the queue is empty, connections use the store-backed handler if the server
+// has a store, else handle().
 func (s *fakeServer) addConnHandler(fn func(net.Conn)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -77,9 +91,12 @@ func (s *fakeServer) acceptLoop() {
 			s.connHandlerIdx++
 		}
 		s.mu.Unlock()
-		if handler != nil {
+		switch {
+		case handler != nil:
 			go handler(conn)
-		} else {
+		case s.store != nil:
+			go s.serveStore(conn)
+		default:
 			go s.handle(conn)
 		}
 	}
@@ -513,4 +530,540 @@ func uidFetchBodyHandler(srv *fakeServer, mailboxes []string, uidBodies map[stri
 			}
 		}
 	}
+}
+
+// fakeMsg is one message a store-backed server holds. An empty body means
+// imapFullBody(msgID).
+type fakeMsg struct {
+	msgID string
+	body  string
+}
+
+type storedMsg struct {
+	msgID string
+	body  string
+	uid   uint32
+}
+
+type appendRecord struct {
+	folder string
+	msgID  string
+}
+
+// mailStore is the mailbox state behind a store-backed fakeServer; the server's
+// mu guards every field. A non-empty reply knob replaces the tagged OK status
+// of its command.
+type mailStore struct {
+	folders      map[string][]storedMsg
+	nextUID      map[string]uint32
+	delimiter    string
+	loginReply   string
+	createReply  string
+	appendReply  string
+	appends      []appendRecord
+	seenMutating int
+}
+
+// newStoreServer starts a fake IMAP server with in-memory mailboxes. Queued
+// connHandlers take precedence. A server with no folders reports no delimiter,
+// so the client assumes "/".
+func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg) *fakeServer {
+	t.Helper()
+	st := &mailStore{
+		folders:   make(map[string][]storedMsg, len(folders)),
+		nextUID:   make(map[string]uint32, len(folders)),
+		delimiter: delimiter,
+	}
+	for name, msgs := range folders {
+		st.folders[name] = nil
+		st.nextUID[name] = 1
+		for _, m := range msgs {
+			body := m.body
+			if body == "" {
+				body = imapFullBody(m.msgID)
+			}
+			st.add(name, m.msgID, body)
+		}
+	}
+	return listenFakeServer(t, st)
+}
+
+func (st *mailStore) add(folder, msgID, body string) {
+	uid := st.nextUID[folder]
+	st.nextUID[folder] = uid + 1
+	st.folders[folder] = append(st.folders[folder], storedMsg{uid: uid, msgID: msgID, body: body})
+}
+
+func (s *fakeServer) refuseLogin() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.loginReply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
+}
+
+func (s *fakeServer) refuseCreate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.createReply = "NO CREATE refused by policy"
+}
+
+func (s *fakeServer) refuseAppend() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.appendReply = "NO Quota exceeded"
+}
+
+// capturedNames returns the mailbox names the clients passed to verb (CREATE
+// for store servers), in arrival order.
+func (s *fakeServer) capturedNames(verb string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.names[verb])
+}
+
+// appended returns the Message-Ids APPENDed to folder, in arrival order.
+func (s *fakeServer) appended(folder string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ids []string
+	for _, rec := range s.store.appends {
+		if rec.folder == folder {
+			ids = append(ids, rec.msgID)
+		}
+	}
+	return ids
+}
+
+// folderMsgIDs returns the Message-Ids stored in folder in UID order, or nil
+// when the folder does not exist.
+func (s *fakeServer) folderMsgIDs(folder string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ids []string
+	for _, m := range s.store.folders[folder] {
+		ids = append(ids, m.msgID)
+	}
+	return ids
+}
+
+func (s *fakeServer) hasFolder(folder string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.store.folders[folder]
+	return ok
+}
+
+// seenMutatingFetches counts FETCH requests that would set \Seen on the
+// source: non-PEEK BODY[...] and bare RFC822, RFC822.TEXT or RFC822.HEADER.
+func (s *fakeServer) seenMutatingFetches() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.store.seenMutating
+}
+
+// replyWriter writes tagged and untagged response lines to one connection.
+// Write errors are dropped: a broken connection ends the read loop anyway.
+type replyWriter struct{ conn net.Conn }
+
+func (w replyWriter) line(format string, args ...any) {
+	_, _ = fmt.Fprintf(w.conn, format+"\r\n", args...)
+}
+
+// serveStore serves one connection from the store. It uses synchronising
+// literals: the greeting does not advertise LITERAL+.
+func (s *fakeServer) serveStore(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	rw := replyWriter{conn: conn}
+	rw.line("* OK [CAPABILITY IMAP4rev1] fake ready")
+
+	rd := bufio.NewReader(conn)
+	var selected string
+	for {
+		raw, err := rd.ReadString('\n')
+		if err != nil {
+			return
+		}
+		raw = strings.TrimRight(raw, "\r\n")
+		if raw == "" {
+			continue
+		}
+		tag, verb, arg := splitCommand(raw)
+		s.recordCommand(verb, arg)
+
+		switch verb {
+		case "LOGIN":
+			s.storeLogin(rw, tag)
+		case "LOGOUT":
+			rw.line("* BYE Logging out")
+			rw.line("%s OK LOGOUT completed", tag)
+			return
+		case "CAPABILITY":
+			rw.line("* CAPABILITY IMAP4rev1")
+			rw.line("%s OK CAPABILITY completed", tag)
+		case "LIST":
+			s.storeList(rw, tag)
+		case "EXAMINE", "SELECT":
+			name, _ := parseMailboxArg(arg)
+			if s.storeSelect(rw, tag, verb, name) {
+				selected = name
+			}
+		case "STATUS":
+			s.storeStatus(rw, tag, arg)
+		case "FETCH":
+			s.storeFetch(rw, tag, selected, arg, false)
+		case "UID":
+			sub, rest, _ := strings.Cut(arg, " ")
+			if strings.EqualFold(sub, "FETCH") {
+				s.storeFetch(rw, tag, selected, rest, true)
+			} else {
+				rw.line("%s OK UID %s completed", tag, strings.ToUpper(sub))
+			}
+		case "CREATE":
+			s.storeCreate(rw, tag, arg)
+		case "APPEND":
+			if !s.storeAppend(rw, rd, tag, arg) {
+				return
+			}
+		default:
+			rw.line("%s OK %s completed", tag, verb)
+		}
+	}
+}
+
+// splitCommand splits "tag VERB args" and upper-cases the verb.
+func splitCommand(line string) (tag, verb, arg string) {
+	tag, rest, _ := strings.Cut(line, " ")
+	verb, arg, _ = strings.Cut(rest, " ")
+	return tag, strings.ToUpper(verb), arg
+}
+
+// recordCommand counts verb, plus "UID <SUB>" for UID commands. CREATE names
+// are recorded on arrival, whether or not the server accepts them.
+func (s *fakeServer) recordCommand(verb, arg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.counts[verb]++
+	switch verb {
+	case "UID":
+		sub, _, _ := strings.Cut(arg, " ")
+		s.counts["UID "+strings.ToUpper(sub)]++
+	case "CREATE":
+		name, _ := parseMailboxArg(arg)
+		s.names[verb] = append(s.names[verb], name)
+	}
+}
+
+func (s *fakeServer) storeLogin(rw replyWriter, tag string) {
+	s.mu.Lock()
+	reply := s.store.loginReply
+	s.mu.Unlock()
+	if reply != "" {
+		rw.line("%s %s", tag, reply)
+		return
+	}
+	rw.line("%s OK LOGIN completed", tag)
+}
+
+func (s *fakeServer) storeList(rw replyWriter, tag string) {
+	s.mu.Lock()
+	delim := s.store.delimiter
+	names := slices.Sorted(maps.Keys(s.store.folders))
+	s.mu.Unlock()
+	for _, name := range names {
+		rw.line(`* LIST () "%s" "%s"`, delim, name)
+	}
+	rw.line("%s OK LIST completed", tag)
+}
+
+// storeSelect reports whether the folder exists and is now selected.
+func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) bool {
+	s.mu.Lock()
+	msgs, ok := s.store.folders[name]
+	n := len(msgs)
+	next := s.store.nextUID[name]
+	s.mu.Unlock()
+	if !ok {
+		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
+		return false
+	}
+	access := "READ-ONLY"
+	if verb == "SELECT" {
+		access = "READ-WRITE"
+	}
+	rw.line("* %d EXISTS", n)
+	rw.line("* 0 RECENT")
+	rw.line(`* FLAGS (\Answered \Flagged \Deleted \Seen \Draft)`)
+	rw.line("* OK [UIDVALIDITY 1] UIDs valid")
+	rw.line("* OK [UIDNEXT %d] Predicted next UID", next)
+	rw.line("%s OK [%s] %s completed", tag, access, verb)
+	return true
+}
+
+func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
+	name, _ := parseMailboxArg(arg)
+	s.mu.Lock()
+	msgs, ok := s.store.folders[name]
+	n := len(msgs)
+	s.mu.Unlock()
+	if !ok {
+		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
+		return
+	}
+	rw.line(`* STATUS "%s" (MESSAGES %d)`, name, n)
+	rw.line("%s OK STATUS completed", tag)
+}
+
+// storeFetch answers FETCH and UID FETCH. Only the requested items are sent,
+// except UID, which a UID FETCH response always carries.
+func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID bool) {
+	set, items, _ := strings.Cut(arg, " ")
+	upper := strings.ToUpper(items)
+
+	s.mu.Lock()
+	if mutatesSeen(upper) {
+		s.store.seenMutating++
+	}
+	msgs := slices.Clone(s.store.folders[selected])
+	s.mu.Unlock()
+
+	if selected == "" {
+		rw.line("%s BAD No mailbox selected", tag)
+		return
+	}
+
+	ranges := parseIDSet(set)
+	wantUID := byUID || hasToken(upper, "UID")
+	wantSize := hasToken(upper, "RFC822.SIZE")
+	wantHeader := strings.Contains(upper, "HEADER.FIELDS")
+	wantEnvelope := strings.Contains(upper, "ENVELOPE")
+	wantBody := strings.Contains(upper, "BODY.PEEK[]") || strings.Contains(upper, "BODY[]")
+
+	for i, m := range msgs {
+		id := uint32(i + 1)
+		if byUID {
+			id = m.uid
+		}
+		if !inIDSet(ranges, id) {
+			continue
+		}
+		var parts []string
+		if wantUID {
+			parts = append(parts, fmt.Sprintf("UID %d", m.uid))
+		}
+		if wantSize {
+			parts = append(parts, fmt.Sprintf("RFC822.SIZE %d", len(m.body)))
+		}
+		if wantEnvelope {
+			parts = append(parts, "ENVELOPE "+nilEnvelope)
+		}
+		if wantHeader {
+			hdr := imapMsgIDHeader(m.msgID)
+			parts = append(parts, fmt.Sprintf("BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s", len(hdr), hdr))
+		}
+		if wantBody {
+			parts = append(parts, fmt.Sprintf("BODY[] {%d}\r\n%s", len(m.body), m.body))
+		}
+		rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
+	}
+	rw.line("%s OK FETCH completed", tag)
+}
+
+func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {
+	name, _ := parseMailboxArg(arg)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.createReply != "" {
+		rw.line("%s %s", tag, s.store.createReply)
+		return
+	}
+	if _, ok := s.store.folders[name]; ok {
+		rw.line("%s NO [ALREADYEXISTS] Mailbox already exists", tag)
+		return
+	}
+	s.store.folders[name] = nil
+	s.store.nextUID[name] = 1
+	rw.line("%s OK CREATE completed", tag)
+}
+
+// storeAppend drains the literal before any tagged reply, refusals included:
+// replying NO before the continuation races go-imap's literal writer. It
+// reports false when the connection died mid-literal.
+func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg string) bool {
+	name, _ := parseMailboxArg(arg)
+	size := parseLiteralSize(arg)
+
+	rw.line("+ Ready for literal data")
+	lit := make([]byte, size)
+	if _, err := io.ReadFull(rd, lit); err != nil {
+		return false
+	}
+	// The command line ends with CRLF after the literal.
+	if _, err := rd.ReadString('\n'); err != nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.appendReply != "" {
+		rw.line("%s %s", tag, s.store.appendReply)
+		return true
+	}
+	if _, ok := s.store.folders[name]; !ok {
+		rw.line("%s NO [TRYCREATE] Mailbox does not exist", tag)
+		return true
+	}
+	msgID := ""
+	if m, err := mail.ReadMessage(bytes.NewReader(lit)); err == nil {
+		msgID = strings.Trim(m.Header.Get("Message-Id"), "<>")
+	}
+	s.store.add(name, msgID, string(lit))
+	s.store.appends = append(s.store.appends, appendRecord{folder: name, msgID: msgID})
+	rw.line("%s OK APPEND completed", tag)
+	return true
+}
+
+// parseMailboxArg reads a quoted or atom mailbox name from the start of arg
+// and returns it with the unparsed remainder.
+func parseMailboxArg(arg string) (name, rest string) {
+	arg = strings.TrimLeft(arg, " ")
+	if !strings.HasPrefix(arg, `"`) {
+		name, rest, _ = strings.Cut(arg, " ")
+		return name, rest
+	}
+	var b strings.Builder
+	for i := 1; i < len(arg); i++ {
+		switch c := arg[i]; {
+		case c == '\\' && i+1 < len(arg):
+			i++
+			b.WriteByte(arg[i])
+		case c == '"':
+			return b.String(), arg[i+1:]
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), ""
+}
+
+type idRange struct{ lo, hi uint32 }
+
+// parseIDSet parses an IMAP sequence or UID set: "5", "2:4", "1,3,7:*".
+func parseIDSet(set string) []idRange {
+	var out []idRange
+	for part := range strings.SplitSeq(set, ",") {
+		lo, hi, isRange := strings.Cut(part, ":")
+		if !isRange {
+			hi = lo
+		}
+		a, b := parseSetBound(lo), parseSetBound(hi)
+		if a > b {
+			a, b = b, a
+		}
+		out = append(out, idRange{lo: a, hi: b})
+	}
+	return out
+}
+
+func parseSetBound(s string) uint32 {
+	if s == "*" {
+		return math.MaxUint32
+	}
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(n)
+}
+
+func inIDSet(ranges []idRange, id uint32) bool {
+	return slices.ContainsFunc(ranges, func(r idRange) bool { return id >= r.lo && id <= r.hi })
+}
+
+// hasToken reports whether tok appears in the upper-cased item list as a whole
+// word, so "RFC822" does not match "RFC822.SIZE".
+func hasToken(upperItems, tok string) bool {
+	words := strings.FieldsFunc(upperItems, func(r rune) bool { return r == ' ' || r == '(' || r == ')' })
+	return slices.Contains(words, tok)
+}
+
+// mutatesSeen reports whether a FETCH item list would set \Seen: a BODY[...]
+// without PEEK, or a bare RFC822, RFC822.TEXT or RFC822.HEADER.
+func mutatesSeen(upperItems string) bool {
+	if strings.Contains(upperItems, "BODY[") {
+		return true
+	}
+	return hasToken(upperItems, "RFC822") || hasToken(upperItems, "RFC822.TEXT") || hasToken(upperItems, "RFC822.HEADER")
+}
+
+// scriptedHandler serves folders. react sees each command first, after any
+// APPEND literal: a reply replaces the tagged status, an empty reply goes
+// silent, handled=false keeps the default. nth is 1-based.
+func scriptedHandler(srv *fakeServer, folders []string, react func(verb string, nth int) (reply string, handled bool)) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		rw := replyWriter{conn: conn}
+		rw.line("* OK [CAPABILITY IMAP4rev1] fake ready")
+
+		rd := bufio.NewReader(conn)
+		seen := make(map[string]int)
+		for {
+			raw, err := rd.ReadString('\n')
+			if err != nil {
+				return
+			}
+			raw = strings.TrimRight(raw, "\r\n")
+			if raw == "" {
+				continue
+			}
+			tag, verb, arg := splitCommand(raw)
+			srv.recordCommand(verb, arg)
+			seen[verb]++
+
+			if verb == "APPEND" {
+				rw.line("+ Ready for literal data")
+				if _, err := io.CopyN(io.Discard, rd, int64(parseLiteralSize(arg))); err != nil {
+					return
+				}
+				if _, err := rd.ReadString('\n'); err != nil {
+					return
+				}
+			}
+			if reply, handled := react(verb, seen[verb]); handled {
+				if reply == "" {
+					_, _ = rd.ReadByte()
+					return
+				}
+				rw.line("%s %s", tag, reply)
+				continue
+			}
+
+			switch verb {
+			case "LIST":
+				for _, name := range folders {
+					rw.line(`* LIST () "/" "%s"`, name)
+				}
+				rw.line("%s OK LIST completed", tag)
+			case "EXAMINE", "SELECT":
+				rw.line("* 0 EXISTS")
+				rw.line("* 0 RECENT")
+				rw.line("%s OK [READ-ONLY] %s completed", tag, verb)
+			case "LOGOUT":
+				rw.line("* BYE Logging out")
+				rw.line("%s OK LOGOUT completed", tag)
+				return
+			default:
+				rw.line("%s OK %s completed", tag, verb)
+			}
+		}
+	}
+}
+
+// listFailsAfterConnectHandler lets client.New spend the first LIST on its cache
+// and refuses every later one, so ListMailboxes fails.
+func listFailsAfterConnectHandler(srv *fakeServer, folders ...string) func(net.Conn) {
+	return scriptedHandler(srv, folders, func(verb string, nth int) (string, bool) {
+		if verb == "LIST" && nth > 1 {
+			return "NO [CANNOT] list refused", true
+		}
+		return "", false
+	})
 }

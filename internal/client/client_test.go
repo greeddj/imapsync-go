@@ -15,6 +15,7 @@ import (
 	"time"
 
 	imapclient "github.com/emersion/go-imap/client"
+	"golang.org/x/time/rate"
 )
 
 // TestSelectIfNeeded_shortCircuitsWhenSameFolder asserts the invariant that
@@ -636,6 +637,64 @@ func Test_New_cramMD5Succeeds(t *testing.T) {
 	}
 }
 
+// Test_connectAndLogin_whenDialFails asserts that a dial error is returned as
+// is and leaves no connection behind.
+func Test_connectAndLogin_whenDialFails(t *testing.T) {
+	t.Parallel()
+
+	errDial := errors.New("dial refused")
+	c := newDisconnectedClient(t, newFakeServer(t))
+	c.dialFn = func(context.Context, string) (net.Conn, error) { return nil, errDial }
+
+	if err := c.connectAndLogin(t.Context()); !errors.Is(err, errDial) {
+		t.Errorf("connectAndLogin error = %v, want %v", err, errDial)
+	}
+	if c.c.Load() != nil {
+		t.Error("c.c holds a connection after a failed dial")
+	}
+}
+
+// Test_New_whenDialFails asserts that New returns the dial error, classified
+// as transient, without a client. The address has no port so the dial fails
+// without touching the network.
+func Test_New_whenDialFails(t *testing.T) {
+	t.Parallel()
+
+	c, err := New(t.Context(), "127.0.0.1", "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the dial error")
+	}
+	if c != nil {
+		t.Error("New returned a non-nil client alongside the error")
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+}
+
+// Test_New_whenMailboxListRefused asserts that a failing LIST after a
+// successful login is reported as a cache load failure, which is what
+// Test_New_cramMD5Refused must not see.
+func Test_New_whenMailboxListRefused(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler((&mailboxScript{listRefused: true}).handler(srv))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the mailbox list failure")
+	}
+	if !strings.Contains(err.Error(), "failed to load mailbox list") {
+		t.Errorf("error = %q, want it to mention the mailbox list load", err)
+	}
+	if got := srv.callCount("LOGOUT"); got != 1 {
+		t.Errorf("LOGOUT count = %d, want 1 (half-built client is closed)", got)
+	}
+}
+
 // Test_cramMD5Auth covers the SASL client the CRAM-MD5 login hands to go-imap.
 func Test_cramMD5Auth(t *testing.T) {
 	t.Parallel()
@@ -821,5 +880,53 @@ func Test_withCancel_When_CanceledInFlight_Then_ClientIsCancelled(t *testing.T) 
 	}
 	if !c.isCancelled() {
 		t.Error("isCancelled() = false after the context was cancelled in flight")
+	}
+}
+
+// Test_New_whenClientsShareLimiters_Then_TheyDrawOneBudget asserts that clients built
+// with the same limiters charge their traffic to those limiters, so the budget is
+// global and each direction has its own bucket.
+func Test_New_whenClientsShareLimiters_Then_TheyDrawOneBudget(t *testing.T) {
+	t.Parallel()
+
+	const burst = 1 << 20
+	spend := func(clients int) (read, write float64) {
+		t.Helper()
+
+		// A near-zero refill rate keeps the bucket from refilling during the test.
+		readLim := rate.NewLimiter(rate.Limit(1e-9), burst)
+		writeLim := rate.NewLimiter(rate.Limit(1e-9), burst)
+		srv := newFakeServer(t)
+		for range clients {
+			srv.addConnHandler(listDelimiterHandler(srv))
+		}
+		for range clients {
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{
+				DialTimeout:  5 * time.Second,
+				ReadLimiter:  readLim,
+				WriteLimiter: writeLim,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+		}
+		return burst - readLim.Tokens(), burst - writeLim.Tokens()
+	}
+
+	read1, write1 := spend(1)
+	read3, write3 := spend(3)
+
+	if read1 <= 0 || write1 <= 0 {
+		t.Fatalf("one client spent read=%v write=%v tokens, want both > 0", read1, write1)
+	}
+	if diff := read3 - 3*read1; diff < -1 || diff > 1 {
+		t.Errorf("three clients spent %v read tokens, want 3 x %v", read3, read1)
+	}
+	if diff := write3 - 3*write1; diff < -1 || diff > 1 {
+		t.Errorf("three clients spent %v write tokens, want 3 x %v", write3, write1)
 	}
 }
