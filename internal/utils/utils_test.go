@@ -120,6 +120,8 @@ func TestAskConfirm_When_AnswerGiven_Then_ReturnsDecision(t *testing.T) {
 		{name: "full word no declines", input: "no\n", want: false},
 		{name: "bare newline declines", input: "\n", want: false},
 		{name: "invalid answer then yes confirms", input: "maybe\ny\n", want: true},
+		{name: "y without a trailing newline confirms", input: "y", want: true},
+		{name: "no without a trailing newline declines", input: "no", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -4,6 +4,7 @@ package utils
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -34,7 +35,9 @@ func AskConfirm(ctx context.Context, in *bufio.Reader, out io.Writer, prompt str
 		}
 		_, _ = fmt.Fprintf(out, "%s [y/N]: ", message)
 		response, err := readLine(ctx, in)
-		if err != nil {
+		// Piped input such as `printf y |` may end without a newline; a
+		// final non-empty answer still counts.
+		if err != nil && (!errors.Is(err, io.EOF) || strings.TrimSpace(response) == "") {
 			return false, fmt.Errorf("error reading user input: %w", err)
 		}
 
