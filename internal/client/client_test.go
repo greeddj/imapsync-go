@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -772,5 +772,54 @@ func stallingFetchHandler(srv *fakeServer) func(net.Conn) {
 				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
 			}
 		}
+	}
+}
+
+func Test_withCancel_When_StoppedBeforeCancel_Then_ClientStaysUsable(t *testing.T) {
+	t.Parallel()
+
+	for i := range 1000 {
+		c := &Client{cancelCh: make(chan struct{})}
+		ctx, cancel := context.WithCancel(t.Context())
+
+		stop := c.withCancel(ctx)
+		stop()
+		cancel()
+
+		// Yield so an AfterFunc callback that stop failed to unregister gets to run.
+		for range 4 {
+			runtime.Gosched()
+		}
+
+		if c.isCancelled() {
+			t.Fatalf("iteration %d: client cancelled by a context cancelled after stop", i)
+		}
+		select {
+		case <-c.cancelCh:
+			t.Fatalf("iteration %d: cancelCh closed by a context cancelled after stop", i)
+		default:
+		}
+	}
+}
+
+func Test_withCancel_When_CanceledInFlight_Then_ClientIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{cancelCh: make(chan struct{})}
+	ctx, cancel := context.WithCancel(t.Context())
+
+	stop := c.withCancel(ctx)
+	t.Cleanup(stop)
+	cancel()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-c.cancelCh:
+	case <-timer.C:
+		t.Fatal("cancelCh not closed within 5s of cancelling the context in flight")
+	}
+	if !c.isCancelled() {
+		t.Error("isCancelled() = false after the context was cancelled in flight")
 	}
 }

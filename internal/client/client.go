@@ -77,13 +77,9 @@ type Options struct {
 // tests; production wiring is set up in New.
 type dialFunc func(ctx context.Context, addr string) (net.Conn, error)
 
-// Client wraps a go-imap client with reconnect/retry logic.
-//
-// The underlying *imapclient.Client is held in an atomic.Pointer so that
-// Reconnect can swap it without racing with the watcher goroutine spawned by
-// withCancel. All IMAP operations go through safeCall, which receives the
-// current client as an argument; on a transient error it transparently
-// reconnects and retries the closure once with the fresh client.
+// Client wraps a go-imap client with reconnect/retry logic. The client sits in
+// an atomic.Pointer so Reconnect can swap it while the Cancel callback from
+// withCancel runs.
 type Client struct {
 	lastReconnect  time.Time
 	tlsConfig      *tls.Config
@@ -296,22 +292,12 @@ func (c *Client) Cancel() {
 
 func (c *Client) isCancelled() bool { return c.cancelled.Load() }
 
-// withCancel bridges context.Context to the underlying connection. When the
-// context is canceled, the connection is Terminate()d so blocked IMAP calls
-// return immediately. The returned function must be called to stop the watcher.
-//
-// ctx must be non-nil; passing nil is a programmer error and will panic on
-// the first ctx.Done() — preferred over silently substituting Background().
+// withCancel terminates the connection if ctx is cancelled while the call runs.
+// After the returned func is called, a later cancellation leaves the client
+// untouched. ctx must be non-nil.
 func (c *Client) withCancel(ctx context.Context) func() {
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			c.Cancel()
-		case <-done:
-		}
-	}()
-	return func() { close(done) }
+	stop := context.AfterFunc(ctx, c.Cancel)
+	return func() { stop() }
 }
 
 // internalContext returns a context that is cancelled when the client itself
