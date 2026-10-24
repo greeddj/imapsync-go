@@ -19,7 +19,7 @@
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (Message-Id intersection), subfolder expansion, delimiter reconciliation, worker pool dispatch.
   The `runSync` and `runShow` tests run end to end against a fake IMAP server that holds mailboxes in memory. These tests cover:
-  - the plan-confirm-execute order;
+  - the plan-confirm-execute order, and the rule that `--quiet` needs `--confirm`;
   - an idempotent second run, and the delimiter rewrite on both sides;
   - nested folder creation, and one rate-limit budget per direction that all workers share;
   - a read-only source (no write commands, no `\Seen` change);

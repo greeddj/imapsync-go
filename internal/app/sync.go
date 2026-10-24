@@ -124,6 +124,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	}
 
 	quiet, verbose, autoConfirm := opts.quiet, opts.verbose, opts.autoConfirm
+	if quiet && !autoConfirm {
+		return errQuietWithoutConfirm
+	}
+
 	out := opts.out
 	// One reader for every prompt: a reader per prompt would buffer past the
 	// first answer and lose the rest of piped input.

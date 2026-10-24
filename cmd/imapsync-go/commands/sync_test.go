@@ -45,7 +45,12 @@ func TestCommands_When_FlagsAreGiven_Then_ActionsReadThemUnderTheirOwnNames(t *t
 		want []string
 	}{
 		{
-			name: "sync -q -y reads -s as the source folder",
+			name: "sync -q alone is refused because quiet needs confirm",
+			args: []string{"sync", "-q"},
+			want: []string{"--quiet", "--confirm"},
+		},
+		{
+			name: "sync -q -y gets past the quiet refusal and reads -s as the source folder",
 			args: []string{"sync", "-q", "-y", "-s", "INBOX"},
 			want: []string{"both --src-folder and --dest-folder must be specified"},
 		},

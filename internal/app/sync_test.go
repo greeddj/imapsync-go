@@ -1816,6 +1816,40 @@ func TestRunSync_When_LoginRefused_Then_NamesTheFailingSide(t *testing.T) {
 	}
 }
 
+func TestRunSync_When_QuietWithoutConfirm_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	tests := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "with configured mappings", mappings: []config.DirectoryMapping{mapping("INBOX", "INBOX")}},
+		{name: "with mappings built from the source"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.quiet = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, errQuietWithoutConfirm) {
+				t.Fatalf("error = %v, want errQuietWithoutConfirm", err)
+			}
+			assertContainsAll(t, err.Error(), "--quiet", "--confirm")
+			if got := out.String(); got != "" {
+				t.Errorf("output = %q, want nothing written", got)
+			}
+			assertNoLogin(t, src, dst)
+		})
+	}
+}
+
 func TestRunSync_When_QuietAndConfirmed_Then_CopiesWithoutPreview(t *testing.T) {
 	t.Parallel()
 
@@ -1967,6 +2001,20 @@ func TestActionSync_When_ConfigIsMissing_Then_ReportsLoadFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "failed to load config") {
 		t.Fatalf("error = %v, want %q", err, "failed to load config")
 	}
+}
+
+func TestActionSync_When_QuietWithoutConfirm_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	src, dst := newFakeServer(t), newFakeServer(t)
+	cfgPath := writeJSONConfig(t, src, dst, mapping("INBOX", "INBOX"))
+
+	err := runCLIAction(t, ActionSync, "sync", syncFlags(), "-c", cfgPath, "sync", "-q")
+
+	if !errors.Is(err, errQuietWithoutConfirm) {
+		t.Fatalf("error = %v, want errQuietWithoutConfirm", err)
+	}
+	assertNoLogin(t, src, dst)
 }
 
 func TestRunSync_When_SourceDelimiterDiffers_Then_SourcePathIsRewritten(t *testing.T) {

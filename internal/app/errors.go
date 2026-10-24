@@ -7,3 +7,8 @@ import "errors"
 // summary to stdout and a second copy of the same information through
 // stderr would just clutter the screen.
 var ErrSilentExit = errors.New("silent exit")
+
+// errQuietWithoutConfirm keeps plan-confirm-execute: quiet mode prints
+// neither the plan nor the prompt, so only an explicit --confirm may
+// authorise writes.
+var errQuietWithoutConfirm = errors.New("--quiet hides the sync plan and its confirmation prompt, so it requires --confirm (-y)")
