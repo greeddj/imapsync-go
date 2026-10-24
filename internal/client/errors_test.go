@@ -30,6 +30,8 @@ func TestClassifyError(t *testing.T) {
 
 		{name: "transientNotLoggedIn", err: errors.New("BAD Not logged in"), want: ClassTransient},
 		{name: "transientNotLoggedInLowercase", err: errors.New("nO nOt LoGgEd In"), want: ClassTransient},
+		{name: "transientConnectionClosed", err: errors.New("imap: connection closed"), want: ClassTransient},
+		{name: "transientConnectionClosedDuringCommand", err: fmt.Errorf("select: %w", errors.New("imap: connection closed during command execution")), want: ClassTransient},
 
 		{name: "permAuth", err: errors.New("authentication failed"), want: ClassPermanent},
 		{name: "permCreds", err: errors.New("Invalid credentials"), want: ClassPermanent},

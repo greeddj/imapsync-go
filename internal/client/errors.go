@@ -77,6 +77,10 @@ func classifyError(err error) ErrClass {
 	// kick). The connection is dead but a fresh login will succeed.
 	case strings.Contains(msg, "not logged in"):
 		return ClassTransient
+	// go-imap's unexported errors for a socket closed under a pending
+	// command; safeCall has already ruled out our own Cancel.
+	case strings.Contains(msg, "imap: connection closed"):
+		return ClassTransient
 
 	// Permanent: authentication or addressing problems.
 	case strings.Contains(msg, "authentication") && strings.Contains(msg, "fail"):

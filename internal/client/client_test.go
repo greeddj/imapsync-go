@@ -930,3 +930,35 @@ func Test_New_whenClientsShareLimiters_Then_TheyDrawOneBudget(t *testing.T) {
 		t.Errorf("three clients spent %v write tokens, want 3 x %v", write3, write1)
 	}
 }
+
+func Test_safeCall_When_ServerClosesMidCommand_Then_ReconnectsAndRetries(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		// Drop the socket with EXAMINE unanswered, as a server restart would.
+		return cmd.verb == "EXAMINE", false
+	}))
+	srv.addConnHandler(interceptHandler(srv, func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+		return false, true
+	}))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+		t.Fatalf("FetchMessageMap: %v, want success after a reconnect", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session after the drop)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the dropped command is retried)", got)
+	}
+}
