@@ -445,7 +445,6 @@ func Test_StreamMessagesByUIDs_whenContextExpiresMidBatch(t *testing.T) {
 	srv := newFakeServer(t)
 	srv.addConnHandler(interceptHandler(srv, hold.intercept))
 	c := newClientWithFake(t, srv)
-	genBefore := c.connGen.Load()
 
 	uids := make([]uint32, uidFetchBatchSize+1)
 	for i := range uids {
@@ -473,8 +472,8 @@ func Test_StreamMessagesByUIDs_whenContextExpiresMidBatch(t *testing.T) {
 	if got := srv.callCount("UID FETCH"); got != 1 {
 		t.Errorf("UID FETCH count = %d, want 1 (no second batch after the cancel)", got)
 	}
-	if got := c.connGen.Load(); got != genBefore {
-		t.Errorf("connGen = %d, want %d (a canceled client must not reconnect)", got, genBefore)
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (a canceled client must not reconnect)", got)
 	}
 }
 
@@ -993,7 +992,132 @@ func cutUIDFetch(log *uidFetchLog, sent int, hangUp bool) func(net.Conn, *bufio.
 	}
 }
 
+// byeAfterUIDFetch answers each UID FETCH in full; after release it sends a BYE
+// and hangs up, so the BYE lands while the caller still drains the batch.
+func byeAfterUIDFetch(log *uidFetchLog, release <-chan struct{}) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		log.record(requested)
+		for _, uid := range requested {
+			writeUIDMessage(conn, uid)
+		}
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		<-release
+		writeLine(conn, "* BYE Autologout; idle for too long")
+		return true, false
+	}
+}
+
 func requestedAsSent(requested []uint32) []uint32 { return requested }
+
+// Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest
+// asserts that a BYE after the first batch ends the session, the next batch
+// selects the folder on a new session, and no delivered UID is fetched again.
+func Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, byeAfterUIDFetch(fetches, release)))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+	first := c.c.Load()
+
+	uids := make([]uint32, uidFetchBatchSize+1)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		if msg.m.Uid == uidFetchBatchSize {
+			releaseOnce()
+			awaitSignal(t, first.LoggedOut(), "the first session to end after the BYE")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success after the reconnect", err)
+	}
+
+	if !slices.Equal(got, uids) {
+		t.Errorf("callback got %d UIDs, want each of the %d exactly once, in order", len(got), len(uids))
+	}
+	want := [][]uint32{uids[:uidFetchBatchSize], uids[uidFetchBatchSize:]}
+	if gotSets := fetches.all(); !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH batches = %d, want %d (500 + 1, no batch fetched twice)", len(gotSets), len(want))
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session after the BYE)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the new session selects the folder)", got)
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain
+// asserts that a refused EXAMINE, which leaves the server with no selected
+// mailbox, does not let the next stream of the earlier folder skip its EXAMINE.
+func Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain(t *testing.T) {
+	t.Parallel()
+
+	// RFC 3501 section 6.3.1: a failed EXAMINE leaves no mailbox selected.
+	selected := ""
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		switch {
+		case cmd.verb == "EXAMINE" && firstArg(cmd.arg) == "Missing":
+			selected = ""
+			writeLine(conn, "%s NO [NONEXISTENT] Mailbox doesn't exist: Missing", cmd.tag)
+			return true, true
+		case cmd.verb == "EXAMINE":
+			selected = firstArg(cmd.arg)
+			return false, true
+		case isUIDFetch(cmd) && selected == "":
+			writeLine(conn, "%s BAD No mailbox selected.", cmd.tag)
+			return true, true
+		case isUIDFetch(cmd):
+			writeUIDMessage(conn, 1)
+			writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+			return true, true
+		}
+		return false, true
+	}))
+	c := newWatchedClient(t, srv, 0)
+
+	if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+		t.Fatalf("FetchMessageMap INBOX: %v", err)
+	}
+	if _, _, err := c.FetchMessageMap(t.Context(), "Missing"); err == nil {
+		t.Fatal("FetchMessageMap Missing returned nil, want the refusal")
+	}
+
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1}, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success after a new EXAMINE", err)
+	}
+
+	if want := []uint32{1}; !slices.Equal(got, want) {
+		t.Errorf("callback got UIDs %v, want %v", got, want)
+	}
+	if got, want := srv.capturedNames("EXAMINE"), []string{"INBOX", "Missing", "INBOX"}; !slices.Equal(got, want) {
+		t.Errorf("EXAMINE names = %v, want %v", got, want)
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (the session is healthy, so no reconnect)", got)
+	}
+}
 
 // Test_StreamMessagesByUIDs_When_TransientErrorAfterPartialBatch_Then_RetryFetchesOnlyUndeliveredUIDs
 // asserts that a retried batch asks for the UIDs not yet handed to the callback,
@@ -1227,7 +1351,7 @@ func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_Re
 			folder:       "Alerts/Account Lockout",
 			dropVerb:     "STATUS",
 			selected:     true,
-			wantExamines: 1,
+			wantExamines: 2,
 			wantStatuses: 1,
 		},
 	}
@@ -1241,7 +1365,9 @@ func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_Re
 			c := newClientWithFake(t, srv)
 			c.SetPrefix(tt.prefix)
 			if tt.selected {
-				c.selectedFolder.Store(&tt.folder)
+				if _, err := c.selectIfNeeded(c.c.Load(), tt.folder); err != nil {
+					t.Fatalf("selectIfNeeded: %v", err)
+				}
 			}
 
 			if _, _, err := c.FetchMessageMap(t.Context(), tt.folder); err != nil {

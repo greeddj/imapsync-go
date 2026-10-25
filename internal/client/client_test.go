@@ -17,50 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
 	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"golang.org/x/time/rate"
 )
-
-// TestSelectIfNeeded_shortCircuitsWhenSameFolder asserts the invariant that
-// callers (FetchMessageMap, StreamMessagesByUIDs, getFolderSize) all rely on:
-// a second call for the same folder on the same connection generation does
-// not touch the underlying imapclient.Client. The test passes a nil cli on
-// purpose - if short-circuit breaks, the call will panic on nil deref.
-func TestSelectIfNeeded_shortCircuitsWhenSameFolder(t *testing.T) {
-	t.Parallel()
-
-	c := newTestClient()
-	f := "INBOX"
-	c.selectedFolder.Store(&f)
-
-	mbox, err := c.selectIfNeeded(nil, "INBOX")
-	if err != nil {
-		t.Fatalf("selectIfNeeded short-circuit returned err=%v", err)
-	}
-	if mbox != nil {
-		t.Errorf("short-circuit returned mbox=%v, want nil", mbox)
-	}
-}
-
-// TestSelectIfNeeded_differentFolderRequiresFreshSelect asserts that the
-// short-circuit only fires for the cached folder; a different name must
-// flow through to cli.Select. A nil cli triggers a panic, which the test
-// recovers as proof that the short-circuit was *not* taken.
-func TestSelectIfNeeded_differentFolderRequiresFreshSelect(t *testing.T) {
-	t.Parallel()
-
-	c := newTestClient()
-	f := "INBOX"
-	c.selectedFolder.Store(&f)
-
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("selectIfNeeded for a different folder did not call cli.Select")
-		}
-	}()
-	_, _ = c.selectIfNeeded(nil, "Archive")
-}
 
 // Test_safeCall_retriesTransient asserts that safeCall reconnects and retries fn
 // when fn returns a transient (io.EOF) error, and returns nil on the retry.
@@ -75,7 +36,6 @@ func Test_safeCall_retriesTransient(t *testing.T) {
 	sleepCtx = func(_ context.Context, d time.Duration) error { return nil }
 	t.Cleanup(func() { sleepCtx = orig })
 
-	gen0 := c.connGen.Load()
 	loginsBefore := srv.callCount("LOGIN")
 
 	calls := 0
@@ -94,9 +54,6 @@ func Test_safeCall_retriesTransient(t *testing.T) {
 	}
 	if got := srv.callCount("LOGIN"); got <= loginsBefore {
 		t.Errorf("LOGIN count did not increase after reconnect (before=%d after=%d)", loginsBefore, got)
-	}
-	if c.connGen.Load() <= gen0 {
-		t.Errorf("connGen not bumped: before=%d after=%d", gen0, c.connGen.Load())
 	}
 }
 
@@ -147,52 +104,6 @@ func Test_safeCall_doesNotRetryThrottled(t *testing.T) {
 	}
 	if got := srv.callCount("LOGIN"); got != loginsBefore {
 		t.Errorf("LOGIN count changed (before=%d after=%d): reconnect must not fire for throttled error", loginsBefore, got)
-	}
-}
-
-// Test_reconnect_bumpsConnGen asserts that every successful reconnect
-// increments the generation counter.
-// Sequential - swaps the package-level sleepCtx var.
-func Test_reconnect_bumpsConnGen(t *testing.T) {
-	srv := newFakeServer(t)
-	c := newClientWithFake(t, srv)
-	c.reconnectDur = 0
-	c.backoff = 0
-
-	orig := sleepCtx
-	sleepCtx = func(_ context.Context, d time.Duration) error { return nil }
-	t.Cleanup(func() { sleepCtx = orig })
-
-	gen0 := c.connGen.Load()
-	if err := c.reconnect(); err != nil {
-		t.Fatalf("reconnect: %v", err)
-	}
-	if c.connGen.Load() != gen0+1 {
-		t.Errorf("connGen = %d, want %d", c.connGen.Load(), gen0+1)
-	}
-}
-
-// Test_reconnect_clearsSelectedFolder asserts that reconnect resets the
-// cached selected-folder pointer so the next safeCall re-issues SELECT.
-// Sequential - swaps the package-level sleepCtx var.
-func Test_reconnect_clearsSelectedFolder(t *testing.T) {
-	srv := newFakeServer(t)
-	c := newClientWithFake(t, srv)
-	c.reconnectDur = 0
-	c.backoff = 0
-
-	orig := sleepCtx
-	sleepCtx = func(_ context.Context, d time.Duration) error { return nil }
-	t.Cleanup(func() { sleepCtx = orig })
-
-	f := "INBOX"
-	c.selectedFolder.Store(&f)
-
-	if err := c.reconnect(); err != nil {
-		t.Fatalf("reconnect: %v", err)
-	}
-	if c.selectedFolder.Load() != nil {
-		t.Errorf("selectedFolder not cleared after reconnect")
 	}
 }
 
@@ -607,8 +518,8 @@ func Test_selectIfNeeded_shortCircuitsOnNetwork(t *testing.T) {
 	}
 }
 
-// Test_selectIfNeeded_afterReconnect_reSelects asserts that after a reconnect
-// (which clears selectedFolder), selectIfNeeded issues a fresh EXAMINE.
+// Test_selectIfNeeded_afterReconnect_reSelects asserts that after a reconnect,
+// selectIfNeeded issues a fresh EXAMINE.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_selectIfNeeded_afterReconnect_reSelects(t *testing.T) {
 	srv := newFakeServer(t)
@@ -647,6 +558,115 @@ func Test_selectIfNeeded_afterReconnect_reSelects(t *testing.T) {
 	}
 	if got := srv.callCount("EXAMINE"); got != examineAfterFirst+1 {
 		t.Errorf("EXAMINE count = %d, want %d after reconnect+reselect", got, examineAfterFirst+1)
+	}
+}
+
+// Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit asserts that
+// a session the server ended is not treated as still holding its selection.
+func Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, byeAfterExamine(release)))
+	c := newWatchedClient(t, srv, 0)
+	cli := c.c.Load()
+
+	if _, err := c.selectIfNeeded(cli, "INBOX"); err != nil {
+		t.Fatalf("selectIfNeeded #1: %v", err)
+	}
+	releaseOnce()
+	awaitSignal(t, cli.LoggedOut(), "the session to end after the BYE")
+
+	mbox, err := c.selectIfNeeded(cli, "INBOX")
+	if mbox != nil {
+		t.Errorf("selectIfNeeded #2 returned mbox=%v, want nil", mbox)
+	}
+	if !errors.Is(err, imapclient.ErrNotLoggedIn) {
+		t.Fatalf("selectIfNeeded #2 error = %v, want %v", err, imapclient.ErrNotLoggedIn)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if got := srv.callCount("EXAMINE"); got != 1 {
+		t.Errorf("EXAMINE count = %d, want 1 (a dead session sends nothing)", got)
+	}
+}
+
+// Test_selectIfNeeded_When_FolderDiffers_Then_SelectsAgain asserts that a
+// selection of one folder never stands in for another folder on the same session.
+func Test_selectIfNeeded_When_FolderDiffers_Then_SelectsAgain(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newClientWithFake(t, srv)
+	cli := c.c.Load()
+
+	for _, folder := range []string{"INBOX", "Archive"} {
+		if _, err := c.selectIfNeeded(cli, folder); err != nil {
+			t.Fatalf("selectIfNeeded %s: %v", folder, err)
+		}
+	}
+
+	if got, want := srv.capturedNames("EXAMINE"), []string{"INBOX", "Archive"}; !slices.Equal(got, want) {
+		t.Errorf("EXAMINE names = %v, want %v", got, want)
+	}
+}
+
+// Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries
+// asserts that a BYE after the EXAMINE and before the FETCH ends the attempt with
+// an error safeCall repairs by reconnecting, and that the retry selects again.
+func Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, byeAfterExamine(release)))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+
+	attempts := 0
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		attempts++
+		if _, err := c.selectIfNeeded(cli, "INBOX"); err != nil {
+			return err
+		}
+		if attempts == 1 {
+			releaseOnce()
+			awaitSignal(t, cli.LoggedOut(), "the session to end after the BYE")
+		}
+		uidSet := new(imap.SeqSet)
+		uidSet.AddNum(1)
+		messages := make(chan *imap.Message, messageChanBuffer)
+		done := make(chan error, 1)
+		go func() { done <- cli.UidFetch(uidSet, []imap.FetchItem{fullBodyPeekSection.FetchItem()}, messages) }()
+		for range messages {
+		}
+		return <-done
+	})
+	if err != nil {
+		t.Fatalf("safeCall: %v, want success after the reconnect", err)
+	}
+
+	if attempts != 2 {
+		t.Errorf("closure ran %d times, want 2", attempts)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session for the retry)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the retry selects again)", got)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1 (the first attempt sends nothing)", got)
 	}
 }
 

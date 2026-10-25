@@ -104,7 +104,6 @@ func Test_AppendMessage_whenServerRefuses(t *testing.T) {
 	srv := newFakeServer(t)
 	srv.addConnHandler(appendOutcomeHandler(srv, "NO [CANNOT] message rejected by policy"))
 	c := newClientWithFake(t, srv)
-	genBefore := c.connGen.Load()
 
 	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
 	if err == nil {
@@ -119,11 +118,8 @@ func Test_AppendMessage_whenServerRefuses(t *testing.T) {
 	if got := srv.callCount("APPEND"); got != 1 {
 		t.Errorf("APPEND count = %d, want 1", got)
 	}
-	if got := c.connGen.Load(); got != genBefore {
-		t.Errorf("connGen = %d, want %d (no reconnect for a permanent refusal)", got, genBefore)
-	}
 	if got := srv.callCount("LOGIN"); got != 1 {
-		t.Errorf("LOGIN count = %d, want 1", got)
+		t.Errorf("LOGIN count = %d, want 1 (no reconnect for a permanent refusal)", got)
 	}
 }
 
@@ -181,8 +177,8 @@ func Test_AppendMessage_repairsConnectionAfterServerLogout(t *testing.T) {
 	if got := classifyError(err); got != ClassTransient {
 		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
 	}
-	if got := c.connGen.Load(); got != 1 {
-		t.Errorf("connGen = %d, want 1 (the failed APPEND repaired the connection)", got)
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the failed APPEND repaired the connection)", got)
 	}
 	if got := srv.callCount("APPEND"); got != 0 {
 		t.Errorf("APPEND count after the failed call = %d, want 0", got)
@@ -194,8 +190,8 @@ func Test_AppendMessage_repairsConnectionAfterServerLogout(t *testing.T) {
 	if got := srv.callCount("APPEND"); got != 1 {
 		t.Errorf("APPEND count = %d, want 1", got)
 	}
-	if got := c.connGen.Load(); got != 1 {
-		t.Errorf("connGen = %d after the second call, want it to stay 1", got)
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d after the second call, want it to stay 2", got)
 	}
 }
 
@@ -220,7 +216,6 @@ func Test_AppendMessage_whenContextExpiresMidAppend(t *testing.T) {
 	srv := newFakeServer(t)
 	srv.addConnHandler(interceptHandler(srv, hold.intercept))
 	c := newClientWithFake(t, srv)
-	genBefore := c.connGen.Load()
 
 	ctx := newFiredContext(t.Context())
 	errc := make(chan error, 1)
@@ -232,11 +227,8 @@ func Test_AppendMessage_whenContextExpiresMidAppend(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want %v", err, context.DeadlineExceeded)
 	}
-	if got := c.connGen.Load(); got != genBefore {
-		t.Errorf("connGen = %d, want %d (a canceled client must not reconnect)", got, genBefore)
-	}
 	if got := srv.callCount("LOGIN"); got != 1 {
-		t.Errorf("LOGIN count = %d, want 1", got)
+		t.Errorf("LOGIN count = %d, want 1 (a canceled client must not reconnect)", got)
 	}
 }
 
@@ -271,7 +263,6 @@ func Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAn
 	srv.addConnHandler(endedSignal(interceptHandler(srv, hold.intercept), hungUp))
 	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
 	c := newWatchedClient(t, srv, tripLimit)
-	genBefore := c.connGen.Load()
 
 	err := awaitCall(t, "AppendMessage", func() error {
 		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
@@ -293,9 +284,6 @@ func Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAn
 	}
 	if got := srv.callCount("LOGIN"); got != 2 {
 		t.Errorf("LOGIN count = %d, want 2 (the failed APPEND repaired the connection)", got)
-	}
-	if got := c.connGen.Load(); got != genBefore+1 {
-		t.Errorf("connGen = %d, want %d", got, genBefore+1)
 	}
 	awaitSignal(t, hungUp, "the client to close the stalled connection")
 
@@ -344,7 +332,6 @@ func Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepa
 	}))
 	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
 	c := newWatchedClient(t, srv, tripLimit)
-	genBefore := c.connGen.Load()
 
 	huge := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
 	huge.Body[&imap.BodySectionName{}] = &zeroLiteral{n: literalSize}
@@ -362,8 +349,8 @@ func Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepa
 	if c.isCancelled() {
 		t.Error("a watchdog trip cancelled the client")
 	}
-	if got := c.connGen.Load(); got != genBefore+1 {
-		t.Errorf("connGen = %d, want %d (the failed APPEND repaired the connection)", got, genBefore+1)
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the failed APPEND repaired the connection)", got)
 	}
 
 	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {

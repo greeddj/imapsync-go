@@ -102,7 +102,6 @@ type Client struct {
 	cancelCh       chan struct{}
 	c              atomic.Pointer[imapclient.Client]
 	idle           atomic.Pointer[idleConn]
-	selectedFolder atomic.Pointer[string]
 	pw             atomic.Pointer[progressWriterRef]
 	tracker        atomic.Pointer[progressTrackerRef]
 	username       string
@@ -112,7 +111,6 @@ type Client struct {
 	serverAddr     string
 	auth           string
 	mailboxCache   mailboxCache
-	connGen        atomic.Uint64
 	backoff        time.Duration
 	reconnectDur   time.Duration
 	dialTimeout    time.Duration
@@ -217,25 +215,15 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	return c, nil
 }
 
-// selectIfNeeded selects folder on cli unless that folder is already selected
-// on the current connection. Each successful reconnect bumps connGen and
-// clears selectedFolder via Cancel/reconnect, so a stale state never causes
-// us to skip a needed Select.
+// selectIfNeeded trusts only cli's own state: a BYE, a failed SELECT and a
+// reconnect each clear it, so a stored copy would drift.
 func (c *Client) selectIfNeeded(cli *imapclient.Client, folder string) (*imap.MailboxStatus, error) {
-	cur := c.selectedFolder.Load()
-	if cur != nil && *cur == folder {
-		// Server-side state is unchanged - re-issuing Select would be a
-		// wasted round-trip. Caller doesn't get the MailboxStatus back, but
-		// nobody downstream needs it on the cached path.
-		return nil, nil
+	if cli.State() == imap.SelectedState {
+		if mbox := cli.Mailbox(); mbox != nil && mbox.Name == folder {
+			return nil, nil
+		}
 	}
-	mbox, err := cli.Select(folder, true)
-	if err != nil {
-		return nil, err
-	}
-	f := folder
-	c.selectedFolder.Store(&f)
-	return mbox, nil
+	return cli.Select(folder, true)
 }
 
 // SetPrefix configures the log prefix used in progress messages.
@@ -547,11 +535,6 @@ func (c *Client) reconnect() error {
 		_ = c.logout(cli)
 		c.c.Store(nil)
 	}
-	// Anything held about the previous connection's state - selected folder,
-	// in-flight literals - is gone with that socket. Bump the generation so
-	// later code knows to re-Select before issuing fetches.
-	c.selectedFolder.Store(nil)
-	c.connGen.Add(1)
 
 	var lastErr error
 	delay := c.backoff

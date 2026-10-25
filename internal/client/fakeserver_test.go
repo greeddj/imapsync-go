@@ -806,6 +806,22 @@ func byeOn(match func(command) bool) func(net.Conn, *bufio.Reader, command) (han
 	}
 }
 
+// byeAfterExamine accepts EXAMINE; after release it sends a BYE and hangs up, so
+// the BYE lands after the client has read the EXAMINE reply.
+func byeAfterExamine(release <-chan struct{}) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "EXAMINE" {
+			return false, true
+		}
+		writeLine(conn, "* 1 EXISTS")
+		writeLine(conn, "* 0 RECENT")
+		writeLine(conn, "%s OK [READ-ONLY] EXAMINE completed", cmd.tag)
+		<-release
+		writeLine(conn, "* BYE Autologout; idle for too long")
+		return true, false
+	}
+}
+
 // awaitSignal fails the test when ch stays open for too long.
 func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()

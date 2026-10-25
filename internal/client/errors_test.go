@@ -34,6 +34,7 @@ func TestClassifyError(t *testing.T) {
 		{name: "transientNotLoggedInLowercase", err: errors.New("nO nOt LoGgEd In"), want: ClassTransient},
 		{name: "transientConnectionClosed", err: errors.New("imap: connection closed"), want: ClassTransient},
 		{name: "transientConnectionClosedDuringCommand", err: fmt.Errorf("select: %w", errors.New("imap: connection closed during command execution")), want: ClassTransient},
+		{name: "transientNoMailboxSelected", err: imapclient.ErrNoMailboxSelected, want: ClassTransient},
 
 		{name: "permAuth", err: errors.New("authentication failed"), want: ClassPermanent},
 		{name: "permCreds", err: errors.New("Invalid credentials"), want: ClassPermanent},
@@ -47,6 +48,7 @@ func TestClassifyError(t *testing.T) {
 		{name: "throttleBeatsTempAuth", err: errors.New("Temporary authentication failure: too many simultaneous connections"), want: ClassThrottled},
 
 		{name: "unknown", err: errors.New("unrecognized server response"), want: ClassUnknown},
+		{name: "unknownServerNoMailboxSelected", err: errors.New("No mailbox selected."), want: ClassUnknown},
 		{name: "unknownGmailDuplicateFolderName", err: errors.New("Duplicate folder name Archive (Failure)"), want: ClassUnknown},
 	}
 
@@ -71,6 +73,7 @@ func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.
 	}{
 		{name: "folder name holds a throttle phrase over a closed connection", err: closedUnderFolder, want: ClassTransient},
 		{name: "folder name holds a throttle phrase over not logged in", err: fmt.Errorf("[src] status %s: %w", "Session expired", imapclient.ErrNotLoggedIn), want: ClassTransient},
+		{name: "body fetch wrapper over no mailbox selected", err: fmt.Errorf("[src] body fetch: %w", imapclient.ErrNoMailboxSelected), want: ClassTransient},
 		{name: "label holds a throttle phrase over a closed connection", err: fmt.Errorf("[%s] fetch IDs: %w", "bandwidth limit exceeded", errors.New("imap: connection closed")), want: ClassTransient},
 		{name: "exceeded in the leaf and quota in the folder name", err: fmt.Errorf("[src] select folder %s: %w", "Quota", errors.New("NO retry count exceeded")), want: ClassUnknown},
 		{name: "wrapper text never makes an error permanent", err: fmt.Errorf("[src] no such mailbox %s: %w", "Work", errors.New("unrecognized server response")), want: ClassUnknown},

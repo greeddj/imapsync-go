@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"strings"
+
+	imapclient "github.com/emersion/go-imap/client"
 )
 
 // ErrClass tells the reconnect machinery whether to retry, give up or back off.
@@ -53,6 +55,11 @@ func classifyError(err error) ErrClass {
 		return ClassTransient
 	}
 	if _, ok := errors.AsType[net.Error](err); ok {
+		return ClassTransient
+	}
+	// go-imap returns this without sending a command when a BYE ended the session
+	// after the SELECT; a fresh session clears it.
+	if errors.Is(err, imapclient.ErrNoMailboxSelected) {
 		return ClassTransient
 	}
 

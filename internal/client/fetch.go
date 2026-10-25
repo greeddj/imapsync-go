@@ -266,10 +266,8 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 			if uidSet.Empty() {
 				return nil
 			}
-			// selectIfNeeded short-circuits when the folder is already
-			// selected on this connection. After a reconnect inside this
-			// safeCall, the generation flip has cleared selectedFolder so
-			// we re-Select here.
+			// A retry after a reconnect runs on a fresh session, which has no
+			// selection, so selectIfNeeded selects the folder again.
 			if _, err := c.selectIfNeeded(cli, folder); err != nil {
 				return fmt.Errorf("[%s] select folder %s: %w", c.prefix, folder, err)
 			}
