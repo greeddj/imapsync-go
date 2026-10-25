@@ -204,8 +204,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 		return nil, err
 	}
 
-	// One LIST "" "*" populates both the existence cache and the
-	// hierarchy delimiter — the older refreshDelimiter call is gone.
+	// One LIST "" "*" fills both the existence cache and the hierarchy delimiter.
 	if err := c.loadMailboxCache(ctx); err != nil {
 		_ = c.Logout()
 		return nil, fmt.Errorf("failed to load mailbox list: %w", err)

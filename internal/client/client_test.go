@@ -322,7 +322,8 @@ func Test_Cancel_interruptsBlockingCall(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeServer(t)
-	srv.addConnHandler(stallingFetchHandler(srv))
+	fetch := newStall(verbIs("FETCH"))
+	srv.addConnHandler(interceptHandler(srv, fetch.intercept))
 
 	c := newClientWithFake(t, srv)
 	c.mailboxCache = mailboxCache{
@@ -330,25 +331,18 @@ func Test_Cancel_interruptsBlockingCall(t *testing.T) {
 		delimiter: "/",
 	}
 
-	type result struct{ err error }
-	ch := make(chan result, 1)
+	errc := make(chan error, 1)
 	go func() {
 		_, _, err := c.FetchMessageMap(context.Background(), "INBOX")
-		ch <- result{err}
+		errc <- err
 	}()
 
-	time.Sleep(10 * time.Millisecond)
+	awaitSignal(t, fetch.reached, "the FETCH to reach the server")
 	c.Cancel()
 
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case res := <-ch:
-		if res.err == nil {
-			t.Error("FetchMessageMap returned nil error after Cancel, want non-nil")
-		}
-	case <-timer.C:
-		t.Error("FetchMessageMap did not return within 100ms after Cancel")
+	err := awaitError(t, errc, "FetchMessageMap after Cancel")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("FetchMessageMap error = %v, want %v", err, context.Canceled)
 	}
 }
 
@@ -448,37 +442,31 @@ func Test_connectAndLogin_CancelInterruptsLogin(t *testing.T) {
 // so that the initial connectAndLogin consumes the default handler, and only the
 // reconnect attempt hits the stalling handler.
 func Test_safeCall_CancelDuringReconnectLogin(t *testing.T) {
+	t.Parallel()
+
 	srv := newFakeServer(t)
 
+	// reconnectDur and backoff at zero keep reconnect from sleeping.
 	c := newClientWithFake(t, srv)
 	c.reconnectDur = 0
 	c.backoff = 0
 
-	srv.addConnHandler(stallingLoginHandler(srv))
+	login := newStall(verbIs("LOGIN"))
+	srv.addConnHandler(interceptHandler(srv, login.intercept))
 
-	orig := sleepCtx
-	sleepCtx = func(_ context.Context, d time.Duration) error { return nil }
-	t.Cleanup(func() { sleepCtx = orig })
-
-	ch := make(chan error, 1)
+	errc := make(chan error, 1)
 	go func() {
-		ch <- c.safeCall(func(_ *imapclient.Client) error {
+		errc <- c.safeCall(func(_ *imapclient.Client) error {
 			return io.EOF
 		})
 	}()
 
-	time.Sleep(10 * time.Millisecond)
+	awaitSignal(t, login.reached, "the reconnect LOGIN to reach the server")
 	c.Cancel()
 
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case err := <-ch:
-		if err == nil {
-			t.Error("safeCall returned nil, want non-nil error after Cancel during reconnect LOGIN")
-		}
-	case <-timer.C:
-		t.Error("safeCall did not return within 100ms after Cancel during reconnect LOGIN")
+	err := awaitError(t, errc, "safeCall after Cancel during the reconnect LOGIN")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("safeCall error = %v, want %v", err, context.Canceled)
 	}
 }
 
@@ -751,61 +739,6 @@ func connHandlerWithLoginReply(srv *fakeServer, loginReply string) func(net.Conn
 				if !strings.HasPrefix(strings.ToUpper(loginReply), "OK") {
 					return
 				}
-			case "LOGOUT":
-				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
-				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
-				return
-			default:
-				_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, verb)
-			}
-		}
-	}
-}
-
-// stallingFetchHandler returns a per-connection handler that serves LOGIN and
-// EXAMINE normally but never replies to FETCH, causing go-imap to block until
-// the connection is closed by Cancel().
-func stallingFetchHandler(srv *fakeServer) func(net.Conn) {
-	return func(conn net.Conn) {
-		defer func() { _ = conn.Close() }()
-		_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1] fake ready\r\n")
-		sc := bufio.NewScanner(conn)
-		for sc.Scan() {
-			line := sc.Text()
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, " ", 3)
-			if len(parts) < 2 {
-				continue
-			}
-			tag, verb := parts[0], strings.ToUpper(parts[1])
-			srv.mu.Lock()
-			srv.counts[verb]++
-			srv.mu.Unlock()
-			arg := ""
-			if len(parts) == 3 {
-				arg = parts[2]
-			}
-			switch verb {
-			case "LOGIN":
-				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
-			case "SELECT", "EXAMINE":
-				// Return 1 message so FetchMessageMap proceeds to the FETCH step.
-				_, _ = fmt.Fprintf(conn, "* 1 EXISTS\r\n")
-				_, _ = fmt.Fprintf(conn, "* 0 RECENT\r\n")
-				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, verb)
-			case "STATUS":
-				mboxName := strings.Trim(strings.SplitN(arg, " ", 2)[0], `"`)
-				_, _ = fmt.Fprintf(conn, "* STATUS %s (MESSAGES 1)\r\n", mboxName)
-				_, _ = fmt.Fprintf(conn, "%s OK STATUS completed\r\n", tag)
-			case "FETCH":
-				// conn.Read returns io.EOF / net.ErrClosed when Cancel()
-				// terminates the connection, so this goroutine exits with
-				// the test instead of leaking until the test binary does.
-				b := make([]byte, 1)
-				_, _ = conn.Read(b)
-				return
 			case "LOGOUT":
 				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
 				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
