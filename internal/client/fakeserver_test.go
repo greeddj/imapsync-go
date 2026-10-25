@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -607,6 +608,13 @@ func literalSize(arg string) (int64, bool) {
 // appendOutcomeHandler drains the whole APPEND literal before sending appendReply.
 // Replying earlier would race go-imap's literal writer.
 func appendOutcomeHandler(srv *fakeServer, appendReply string) func(net.Conn) {
+	return appendCaptureHandler(srv, appendReply, nil)
+}
+
+// appendCaptureHandler is appendOutcomeHandler that also sends the bytes of each
+// APPEND literal to literals before it replies. literals must be buffered, and nil
+// drops the bytes.
+func appendCaptureHandler(srv *fakeServer, appendReply string, literals chan<- []byte) func(net.Conn) {
 	return func(conn net.Conn) {
 		serveCommands(srv, conn, scriptedGreeting, func(rd *bufio.Reader, cmd command) bool {
 			switch cmd.verb {
@@ -617,11 +625,15 @@ func appendOutcomeHandler(srv *fakeServer, appendReply string) func(net.Conn) {
 					return true
 				}
 				writeLine(conn, "+ Ready for literal data")
-				if _, err := io.CopyN(io.Discard, rd, size); err != nil {
+				var got bytes.Buffer
+				if _, err := io.CopyN(&got, rd, size); err != nil {
 					return false
 				}
 				if _, err := rd.ReadString('\n'); err != nil {
 					return false
+				}
+				if literals != nil {
+					literals <- got.Bytes()
 				}
 				writeLine(conn, "%s %s", cmd.tag, appendReply)
 			case "LOGOUT":
@@ -636,9 +648,10 @@ func appendOutcomeHandler(srv *fakeServer, appendReply string) func(net.Conn) {
 	}
 }
 
-// byeAfterLoginHandler accepts LOGIN, then sends BYE and closes once release is
-// closed. The gate keeps the BYE from racing the client reading the LOGIN reply.
-func byeAfterLoginHandler(srv *fakeServer, release <-chan struct{}) func(net.Conn) {
+// byeAfterLoginHandler accepts LOGIN and, once release is closed, sends farewell
+// and hangs up; an empty farewell sends nothing. The gate keeps the farewell from
+// racing the LOGIN reply.
+func byeAfterLoginHandler(srv *fakeServer, release <-chan struct{}, farewell string) func(net.Conn) {
 	return func(conn net.Conn) {
 		serveCommands(srv, conn, scriptedGreeting, func(_ *bufio.Reader, cmd command) bool {
 			if cmd.verb != "LOGIN" {
@@ -647,7 +660,9 @@ func byeAfterLoginHandler(srv *fakeServer, release <-chan struct{}) func(net.Con
 			}
 			writeLine(conn, "%s OK LOGIN completed", cmd.tag)
 			<-release
-			writeLine(conn, "* BYE server shutting down")
+			if farewell != "" {
+				writeLine(conn, "%s", farewell)
+			}
 			return false
 		})
 	}

@@ -6,17 +6,34 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	imapclient "github.com/emersion/go-imap/client"
 )
 
-// AppendMessage uploads a single message to the destination folder.
-//
-// The body is streamed straight from the fetched message (which already holds
-// it in memory) into the APPEND literal - no extra io.ReadAll buffer. The
-// trade-off is that the literal is not replayable: a transient network error
-// mid-APPEND cannot be retried, because the body has been partially sent.
-// That's acceptable for our flow: the next sync run is idempotent (the
-// Message-Id diff will pick up the message again), and avoiding the second
-// in-memory copy halves peak RAM with multi-MB attachments and 10 workers.
+// readTracker records whether go-imap read the literal. A body that go-imap never
+// read never reached the server, so another session can send it without a duplicate.
+type readTracker struct {
+	imap.Literal
+	read bool
+}
+
+func (r *readTracker) Read(p []byte) (int, error) {
+	r.read = true
+	return r.Literal.Read(p)
+}
+
+// sessionEnded reports whether the reader of cli stopped, after a BYE or a closed socket.
+// An APPEND on such a session gets no continuation and can block forever.
+func sessionEnded(cli *imapclient.Client) bool {
+	select {
+	case <-cli.LoggedOut():
+		return true
+	default:
+		return false
+	}
+}
+
+// AppendMessage streams the body with no copy. A failure before go-imap reads it
+// gets one reconnect and one retry. A later failure is left to the next run's Message-Id diff.
 func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -37,9 +54,10 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 	}
 
 	cli := c.c.Load()
-	revived := cli == nil
-	if revived {
-		// An earlier reconnect gave up, and the server can be back.
+	// An earlier reconnect gave up, or the server ended the session while the session was idle.
+	// Either way a new login comes first.
+	reconnected := cli == nil || sessionEnded(cli)
+	if reconnected {
 		var err error
 		if cli, err = c.reconnectSession(); err != nil {
 			if ctx.Err() != nil {
@@ -56,17 +74,28 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 		date = env.Date
 	}
 	flags := []string{imap.SeenFlag}
-	w := c.idle.Load()
-	w.begin()
-	err := cli.Append(folder, flags, date, body)
-	w.end()
-	if err = w.idleErr(err); err != nil {
+	literal := &readTracker{Literal: body}
+	send := func(cli *imapclient.Client) error { return cli.Append(folder, flags, date, literal) }
+
+	err := c.call(cli, send)
+	if err != nil && isRetryable(err) && !literal.read && !reconnected && ctx.Err() == nil && !c.isCancelled() {
+		c.noteIdleTrip(err)
+		if cli, err = c.reconnectSession(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		reconnected = true
+		err = c.call(cli, send)
+	}
+	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// The literal is partly sent, so this message cannot be retried. Repair the
+		// go-imap read part of the body, so this message cannot be retried. Repair the
 		// session so the next APPEND does not fail too, unless this call already reconnected.
-		if isRetryable(err) && !revived && !c.isCancelled() {
+		if isRetryable(err) && !reconnected && !c.isCancelled() {
 			c.noteIdleTrip(err)
 			_ = c.reconnect()
 		}

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -163,53 +166,366 @@ func Test_AppendMessage_logsWhenVerbose(t *testing.T) {
 	}
 }
 
-// Test_AppendMessage_repairsConnectionAfterServerLogout asserts that when the
-// server has dropped the session, the failing APPEND reconnects so the next
-// APPEND in the same plan succeeds instead of cascading "Not logged in".
-func Test_AppendMessage_repairsConnectionAfterServerLogout(t *testing.T) {
-	t.Parallel()
+// testMessage returns a message whose full body is body.
+func testMessage(body string) Message {
+	msg := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
+	msg.Body[&imap.BodySectionName{}] = strings.NewReader(body)
+	msg.Envelope = &imap.Envelope{MessageId: "test-id@example.com"}
+	return Message{m: msg}
+}
 
-	release := make(chan struct{})
-	releaseOnce := sync.OnceFunc(func() { close(release) })
-	t.Cleanup(releaseOnce)
+// testMessageBody returns the body that buildTestIMAPMessage sends.
+func testMessageBody(t *testing.T) string {
+	t.Helper()
 
-	srv := newFakeServer(t)
-	srv.addConnHandler(byeAfterLoginHandler(srv, release))
-	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
-	c := newClientWithFake(t, srv)
+	body, err := io.ReadAll(buildTestIMAPMessage().m.GetBody(fullBodyPeekSection))
+	if err != nil {
+		t.Fatalf("read the test message body: %v", err)
+	}
+	return string(body)
+}
 
-	loggedOut := c.c.Load().LoggedOut()
-	releaseOnce()
+// awaitLiteral returns the next APPEND literal that appendCaptureHandler reported.
+func awaitLiteral(t *testing.T, literals <-chan []byte) string {
+	t.Helper()
+
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	select {
-	case <-loggedOut:
+	case got := <-literals:
+		return string(got)
 	case <-timer.C:
-		t.Fatal("client did not notice the server closing the session")
+		t.Fatal("the server received no APPEND literal")
+		return ""
 	}
+}
 
-	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+// endSessionAtClient puts the session of c into go-imap's logout state while its
+// reader still runs: the window between the BYE handler and the exit of the reader.
+func endSessionAtClient(t *testing.T, c *Client) {
+	t.Helper()
+
+	cli := c.c.Load()
+	if cli == nil {
+		t.Fatal("the client holds no session")
+	}
+	cli.SetState(imap.LogoutState, nil)
+}
+
+// resetConn fails a Write with a connection reset once armed. A marker limits the
+// failure to the Writes whose bytes contain it, and an empty marker fails every Write.
+type resetConn struct {
+	net.Conn
+	marker []byte
+	armed  atomic.Bool
+}
+
+func (c *resetConn) Write(p []byte) (int, error) {
+	if c.armed.Load() && bytes.Contains(p, c.marker) {
+		return 0, &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}
+	}
+	return c.Conn.Write(p)
+}
+
+// wrapDialedConn makes the nth connection (counting from 1) that c dials a resetConn.
+func wrapDialedConn(c *Client, nth int32, marker string) *resetConn {
+	target := &resetConn{marker: []byte(marker)}
+	var dials atomic.Int32
+	dial := c.dialFn
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, addr)
+		if err != nil || dials.Add(1) != nth {
+			return conn, err
+		}
+		target.Conn = conn
+		return target, nil
+	}
+	return target
+}
+
+// Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends asserts
+// that an APPEND on a session the server ended, with or without a BYE, logs in
+// again and sends the message in the same call.
+func Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		farewell string
+	}{
+		{name: "the server sent a BYE", farewell: "* BYE server shutting down"},
+		{name: "the server hung up without a BYE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			release := make(chan struct{})
+			releaseOnce := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(releaseOnce)
+
+			literals := make(chan []byte, 2)
+			srv := newFakeServer(t)
+			srv.addConnHandler(byeAfterLoginHandler(srv, release, tt.farewell))
+			srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", literals))
+			c := newClientWithFake(t, srv)
+
+			loggedOut := c.c.Load().LoggedOut()
+			releaseOnce()
+			awaitSignal(t, loggedOut, "the client to notice the server ending the session")
+
+			err := awaitCall(t, "AppendMessage", func() error {
+				return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+			})
+			if err != nil {
+				t.Fatalf("first AppendMessage: %v, want the message sent on a new session", err)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2", got)
+			}
+			if got := srv.callCount("APPEND"); got != 1 {
+				t.Errorf("APPEND count = %d, want 1", got)
+			}
+			if got, want := awaitLiteral(t, literals), testMessageBody(t); got != want {
+				t.Errorf("literal = %q, want %q", got, want)
+			}
+
+			err = awaitCall(t, "second AppendMessage", func() error {
+				return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+			})
+			if err != nil {
+				t.Fatalf("second AppendMessage: %v", err)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count after the second call = %d, want it to stay 2", got)
+			}
+			if got := srv.callCount("APPEND"); got != 2 {
+				t.Errorf("APPEND count after the second call = %d, want 2", got)
+			}
+		})
+	}
+}
+
+// Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce asserts that an
+// APPEND that fails with a retryable error before go-imap reads the body reconnects
+// once and sends the message, and that the first connection received no APPEND.
+func Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		fail func(t *testing.T, c *Client, first *resetConn)
+		name string
+	}{
+		{
+			name: "go-imap is in the logout state while its reader still runs",
+			fail: func(t *testing.T, c *Client, _ *resetConn) { endSessionAtClient(t, c) },
+		},
+		{
+			name: "the socket write fails before the literal",
+			fail: func(_ *testing.T, _ *Client, first *resetConn) { first.armed.Store(true) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			literals := make(chan []byte, 2)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, serveNormally))
+			srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", literals))
+			c := newDisconnectedClient(t, srv)
+			first := wrapDialedConn(c, 1, "")
+			if err := c.connectAndLogin(t.Context()); err != nil {
+				t.Fatalf("connectAndLogin: %v", err)
+			}
+			tt.fail(t, c, first)
+
+			err := awaitCall(t, "AppendMessage", func() error {
+				return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+			})
+			if err != nil {
+				t.Fatalf("AppendMessage: %v, want the message sent on a new session", err)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2", got)
+			}
+			if got := srv.callCount("APPEND"); got != 1 {
+				t.Errorf("APPEND count = %d, want 1 (the first connection received none)", got)
+			}
+			if got, want := awaitLiteral(t, literals), testMessageBody(t); got != want {
+				t.Errorf("literal = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry asserts that a
+// connection that drops after go-imap sent the body is repaired but not retried,
+// so the destination gets no duplicate. An empty body counts as sent.
+func Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		message func() Message
+		name    string
+	}{
+		{name: "a normal body", message: buildTestIMAPMessage},
+		{name: "an empty body", message: func() Message { return testMessage("") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+				if cmd.verb != "APPEND" {
+					return false, true
+				}
+				_ = readAppendLiteral(conn, rd, cmd)
+				return true, false
+			}))
+			srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+			c := newClientWithFake(t, srv)
+
+			err := awaitCall(t, "AppendMessage", func() error {
+				return c.AppendMessage(t.Context(), "INBOX", tt.message())
+			})
+			if err == nil {
+				t.Fatal("AppendMessage returned nil, want the error of the dropped connection")
+			}
+			if got := classifyError(err); got != ClassTransient {
+				t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+			}
+			if got := srv.callCount("APPEND"); got != 1 {
+				t.Errorf("APPEND count = %d, want 1 (a sent body must not be sent again)", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2 (the failed APPEND repaired the connection)", got)
+			}
+		})
+	}
+}
+
+// Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError asserts
+// that a refused login for the retry returns the reconnect error as it is, and that
+// the next call logs in again.
+func Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newClientWithFake(t, srv)
+	endSessionAtClient(t, c)
+
+	err := awaitCall(t, "AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	})
 	if err == nil {
-		t.Fatal("first AppendMessage returned nil, want the logged-out error")
+		t.Fatal("AppendMessage returned nil, want the refused login")
 	}
-	if got := classifyError(err); got != ClassTransient {
-		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassPermanent)
 	}
-	if got := srv.callCount("LOGIN"); got != 2 {
-		t.Errorf("LOGIN count = %d, want 2 (the failed APPEND repaired the connection)", got)
+	if strings.Contains(err.Error(), "append:") {
+		t.Errorf("error = %q, want the reconnect error without the append wrapper", err)
 	}
 	if got := srv.callCount("APPEND"); got != 0 {
-		t.Errorf("APPEND count after the failed call = %d, want 0", got)
+		t.Errorf("APPEND count = %d, want 0", got)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (initial and the refused retry)", got)
+	}
+	if c.c.Load() != nil {
+		t.Fatal("the client holds a session although the login was refused")
 	}
 
-	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {
-		t.Fatalf("second AppendMessage: %v", err)
+	err = awaitCall(t, "second AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	})
+	if err != nil {
+		t.Fatalf("second AppendMessage: %v, want success after a new login", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3", got)
 	}
 	if got := srv.callCount("APPEND"); got != 1 {
 		t.Errorf("APPEND count = %d, want 1", got)
 	}
+}
+
+// Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect
+// asserts that the retry runs under the new session's watchdog, that its failure
+// starts no further reconnect, and that the next call detects the ended session.
+func Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect(t *testing.T) {
+	t.Parallel()
+
+	hold := newStall(verbIs("APPEND"))
+	hold.before = readAppendLiteral
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	srv.addConnHandler(interceptHandler(srv, hold.intercept))
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newWatchedClient(t, srv, tripLimit)
+	endSessionAtClient(t, c)
+
+	err := awaitCall(t, "AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	})
+	if !errors.Is(err, errIdleTimeout) {
+		t.Fatalf("error = %v, want it to wrap errIdleTimeout", err)
+	}
+	if c.isCancelled() {
+		t.Error("a watchdog trip cancelled the client")
+	}
 	if got := srv.callCount("LOGIN"); got != 2 {
-		t.Errorf("LOGIN count = %d after the second call, want it to stay 2", got)
+		t.Errorf("LOGIN count = %d, want 2 (no repair after the failed retry)", got)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count = %d, want 1", got)
+	}
+
+	err = awaitCall(t, "second AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	})
+	if err != nil {
+		t.Fatalf("second AppendMessage: %v, want success on a new session", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3", got)
+	}
+	if got := srv.callCount("APPEND"); got != 2 {
+		t.Errorf("APPEND count = %d, want 2", got)
+	}
+}
+
+// Test_AppendMessage_When_ContextEndsDuringRetry_Then_ReturnsContextError asserts
+// that a context that ends while the retry waits for the server returns its error,
+// without a further reconnect.
+func Test_AppendMessage_When_ContextEndsDuringRetry_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	hold := newStall(verbIs("APPEND"))
+	hold.before = readAppendLiteral
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	srv.addConnHandler(interceptHandler(srv, hold.intercept))
+	c := newClientWithFake(t, srv)
+	endSessionAtClient(t, c)
+
+	ctx := newFiredContext(t.Context())
+	errc := make(chan error, 1)
+	go func() { errc <- c.AppendMessage(ctx, "INBOX", buildTestIMAPMessage()) }()
+	awaitSignal(t, hold.reached, "the server to receive the retried literal")
+	ctx.fire()
+
+	err := awaitError(t, errc, "AppendMessage")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (a canceled client must not reconnect again)", got)
 	}
 }
 
@@ -284,6 +600,50 @@ func Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnec
 	}
 	if got := srv.callCount("APPEND"); got != 1 {
 		t.Errorf("APPEND count = %d, want 1", got)
+	}
+}
+
+// Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain
+// asserts that an APPEND that reconnected first does not reconnect a second time to
+// retry when the new session fails before go-imap reads the body.
+func Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(byeAfterLoginHandler(srv, release, "* BYE server shutting down"))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newDisconnectedClient(t, srv)
+	wrapDialedConn(c, 2, " APPEND ").armed.Store(true)
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("connectAndLogin: %v", err)
+	}
+
+	loggedOut := c.c.Load().LoggedOut()
+	releaseOnce()
+	awaitSignal(t, loggedOut, "the client to notice the server ending the session")
+
+	err := awaitCall(t, "AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	})
+	if err == nil {
+		t.Fatal("AppendMessage returned nil, want the error of the failed write")
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if !strings.Contains(err.Error(), "append:") {
+		t.Errorf("error = %q, want it to contain %q", err, "append:")
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (initial and the revive, no second reconnect)", got)
+	}
+	if got := srv.callCount("APPEND"); got != 0 {
+		t.Errorf("APPEND count = %d, want 0", got)
 	}
 }
 
