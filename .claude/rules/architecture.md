@@ -28,6 +28,8 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 - All sleeps in the reconnect path use `sleepCtx` so Ctrl-C is honoured.
 - Every long-running public `Client` method runs `defer c.withCancel(ctx)()` and checks `ctx.Err()` after each blocking step.
 - `c.pw` / `c.tracker` are `atomic.Pointer`. Read via `progressWriter()` / `progressTracker()`. Direct field access is a bug.
+- A go-imap call outside `safeCall` opens its own watchdog span, as `AppendMessage` and `connectAndLogin` do. Without a span, a silent server can hold that call forever.
+- Caller work inside a `safeCall` closure ends the span while it runs and opens it again after, as `StreamMessagesByUIDs` does around `onMessage`. Otherwise slow work on the other side counts as server silence.
 
 ## Rate limiting
 

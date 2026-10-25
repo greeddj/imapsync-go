@@ -35,6 +35,8 @@ A change can be safe per-file and unsafe in combination. Look for:
   - In go-imap v1.2.1, such lines are parse errors and network errors. A parse error holds server text in only two places: one of the characters `(`, `{` or `"`, and a literal length that `strconv` quotes. Neither can carry a control sequence.
   - Audit this again on each go-imap upgrade.
   - A full fix needs go-imap v2, or a fork with a logger option. A patch of `vendor/` does not last, because `just deps` rewrites it.
+- **go-imap v1.2.1 panics on some untagged responses.** An untagged `EXPUNGE` or `FETCH` without a message number makes the reader goroutine index an empty slice. A hostile server can stop the process this way. No mail is lost, and the next run continues the sync. A fix needs go-imap v2.
+- **go-imap v1.2.1 reads a literal of any announced size.** The server sets the size in `{N}`, up to 4 GiB, and go-imap allocates it. A hostile server can exhaust the memory. `imapclient` has no setting for the maximum literal size. A fix needs go-imap v2.
 - **UTF-8 terminals only.** `termsafe.Escape` assumes a UTF-8 terminal. A terminal that acts on 8-bit C1 bytes inside multi-byte runes is out of scope.
 - **Backslash is not escaped.** A folder named `\x1b` looks the same as a folder that contains an ESC character. Both forms are inert text.
 - **Existing `%q` sites keep graphic invisible runes.** The `%q` sites in `internal/app/sync.go` are safe against control sequences. They keep runes such as `\u3164`, so a folder name can look like another name in those lines. The plan preview uses `Escape`.

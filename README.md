@@ -189,7 +189,7 @@ sync -w 4
 - `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the final line of a sync that copies messages still show. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
 - `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
 - `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`). The limit is shared by all workers. Below about 110 bytes/sec for each worker, an upload can wait so long that the 5-minute idle limit closes the connection, so `sync` prints a warning before the plan.
-- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = no cap). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
+- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
 
 The same `bps-down`, `bps-up`, and `max-connections` values can be set in config under a `rate_limit` block (`down_bps`, `up_bps`, `max_connections`). CLI flags take precedence when both are set.
 
@@ -261,18 +261,17 @@ safe, but it has two known limitations:
 
 ## Known issues
 
-### Ctrl+C may not exit immediately during a network disruption
+### Ctrl+C may not stop a stalled upload
 
-During a sync, if the network connection drops mid-transfer, pressing Ctrl+C
-may take up to a few minutes to fully cancel. The underlying IMAP client cannot
-interrupt a transfer that is waiting on a server response that never arrives
-(because the server is unreachable). TCP keepalive will eventually detect the
-dead connection — typically within a few minutes on macOS and Linux — and the
-program will exit cleanly once that happens.
+To upload a message, the program first sends the size of the message. Then it
+waits for the server to accept the upload. If the server or the network stops
+in this step, Ctrl+C does not stop the program. The idle limit and TCP
+keepalive close the connection, but the program continues to wait.
 
-If you need to abort immediately, press Ctrl+\ instead. This dumps all
-goroutine stacks to stderr and exits right away; it is the escape hatch for
-when the program appears stuck.
+In this case, press Ctrl+\ (SIGQUIT). The program writes the stacks of all
+goroutines to stderr and exits with code 131.
+
+At all other steps, Ctrl+C stops the program at once.
 
 ### Limits during connection, commands and exit
 
