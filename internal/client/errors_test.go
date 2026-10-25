@@ -38,6 +38,13 @@ func TestClassifyError(t *testing.T) {
 		{name: "permAuth", err: errors.New("authentication failed"), want: ClassPermanent},
 		{name: "permCreds", err: errors.New("Invalid credentials"), want: ClassPermanent},
 		{name: "permMailbox", err: errors.New("NO such mailbox"), want: ClassPermanent},
+		{name: "permAuthDovecot", err: errors.New("Authentication failed."), want: ClassPermanent},
+		{name: "permCredsGmail", err: errors.New("Invalid credentials (Failure)"), want: ClassPermanent},
+
+		{name: "transientTempAuthDovecot", err: errors.New("Temporary authentication failure. [mx1:2026-10-25 10:00:00]"), want: ClassTransient},
+		{name: "transientTempAuthUnavailable", err: errors.New("Authentication service temporarily unavailable"), want: ClassTransient},
+		{name: "unknownTempNonAuth", err: errors.New("Temporary System Problem. Try again later."), want: ClassUnknown},
+		{name: "throttleBeatsTempAuth", err: errors.New("Temporary authentication failure: too many simultaneous connections"), want: ClassThrottled},
 
 		{name: "unknown", err: errors.New("unrecognized server response"), want: ClassUnknown},
 	}
@@ -82,6 +89,12 @@ func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.
 			name: "multi-wrap node with only unknown leaves",
 			err:  fmt.Errorf("[src] %w and %w", errors.New("unrecognized server response"), errors.New("another unrecognized response")),
 			want: ClassUnknown,
+		},
+		{name: "label holds temporary over a credential failure", err: fmt.Errorf("[%s] login: %w", "Temporary", errors.New("Authentication failed.")), want: ClassPermanent},
+		{
+			name: "temporary authentication leaf under a reconnect wrapper",
+			err:  fmt.Errorf("[src] failed to reconnect after retries: %w", errors.New("Temporary authentication failure.")),
+			want: ClassTransient,
 		},
 		{name: "wrap node without a cause is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w", nil), want: ClassThrottled},
 		{name: "multi-wrap node without causes is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w %w", nil, nil), want: ClassThrottled},

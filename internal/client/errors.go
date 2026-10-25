@@ -7,20 +7,18 @@ import (
 	"strings"
 )
 
-// ErrClass categorizes IMAP errors so that the reconnect machinery can pick a
-// strategy: retry quickly, give up, or back off for a long time.
-//
-// Classification is heuristic - IMAP responses are textual and there is no
-// standard error code, so we match on error strings emitted by go-imap and the
-// most common server-side messages (Gmail in particular).
+// ErrClass tells the reconnect machinery whether to retry, give up or back off.
+// go-imap v1 drops RFC 5530 codes such as [UNAVAILABLE] from errors, so
+// classification matches error text.
 type ErrClass int
 
 const (
 	// ClassUnknown is the zero value: the error has not been classified.
 	// Caller should treat it as non-retryable to avoid loops on novel errors.
 	ClassUnknown ErrClass = iota
-	// ClassTransient indicates a network-level failure (EOF, closed conn,
-	// timeout). Reconnect-and-retry is appropriate.
+	// ClassTransient indicates a failure a fresh session can clear: a network
+	// failure (EOF, closed conn, timeout), a server-side logout or a temporary
+	// authentication failure. Reconnect-and-retry is appropriate.
 	ClassTransient
 	// ClassPermanent indicates an authoritative refusal (auth failure, bad
 	// command, missing mailbox). Retry will not help.
@@ -107,6 +105,10 @@ func classifyMessage(msg string) ErrClass {
 	// go-imap's unexported errors for a socket closed under a pending
 	// command; safeCall has already ruled out our own Cancel.
 	case strings.Contains(msg, "imap: connection closed"):
+		return ClassTransient
+	// Dovecot's [UNAVAILABLE] auth-backend outage; go-imap drops the code,
+	// so the text decides. Must precede the permanent auth rule.
+	case strings.Contains(msg, "authentication") && strings.Contains(msg, "temporar"):
 		return ClassTransient
 
 	// Permanent: authentication or addressing problems.

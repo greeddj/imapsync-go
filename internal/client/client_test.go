@@ -245,6 +245,144 @@ func Test_reconnect_throttledBackoff(t *testing.T) {
 	}
 }
 
+const dovecotTempAuthFailure = "NO [UNAVAILABLE] Temporary authentication failure. [mx1:2026-10-25 10:00:00]"
+
+// Test_safeCall_When_ReconnectLoginFailsTemporarily_Then_RetriesAndRecovers
+// asserts that a temporary authentication failure during the reconnect LOGIN
+// takes the transient backoff branch and the next attempt restores the session.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_safeCall_When_ReconnectLoginFailsTemporarily_Then_RetriesAndRecovers(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+	srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+	c := newDisconnectedClient(t, srv)
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("initial connectAndLogin: %v", err)
+	}
+
+	var recorded []time.Duration
+	orig := sleepCtx
+	sleepCtx = func(_ context.Context, d time.Duration) error {
+		recorded = append(recorded, d)
+		return nil
+	}
+	t.Cleanup(func() { sleepCtx = orig })
+
+	calls := 0
+	err := c.safeCall(func(_ *imapclient.Client) error {
+		calls++
+		if calls == 1 {
+			return io.EOF
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("safeCall returned err=%v, want nil", err)
+	}
+	if calls != 2 {
+		t.Errorf("fn called %d times, want 2", calls)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3", got)
+	}
+	if want := []time.Duration{initialBackoff}; !slices.Equal(recorded, want) {
+		t.Errorf("sleeps = %v, want %v", recorded, want)
+	}
+	if c.c.Load() == nil {
+		t.Error("no imap client after the second reconnect attempt")
+	}
+}
+
+// Test_reconnect_When_LoginAlwaysFailsTemporarily_Then_StopsAfterMaxAttempts
+// asserts that a temporary authentication failure uses the whole attempt
+// budget and never waits for the throttle cool-down.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_reconnect_When_LoginAlwaysFailsTemporarily_Then_StopsAfterMaxAttempts(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+	for range maxReconnectAttempts {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	c := newDisconnectedClient(t, srv)
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("initial connectAndLogin: %v", err)
+	}
+
+	var recorded []time.Duration
+	orig := sleepCtx
+	sleepCtx = func(_ context.Context, d time.Duration) error {
+		recorded = append(recorded, d)
+		return nil
+	}
+	t.Cleanup(func() { sleepCtx = orig })
+
+	err := c.reconnect()
+	if err == nil {
+		t.Fatal("reconnect returned nil, want error")
+	}
+	for _, want := range []string{"failed to reconnect after retries", "Temporary authentication failure"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("reconnect error %q does not contain %q", err, want)
+		}
+	}
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts; got != want {
+		t.Errorf("LOGIN count = %d, want %d", got, want)
+	}
+	if slices.Contains(recorded, throttledBackoff) {
+		t.Errorf("sleeps %v hold throttledBackoff, want only the transient backoff", recorded)
+	}
+}
+
+// Test_reconnect_When_LoginFailsWithBadCredentials_Then_GivesUpAfterOneAttempt
+// asserts that a real credential refusal stops reconnect at the first attempt,
+// so a wrong password is never sent twice.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_reconnect_When_LoginFailsWithBadCredentials_Then_GivesUpAfterOneAttempt(t *testing.T) {
+	var recorded []time.Duration
+	orig := sleepCtx
+	sleepCtx = func(_ context.Context, d time.Duration) error {
+		recorded = append(recorded, d)
+		return nil
+	}
+	t.Cleanup(func() { sleepCtx = orig })
+
+	tests := []struct {
+		name  string
+		reply string
+	}{
+		{name: "dovecot authentication failed", reply: "NO [AUTHENTICATIONFAILED] Authentication failed."},
+		{name: "gmail invalid credentials", reply: "NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorded = nil
+			srv := newFakeServer(t)
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			srv.addConnHandler(connHandlerWithLoginReply(srv, tt.reply))
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			c := newDisconnectedClient(t, srv)
+			if err := c.connectAndLogin(t.Context()); err != nil {
+				t.Fatalf("initial connectAndLogin: %v", err)
+			}
+
+			err := c.reconnect()
+			if err == nil {
+				t.Fatal("reconnect returned nil, want error")
+			}
+			if got := classifyError(err); got != ClassPermanent {
+				t.Errorf("classifyError(%v) = %s, want %s", err, got, ClassPermanent)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2", got)
+			}
+			if len(recorded) != 0 {
+				t.Errorf("sleeps = %v, want none", recorded)
+			}
+		})
+	}
+}
+
 // Test_selectIfNeeded_shortCircuitsOnNetwork asserts that a second call to
 // selectIfNeeded for the same folder on the same connection does not send
 // another EXAMINE to the server.
