@@ -278,6 +278,21 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 			wantCreates: []string{"A", "A/B"},
 			wantCached:  []string{"A", "A/B"},
 		},
+		{
+			name:        "target answered with Gmail's duplicate folder name",
+			target:      "Archive",
+			replies:     map[string]string{"Archive": "NO [ALREADYEXISTS] Duplicate folder name Archive (Failure)"},
+			wantCreates: []string{"Archive"},
+			wantCached:  []string{"Archive"},
+		},
+		{
+			name:        "parent answered with Gmail's duplicate folder name",
+			target:      "A/B",
+			replies:     map[string]string{"A": "NO [ALREADYEXISTS] Duplicate folder name A (Failure)"},
+			wantCreated: true,
+			wantCreates: []string{"A", "A/B"},
+			wantCached:  []string{"A", "A/B"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -317,6 +332,52 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 				t.Errorf("LIST count = %d, want 0 (the cache answered every lookup)", got)
 			}
 		})
+	}
+}
+
+// Test_CreateMailbox_When_RetriedCreateAnswersDuplicateFolderName_Then_ReportsExisting
+// asserts that a CREATE the server applied before it dropped the connection
+// does not fail when safeCall sends it again and Gmail refuses the duplicate.
+func Test_CreateMailbox_When_RetriedCreateAnswersDuplicateFolderName_Then_ReportsExisting(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	createArchive := verbOn("CREATE", "Archive")
+	srv.addConnHandler(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if createArchive(cmd) {
+			return true, false
+		}
+		return false, true
+	}))
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if createArchive(cmd) {
+			writeLine(conn, "%s NO [ALREADYEXISTS] Duplicate folder name Archive (Failure)", cmd.tag)
+			return true, true
+		}
+		return false, true
+	}))
+	c := newClientWithFake(t, srv)
+	c.delimiter = "/"
+	c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
+
+	created, err := c.CreateMailbox(t.Context(), "Archive")
+	if err != nil {
+		t.Fatalf("CreateMailbox: %v", err)
+	}
+	if created {
+		t.Error("created = true, want false (the folder existed already)")
+	}
+	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"Archive", "Archive"}) {
+		t.Errorf("CREATE names = %v, want [Archive Archive]", got)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session after the drop)", got)
+	}
+	if ok, _ := c.MailboxExists(t.Context(), "Archive"); !ok {
+		t.Error("MailboxExists(Archive) = false, want true")
+	}
+	if got := srv.callCount("LIST"); got != 0 {
+		t.Errorf("LIST count = %d, want 0 (the cache answered every lookup)", got)
 	}
 }
 

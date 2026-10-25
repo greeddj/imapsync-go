@@ -611,6 +611,16 @@ func (st *mailStore) addStored(folder string, m storedMsg) {
 	st.folders[folder] = append(st.folders[folder], m)
 }
 
+func (s *fakeServer) addFolder(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.store.folders[name]; ok {
+		return
+	}
+	s.store.folders[name] = nil
+	s.store.nextUID[name] = 1
+}
+
 func (s *fakeServer) refuseLogin() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

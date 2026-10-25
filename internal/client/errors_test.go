@@ -47,6 +47,7 @@ func TestClassifyError(t *testing.T) {
 		{name: "throttleBeatsTempAuth", err: errors.New("Temporary authentication failure: too many simultaneous connections"), want: ClassThrottled},
 
 		{name: "unknown", err: errors.New("unrecognized server response"), want: ClassUnknown},
+		{name: "unknownGmailDuplicateFolderName", err: errors.New("Duplicate folder name Archive (Failure)"), want: ClassUnknown},
 	}
 
 	for _, tt := range tests {
@@ -121,6 +122,10 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 		{name: "lowercaseAlreadyExists", err: errors.New("CREATE failed: mailbox already exists"), want: true},
 		{name: "mixedCaseAlreadyExists", err: errors.New("Folder Already Exists"), want: true},
 		{name: "dovecotMailboxExists", err: errors.New("NO Mailbox exists"), want: true},
+		{name: "gmailDuplicateFolderName", err: errors.New("Duplicate folder name Archive (Failure)"), want: true},
+		{name: "gmailDuplicateFolderNameWithoutName", err: errors.New("Duplicate folder name (Failure)"), want: true},
+		{name: "upperCaseDuplicateFolderName", err: errors.New("DUPLICATE FOLDER NAME Archive"), want: true},
+		{name: "otherFolderNameRefusal", err: errors.New("Invalid folder name Archive (Failure)"), want: false},
 		{name: "unrelated", err: errors.New("permission denied"), want: false},
 	}
 	for _, tt := range tests {

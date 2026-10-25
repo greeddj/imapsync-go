@@ -1773,6 +1773,36 @@ func TestRunSync_When_FolderCreationRefused_Then_FailsBeforeAnyAppend(t *testing
 	}
 }
 
+func TestRunSync_When_CreateAnswersDuplicateFolderName_Then_SyncCompletes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	// Another client creates Work after the planning LIST, so Gmail refuses our CREATE.
+	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb != "CREATE" {
+			return "", false
+		}
+		dst.addFolder("Work")
+		return "NO [ALREADYEXISTS] Duplicate folder name Work (Failure)", true
+	}))
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+	opts.verbose = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work")
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+	assertContainsAll(t, out.String(), "Folder Work already exists")
+	assertContainsNone(t, out.String(), "Failed to create folder", "failed to create")
+}
+
 func TestRunSync_When_AppendRefused_Then_ReportsErrorsAndExitsSilently(t *testing.T) {
 	t.Parallel()
 
