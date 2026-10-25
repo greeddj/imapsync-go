@@ -794,6 +794,18 @@ func verbOn(verb, name string) func(command) bool {
 	return func(cmd command) bool { return cmd.verb == verb && firstArg(cmd.arg) == name }
 }
 
+// byeOn is an interceptHandler hook that answers each command match accepts with
+// an untagged BYE and ends the connection, as a server does on autologout.
+func byeOn(match func(command) bool) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !match(cmd) {
+			return false, true
+		}
+		writeLine(conn, "* BYE Autologout; idle for too long")
+		return true, false
+	}
+}
+
 // awaitSignal fails the test when ch stays open for too long.
 func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()

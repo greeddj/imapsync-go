@@ -1095,6 +1095,101 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered(
 	}
 }
 
+// Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries
+// asserts that a folder name or a label never keeps a dropped connection from
+// being repaired: the error class comes from go-imap, not from our wrapper text.
+func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		folder       string
+		prefix       string
+		dropVerb     string
+		selected     bool
+		wantExamines int
+		wantStatuses int
+	}{
+		{name: "plain folder name", folder: "Work", dropVerb: "EXAMINE", wantExamines: 2},
+		{name: "folder name with lockout", folder: "Alerts/Account Lockout", dropVerb: "EXAMINE", wantExamines: 2},
+		{name: "folder name with quota exceeded", folder: "Quota exceeded", dropVerb: "EXAMINE", wantExamines: 2},
+		{name: "folder name with session expired", folder: "Session expired", dropVerb: "EXAMINE", wantExamines: 2},
+		{name: "folder name with too many simultaneous", folder: "Too many simultaneous", dropVerb: "EXAMINE", wantExamines: 2},
+		{name: "label with bandwidth limit exceeded", folder: "Work", prefix: "bandwidth limit exceeded", dropVerb: "EXAMINE", wantExamines: 2},
+		{
+			name:         "status of the already selected folder",
+			folder:       "Alerts/Account Lockout",
+			dropVerb:     "STATUS",
+			selected:     true,
+			wantExamines: 1,
+			wantStatuses: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, byeOn(verbIs(tt.dropVerb))))
+			srv.addConnHandler(interceptHandler(srv, serveNormally))
+			c := newClientWithFake(t, srv)
+			c.SetPrefix(tt.prefix)
+			if tt.selected {
+				c.selectedFolder.Store(&tt.folder)
+			}
+
+			if _, _, err := c.FetchMessageMap(t.Context(), tt.folder); err != nil {
+				t.Fatalf("FetchMessageMap: %v, want success after the reconnect", err)
+			}
+
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2 (one fresh session for the retry)", got)
+			}
+			if got := srv.callCount("EXAMINE"); got != tt.wantExamines {
+				t.Errorf("EXAMINE count = %d, want %d", got, tt.wantExamines)
+			}
+			if got := srv.callCount("STATUS"); got != tt.wantStatuses {
+				t.Errorf("STATUS count = %d, want %d", got, tt.wantStatuses)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndStreams
+// asserts the same for the copy phase, and that the retry fetches each UID once.
+func Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndStreams(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, byeOn(verbIs("EXAMINE"))))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newClientWithFake(t, srv)
+
+	uids := []uint32{1, 2, 3}
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "Quota exceeded", uids, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success after the reconnect", err)
+	}
+
+	if !slices.Equal(got, uids) {
+		t.Errorf("callback got UIDs %v, want each of %v exactly once", got, uids)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session for the retry)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the retry selects again)", got)
+	}
+	if gotSets, want := fetches.all(), [][]uint32{uids}; !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH asked for %v, want %v (only the new session fetches)", gotSets, want)
+	}
+}
+
 func Test_FetchMessageMap_When_FolderNameCarriesControlCharacters_Then_WarningShowsEscapes(t *testing.T) {
 	t.Parallel()
 

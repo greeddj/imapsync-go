@@ -1429,6 +1429,28 @@ func TestRunSync_When_AutoConfirmed_Then_CopiesMissingMessages(t *testing.T) {
 	}
 }
 
+func TestRunSync_When_SourceDropsOnFolderNamedLikeThrottle_Then_FolderIsStillCopied(t *testing.T) {
+	t.Parallel()
+
+	const folder = "Alerts/Account Lockout"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, folder: fakeMsgs("lock1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping(folder, folder))
+	src.dropOnceOnOpen(folder)
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	if n := src.callCount("DROP"); n != 1 {
+		t.Errorf("source dropped %d connections, want 1", n)
+	}
+	assertIDs(t, "dst APPENDs to "+folder, dst.appended(folder), "lock1@x")
+	assertReadOnly(t, "source", src)
+}
+
 func TestRunSync_When_RunTwice_Then_SecondRunWritesNothing(t *testing.T) {
 	t.Parallel()
 

@@ -572,6 +572,7 @@ type mailStore struct {
 	loginReply   string
 	createReply  string
 	appendReply  string
+	dropOnOpen   string
 	appends      []appendRecord
 	seenMutating int
 }
@@ -626,6 +627,27 @@ func (s *fakeServer) refuseCreateWith(reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.createReply = reply
+}
+
+// dropOnceOnOpen makes the next EXAMINE or SELECT of folder end with an untagged
+// BYE and a closed connection. Later opens of folder are served normally.
+func (s *fakeServer) dropOnceOnOpen(folder string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.dropOnOpen = folder
+}
+
+// takeDropOnOpen reports whether the open of name must drop the connection. It
+// clears the knob and counts the drop as the synthetic event "DROP".
+func (s *fakeServer) takeDropOnOpen(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.dropOnOpen == "" || s.store.dropOnOpen != name {
+		return false
+	}
+	s.store.dropOnOpen = ""
+	s.counts["DROP"]++
+	return true
 }
 
 func (s *fakeServer) refuseAppend() {
@@ -731,6 +753,10 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 			s.storeList(rw, tag)
 		case "EXAMINE", "SELECT":
 			name, _ := parseMailboxArg(arg)
+			if s.takeDropOnOpen(name) {
+				rw.line("* BYE Autologout")
+				return
+			}
 			if s.storeSelect(rw, tag, verb, name) {
 				selected = name
 			}

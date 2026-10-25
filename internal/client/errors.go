@@ -58,7 +58,34 @@ func classifyError(err error) ErrClass {
 		return ClassTransient
 	}
 
-	msg := strings.ToLower(err.Error())
+	return classifyLeaves(err)
+}
+
+// classifyLeaves matches text only on leaf errors. Wrappers add our folder
+// names and labels, which must not choose the class.
+func classifyLeaves(err error) ErrClass {
+	if child := errors.Unwrap(err); child != nil {
+		return classifyLeaves(child)
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		hasChild := false
+		for _, child := range multi.Unwrap() {
+			if child == nil {
+				continue
+			}
+			hasChild = true
+			if class := classifyLeaves(child); class != ClassUnknown {
+				return class
+			}
+		}
+		if hasChild {
+			return ClassUnknown
+		}
+	}
+	return classifyMessage(strings.ToLower(err.Error()))
+}
+
+func classifyMessage(msg string) ErrClass {
 	switch {
 	// Server-signaled throttling: Gmail and Workspace use these phrasings.
 	case strings.Contains(msg, "too many simultaneous"):
