@@ -383,6 +383,203 @@ func Test_reconnect_When_LoginFailsWithBadCredentials_Then_GivesUpAfterOneAttemp
 	}
 }
 
+// sleepLog holds every wait that reconnect asked for, with the LOGIN count the
+// server had seen when the wait began.
+type sleepLog struct {
+	waits  []time.Duration
+	logins []int
+}
+
+// recordSleeps swaps the package-level sleepCtx var, so the caller must be
+// sequential. The swap is undone when the test ends.
+func recordSleeps(t *testing.T, srv *fakeServer) *sleepLog {
+	t.Helper()
+
+	rec := &sleepLog{}
+	orig := sleepCtx
+	sleepCtx = func(_ context.Context, d time.Duration) error {
+		rec.waits = append(rec.waits, d)
+		rec.logins = append(rec.logins, srv.callCount("LOGIN"))
+		return nil
+	}
+	t.Cleanup(func() { sleepCtx = orig })
+	return rec
+}
+
+// transientBackoffs returns the waits between maxReconnectAttempts attempts
+// when every failure takes the exponential branch.
+func transientBackoffs() []time.Duration {
+	waits := make([]time.Duration, 0, maxReconnectAttempts-1)
+	for k := range maxReconnectAttempts - 1 {
+		waits = append(waits, initialBackoff<<k)
+	}
+	return waits
+}
+
+// Test_reconnect_When_EveryAttemptFails_Then_NoWaitFollowsTheLastAttempt
+// asserts that reconnect returns at once after the last failed attempt,
+// waits only between attempts, and says so on the tracker.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_reconnect_When_EveryAttemptFails_Then_NoWaitFollowsTheLastAttempt(t *testing.T) {
+	transientWaits := transientBackoffs()
+	throttledWaits := slices.Repeat([]time.Duration{throttledBackoff}, maxReconnectAttempts-1)
+
+	tests := []struct {
+		name      string
+		reply     string
+		wantWaits []time.Duration
+		wantClass ErrClass
+	}{
+		{name: "transient failure", reply: dovecotTempAuthFailure, wantClass: ClassTransient, wantWaits: transientWaits},
+		{name: "unknown failure", reply: "NO [UNAVAILABLE] Server busy", wantClass: ClassUnknown, wantWaits: transientWaits},
+		{name: "throttled failure", reply: "NO [ALERT] Too many simultaneous connections", wantClass: ClassThrottled, wantWaits: throttledWaits},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFakeServer(t)
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			for range maxReconnectAttempts {
+				srv.addConnHandler(connHandlerWithLoginReply(srv, tt.reply))
+			}
+			c := newDisconnectedClient(t, srv)
+			if err := c.connectAndLogin(t.Context()); err != nil {
+				t.Fatalf("initial connectAndLogin: %v", err)
+			}
+			tr := &recordingTracker{}
+			c.SetProgressTracker(tr)
+			rec := recordSleeps(t, srv)
+
+			err := c.reconnect()
+			if err == nil {
+				t.Fatal("reconnect returned nil, want error")
+			}
+			if !strings.Contains(err.Error(), "failed to reconnect after retries") {
+				t.Errorf("reconnect error %q does not contain %q", err, "failed to reconnect after retries")
+			}
+			if got := classifyError(err); got != tt.wantClass {
+				t.Errorf("classifyError(%v) = %s, want %s", err, got, tt.wantClass)
+			}
+			if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts; got != want {
+				t.Errorf("LOGIN count = %d, want %d", got, want)
+			}
+			if !slices.Equal(rec.waits, tt.wantWaits) {
+				t.Errorf("waits = %v, want %v", rec.waits, tt.wantWaits)
+			}
+			total := srv.callCount("LOGIN")
+			for k, got := range rec.logins {
+				if want := 2 + k; got != want {
+					t.Errorf("LOGIN count at wait %d = %d, want %d", k, got, want)
+				}
+				if got >= total {
+					t.Errorf("no LOGIN follows wait %d: %d at the wait, %d in total", k, got, total)
+				}
+			}
+
+			if len(tr.messages) == 0 {
+				t.Fatal("tracker got no message")
+			}
+			last := tr.messages[len(tr.messages)-1]
+			if want := fmt.Sprintf("giving up after %d", maxReconnectAttempts); !strings.Contains(last, want) {
+				t.Errorf("last tracker message = %q, want it to contain %q", last, want)
+			}
+			var announced int
+			for _, m := range tr.messages {
+				if strings.Contains(m, "retrying in") || strings.Contains(m, "backing off") {
+					announced++
+				}
+			}
+			if want := maxReconnectAttempts - 1; announced != want {
+				t.Errorf("%d tracker messages announce a wait, want %d: %q", announced, want, tr.messages)
+			}
+
+			if c.c.Load() != nil {
+				t.Error("imap client is set after every attempt failed")
+			}
+			if !c.mu.TryLock() {
+				t.Fatal("c.mu is still locked after reconnect returned")
+			}
+			c.mu.Unlock()
+		})
+	}
+}
+
+// Test_reconnect_When_LastAttemptFailsPermanently_Then_ReturnsTheRefusal
+// asserts that a permanent refusal on the last attempt is returned as it
+// is, not as an exhausted budget.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_reconnect_When_LastAttemptFailsPermanently_Then_ReturnsTheRefusal(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+	for range maxReconnectAttempts - 1 {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+	c := newDisconnectedClient(t, srv)
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("initial connectAndLogin: %v", err)
+	}
+	tr := &recordingTracker{}
+	c.SetProgressTracker(tr)
+	rec := recordSleeps(t, srv)
+
+	err := c.reconnect()
+	if err == nil {
+		t.Fatal("reconnect returned nil, want error")
+	}
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(%v) = %s, want %s", err, got, ClassPermanent)
+	}
+	if strings.Contains(err.Error(), "failed to reconnect after retries") {
+		t.Errorf("reconnect error %q reports an exhausted budget, want the refusal itself", err)
+	}
+	if want := transientBackoffs(); !slices.Equal(rec.waits, want) {
+		t.Errorf("waits = %v, want %v", rec.waits, want)
+	}
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts; got != want {
+		t.Errorf("LOGIN count = %d, want %d", got, want)
+	}
+	if len(tr.messages) == 0 {
+		t.Fatal("tracker got no message")
+	}
+	if last, want := tr.messages[len(tr.messages)-1], "Permanent error, giving up"; !strings.Contains(last, want) {
+		t.Errorf("last tracker message = %q, want it to contain %q", last, want)
+	}
+}
+
+// Test_reconnect_When_LastAttemptSucceeds_Then_Reconnects asserts that the
+// last attempt still runs after maxReconnectAttempts-1 failures and that its
+// success resets the backoff.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_reconnect_When_LastAttemptSucceeds_Then_Reconnects(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+	for range maxReconnectAttempts - 1 {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+	c := newDisconnectedClient(t, srv)
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("initial connectAndLogin: %v", err)
+	}
+	rec := recordSleeps(t, srv)
+
+	if err := c.reconnect(); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	if c.c.Load() == nil {
+		t.Error("no imap client after the last attempt succeeded")
+	}
+	if want := transientBackoffs(); !slices.Equal(rec.waits, want) {
+		t.Errorf("waits = %v, want %v", rec.waits, want)
+	}
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts; got != want {
+		t.Errorf("LOGIN count = %d, want %d", got, want)
+	}
+	if c.backoff != initialBackoff {
+		t.Errorf("backoff = %s, want %s", c.backoff, initialBackoff)
+	}
+}
+
 // Test_selectIfNeeded_shortCircuitsOnNetwork asserts that a second call to
 // selectIfNeeded for the same folder on the same connection does not send
 // another EXAMINE to the server.

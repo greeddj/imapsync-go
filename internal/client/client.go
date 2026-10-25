@@ -567,7 +567,13 @@ func (c *Client) reconnect() error {
 		}
 		lastErr = err
 
-		switch classifyError(err) {
+		class := classifyError(err)
+		// No attempt follows the last failure, so a wait there only delays the error and holds c.mu.
+		if class != ClassPermanent && i == maxReconnectAttempts {
+			c.log("[%s] 🔄 Failed: %v, giving up after %d attempts", c.prefix, err, maxReconnectAttempts)
+			break
+		}
+		switch class {
 		case ClassPermanent:
 			// Auth fails won't get better with retries; bail out fast.
 			c.log("[%s] 🔄 Permanent error, giving up: %v", c.prefix, err)
