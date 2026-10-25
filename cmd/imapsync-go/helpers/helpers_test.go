@@ -8,27 +8,38 @@ import (
 	"testing"
 )
 
-func TestVersion_offlineFlagSkipsNetwork(t *testing.T) {
-	// IMAPSYNC_OFFLINE forces latestTag to return defaultVersion without
-	// touching the network. The release-binary path is already proven —
-	// goreleaser always sets a non-empty version — so this test guards
-	// the dev/source-build path where latestTag() used to fire blindly.
-	t.Setenv("IMAPSYNC_OFFLINE", "1")
+func TestVersion_withoutVersion_usesPlaceholderOffline(t *testing.T) {
+	// The root command builds Version on every run, so even with both
+	// opt-outs unset it must not ask GitHub for the latest tag.
+	t.Setenv("IMAPSYNC_OFFLINE", "")
 	t.Setenv("CI", "")
 
 	got := Version("", "", "", "")
-	if !strings.Contains(got, defaultVersion) {
-		t.Errorf("Version with IMAPSYNC_OFFLINE=1 = %q, want substring %q", got, defaultVersion)
+	if !strings.HasPrefix(got, defaultVersion+" ") {
+		t.Errorf("Version without a version = %q, want it to start with %q", got, defaultVersion)
 	}
 }
 
-func TestVersion_ciFlagSkipsNetwork(t *testing.T) {
-	t.Setenv("CI", "true")
-	t.Setenv("IMAPSYNC_OFFLINE", "")
-
-	got := Version("", "", "", "")
-	if !strings.Contains(got, defaultVersion) {
-		t.Errorf("Version with CI=true = %q, want substring %q", got, defaultVersion)
+func TestLatestVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		offline string
+		ci      string
+		version string
+		want    string
+	}{
+		{name: "preset version wins without a lookup", version: "v1.2.3", want: "v1.2.3"},
+		{name: "offline flag skips the network", offline: "1", want: defaultVersion},
+		{name: "CI skips the network", ci: "true", want: defaultVersion},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("IMAPSYNC_OFFLINE", tt.offline)
+			t.Setenv("CI", tt.ci)
+			if got := LatestVersion(tt.version); got != tt.want {
+				t.Errorf("LatestVersion(%q) = %q, want %q", tt.version, got, tt.want)
+			}
+		})
 	}
 }
 

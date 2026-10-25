@@ -36,7 +36,7 @@ func main() {
 func run() int {
 	// Customize the version printer to show only the version.
 	cli.VersionPrinter = func(c *cli.Command) {
-		_, _ = fmt.Fprintln(c.Writer, Version)
+		_, _ = fmt.Fprintln(c.Writer, helpers.LatestVersion(Version))
 	}
 
 	app := &cli.Command{

@@ -12,10 +12,11 @@ import (
 	"github.com/greeddj/imapsync-go/internal/termsafe"
 )
 
-// Version returns the formatted version string for the application.
+// Version returns the formatted version string for the application. It never
+// touches the network: the root command builds it on every run.
 func Version(version, commit, date, builtBy string) string {
 	if version == "" {
-		version = latestTag()
+		version = defaultVersion
 	}
 
 	if builtBy == "" {
@@ -32,6 +33,15 @@ func Version(version, commit, date, builtBy string) string {
 	default:
 		return fmt.Sprintf("%s (built by %s) // %s", version, builtBy, runtime.Version())
 	}
+}
+
+// LatestVersion returns version, or for a build without one the latest release
+// tag from GitHub. Only the --version printer calls it, so other runs stay offline.
+func LatestVersion(version string) string {
+	if version != "" {
+		return version
+	}
+	return latestTag()
 }
 
 // latestTag fetches the latest release tag from GitHub. Skipped entirely when
