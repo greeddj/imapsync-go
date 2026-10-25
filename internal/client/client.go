@@ -580,13 +580,13 @@ func (c *Client) reconnect() error {
 		}
 	}
 
+	// Every give-up stamps, permanent ones too: the next call's reconnect first waits out reconnectInterval.
 	c.lastReconnect = time.Now()
 	return fmt.Errorf("[%s] failed to reconnect after retries: %w", c.prefix, lastErr)
 }
 
-// safeCall runs fn with the current IMAP client. If fn returns a transient
-// error, safeCall reconnects and retries fn once with the fresh client.
-// Permanent and throttled errors are surfaced to the caller as-is.
+// safeCall starts at most one reconnect per call: a transient fn error gets a
+// reconnect and one retry, and without a session fn runs once after the reconnect.
 //
 // The closure must be re-runnable: any state that fn accumulates on the first
 // attempt (slices, maps, counters) has to be reset at the top of the closure.
@@ -594,34 +594,39 @@ func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 	if c.isCancelled() {
 		return context.Canceled
 	}
-	cli := c.c.Load()
-	if cli == nil {
-		return errors.New("imap client not connected")
+	if cli := c.c.Load(); cli != nil {
+		err := c.call(cli, fn)
+		if err == nil {
+			return nil
+		}
+		if c.isCancelled() {
+			return context.Canceled
+		}
+		if !isRetryable(err) {
+			return err
+		}
+		c.noteIdleTrip(err)
 	}
 
-	err := c.call(cli, fn)
-	if err == nil {
-		return nil
-	}
-	if c.isCancelled() {
-		return context.Canceled
-	}
-	if !isRetryable(err) {
+	cli, err := c.reconnectSession()
+	if err != nil {
 		return err
 	}
-
-	c.noteIdleTrip(err)
-	if rerr := c.reconnect(); rerr != nil {
-		return rerr
-	}
-	if c.isCancelled() {
-		return context.Canceled
-	}
-	cli = c.c.Load()
-	if cli == nil {
-		return errors.New("imap client not connected after reconnect")
-	}
 	return c.call(cli, fn)
+}
+
+func (c *Client) reconnectSession() (*imapclient.Client, error) {
+	if err := c.reconnect(); err != nil {
+		return nil, err
+	}
+	// Ctrl-C can land while reconnect runs, and a cancelled client must not use the new session.
+	if c.isCancelled() {
+		return nil, context.Canceled
+	}
+	if cli := c.c.Load(); cli != nil {
+		return cli, nil
+	}
+	return nil, errors.New("imap client not connected after reconnect")
 }
 
 // noteIdleTrip logs why a reconnect follows a watchdog trip; the reconnect

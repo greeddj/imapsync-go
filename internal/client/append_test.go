@@ -16,10 +16,12 @@ import (
 )
 
 // Test_AppendMessage_rejectsWithoutAppend asserts that every precondition
-// failure of AppendMessage is reported without an APPEND reaching the server.
+// failure of AppendMessage is reported without an APPEND or a LOGIN reaching the
+// server, also when the client has no session.
 func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 	t.Parallel()
 
+	noBody := func() Message { return Message{m: imap.NewMessage(1, []imap.FetchItem{imap.FetchEnvelope})} }
 	tests := []struct {
 		message      func() Message
 		wantErrIs    error
@@ -27,13 +29,11 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 		wantErrText  string
 		cancelCtx    bool
 		cancelClient bool
-		dropConn     bool
+		noSession    bool
 	}{
 		{
-			name: "message has no body section",
-			message: func() Message {
-				return Message{m: imap.NewMessage(1, []imap.FetchItem{imap.FetchEnvelope})}
-			},
+			name:        "message has no body section",
+			message:     noBody,
 			wantErrText: "no body",
 		},
 		{
@@ -54,10 +54,24 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 			wantErrIs:    context.Canceled,
 		},
 		{
-			name:        "no live connection",
-			message:     buildTestIMAPMessage,
-			dropConn:    true,
-			wantErrText: "not connected",
+			name:        "message has no body section and the client has no session",
+			message:     noBody,
+			noSession:   true,
+			wantErrText: "no body",
+		},
+		{
+			name:         "client already canceled and has no session",
+			message:      buildTestIMAPMessage,
+			noSession:    true,
+			cancelClient: true,
+			wantErrIs:    context.Canceled,
+		},
+		{
+			name:      "context already canceled and the client has no session",
+			message:   buildTestIMAPMessage,
+			noSession: true,
+			cancelCtx: true,
+			wantErrIs: context.Canceled,
 		},
 	}
 	for _, tt := range tests {
@@ -66,17 +80,18 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 
 			srv := newFakeServer(t)
 			c := newClientWithFake(t, srv)
+			if tt.noSession {
+				loseSession(t, srv, c)
+			}
 			if tt.cancelClient {
 				c.Cancel()
-			}
-			if tt.dropConn {
-				c.c.Store(nil)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			t.Cleanup(cancel)
 			if tt.cancelCtx {
 				cancel()
 			}
+			loginsBefore := srv.callCount("LOGIN")
 
 			err := c.AppendMessage(ctx, "INBOX", tt.message())
 			if err == nil {
@@ -90,6 +105,9 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 			}
 			if got := srv.callCount("APPEND"); got != 0 {
 				t.Errorf("APPEND count = %d, want 0", got)
+			}
+			if got := srv.callCount("LOGIN"); got != loginsBefore {
+				t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, got)
 			}
 		})
 	}
@@ -192,6 +210,80 @@ func Test_AppendMessage_repairsConnectionAfterServerLogout(t *testing.T) {
 	}
 	if got := srv.callCount("LOGIN"); got != 2 {
 		t.Errorf("LOGIN count = %d after the second call, want it to stay 2", got)
+	}
+}
+
+// Test_AppendMessage_When_RepairGaveUp_Then_NextAppendReconnects asserts that an
+// APPEND on a client whose repair gave up logs in again and uploads the message.
+func Test_AppendMessage_When_RepairGaveUp_Then_NextAppendReconnects(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "APPEND" {
+			return false, true
+		}
+		_ = readAppendLiteral(conn, rd, cmd)
+		return true, false
+	}))
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newClientWithFake(t, srv)
+
+	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	if err == nil {
+		t.Fatal("first AppendMessage returned nil, want the error of the dropped connection")
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if c.c.Load() != nil {
+		t.Fatal("the client holds a session although the repair was refused")
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Fatalf("LOGIN count after the first call = %d, want 2 (initial and the refused repair)", got)
+	}
+
+	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {
+		t.Fatalf("second AppendMessage: %v, want success after a new login", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3", got)
+	}
+	if got := srv.callCount("APPEND"); got != 2 {
+		t.Errorf("APPEND count = %d, want 2 (one per connection)", got)
+	}
+}
+
+// Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain
+// asserts that an APPEND that had to reconnect first does not reconnect again after a
+// transient failure.
+func Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	loseSession(t, srv, c)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "APPEND" {
+			return false, true
+		}
+		_ = readAppendLiteral(conn, rd, cmd)
+		return true, false
+	}))
+
+	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	if err == nil {
+		t.Fatal("AppendMessage returned nil, want the error of the dropped connection")
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3 (initial, refused, revive) and no repair", got)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count = %d, want 1", got)
 	}
 }
 

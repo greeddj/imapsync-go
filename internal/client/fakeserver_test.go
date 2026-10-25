@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	imapclient "github.com/emersion/go-imap/client"
 )
 
 // fakeServer is a minimal IMAP wire-level server for unit tests. It records
@@ -944,5 +945,20 @@ func awaitCall(t *testing.T, what string, call func() error) error {
 	case <-timer.C:
 		t.Fatalf("%s still blocked 5s into a server stall", what)
 		return nil
+	}
+}
+
+// loseSession makes the reconnect of c give up on a permanent refusal. The current
+// connection must answer LOGOUT; queue handlers for later connections after this call.
+func loseSession(t *testing.T, srv *fakeServer, c *Client) {
+	t.Helper()
+
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+	err := c.safeCall(func(*imapclient.Client) error { return io.EOF })
+	if got := classifyError(err); got != ClassPermanent {
+		t.Fatalf("loseSession: classifyError(%v) = %s, want %s", err, got, ClassPermanent)
+	}
+	if c.c.Load() != nil {
+		t.Fatal("loseSession: the client still holds a session")
 	}
 }

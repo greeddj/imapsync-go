@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -38,8 +37,16 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 	}
 
 	cli := c.c.Load()
-	if cli == nil {
-		return errors.New("imap client not connected")
+	revived := cli == nil
+	if revived {
+		// An earlier reconnect gave up, and the server can be back.
+		var err error
+		if cli, err = c.reconnectSession(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
 	}
 
 	// A server may omit ENVELOPE; the zero date makes go-imap leave the
@@ -57,12 +64,9 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// The literal has been partially consumed, so we can't retry THIS
-		// message - but repair the connection so the next APPEND in the
-		// same plan doesn't fail again at the IMAP layer. Without this,
-		// one server-side disconnect cascades into "Not logged in" for
-		// every remaining message in the folder.
-		if isRetryable(err) && !c.isCancelled() {
+		// The literal is partly sent, so this message cannot be retried. Repair the
+		// session so the next APPEND does not fail too, unless this call already reconnected.
+		if isRetryable(err) && !revived && !c.isCancelled() {
 			c.noteIdleTrip(err)
 			_ = c.reconnect()
 		}

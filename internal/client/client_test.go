@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2570,5 +2571,353 @@ func Test_noteIdleTrip_When_ErrorIsNotATrip_Then_LogsNothing(t *testing.T) {
 	c.noteIdleTrip(fmt.Errorf("read: %w", errIdleTimeout))
 	if want := []string{"[src] No data from server for 1m0s, reconnecting"}; !slices.Equal(tr.messages, want) {
 		t.Errorf("tracker messages = %q, want %q", tr.messages, want)
+	}
+}
+
+// Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects asserts
+// that a call after a give-up waits for the rest of the reconnect interval, logs in
+// again and runs fn once. Sequential - swaps the package-level sleepCtx var.
+func Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects(t *testing.T) {
+	tests := []struct {
+		name     string
+		reply    string
+		refusals int
+	}{
+		{name: "temporary failures use the whole budget", reply: dovecotTempAuthFailure, refusals: maxReconnectAttempts},
+		{name: "permanent refusal stops at once", reply: "NO [AUTHENTICATIONFAILED] Authentication failed.", refusals: 1},
+		{name: "throttled refusals use the whole budget", reply: "NO [ALERT] Too many simultaneous connections", refusals: maxReconnectAttempts},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFakeServer(t)
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			for range tt.refusals {
+				srv.addConnHandler(connHandlerWithLoginReply(srv, tt.reply))
+			}
+			c := newClientWithFake(t, srv)
+			c.reconnectDur = reconnectInterval
+			rec := recordSleeps(t, srv)
+
+			if err := c.safeCall(func(*imapclient.Client) error { return io.EOF }); err == nil {
+				t.Fatal("first safeCall returned nil, want the reconnect to give up")
+			}
+			if c.c.Load() != nil {
+				t.Fatal("the client still holds a session after the give-up")
+			}
+			if got, want := srv.callCount("LOGIN"), 1+tt.refusals; got != want {
+				t.Fatalf("LOGIN count after the give-up = %d, want %d", got, want)
+			}
+			waitsBefore := len(rec.waits)
+
+			runs := 0
+			err := c.safeCall(func(*imapclient.Client) error {
+				runs++
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("second safeCall error = %v, want nil", err)
+			}
+			if runs != 1 {
+				t.Errorf("fn ran %d times, want 1", runs)
+			}
+			if got, want := srv.callCount("LOGIN"), 1+tt.refusals+1; got != want {
+				t.Errorf("LOGIN count = %d, want %d", got, want)
+			}
+			waits := rec.waits[waitsBefore:]
+			if len(waits) != 1 {
+				t.Fatalf("second safeCall waited %v, want exactly one wait", waits)
+			}
+			if waits[0] <= 0 || waits[0] > reconnectInterval {
+				t.Errorf("wait = %s, want within (0, %s]", waits[0], reconnectInterval)
+			}
+			if got, want := rec.logins[waitsBefore], 1+tt.refusals; got != want {
+				t.Errorf("LOGIN count at the wait = %d, want %d (the wait comes before the new LOGIN)", got, want)
+			}
+			if c.c.Load() == nil {
+				t.Error("the client holds no session after the second safeCall")
+			}
+		})
+	}
+}
+
+// Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneReconnect
+// asserts that each call after a give-up spends one reconnect, with its own wait and
+// attempts, and skips fn when it fails. Sequential - swaps the package-level sleepCtx var.
+func Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneReconnect(t *testing.T) {
+	tests := []struct {
+		name         string
+		reply        string
+		wantText     string
+		wantBackoffs []time.Duration
+		refusals     int
+		wantLogins   int
+		wantClass    ErrClass
+	}{
+		{
+			name:         "temporary failures",
+			reply:        dovecotTempAuthFailure,
+			refusals:     2 * maxReconnectAttempts,
+			wantLogins:   maxReconnectAttempts,
+			wantBackoffs: transientBackoffs(),
+			wantText:     "failed to reconnect after retries",
+			wantClass:    ClassTransient,
+		},
+		{
+			name:       "permanent refusal",
+			reply:      "NO [AUTHENTICATIONFAILED] Authentication failed.",
+			refusals:   2,
+			wantLogins: 1,
+			wantClass:  ClassPermanent,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFakeServer(t)
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			for range tt.refusals {
+				srv.addConnHandler(connHandlerWithLoginReply(srv, tt.reply))
+			}
+			c := newClientWithFake(t, srv)
+			c.reconnectDur = reconnectInterval
+			rec := recordSleeps(t, srv)
+
+			if err := c.safeCall(func(*imapclient.Client) error { return io.EOF }); err == nil {
+				t.Fatal("first safeCall returned nil, want the reconnect to give up")
+			}
+			loginsBefore := srv.callCount("LOGIN")
+			waitsBefore := len(rec.waits)
+
+			runs := 0
+			err := c.safeCall(func(*imapclient.Client) error {
+				runs++
+				return nil
+			})
+			if err == nil {
+				t.Fatal("second safeCall returned nil, want the refusal")
+			}
+			if tt.wantText != "" && !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("error %q does not contain %q", err, tt.wantText)
+			}
+			if got := classifyError(err); got != tt.wantClass {
+				t.Errorf("classifyError(%v) = %s, want %s", err, got, tt.wantClass)
+			}
+			if runs != 0 {
+				t.Errorf("fn ran %d times, want 0 (there was no session to run it on)", runs)
+			}
+			if got := srv.callCount("LOGIN") - loginsBefore; got != tt.wantLogins {
+				t.Errorf("the second call sent %d LOGINs, want %d", got, tt.wantLogins)
+			}
+			if got, want := srv.callCount("LOGIN"), 1+tt.refusals; got != want {
+				t.Errorf("LOGIN count = %d, want %d (the initial login and every refusal)", got, want)
+			}
+			waits := rec.waits[waitsBefore:]
+			if len(waits) != 1+len(tt.wantBackoffs) {
+				t.Fatalf("second safeCall waited %v, want the interval wait and then %v", waits, tt.wantBackoffs)
+			}
+			if waits[0] <= 0 || waits[0] > reconnectInterval {
+				t.Errorf("first wait = %s, want within (0, %s]", waits[0], reconnectInterval)
+			}
+			if !slices.Equal(waits[1:], tt.wantBackoffs) {
+				t.Errorf("backoffs = %v, want %v", waits[1:], tt.wantBackoffs)
+			}
+			if c.c.Load() != nil {
+				t.Error("the client holds a session although every login was refused")
+			}
+			if !c.mu.TryLock() {
+				t.Fatal("c.mu is still held after the reconnect gave up")
+			}
+			c.mu.Unlock()
+		})
+	}
+}
+
+// Test_safeCall_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain
+// asserts that a call that had to reconnect first runs fn once. Its transient
+// error returns to the caller, because the call already spent its reconnect.
+func Test_safeCall_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	loseSession(t, srv, c)
+
+	runs := 0
+	err := c.safeCall(func(*imapclient.Client) error {
+		runs++
+		return io.EOF
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("safeCall error = %v, want io.EOF", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%v) = %s, want %s", err, got, ClassTransient)
+	}
+	if runs != 1 {
+		t.Errorf("fn ran %d times, want 1", runs)
+	}
+	if got := srv.callCount("LOGIN"); got != 3 {
+		t.Errorf("LOGIN count = %d, want 3 (initial, refused, one revive and no more)", got)
+	}
+}
+
+// Test_safeCall_When_CancelledWithoutSession_Then_ReturnsCanceledWithoutDial
+// asserts that a cancelled client does not revive a lost session.
+func Test_safeCall_When_CancelledWithoutSession_Then_ReturnsCanceledWithoutDial(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	var dials atomic.Int32
+	dial := c.dialFn
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return dial(ctx, addr)
+	}
+	loseSession(t, srv, c)
+	c.Cancel()
+	dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+	runs := 0
+	err := c.safeCall(func(*imapclient.Client) error {
+		runs++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("safeCall error = %v, want context.Canceled", err)
+	}
+	if runs != 0 {
+		t.Errorf("fn ran %d times, want 0", runs)
+	}
+	if got := dials.Load(); got != dialsBefore {
+		t.Errorf("dial count went from %d to %d, want no dial after Cancel", dialsBefore, got)
+	}
+	if got := srv.callCount("LOGIN"); got != loginsBefore {
+		t.Errorf("LOGIN count went from %d to %d, want no LOGIN after Cancel", loginsBefore, got)
+	}
+}
+
+// Test_safeCall_When_CancelledDuringWaitBeforeReconnect_Then_ReturnsCanceledWithoutLogin
+// asserts that Ctrl-C ends the interval wait that precedes a revive, and that no
+// LOGIN follows.
+func Test_safeCall_When_CancelledDuringWaitBeforeReconnect_Then_ReturnsCanceledWithoutLogin(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	loseSession(t, srv, c)
+	c.reconnectDur = reconnectInterval
+	c.verbose = true
+	waiting := make(chan struct{})
+	var once sync.Once
+	c.SetProgressWriter(&logCapture{fn: func(msg string) {
+		if strings.Contains(msg, "Reconnecting in") {
+			once.Do(func() { close(waiting) })
+		}
+	}})
+	loginsBefore := srv.callCount("LOGIN")
+
+	runs := 0
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.safeCall(func(*imapclient.Client) error {
+			runs++
+			return nil
+		})
+	}()
+	awaitSignal(t, waiting, "the call to wait before it reconnects")
+	c.Cancel()
+
+	if err := awaitError(t, errc, "safeCall"); !errors.Is(err, context.Canceled) {
+		t.Errorf("safeCall error = %v, want context.Canceled", err)
+	}
+	if runs != 0 {
+		t.Errorf("fn ran %d times, want 0", runs)
+	}
+	if got := srv.callCount("LOGIN"); got != loginsBefore {
+		t.Errorf("LOGIN count went from %d to %d, want no LOGIN after Cancel", loginsBefore, got)
+	}
+}
+
+// Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect asserts that
+// each public operation that goes through safeCall logs in again on a client that
+// has no session, and then sends its command on the new connection.
+func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		handler      func(srv *fakeServer) func(net.Conn)
+		run          func(t *testing.T, c *Client) error
+		wantCommands map[string]int
+		name         string
+	}{
+		{
+			name:         "FetchMessageMap",
+			handler:      func(srv *fakeServer) func(net.Conn) { return interceptHandler(srv, serveNormally) },
+			wantCommands: map[string]int{"EXAMINE": 1},
+			run: func(t *testing.T, c *Client) error {
+				t.Helper()
+				_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+				return err
+			},
+		},
+		{
+			name: "StreamMessagesByUIDs",
+			handler: func(srv *fakeServer) func(net.Conn) {
+				return (&mailboxScript{uidMessages: 3}).handler(srv)
+			},
+			wantCommands: map[string]int{"UID FETCH": 1},
+			run: func(t *testing.T, c *Client) error {
+				t.Helper()
+				delivered := make(map[uint32]int)
+				err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1, 2, 3}, func(msg Message) error {
+					delivered[msg.m.Uid]++
+					return nil
+				})
+				for _, uid := range []uint32{1, 2, 3} {
+					if delivered[uid] != 1 {
+						t.Errorf("UID %d reached onMessage %d times, want 1", uid, delivered[uid])
+					}
+				}
+				return err
+			},
+		},
+		{
+			name:         "CreateMailbox",
+			handler:      func(srv *fakeServer) func(net.Conn) { return interceptHandler(srv, serveNormally) },
+			wantCommands: map[string]int{"CREATE": 1},
+			run: func(t *testing.T, c *Client) error {
+				t.Helper()
+				created, err := c.CreateMailbox(t.Context(), "Archive")
+				if err == nil && !created {
+					t.Error("CreateMailbox returned created=false, want true")
+				}
+				if err == nil && !c.hasMailbox("Archive") {
+					t.Error("the mailbox cache does not hold Archive")
+				}
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c := newClientWithFake(t, srv)
+			loseSession(t, srv, c)
+			srv.addConnHandler(tt.handler(srv))
+
+			if err := tt.run(t, c); err != nil {
+				t.Fatalf("operation error = %v, want nil", err)
+			}
+			if got := srv.callCount("LOGIN"); got != 3 {
+				t.Errorf("LOGIN count = %d, want 3 (initial, refused, one revive)", got)
+			}
+			for verb, want := range tt.wantCommands {
+				if got := srv.callCount(verb); got != want {
+					t.Errorf("%s count = %d, want %d", verb, got, want)
+				}
+			}
+		})
 	}
 }
