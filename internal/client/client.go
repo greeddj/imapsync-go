@@ -45,6 +45,9 @@ const (
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
 	uidFetchBatchSize  = 500
 	tcpKeepAlivePeriod = 30 * time.Second
+	// maxMessageMapHint caps the map pre-size in FetchMessageMap. The count comes
+	// from the server, so it must not size an allocation alone.
+	maxMessageMapHint = 1 << 16
 	// logoutTimeout bounds the wait for the LOGOUT reply. LOGOUT is the last
 	// command of a session, so closing the socket early loses nothing.
 	logoutTimeout = 2 * time.Second

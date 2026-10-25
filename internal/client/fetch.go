@@ -103,7 +103,7 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		}
 		c.log("[%s] Fetching %d message IDs from %s...", c.prefix, total, folder)
 
-		ids = make(map[string]uint32, total)
+		ids = make(map[string]uint32, min(total, maxMessageMapHint))
 		seqset := new(imap.SeqSet)
 		seqset.AddRange(1, total)
 		messages := make(chan *imap.Message, messageChanBuffer)

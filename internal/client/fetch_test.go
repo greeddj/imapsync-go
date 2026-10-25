@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -622,6 +624,110 @@ func writeFetchResponses(conn net.Conn) {
 		"* 2 FETCH (UID 2 RFC822.SIZE 512 BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)\r\n",
 		len(hdr2), hdr2,
 	)
+}
+
+// countIntercept reports examineCount messages for SELECT and EXAMINE and
+// statusCount for STATUS. It sends the sequence set of each FETCH on fetchSets
+// and answers it with writeFetchResponses.
+func countIntercept(examineCount, statusCount uint32, fetchSets chan<- string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (bool, bool) {
+		switch cmd.verb {
+		case "SELECT", "EXAMINE":
+			writeLine(conn, "* %d EXISTS", examineCount)
+			writeLine(conn, "* 0 RECENT")
+			writeLine(conn, "%s OK [READ-ONLY] %s completed", cmd.tag, cmd.verb)
+		case "STATUS":
+			writeLine(conn, `* STATUS "%s" (MESSAGES %d)`, firstArg(cmd.arg), statusCount)
+			writeLine(conn, "%s OK STATUS completed", cmd.tag)
+		case "FETCH":
+			fetchSets <- firstArg(cmd.arg)
+			writeFetchResponses(conn)
+			writeLine(conn, "%s OK FETCH completed", cmd.tag)
+		default:
+			return false, true
+		}
+		return true, true
+	}
+}
+
+func Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall(t *testing.T) {
+	// Not parallel: TotalAlloc counts every goroutine, so a parallel test would add its own allocations.
+	const (
+		hugeMessageCount uint32 = 1 << 22
+		// The capped hint costs about 3.3 MiB. An uncapped hint for hugeMessageCount costs about 213 MiB.
+		maxScanAlloc uint64 = 16 << 20
+	)
+	wantSeqSet := fmt.Sprintf("1:%d", hugeMessageCount)
+
+	tests := []struct {
+		name         string
+		examineCount uint32
+		statusCount  uint32
+		wantExamine  int
+		wantStatus   int
+		warmUp       bool
+	}{
+		{
+			name:         "count from EXAMINE",
+			examineCount: hugeMessageCount,
+			wantExamine:  1,
+		},
+		{
+			name:         "count from STATUS of the selected folder",
+			examineCount: 2,
+			statusCount:  hugeMessageCount,
+			wantExamine:  1,
+			wantStatus:   1,
+			warmUp:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sets := make(chan string, 2)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, countIntercept(tt.examineCount, tt.statusCount, sets)))
+			c := newClientWithFake(t, srv)
+
+			if tt.warmUp {
+				if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+					t.Fatalf("FetchMessageMap while selecting the folder: %v", err)
+				}
+				if got := <-sets; got != "1:2" {
+					t.Fatalf("FETCH sequence set while selecting the folder = %q, want %q", got, "1:2")
+				}
+			}
+
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			ids, size, err := c.FetchMessageMap(t.Context(), "INBOX")
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("FetchMessageMap: %v", err)
+			}
+
+			if want := map[string]uint32{"ok@host": 1}; !maps.Equal(ids, want) {
+				t.Errorf("ids = %v, want %v", ids, want)
+			}
+			if size != 1536 {
+				t.Errorf("size = %d, want 1536", size)
+			}
+			delta := after.TotalAlloc - before.TotalAlloc
+			t.Logf("FetchMessageMap allocated %.1f MiB", float64(delta)/(1<<20))
+			if delta >= maxScanAlloc {
+				t.Errorf("FetchMessageMap allocated %.1f MiB, want less than %d MiB",
+					float64(delta)/(1<<20), maxScanAlloc>>20)
+			}
+			if got := <-sets; got != wantSeqSet {
+				t.Errorf("FETCH sequence set = %q, want %q (the range must not be capped)", got, wantSeqSet)
+			}
+			if got := srv.callCount("EXAMINE"); got != tt.wantExamine {
+				t.Errorf("EXAMINE count = %d, want %d", got, tt.wantExamine)
+			}
+			if got := srv.callCount("STATUS"); got != tt.wantStatus {
+				t.Errorf("STATUS count = %d, want %d", got, tt.wantStatus)
+			}
+		})
+	}
 }
 
 func TestMessage_MessageID(t *testing.T) {

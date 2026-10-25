@@ -14,6 +14,7 @@
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
   - CRAM-MD5 failure and success;
+  - a very large message count from EXAMINE or STATUS, which must not cause a large allocation;
   - `withCancel` after stop, and shared limiters that draw from one budget.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
