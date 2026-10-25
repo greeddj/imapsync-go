@@ -200,7 +200,7 @@ the confirm prompt with the relevant Workspace IMAP limits:
 
 - 15 simultaneous IMAP connections per account
 - 2,500 MB/day download, 500 MB/day upload via IMAP
-- Exceeding the bandwidth limit suspends the account for 1–24 hours
+- Exceeding the bandwidth limit suspends the account for 1-24 hours
 
 For Gmail, run with explicit throttling so the daily quotas don't trigger an
 account lockout mid-migration:
@@ -215,15 +215,15 @@ imapsync-go sync \
 
 `--max-connections 10` reserves one slot for the planning client, leaving 9
 slots for workers. `-w 9` matches that ceiling; setting `-w` higher than
-`maxConn−1` is harmless — the cap is enforced automatically.
+`maxConn−1` is harmless - the cap is enforced automatically.
 
-The defaults (no throttle) match `imapsync`'s default behaviour — they're
+The defaults (no throttle) match `imapsync`'s default behaviour - they're
 appropriate for self-hosted IMAP servers on a LAN, not for big-provider
 mailboxes.
 
 ## Notes
 
-- **Ctrl-C** exits with code 130 and prints `Cancelled.` — this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
+- **Ctrl-C** exits with code 130 and prints `Cancelled.` - this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
 - **Ctrl+\\** (SIGQUIT) writes the stacks of all goroutines to stderr and exits with code 131.
 - **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default. Other commands and `--help` make no request.
 

@@ -10,7 +10,7 @@ import (
 // ErrClass categorizes IMAP errors so that the reconnect machinery can pick a
 // strategy: retry quickly, give up, or back off for a long time.
 //
-// Classification is heuristic — IMAP responses are textual and there is no
+// Classification is heuristic - IMAP responses are textual and there is no
 // standard error code, so we match on error strings emitted by go-imap and the
 // most common server-side messages (Gmail in particular).
 type ErrClass int
@@ -95,7 +95,7 @@ func classifyError(err error) ErrClass {
 }
 
 // isRetryable reports whether reconnect-and-retry should be attempted for err.
-// ClassThrottled is intentionally NOT retryable here — the caller is expected
+// ClassThrottled is intentionally NOT retryable here - the caller is expected
 // to surface it to the user, which gets clearer behaviour than a stuck loop.
 func isRetryable(err error) bool {
 	return classifyError(err) == ClassTransient
@@ -103,7 +103,7 @@ func isRetryable(err error) bool {
 
 // isAlreadyExistsErr matches the two phrasings IMAP servers use to refuse a
 // CREATE for a mailbox that already exists. Confined to this package so the
-// app layer does not have to grep server text — see go-style.md.
+// app layer does not have to grep server text - see go-style.md.
 func isAlreadyExistsErr(err error) bool {
 	if err == nil {
 		return false

@@ -7,7 +7,7 @@ import "strings"
 //
 // Numbers come from imapsync's empirical recommendations (FAQ.Gmail.txt) and
 // from the official Workspace bandwidth documentation. They are guidance, not
-// hard constants — a server may tighten or relax them at any time.
+// hard constants - a server may tighten or relax them at any time.
 type Provider struct {
 	Name           string
 	Notes          string
@@ -38,7 +38,7 @@ var knownProviders = map[string]Provider{
 func DetectProvider(serverAddr string) (Provider, bool) {
 	host := serverAddr
 	if i := strings.LastIndex(host, ":"); i >= 0 {
-		// Trim port only if what follows looks numeric — guards against IPv6
+		// Trim port only if what follows looks numeric - guards against IPv6
 		// literals being mangled, though we don't expect them here.
 		port := host[i+1:]
 		if port != "" && allDigits(port) {

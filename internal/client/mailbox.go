@@ -71,9 +71,8 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 			return false, ctx.Err()
 		}
 		// Another client (or our own stale cache) created the folder
-		// between hasMailbox() and Create(). Treat as idempotent success
-		// — but still refresh the cache so subsequent lookups skip the
-		// LIST round-trip.
+		// between hasMailbox() and Create(). Treat as idempotent success,
+		// and record the folder so later lookups see it.
 		if isAlreadyExistsErr(err) {
 			c.addMailboxToCache(name)
 			return false, nil
@@ -222,7 +221,7 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 			case err == nil:
 				mbox.Size = size
 			case ctx.Err() != nil:
-				// canceled — outer loop will bail
+				// canceled - outer loop will bail
 			case c.verbose:
 				c.log("[%s] failed to size %s: %v", c.prefix, mbox.Name, err)
 			}
@@ -257,7 +256,7 @@ func (c *Client) getFolderSize(ctx context.Context, folder string) (uint64, erro
 			return err
 		}
 		// selectIfNeeded returns nil when the folder is already selected
-		// on this connection — fall back to STATUS for the count, same as
+		// on this connection - fall back to STATUS for the count, same as
 		// FetchMessageMap does.
 		var total uint32
 		if mbox != nil {

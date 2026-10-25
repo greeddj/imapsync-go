@@ -3,7 +3,7 @@ description: Hand the task to the `architect` agent. Architect validates, plans,
 argument-hint: <free-form task description>
 ---
 
-Invoke the `architect` subagent with the task below. Pass the user's request verbatim. Do not pre-process. Do not implement anything yourself — the architect decides whether to proceed, what to delegate, and to whom.
+Invoke the `architect` subagent with the task below. Pass the user's request verbatim. Do not pre-process. Do not implement anything yourself - the architect decides whether to proceed, what to delegate, and to whom.
 
 Task from user:
 

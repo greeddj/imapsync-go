@@ -397,7 +397,7 @@ func Test_runFolderSync_persistentLogOnlyUnderVerbose(t *testing.T) {
 			sb := &syncBuffer{}
 			// numTrackers=2: one for the plan, one sentinel that stays active so
 			// the final renderTrackers pass (triggered by Stop) is not skipped by
-			// the LengthActive()==0 short-circuit — that short-circuit would drop
+			// the LengthActive()==0 short-circuit - that short-circuit would drop
 			// any queued pw.Log lines before they reach the output writer.
 			pw := progress.NewWriter(2, true)
 			pw.SetOutputWriter(sb)

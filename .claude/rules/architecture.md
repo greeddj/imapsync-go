@@ -1,23 +1,23 @@
 # Architectural invariants
 
-Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emphasis, not new rules.
+Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphasis, not new rules.
 
 ## Non-negotiable layering
 
 - `cmd/...` imports `internal/...`. **Never the other way around.**
 - `internal/client` defines its own minimal `ProgressWriter` / `ProgressTracker` interfaces. It must not import `internal/progress` (which pulls in go-pretty). Same shape for any future cross-package callback: declare the interface where it is consumed, satisfy it where it is produced.
-- `internal/progress` and `internal/ratelimit` are leaves — they depend on stdlib + one external package each. Keep them that way.
+- `internal/progress` and `internal/ratelimit` are leaves - they depend on stdlib + one external package each. Keep them that way.
 - `internal/termsafe` is a leaf that uses only the standard library. It must not import `internal/progress`. Keep it that way, so `internal/client` can import it without a path to go-pretty.
-- `internal/app` orchestrates; it owns the worker pool, the plan, and the confirmation prompts. It does not reach into `*imap.*` types — that abstraction lives in `internal/client`.
+- `internal/app` orchestrates; it owns the worker pool, the plan, and the confirmation prompts. It does not reach into `*imap.*` types - that abstraction lives in `internal/client`.
 - `ActionSync` / `ActionShow` stay thin adapters that pass `client.Options{UseTLS: true}` to `runSync` / `runShow`. Only tests pass plaintext options. A config, flag or environment switch for plaintext is a security review point.
 
 ## Sync flow invariants
 
-1. **Plan, confirm, execute** — never stream-as-you-go. The Message-Id diff must be computed and shown before any write to the destination. `--quiet` hides the plan, so it requires `--confirm`.
+1. **Plan, confirm, execute** - never stream-as-you-go. The Message-Id diff must be computed and shown before any write to the destination. `--quiet` hides the plan, so it requires `--confirm`.
 2. **Idempotency = Message-Id diff**, not UID bookkeeping. Do not add a state store.
-3. **`BODY.PEEK[...]` everywhere a body or header is fetched** — `FetchRFC822` sets `\Seen` on the source, which is a write a sync tool must not perform.
-4. **`AppendMessage` streams the literal** — `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. Transient mid-APPEND failures are tolerated because the next run re-diffs.
-5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch — servers reject longer arg lists.
+3. **`BODY.PEEK[...]` everywhere a body or header is fetched** - `FetchRFC822` sets `\Seen` on the source, which is a write a sync tool must not perform.
+4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. Transient mid-APPEND failures are tolerated because the next run re-diffs.
+5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch - servers reject longer arg lists.
 6. **`selectIfNeeded` over `cli.Select`.** Generation-aware caching saves a round-trip per batch and is invalidated correctly on reconnect.
 7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
 
@@ -48,7 +48,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 ## Concurrency
 
 - Workers are clamped `[1, 10]` in `config.New`. A value out of range changes to the nearest limit. Do not surface this as a runtime panic.
-- Folder creation uses per-path `sync.Mutex` from `Client.folderLocks`. Do not replace with a global mutex — concurrent creates of unrelated paths must not serialise.
+- Folder creation uses per-path `sync.Mutex` from `Client.folderLocks`. Do not replace with a global mutex - concurrent creates of unrelated paths must not serialise.
 - The worker pool is **persistent**: each worker owns one src + one dst `Client` for the whole sync. Do not reconnect per plan.
 
 ## Tooling invariants

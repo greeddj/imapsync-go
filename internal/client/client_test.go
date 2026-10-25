@@ -26,7 +26,7 @@ import (
 // callers (FetchMessageMap, StreamMessagesByUIDs, getFolderSize) all rely on:
 // a second call for the same folder on the same connection generation does
 // not touch the underlying imapclient.Client. The test passes a nil cli on
-// purpose — if short-circuit breaks, the call will panic on nil deref.
+// purpose - if short-circuit breaks, the call will panic on nil deref.
 func TestSelectIfNeeded_shortCircuitsWhenSameFolder(t *testing.T) {
 	t.Parallel()
 
@@ -64,7 +64,7 @@ func TestSelectIfNeeded_differentFolderRequiresFreshSelect(t *testing.T) {
 
 // Test_safeCall_retriesTransient asserts that safeCall reconnects and retries fn
 // when fn returns a transient (io.EOF) error, and returns nil on the retry.
-// Sequential — swaps the package-level sleepCtx var (used by reconnect).
+// Sequential - swaps the package-level sleepCtx var (used by reconnect).
 func Test_safeCall_retriesTransient(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newClientWithFake(t, srv)
@@ -152,7 +152,7 @@ func Test_safeCall_doesNotRetryThrottled(t *testing.T) {
 
 // Test_reconnect_bumpsConnGen asserts that every successful reconnect
 // increments the generation counter.
-// Sequential — swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_bumpsConnGen(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newClientWithFake(t, srv)
@@ -174,7 +174,7 @@ func Test_reconnect_bumpsConnGen(t *testing.T) {
 
 // Test_reconnect_clearsSelectedFolder asserts that reconnect resets the
 // cached selected-folder pointer so the next safeCall re-issues SELECT.
-// Sequential — swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_clearsSelectedFolder(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newClientWithFake(t, srv)
@@ -198,7 +198,7 @@ func Test_reconnect_clearsSelectedFolder(t *testing.T) {
 
 // Test_reconnect_throttledBackoff asserts that when connectAndLogin returns a
 // throttled error, reconnect calls sleepCtx with throttledBackoff (5m).
-// Sequential — swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_throttledBackoff(t *testing.T) {
 	srv := newFakeServer(t)
 
@@ -274,7 +274,7 @@ func Test_selectIfNeeded_shortCircuitsOnNetwork(t *testing.T) {
 
 // Test_selectIfNeeded_afterReconnect_reSelects asserts that after a reconnect
 // (which clears selectedFolder), selectIfNeeded issues a fresh EXAMINE.
-// Sequential — swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_selectIfNeeded_afterReconnect_reSelects(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newClientWithFake(t, srv)

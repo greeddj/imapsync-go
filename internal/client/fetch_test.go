@@ -506,7 +506,7 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 		t.Errorf("expected key ok@host in map, got %v", result)
 	}
 	if totalSize == 0 {
-		t.Error("totalSize = 0, want > 0 — RFC822.SIZE not aggregated from fake server response")
+		t.Error("totalSize = 0, want > 0 - RFC822.SIZE not aggregated from fake server response")
 	}
 
 	var foundLog bool

@@ -45,7 +45,7 @@ func LatestVersion(version string) string {
 }
 
 // latestTag fetches the latest release tag from GitHub. Skipped entirely when
-// IMAPSYNC_OFFLINE or CI is set — a surprise outbound HTTPS call on every
+// IMAPSYNC_OFFLINE or CI is set - a surprise outbound HTTPS call on every
 // --version is bad UX in air-gapped or rate-limited environments.
 func latestTag() string {
 	if os.Getenv("IMAPSYNC_OFFLINE") != "" || os.Getenv("CI") != "" {

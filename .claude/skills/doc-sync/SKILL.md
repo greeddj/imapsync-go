@@ -12,7 +12,7 @@ Read [.claude/rules/docs.md](../../rules/docs.md) first.
 | Doc surface | Source of truth for its content |
 |---|---|
 | CLAUDE.md "Common commands" | `Justfile` (`just --list`) |
-| CLAUDE.md "Architecture" sections 1–5 | `internal/` layout and behaviour |
+| CLAUDE.md "Architecture" sections 1-6 | `internal/` layout and behaviour |
 | CLAUDE.md "Conventions" | `internal/config/config.go`, CLI flag definitions, vendored state |
 | README.md install/run | binary name, Justfile targets |
 | README.md examples | actual CLI flags and config examples |
@@ -49,7 +49,7 @@ Every field tagged here must appear in both example files.
 
 ## When the two example configs disagree
 
-They must have the same set of fields and equivalent values. If they don't, fix the one that drifted — usually you can infer which is current by checking the most recent commit that touched `internal/config/config.go`.
+They must have the same set of fields and equivalent values. If they don't, fix the one that drifted - usually you can infer which is current by checking the most recent commit that touched `internal/config/config.go`.
 
 ## When code and docs disagree and you can't tell which is right
 

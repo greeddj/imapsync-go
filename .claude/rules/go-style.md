@@ -5,7 +5,7 @@ These rules are stricter than the Go community defaults. The architect enforces 
 ## Allocations and ressources
 
 - Prefer streaming to buffering. Examples already in the codebase: `AppendMessage` hands `msg.GetBody(...)` straight to `cli.Append` rather than `io.ReadAll`; `StreamMessagesByUIDs` ranges over a channel of messages, not a slice.
-- Pre-size slices and maps when the upper bound is known (`make([]T, 0, n)`, `make(map[K]V, n)`). The sync planner does this for UID slices — follow the pattern.
+- Pre-size slices and maps when the upper bound is known (`make([]T, 0, n)`, `make(map[K]V, n)`). The sync planner does this for UID slices - follow the pattern.
 - Avoid `fmt.Sprintf` on hot paths. Use `strconv` or `strings.Builder` when concatenating in a loop.
 - `[]byte`/`string` conversions are not free. Don't roundtrip when a byte slice would do.
 - `bytes.Buffer` / `strings.Builder` over `+=`.
@@ -17,7 +17,7 @@ These rules are stricter than the Go community defaults. The architect enforces 
 - One channel direction per parameter (`chan<- T`, `<-chan T`) at function boundaries.
 - Goroutines created in library code must have a defined termination condition tied to the caller's context. No fire-and-forget.
 - `errgroup.Group` with a context-derived cancel for fan-out (`internal/app/show.go` uses this for parallel `ListMailboxes`).
-- Atomic access to fields that cross goroutines (`atomic.Pointer`, `atomic.Int64`). Mixing atomics with mutex-protected fields in the same struct is a smell — pick one.
+- Atomic access to fields that cross goroutines (`atomic.Pointer`, `atomic.Int64`). Mixing atomics with mutex-protected fields in the same struct is a smell - pick one.
 
 ## Errors
 
@@ -29,23 +29,23 @@ These rules are stricter than the Go community defaults. The architect enforces 
 ## API shape
 
 - Constructors take a context as the first parameter when they perform I/O (`client.New(ctx, ...)`).
-- Optional arguments live in an `Options` struct — never positional bools. See `client.Options`.
-- Exported names are nouns for types, verbs for methods. Avoid stutter (`client.Client` is acceptable for the package; `client.NewClient` is not — use `client.New`).
+- Optional arguments live in an `Options` struct - never positional bools. See `client.Options`.
+- Exported names are nouns for types, verbs for methods. Avoid stutter (`client.Client` is acceptable for the package; `client.NewClient` is not - use `client.New`).
 - No package-level mutable state.
 
 ## Comments
 
 - Default: **no comment**. Identifiers should explain themselves.
 - Write a comment only when WHY is non-obvious: an invariant, a workaround for a specific bug, a deliberately surprising choice.
-- Never describe WHAT — the reader can read the code.
+- Never describe WHAT - the reader can read the code.
 - Never reference the current task / PR / issue / "added for X". Those belong in the commit message and rot in the source.
 - Exported types and functions need a single-line godoc starting with the identifier name, only when the identifier is part of a public-ish surface (i.e. used across packages). Internal helpers don't.
 
 ## Tests
 
 - One `_test.go` per source file. Subtests with `t.Run`, table-driven where the cases share shape.
-- Test names: `TestFunc_When_Then` or `TestFunc_Case` — readable English in the subtest name, not a punctuation soup.
-- Use the real types — no mocks of internal packages. For IMAP, use the same `client.Client` and dial a fake (see existing tests). For nothing else.
+- Test names: `TestFunc_When_Then` or `TestFunc_Case` - readable English in the subtest name, not a punctuation soup.
+- Use the real types - no mocks of internal packages. For IMAP, use the same `client.Client` and dial a fake (see existing tests). For nothing else.
 - `t.Helper()` on any helper.
 - `t.Cleanup` over `defer` in tests that mutate global state.
 - `t.Parallel()` whenever possible.

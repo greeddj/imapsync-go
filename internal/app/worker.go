@@ -62,7 +62,7 @@ func logoutAll(clients ...*client.Client) {
 }
 
 // newSyncWorkerPool constructs n workers up-front. If any single worker fails
-// to connect, every preceding worker is closed before the error returns —
+// to connect, every preceding worker is closed before the error returns -
 // otherwise we'd leak partially-open IMAP sessions.
 func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts client.Options, n int) (*syncWorkerPool, error) {
 	pool := &syncWorkerPool{all: make([]*syncWorker, 0, n)}
@@ -110,7 +110,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	tr.UpdateTotal(int64(p.NewMessages))
 	tr.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIdx+1, planCount, srcShown, dstShown))
 
-	// lastUpdate throttles the per-message message-string update — it lives
+	// lastUpdate throttles the per-message message-string update - it lives
 	// on the worker goroutine, so an unsynchronized time.Time is fine.
 	var lastUpdate time.Time
 	var lastErrMsg string

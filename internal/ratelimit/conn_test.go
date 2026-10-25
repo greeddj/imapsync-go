@@ -78,7 +78,7 @@ func TestConnWriteThrottles(t *testing.T) {
 	}
 
 	start := time.Now()
-	// Write 256 bytes — at 1 KB/s, this should take ~250 ms.
+	// Write 256 bytes - at 1 KB/s, this should take ~250 ms.
 	payload := make([]byte, 256)
 	if _, err := c.Write(payload); err != nil {
 		t.Fatalf("Write: %v", err)

@@ -4,13 +4,13 @@ Authoritative description of how `architect`, `developer`, `tester`, `security` 
 
 ## Roles in one line
 
-- **architect** (opus) — gatekeeper, planner, reviewer of architecture. Sole entry point for non-trivial changes. May reject. Delegates to others.
-- **developer** (sonnet) — implements what architect specifies; writes code + comments + unit tests; runs targeted `just lint` / `just test` on changed packages.
+- **architect** (opus) - gatekeeper, planner, reviewer of architecture. Sole entry point for non-trivial changes. May reject. Delegates to others.
+- **developer** (sonnet) - implements what architect specifies; writes code + comments + unit tests; runs targeted `just lint` / `just test` on changed packages.
 - **tester** (sonnet) - runs full test suite, audits coverage, identifies missing cases, marks deliberate exclusions in [testing.md](testing.md).
-- **security** (opus) — CVE / dependency audit; static review of attack surface (auth, parsing, network, file I/O, command exec); reasons about combined risk that a single-file review would miss.
-- **tech-writer** (sonnet) — verifies comments match the project rule "default to no comments, only WHY-comments"; refreshes `CLAUDE.md` and `README.md` when behaviour changed.
+- **security** (opus) - CVE / dependency audit; static review of attack surface (auth, parsing, network, file I/O, command exec); reasons about combined risk that a single-file review would miss.
+- **tech-writer** (sonnet) - verifies comments match the project rule "default to no comments, only WHY-comments"; refreshes `CLAUDE.md` and `README.md` when behaviour changed.
 
-## Default flow — architect-led with delegation
+## Default flow - architect-led with delegation
 
 Used when the architect agent has the `Agent` tool available. Main thread only kicks off the architect and receives the final report.
 
@@ -22,9 +22,9 @@ Step by step:
 
 1. **main thread** distils the user's intent into a concrete, file-grounded brief and hands it to `architect`.
 2. **architect** reads `CLAUDE.md`, the directories the change touches, and `git log`. Validates the brief against the layering rules in [architecture.md](architecture.md). Three outcomes:
-   - **reject** — back to main thread with the reason and a counter-proposal.
-   - **clarify** — ask main thread one focused question.
-   - **proceed** — write a precise implementation brief for `developer` (files to touch, contracts to preserve, tests to add).
+   - **reject** - back to main thread with the reason and a counter-proposal.
+   - **clarify** - ask main thread one focused question.
+   - **proceed** - write a precise implementation brief for `developer` (files to touch, contracts to preserve, tests to add).
 3. **developer** implements, writes WHY-comments only (see [go-style.md](go-style.md)), adds unit tests, runs `just lint` and `just test` on the changed packages, and reports a structured diff + test summary to `architect`.
 4. **architect** reviews the diff against the original brief. Either sends a correction back to `developer` or proceeds.
 5. **architect** writes a test brief for `tester` (which packages to focus on, which edge cases to verify, which invariants must be exercised).
@@ -35,7 +35,7 @@ Step by step:
 10. When the code is at "written, won't get better" level, `architect` calls `tech-writer` to verify/update comments and docs.
 11. **tech-writer** confirms, `architect` reports completion back to main thread with: summary, files changed, test coverage delta, security verdict, doc updates.
 
-## Fallback flow — main-thread orchestration
+## Fallback flow - main-thread orchestration
 
 If subagents cannot call `Agent` themselves (sandboxed mode), main thread plays the architect's dispatcher role:
 
@@ -54,7 +54,7 @@ The semantics are identical; only who holds the pen changes.
 ## Hard rules
 
 - The architect is the **only** agent that talks to the main thread mid-flight. Other agents always report to whoever called them.
-- The architect never writes code — it only reads, plans, reviews, delegates.
+- The architect never writes code - it only reads, plans, reviews, delegates.
 - The developer never escalates scope on its own. If something outside the brief looks wrong, it reports and asks; it does not silently refactor.
 - The tester never deletes or weakens existing tests without architect approval.
 - The security agent is non-blocking for trivial doc/test-only changes; the architect may skip it for those.

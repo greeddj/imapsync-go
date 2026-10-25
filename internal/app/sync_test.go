@@ -70,7 +70,7 @@ func TestBuildProviderWarning_gmailDst_withLimiter_omitsRecommendation(t *testin
 		Dst:     config.Credentials{Server: "imap.gmail.com:993"},
 		Workers: 4,
 	}
-	// A non-nil limiter signals "user already configured throttle" — the
+	// A non-nil limiter signals "user already configured throttle" - the
 	// warning must not nag with another recommendation.
 	dstLim := ratelimit.NewLimiter(300_000)
 	got := buildProviderWarning(cfg, nil, dstLim)
@@ -257,7 +257,7 @@ func makePlanPW() (*progress.Writer, *progress.Tracker, *progress.Tracker) {
 // Test_buildSyncPlan_emptySrc_returnsNoPlans asserts the "already in sync"
 // short-circuit: when src has zero messages, the plan list is empty.
 func Test_buildSyncPlan_emptySrc_returnsNoPlans(t *testing.T) {
-	// Not t.Parallel() — per-connection handler state is shared with the
+	// Not t.Parallel() - per-connection handler state is shared with the
 	// fakeServer acceptLoop, and parallel tests would race on connHandlerIdx.
 
 	srcSrv := newFakeServer(t)
@@ -282,7 +282,7 @@ func Test_buildSyncPlan_emptySrc_returnsNoPlans(t *testing.T) {
 }
 
 // Test_buildSyncPlan_messageIdDiff_correct asserts the Message-Id diff: src
-// has a@x, b@x, c@x at UIDs 1–3; dst has only b@x → plan must contain UIDs
+// has a@x, b@x, c@x at UIDs 1-3; dst has only b@x → plan must contain UIDs
 // 1 and 3 (sorted), NewMessages==2, DestinationFolderExists==true.
 func Test_buildSyncPlan_messageIdDiff_correct(t *testing.T) {
 	srcSrv := newFakeServer(t)
@@ -756,7 +756,7 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	if want := "Found subfolder: INBOX/Sub"; !strings.Contains(out.String(), want) {
 		t.Errorf("output %q does not contain %q", out.String(), want)
 	}
-	if want := "Mapping \"INBOX/Sub\" skipped \u2014 already covered by a parent mapping's expansion"; !strings.Contains(out.String(), want) {
+	if want := "Mapping \"INBOX/Sub\" skipped - already covered by a parent mapping's expansion"; !strings.Contains(out.String(), want) {
 		t.Errorf("output %q does not contain %q", out.String(), want)
 	}
 }
@@ -869,7 +869,7 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 			srcFolderCount: 2,
 		}
 
-		// First call: only one side arrived — must not diff yet.
+		// First call: only one side arrived - must not diff yet.
 		if maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned true on first call, want false")
 		}
@@ -877,7 +877,7 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 			t.Fatal("maps freed prematurely after first call")
 		}
 
-		// Second call: both sides arrived — diff fires.
+		// Second call: both sides arrived - diff fires.
 		if !maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned false on second call, want true")
 		}
@@ -918,12 +918,12 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 			dstIDs: map[string]struct{}{"b@x": {}},
 		}
 
-		// First call: one side arrived — no diff yet.
+		// First call: one side arrived - no diff yet.
 		if maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned true on first call, want false")
 		}
 
-		// Second call: both sides arrived — error branch must free maps and
+		// Second call: both sides arrived - error branch must free maps and
 		// leave the plan empty.
 		if !maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned false on second call, want true")
@@ -957,12 +957,12 @@ func Test_maybeDiff_freesMaps(t *testing.T) {
 			dstIDs: map[string]struct{}{"b@x": {}},
 		}
 
-		// First call: one side arrived — no diff yet.
+		// First call: one side arrived - no diff yet.
 		if maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned true on first call, want false")
 		}
 
-		// Second call: both sides arrived — dstErr branch must free maps and
+		// Second call: both sides arrived - dstErr branch must free maps and
 		// leave the plan empty.
 		if !maybeDiff(s, 0, mappings, plans, &totalNew, &totalNewSize) {
 			t.Fatal("maybeDiff returned false on second call, want true")
@@ -1140,7 +1140,7 @@ func Test_buildSyncPlan_cancelHaltsBothSides(t *testing.T) {
 	}
 	mailboxes := []string{"INBOX"}
 
-	// Both sides sleep 300ms per EXAMINE — long enough that we can cancel mid-flight.
+	// Both sides sleep 300ms per EXAMINE - long enough that we can cancel mid-flight.
 	srcSrv.addConnHandler(slowExamineHandler(srcSrv, mailboxes, msgs, 300*time.Millisecond))
 	dstSrv.addConnHandler(slowExamineHandler(dstSrv, mailboxes, msgs, 300*time.Millisecond))
 

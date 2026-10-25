@@ -18,7 +18,7 @@ import (
 // terminating CRLF, with PEEK so the source's \Seen flag is unchanged.
 //
 // Every Fetch method below uses this section instead of FetchEnvelope. On
-// large folders this is dramatically less data on the wire — Envelope also
+// large folders this is dramatically less data on the wire - Envelope also
 // pulls From/To/Cc/Bcc/Subject/Date/References/InReplyTo, which we don't
 // need for the planning diff.
 var messageIDHeaderSection = &imap.BodySectionName{
@@ -51,7 +51,7 @@ func (m Message) MessageID() string {
 // the sum of RFC822.SIZE across all messages.
 //
 // One pass over the folder yields all three pieces. Messages without a usable
-// Message-Id are counted and reported once via the progress writer — without
+// Message-Id are counted and reported once via the progress writer - without
 // that header the diff has no key to match on, so they cannot be tracked
 // across servers and will be silently skipped. The folder-wide size total is
 // used by callers (sync preview) to estimate transfer volume; messages without
@@ -109,7 +109,7 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		messages := make(chan *imap.Message, messageChanBuffer)
 		done := make(chan error, 1)
 		// RFC822.SIZE is part of the same FETCH so the size total comes
-		// free with the diff scan — no extra round-trip per folder.
+		// free with the diff scan - no extra round-trip per folder.
 		items := []imap.FetchItem{messageIDHeaderSection.FetchItem(), imap.FetchUid, imap.FetchRFC822Size}
 		go func() { done <- cli.Fetch(seqset, items, messages) }()
 
@@ -133,7 +133,7 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 
 	if err == nil && missingCount > 0 {
 		if pw := c.progressWriter(); pw != nil {
-			pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped — sync cannot track them",
+			pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped - sync cannot track them",
 				c.prefix, termsafe.Escape(folder), missingCount)
 		}
 	}
@@ -215,7 +215,7 @@ func trimAngleBrackets(id string) string {
 
 // StreamMessagesByUIDs fetches the bodies for the given UIDs in batches and
 // invokes onMessage for each as it arrives. The caller is expected to feed in
-// UIDs already filtered against the destination — typically the result of a
+// UIDs already filtered against the destination - typically the result of a
 // Message-Id diff produced from two FetchMessageMap calls.
 //
 // Streaming avoids materializing every body into memory at once; large

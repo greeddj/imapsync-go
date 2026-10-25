@@ -46,7 +46,7 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	// total rendered width MUST stay strictly below the terminal width.
 	// If it equals terminalWidth, some terminals wrap the trailing space
 	// to the next line, and go-pretty's cursor-up + erase-line redraw
-	// cycle then strips only the wrapped portion — the original line
+	// cycle then strips only the wrapped portion - the original line
 	// becomes a "zombie" on screen that StopAndClear cannot erase.
 	//
 	// The stats portion (percent + bar + time + separators) is bounded

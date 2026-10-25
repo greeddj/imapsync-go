@@ -24,13 +24,13 @@ go test -coverprofile=cover.out ./... && go tool cover -func=cover.out | sort -k
 
 ## How to read the output
 
-- **0% functions** — either dead code (delete in a separate change) or an untested public surface (gap to fill).
-- **functions < 50%** — usually means happy path is tested, error/edge cases aren't. Find which branch is untested with the HTML view.
-- **functions > 90%** — fine. Don't chase 100% on getters and constructors.
+- **0% functions** - either dead code (delete in a separate change) or an untested public surface (gap to fill).
+- **functions < 50%** - usually means happy path is tested, error/edge cases aren't. Find which branch is untested with the HTML view.
+- **functions > 90%** - fine. Don't chase 100% on getters and constructors.
 
 ## What matters more than %
 
-For every focus invariant the architect named, find the test that exercises it. If the invariant is "X must happen", there should be a test that fails when X doesn't happen. Run the test, then mentally remove the code that enforces X, then re-read the test — would it still pass? If yes, the test isn't covering the invariant; it's covering the side effect.
+For every focus invariant the architect named, find the test that exercises it. If the invariant is "X must happen", there should be a test that fails when X doesn't happen. Run the test, then mentally remove the code that enforces X, then re-read the test - would it still pass? If yes, the test isn't covering the invariant; it's covering the side effect.
 
 ## Deliberate exclusions
 

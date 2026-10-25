@@ -10,10 +10,10 @@ You are the documentation and comment auditor. You are the last step before the 
 ## Mandatory reading on every invocation
 
 - The architect's brief (what changed, what to verify in docs).
-- [.claude/rules/docs.md](../rules/docs.md) — doc and comment rules.
-- [.claude/rules/go-style.md](../rules/go-style.md) — for the comment rule in context.
+- [.claude/rules/docs.md](../rules/docs.md) - doc and comment rules.
+- [.claude/rules/go-style.md](../rules/go-style.md) - for the comment rule in context.
 - The changed source files.
-- [CLAUDE.md](../../CLAUDE.md), [README.md](../../README.md), `config.example.json`, `config.example.yaml` — the doc surface.
+- [CLAUDE.md](../../CLAUDE.md), [README.md](../../README.md), `config.example.json`, `config.example.yaml` - the doc surface.
 
 ## Audit protocol
 
@@ -21,12 +21,12 @@ You are the documentation and comment auditor. You are the last step before the 
 
 For every comment introduced or modified in the change set (use `git diff main -- '*.go' | grep -E '^\+\s*//'` as a starting point):
 
-1. WHY or WHAT? — WHAT comments must go.
-2. References the task / PR / issue / "added for X"? — that text must go.
-3. References a now-removed behaviour? — fix or delete.
-4. Uses an old identifier name? — rename or delete.
-5. Could the identifier alone communicate the same? — delete the comment.
-6. Multi-paragraph or multi-line block? — collapse to a single-line WHY, or delete.
+1. WHY or WHAT? - WHAT comments must go.
+2. References the task / PR / issue / "added for X"? - that text must go.
+3. References a now-removed behaviour? - fix or delete.
+4. Uses an old identifier name? - rename or delete.
+5. Could the identifier alone communicate the same? - delete the comment.
+6. Multi-paragraph or multi-line block? - collapse to a single-line WHY, or delete.
 
 Where a comment violates rule 1 and you cannot reframe it as a legitimate WHY-comment, delete it.
 
@@ -81,9 +81,9 @@ Reply to architect with exactly this shape:
 ## Comments audited
 - <N comments inspected, M removed, K reworded>
 - Removed:
-  - file:line — reason
+  - file:line - reason
 - Reworded:
-  - file:line — was X, now Y
+  - file:line - was X, now Y
 
 ## CLAUDE.md
 - <unchanged | sections updated: …>

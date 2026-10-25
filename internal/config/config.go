@@ -48,7 +48,7 @@ type Config struct {
 // corresponding limiter is not constructed at all.
 //
 // MaxConnections caps the simultaneous IMAP sessions per side. Many providers
-// enforce this server-side (Gmail = 15) — exceeding it earns a temporary ban.
+// enforce this server-side (Gmail = 15) - exceeding it earns a temporary ban.
 type RateLimit struct {
 	DownBPS        int `json:"down_bps"        yaml:"down_bps"`
 	UpBPS          int `json:"up_bps"          yaml:"up_bps"`
@@ -115,12 +115,12 @@ func New(c *cli.Command) (*Config, error) {
 	}
 
 	// Clamp worker count to [minWorkers, maxWorkers]. The user-facing default
-	// (4) lives on the CLI flag — config only enforces the safe range, so an
+	// (4) lives on the CLI flag - config only enforces the safe range, so an
 	// out-of-range value is corrected without silently falling back to 1.
 	cfg.Workers = clampWorkers(c.Int("workers"))
 
 	// CLI flags take precedence when the user explicitly sets them; config
-	// values fill in only the unset fields. We use 0 as "unset" — that also
+	// values fill in only the unset fields. We use 0 as "unset" - that also
 	// happens to be the "unlimited" sentinel, which is fine: a config-set
 	// value of 0 means the same thing.
 	if v := c.Int("bps-down"); v != 0 {

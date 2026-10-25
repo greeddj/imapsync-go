@@ -108,7 +108,7 @@ func TestNew_unknownExtensionReturnsError(t *testing.T) {
 
 func TestNew_missingFileReturnsError(t *testing.T) {
 	t.Parallel()
-	// Manually drive New with a config flag pointing at a non-existent path —
+	// Manually drive New with a config flag pointing at a non-existent path -
 	// we cannot reuse runNewWithArgs because it always writes the file.
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "does-not-exist.json")

@@ -9,7 +9,7 @@ Read [.claude/rules/security.md](../../rules/security.md) first.
 
 ## Threat model in one paragraph
 
-The operator running the binary is trusted. The IMAP servers and the network between them are partially trusted — they may be slow, hostile, or compromised. The local host must not be put at risk by anything the binary does in response to server input. The binary does not listen; if it did, that would be a separate threat model that does not exist yet.
+The operator running the binary is trusted. The IMAP servers and the network between them are partially trusted - they may be slow, hostile, or compromised. The local host must not be put at risk by anything the binary does in response to server input. The binary does not listen; if it did, that would be a separate threat model that does not exist yet.
 
 ## Standing checks (run every time)
 
@@ -23,7 +23,7 @@ go tool staticcheck ./...   # additional smells
 
 ## Combined-surface checks
 
-Run these greps on the changed files explicitly — single-file review misses them:
+Run these greps on the changed files explicitly - single-file review misses them:
 
 ```sh
 # IMAP ops bypassing safeCall
@@ -52,15 +52,15 @@ If `internal/client/client.go` changed:
 - `maxReconnectAttempts` still ≤ 5?
 - `throttledBackoff` still ≥ 5m?
 
-Any weakening makes the binary look like an attacker to the remote — that's both a security and a reputation issue.
+Any weakening makes the binary look like an attacker to the remote - that's both a security and a reputation issue.
 
 ## Severity calibration for this repo
 
-- **Critical** — credentials leaked to stdout / log / error message; arbitrary code exec from server input; arbitrary file write from server input.
-- **High** — TLS verification disabled by default; new listening socket; race that could land messages in the wrong folder.
-- **Medium** — IMAP op bypassing `safeCall`; new goroutine without `ctx`; new direct dep with unaudited CVE history; reconnect protections weakened.
-- **Low** — verbose error message that leaks server-side info to the user (not a remote disclosure but harms least-privilege).
-- **Info** — style / defence-in-depth suggestion with no concrete attack.
+- **Critical** - credentials leaked to stdout / log / error message; arbitrary code exec from server input; arbitrary file write from server input.
+- **High** - TLS verification disabled by default; new listening socket; race that could land messages in the wrong folder.
+- **Medium** - IMAP op bypassing `safeCall`; new goroutine without `ctx`; new direct dep with unaudited CVE history; reconnect protections weakened.
+- **Low** - verbose error message that leaks server-side info to the user (not a remote disclosure but harms least-privilege).
+- **Info** - style / defence-in-depth suggestion with no concrete attack.
 
 ## Reporting
 

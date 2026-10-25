@@ -8,14 +8,14 @@
 
 ## What we test
 
-- **`internal/config`** — JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), env interpolation.
+- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), env interpolation.
 - **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries, reconnect generation bump, Select-cache short-circuit, AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
   - CRAM-MD5 failure and success;
   - `withCancel` after stop, and shared limiters that draw from one budget.
-- **`internal/ratelimit`** — token starvation, nil-limiter pass-through, read+write directions independent.
+- **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (Message-Id intersection), subfolder expansion, delimiter reconciliation, worker pool dispatch.
   The `runSync` and `runShow` tests run end to end against a fake IMAP server that holds mailboxes in memory. These tests cover:
@@ -26,7 +26,7 @@
   - a cancel at each boundary between sync phases;
   - the refusal paths (login, LIST, EXAMINE, CREATE, APPEND);
   - the `ActionSync` and `ActionShow` adapters, which run through a urfave/cli root (the TLS-only dial and the config load errors).
-- **`internal/progress`** — interface compliance against the contract `internal/client` expects.
+- **`internal/progress`** - interface compliance against the contract `internal/client` expects.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
 - **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact.
 - **`cmd/imapsync-go`** - `TestReportError` covers the exit code and the escaped `Error:` line. `TestFetchTag` covers `helpers.fetchTag` against an `httptest` server.
@@ -42,13 +42,13 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 ### Deliberate exclusions in `internal/client`
 
 - **`client.New`** - the `Test_New_*` tests cover CRAM-MD5, dial failure, LIST refusal, cancel during LOGIN and shared limiters. Only `internal/app` tests cover two branches: the `tls.Dialer` path and the default dial timeout. The `tls.Dialer` test uses a plaintext server, so a handshake error is expected. The standard library handles a successful TLS handshake, so no test covers it.
-- **`Client.SetPrefix`, `Client.GetDelimiter`** — trivial one-liners; observable in all fake-server tests that set a delimiter.
-- **`Client.SetProgressTracker`** — symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
-- **`realSleepCtx`** — production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
+- **`Client.SetPrefix`, `Client.GetDelimiter`** - trivial one-liners; observable in all fake-server tests that set a delimiter.
+- **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
+- **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
 - **`AppendMessage` mid-APPEND transient retry** - the code hands `msg.GetBody(...)` straight to `cli.Append`, with no `io.ReadAll`. The client consumes part of the literal before it detects a mid-APPEND error, so nothing remains to retry. The next sync run recovers through the Message-Id diff. A test of this path needs a mock that fails in the middle of a literal. Such a mock does not test real go-imap behaviour. Two nearby paths have tests:
   - `Test_AppendMessage_repairsConnectionAfterServerLogout` covers the reconnect after a failed APPEND;
   - `Test_AppendMessage_whenContextExpiresMidAppend` covers a context that ends mid-APPEND.
-- **`safeCall` post-reconnect `isCancelled()` branch** — exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
+- **`safeCall` post-reconnect `isCancelled()` branch** - exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
   - `StreamMessagesByUIDs`, at the top of the second and later batches;
   - `CreateMailbox`, after the parent walk;
@@ -95,16 +95,16 @@ If the tester finds an untested branch that does not match an existing exclusion
 
 ## Test commands
 
-- `just test` — full suite.
-- `go test ./internal/client -run TestFunc` — single test.
-- `go test -race ./...` — race detector. Run before declaring done on anything that touches goroutines.
-- `go test -cover ./internal/<pkg>` — coverage for one package.
-- `go test -coverprofile=cover.out ./... && go tool cover -func=cover.out | sort -k3 -n` — coverage report sorted by % (find the holes fast).
+- `just test` - full suite.
+- `go test ./internal/client -run TestFunc` - single test.
+- `go test -race ./...` - race detector. Run before declaring done on anything that touches goroutines.
+- `go test -cover ./internal/<pkg>` - coverage for one package.
+- `go test -coverprofile=cover.out ./... && go tool cover -func=cover.out | sort -k3 -n` - coverage report sorted by % (find the holes fast).
 
 ## When a test fails
 
 - Do not "fix" by adjusting the assertion to match observed behaviour. Find the regression.
-- If the failure is in a test the developer just wrote and the new code is correct, the test is wrong — fix the test, explain in the developer→architect report.
+- If the failure is in a test the developer just wrote and the new code is correct, the test is wrong - fix the test, explain in the developer→architect report.
 - If the failure is in a pre-existing test, stop. Report to architect. Do not modify pre-existing tests without explicit instruction.
 
 ## Race detector

@@ -359,7 +359,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			_, _ = fmt.Fprintf(out, "📤 Messages to be copied to destination:\n")
 			foldersToCreate := make([]string, 0, len(summary.Plans))
 			for _, plan := range summary.Plans {
-				// Preview only the folders we will actually create — the
+				// Preview only the folders we will actually create - the
 				// real creation loop below filters the same way, so showing
 				// already-existing folders here just misleads the user.
 				if !plan.DestinationFolderExists {
@@ -371,7 +371,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 						plan.NewMessages, utils.FormatSize(plan.NewSize))
 					if verbose {
 						// Dumping every UID before the confirm-prompt
-						// drowns the user in screens of integers — a
+						// drowns the user in screens of integers - a
 						// 10k-message plan turned the prompt invisible.
 						// Show a sample and a count.
 						n := len(plan.SrcUIDs)
@@ -608,7 +608,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 
 	// errgroup.WithContext: if either goroutine returns a non-nil error,
 	// gCtx is cancelled, which causes the other goroutine's next gCtx.Err()
-	// check to bail out immediately — no need to drain all remaining folders.
+	// check to bail out immediately - no need to drain all remaining folders.
 	g, gCtx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
@@ -643,7 +643,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			case err != nil:
 				scans[idx].dstErr = err
 			case !exists:
-				// dstExists stays false, dstIDs stays nil — benign; folder will be created.
+				// dstExists stays false, dstIDs stays nil - benign; folder will be created.
 			default:
 				scans[idx].dstExists = true
 				ids, err := dstClient.FetchMessageIDSet(gCtx, m.Destination)
@@ -694,7 +694,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 // Frees srcMap and dstIDs immediately after the diff to keep peak memory
 // proportional to one folder at a time, not len(mappings).
 //
-// NewSize is estimated as srcFolderSize × newCount / srcFolderCount — the
+// NewSize is estimated as srcFolderSize × newCount / srcFolderCount - the
 // exact size would require an extra UID FETCH RFC822.SIZE for each new UID
 // before the user has even confirmed, which is too eager. The proportion is
 // good enough for the preview header.
@@ -745,7 +745,7 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 // with the server's. ok is true also when path contains no delimiter at all
 // (there is nothing to mismatch).
 //
-// "none" is returned for the detected value when the path is flat — callers
+// "none" is returned for the detected value when the path is flat - callers
 // rely on that string to skip rewrite logic in the fix-up loop.
 func folderDelimiter(path, serverDelimiter string) (detected string, ok bool) {
 	for _, d := range [...]string{"/", ".", "\\"} {
@@ -818,7 +818,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 	deduped, dropped := dedupeMappings(expanded)
 	if verbose && !quiet {
 		for _, m := range dropped {
-			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped \u2014 already covered by a parent mapping's expansion\n", m.Source)
+			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", m.Source)
 		}
 	}
 	return deduped, nil
@@ -868,7 +868,7 @@ func getSubfolders(ctx context.Context, c *client.Client, folder string, delimit
 // providers with known IMAP limits. Empty string when neither side is a known
 // provider, so the caller can print unconditionally.
 //
-// The banner is informational, not blocking — it sits before the confirm
+// The banner is informational, not blocking - it sits before the confirm
 // prompt in the sync flow so the user has a chance to abort and re-run with
 // safer flags before kicking off a transfer that might hit a daily quota.
 func buildProviderWarning(cfg *config.Config, srcReadLim, dstWriteLim *rate.Limiter) string {
@@ -898,7 +898,7 @@ func buildProviderWarning(cfg *config.Config, srcReadLim, dstWriteLim *rate.Limi
 	var b strings.Builder
 	b.WriteString("\n⚠️  Provider with known IMAP limits detected:\n")
 	for _, h := range hits {
-		fmt.Fprintf(&b, "   %s [%s] — %s\n", h.side, h.host, h.provider.Name)
+		fmt.Fprintf(&b, "   %s [%s] - %s\n", h.side, h.host, h.provider.Name)
 		if h.provider.MaxConnections > 0 {
 			fmt.Fprintf(&b, "     • max simultaneous connections: %d\n", h.provider.MaxConnections)
 			if cfg.Workers >= h.provider.MaxConnections {
@@ -917,7 +917,7 @@ func buildProviderWarning(cfg *config.Config, srcReadLim, dstWriteLim *rate.Limi
 				flag = "--bps-up"
 			}
 			if recommended > 0 {
-				fmt.Fprintf(&b, "     • no rate limit set — recommended: %s %d\n", flag, recommended)
+				fmt.Fprintf(&b, "     • no rate limit set - recommended: %s %d\n", flag, recommended)
 			}
 		}
 		if h.provider.Notes != "" {

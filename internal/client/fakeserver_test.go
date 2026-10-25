@@ -106,7 +106,7 @@ func (s *fakeServer) acceptLoop() {
 func (s *fakeServer) handle(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
-	// IMAP greeting — go-imap's imapclient.New blocks until it sees this.
+	// IMAP greeting - go-imap's imapclient.New blocks until it sees this.
 	_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN] fake ready\r\n")
 
 	scanner := bufio.NewScanner(conn)

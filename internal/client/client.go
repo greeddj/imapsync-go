@@ -147,7 +147,7 @@ func (c *Client) folderLock(path string) *sync.Mutex {
 
 // newDialer builds the *net.Dialer used by Client. 30 s idle before the first
 // keepalive probe; dead-peer detection then falls within the OS-default
-// keepalive envelope (typically several minutes on macOS/Linux) — fast enough
+// keepalive envelope (typically several minutes on macOS/Linux) - fast enough
 // that a Wi-Fi flap doesn't strand the sync indefinitely, slow enough to not
 // break legitimate long fetches.
 func newDialer(timeout time.Duration) *net.Dialer {
@@ -221,7 +221,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 func (c *Client) selectIfNeeded(cli *imapclient.Client, folder string) (*imap.MailboxStatus, error) {
 	cur := c.selectedFolder.Load()
 	if cur != nil && *cur == folder {
-		// Server-side state is unchanged — re-issuing Select would be a
+		// Server-side state is unchanged - re-issuing Select would be a
 		// wasted round-trip. Caller doesn't get the MailboxStatus back, but
 		// nobody downstream needs it on the cached path.
 		return nil, nil
@@ -399,7 +399,7 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	c.idle.Store(w)
 
 	// Store cli before Login so Cancel() can Terminate the underlying
-	// connection mid-LOGIN — without this, a half-open TCP after a Wi-Fi
+	// connection mid-LOGIN - without this, a half-open TCP after a Wi-Fi
 	// flap leaves Login blocked until the kernel times the socket out.
 	c.c.Store(cli)
 
@@ -544,8 +544,8 @@ func (c *Client) reconnect() error {
 		_ = c.logout(cli)
 		c.c.Store(nil)
 	}
-	// Anything held about the previous connection's state — selected folder,
-	// in-flight literals — is gone with that socket. Bump the generation so
+	// Anything held about the previous connection's state - selected folder,
+	// in-flight literals - is gone with that socket. Bump the generation so
 	// later code knows to re-Select before issuing fetches.
 	c.selectedFolder.Store(nil)
 	c.connGen.Add(1)

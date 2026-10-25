@@ -1,6 +1,6 @@
 ---
 name: imap-sync-correctness
-description: Apply when reviewing or writing code that touches the IMAP sync flow — anything in internal/client, internal/app/sync.go, internal/app/worker.go, internal/app/show.go. Encodes the non-obvious correctness traps specific to IMAP and to this tool's plan-confirm-execute model.
+description: Apply when reviewing or writing code that touches the IMAP sync flow - anything in internal/client, internal/app/sync.go, internal/app/worker.go, internal/app/show.go. Encodes the non-obvious correctness traps specific to IMAP and to this tool's plan-confirm-execute model.
 ---
 
 # IMAP sync correctness
@@ -9,8 +9,8 @@ This is a sync tool. The single most important property is "running it again doe
 
 ## Read first
 
-- [.claude/rules/architecture.md](../../rules/architecture.md) — sync-flow invariants.
-- [CLAUDE.md](../../../CLAUDE.md) "Architecture" sections 2–5.
+- [.claude/rules/architecture.md](../../rules/architecture.md) - sync-flow invariants.
+- [CLAUDE.md](../../../CLAUDE.md) "Architecture" sections 2-5.
 
 ## Traps that bite
 
@@ -18,7 +18,7 @@ This is a sync tool. The single most important property is "running it again doe
 2. **Bypassing `safeCall`.** Direct `c.Client.<method>` calls skip the reconnect+classify+cancel pipeline. New IMAP ops always go through `safeCall`.
 3. **Skipping `selectIfNeeded`.** Calling `cli.Select` directly costs a round-trip per batch and races with reconnect. Always use `selectIfNeeded`.
 4. **Unbatched UID FETCH.** `uidFetchBatchSize = 500` exists because some servers reject longer arg lists with "Too long argument". Do not unbatch.
-5. **Streaming APPEND retry.** `AppendMessage` consumes the message body once. A transient mid-APPEND error cannot be retried inside this run — the literal is gone. The diff catches it on the next run. Do not "fix" this by adding `io.ReadAll` — that doubles peak RAM.
+5. **Streaming APPEND retry.** `AppendMessage` consumes the message body once. A transient mid-APPEND error cannot be retried inside this run - the literal is gone. The diff catches it on the next run. Do not "fix" this by adding `io.ReadAll` - that doubles peak RAM.
 6. **Per-connection rate limiters.** The limiters are global by design (one per direction, shared across all Clients on that side). Per-connection limiters would defeat the BPS cap. Don't introduce them.
 7. **Reconnect storms.** `reconnectInterval = 10s`, `maxReconnectAttempts = 5`, `throttledBackoff = 5m`. Don't weaken these "for testing" without reverting before commit.
 8. **Mailbox cache.** Populated by one `LIST "" "*"` per Client. Invalidated only on `CreateMailbox`. Re-LISTing on every check is a regression.
@@ -42,4 +42,4 @@ A streaming "fetch one, append one, repeat" model would also work but it would l
 
 ## Idempotency is Message-Id-based
 
-There is no UID bookkeeping. There is no resume file. Re-running on a partially completed sync re-diffs and continues. If you find yourself wanting to add a state store, stop and explain the use case to the architect — there is probably a way to express it as part of the diff instead.
+There is no UID bookkeeping. There is no resume file. Re-running on a partially completed sync re-diffs and continues. If you find yourself wanting to add a state store, stop and explain the use case to the architect - there is probably a way to express it as part of the diff instead.

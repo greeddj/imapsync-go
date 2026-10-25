@@ -10,13 +10,13 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// minBurst guarantees rate.Limiter.WaitN never fails with "n exceeds burst" —
+// minBurst guarantees rate.Limiter.WaitN never fails with "n exceeds burst" -
 // IMAP literals can be tens of KB and we always want to be able to wait for
 // them, even when the configured BPS is small.
 const minBurst = 64 * 1024
 
 // Conn wraps a net.Conn and applies token-bucket rate limiting to Read and Write.
-// Either limiter may be nil — that direction is then unlimited.
+// Either limiter may be nil - that direction is then unlimited.
 //
 // Conn is safe for concurrent use by multiple goroutines because *rate.Limiter
 // is itself concurrency-safe and net.Conn implementations are required to be

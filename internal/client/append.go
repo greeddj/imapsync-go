@@ -12,7 +12,7 @@ import (
 // AppendMessage uploads a single message to the destination folder.
 //
 // The body is streamed straight from the fetched message (which already holds
-// it in memory) into the APPEND literal — no extra io.ReadAll buffer. The
+// it in memory) into the APPEND literal - no extra io.ReadAll buffer. The
 // trade-off is that the literal is not replayable: a transient network error
 // mid-APPEND cannot be retried, because the body has been partially sent.
 // That's acceptable for our flow: the next sync run is idempotent (the
@@ -58,7 +58,7 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 			return ctx.Err()
 		}
 		// The literal has been partially consumed, so we can't retry THIS
-		// message — but repair the connection so the next APPEND in the
+		// message - but repair the connection so the next APPEND in the
 		// same plan doesn't fail again at the IMAP layer. Without this,
 		// one server-side disconnect cascades into "Not logged in" for
 		// every remaining message in the folder.
