@@ -314,3 +314,31 @@ func TestRunShow_When_CanceledWhileListing_Then_ReportsCancelNotAccountFailure(t
 		t.Errorf("error %q reports an account failure for a Ctrl+C", err)
 	}
 }
+
+func TestRunShow_When_FolderNameCarriesControlCharacters_Then_TableShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":         nil,
+		hostileWireName: fakeMsgs("a@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1)
+	out := &syncBuffer{}
+
+	if err := runShow(e2eContext(t), cfg, e2eShowOptions(out, false)); err != nil {
+		t.Fatalf("runShow: %v", err)
+	}
+
+	got := stripANSI(out.String())
+	_, tables, ok := strings.Cut(got, "Source")
+	if !ok {
+		t.Fatalf("output has no Source title:\n%s", got)
+	}
+	srcSection, _, ok := strings.Cut(tables, "Destination")
+	if !ok {
+		t.Fatalf("output has no Destination title:\n%s", got)
+	}
+	assertFolderRow(t, srcSection, hostileShownName, 1, uint64(len(imapFullBody("a@x"))))
+	assertContainsNone(t, out.String(), hostileName, "\u202e", "\x1b[2J")
+}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 )
 
 // messageIDHeaderSection is the smallest fetch we can ask for that still
@@ -133,7 +134,7 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	if err == nil && missingCount > 0 {
 		if pw := c.progressWriter(); pw != nil {
 			pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped — sync cannot track them",
-				c.prefix, folder, missingCount)
+				c.prefix, termsafe.Escape(folder), missingCount)
 		}
 	}
 	if err != nil {

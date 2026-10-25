@@ -7,6 +7,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 - `cmd/...` imports `internal/...`. **Never the other way around.**
 - `internal/client` defines its own minimal `ProgressWriter` / `ProgressTracker` interfaces. It must not import `internal/progress` (which pulls in go-pretty). Same shape for any future cross-package callback: declare the interface where it is consumed, satisfy it where it is produced.
 - `internal/progress` and `internal/ratelimit` are leaves — they depend on stdlib + one external package each. Keep them that way.
+- `internal/termsafe` is a leaf that uses only the standard library. It must not import `internal/progress`. Keep it that way, so `internal/client` can import it without a path to go-pretty.
 - `internal/app` orchestrates; it owns the worker pool, the plan, and the confirmation prompts. It does not reach into `*imap.*` types — that abstraction lives in `internal/client`.
 - `ActionSync` / `ActionShow` stay thin adapters that pass `client.Options{UseTLS: true}` to `runSync` / `runShow`. Only tests pass plaintext options. A config, flag or environment switch for plaintext is a security review point.
 
@@ -33,6 +34,15 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 - One limiter per direction is shared across all `Client`s that talk to the same side. Per-connection limiters would defeat the global cap.
 - `ratelimit.NewLimiter(bps)` returning `nil` is the "unlimited" sentinel. Callers must nil-check, not call methods on it.
 
+## Terminal output
+
+- Show text from an IMAP server on the terminal only through `termsafe.Escape`. A new output site must use `Escape`. A `%q` verb is accepted only at the sites that already use it, in `internal/app/sync.go`. `%q` is safe against control sequences, but it keeps graphic invisible runes such as `\u3164`.
+- Escape at the presentation boundary: the place that prints text or composes a display line. Do not escape earlier.
+- These values stay byte-exact: arguments that go back to a server (SELECT, EXAMINE, STATUS, CREATE, APPEND), plan data, mappings, map keys and error values.
+- `classifyError` and `isAlreadyExistsErr` match on raw server text. Do not give them escaped text.
+- A coloured tracker line carries our own SGR codes. Escape the server parts before you compose the line, never the whole line.
+- A new output site that shows server text follows this rule. Operator text (labels, server, user, config path) is trusted.
+
 ## Concurrency
 
 - Workers are clamped `[1, 10]` in `config.New`. A value out of range changes to the nearest limit. Do not surface this as a runtime panic.
@@ -49,4 +59,4 @@ Read [CLAUDE.md](../../CLAUDE.md) first — this file only adds review-time emph
 
 ## When in doubt
 
-Re-read the five numbered sections in [CLAUDE.md](../../CLAUDE.md) "Architecture". Those are the invariants the architect enforces.
+Re-read the six numbered sections in [CLAUDE.md](../../CLAUDE.md) "Architecture". Those are the invariants the architect enforces.

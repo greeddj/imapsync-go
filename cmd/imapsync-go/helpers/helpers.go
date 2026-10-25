@@ -8,6 +8,8 @@ import (
 	"os"
 	"runtime"
 	"time"
+
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 )
 
 // Version returns the formatted version string for the application.
@@ -39,8 +41,12 @@ func latestTag() string {
 	if os.Getenv("IMAPSYNC_OFFLINE") != "" || os.Getenv("CI") != "" {
 		return defaultVersion
 	}
+	return fetchTag(latestVersionURL)
+}
+
+func fetchTag(url string) string {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, latestVersionURL, http.NoBody)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return defaultVersion
 	}
@@ -68,5 +74,6 @@ func latestTag() string {
 	if payload.Tag == "" {
 		return defaultVersion
 	}
-	return payload.Tag
+	// The tag is remote text printed in --help, and git allows C1 and bidi characters in tag names.
+	return termsafe.Escape(payload.Tag)
 }

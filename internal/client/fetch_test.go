@@ -1094,3 +1094,31 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered(
 		t.Errorf("UID FETCH batches = %d, want %d (500 + 1)", len(gotSets), len(want))
 	}
 }
+
+func Test_FetchMessageMap_When_FolderNameCarriesControlCharacters_Then_WarningShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(fetchTwoMessagesHandler(srv))
+	c := newClientWithFake(t, srv)
+	c.verbose = true
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	if _, _, err := c.FetchMessageMap(t.Context(), hostileName); err != nil {
+		t.Fatalf("FetchMessageMap: %v", err)
+	}
+
+	for _, msg := range logged {
+		assertGraphic(t, "log line", msg)
+	}
+	var warning string
+	for _, msg := range logged {
+		if strings.Contains(msg, "1 message(s) without Message-Id") {
+			warning = msg
+		}
+	}
+	if !strings.Contains(warning, hostileShownName) {
+		t.Errorf("warning = %q, want it to hold %q", warning, hostileShownName)
+	}
+}

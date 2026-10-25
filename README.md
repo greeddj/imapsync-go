@@ -227,6 +227,21 @@ mailboxes.
 - **Ctrl+\\** (SIGQUIT) writes the stacks of all goroutines to stderr and exits with code 131.
 - **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default.
 
+## Terminal output
+
+A server can send folder names, error messages and Message-Ids that contain control or invisible characters. These characters can move the cursor, remove text from the screen or hide text.
+
+`imapsync-go` shows these characters as escape text. For example, a folder name with an ESC character, a carriage return and a right-to-left override shows as `Evil\x1b[2J\rx\u202egpj`.
+
+- The escape forms are `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\xNN`, `\uNNNN` and `\UNNNNNNNN`.
+- Letters of all scripts, punctuation, symbols, emoji and spaces do not change.
+- Some status messages show invisible letters, for example `\u3164`, without change. These messages are the delimiter messages, the folder-creation messages and the skipped-mapping message. Control characters in these messages still show as escape text.
+- Only the display changes. The program sends the exact folder names to the servers.
+- The final `Error:` line escapes line breaks too. A multi-line error, for example a YAML type error in the config file, prints on one line with `\n` between the parts.
+- The line breaks are escaped on purpose. A raw line break lets a server make a false status line after `Error:`.
+
+The escaping is for UTF-8 terminals.
+
 ## Idempotency caveats
 
 `imapsync-go` decides what to copy by diffing message **`Message-Id`** headers

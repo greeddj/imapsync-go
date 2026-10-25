@@ -23,7 +23,7 @@ The container image is built from the per-platform tree `dockers_v2` assembles: 
 
 ## Architecture
 
-Single-binary IMAP-to-IMAP sync tool. Five things to internalize before making changes.
+Single-binary IMAP-to-IMAP sync tool. Six things to internalize before making changes.
 
 ### 1. Layering
 
@@ -44,12 +44,15 @@ internal/client/provider.go     — DetectProvider, used by sync.go to print quo
 internal/config/                — JSON+YAML config loader (extension-driven), validation
 internal/progress/              — go-pretty progress writer/tracker abstraction (interfaces consumed by client)
 internal/ratelimit/             - net.Conn wrapper applying golang.org/x/time/rate, installed by guardConn
+internal/termsafe/              - Escape and Writer: make text from IMAP servers safe to print on a UTF-8 terminal (stdlib only)
 internal/utils/                 — `AskConfirm(ctx, in *bufio.Reader, out io.Writer, prompt)` and friends
 ```
 
 `ActionSync` and `ActionShow` are thin CLI adapters. They pass `client.Options{UseTLS: true}`, `os.Stdout` and `os.Stdin` to `runSync` / `runShow`. Tests pass plaintext options, a buffer and a scripted reader to dial the fake IMAP servers. Do not add a config, flag or environment switch that disables TLS.
 
 `internal/client` defines minimal `ProgressWriter` / `ProgressTracker` interfaces it consumes; `internal/progress` implements them. Preserve this split when adding progress hooks — the alternative pulls `internal/progress` (which depends on go-pretty) into the client package.
+
+`internal/termsafe` is a leaf package that uses only the standard library. `internal/client`, `internal/app` and `cmd/imapsync-go` import it. It does not import `internal/progress`.
 
 `cmd/...` is the CLI entry point and depends on `internal/...`. Never import `cmd/` from `internal/`.
 
@@ -97,7 +100,7 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 - A retry of a `StreamMessagesByUIDs` batch (after a transient error, through `safeCall`) fetches only the UIDs whose body `onMessage` did not receive. If `onMessage` received all of them, the retry sends no SELECT or FETCH command. The code does not deliver a second response with the body for the same UID. So a retry creates no duplicate APPEND on the destination. A response without a body does not mark its UID.
 - Folder creation uses a per-path `sync.Mutex` (`folderLocks` map) to make concurrent `CreateMailbox` calls for nested paths race-free; parents are created walking down the hierarchy.
 - `c.pw` and `c.tracker` are `atomic.Pointer[progressWriterRef|progressTrackerRef]`. Read via `c.progressWriter()` / `c.progressTracker()`; do not access the fields directly.
-- go-imap writes every read error to stderr, including the error that each `Terminate` causes. `connectAndLogin` calls `muteErrorLog`, which sends that log to `io.Discard` unless `--verbose` is set. The function changes the output of the existing `*log.Logger` with `SetOutput`, because the reader goroutine already runs and a field write would race.
+- go-imap writes every read error to stderr, including the error that each `Terminate` causes. `greet` calls `routeErrorLog` right after `imapclient.New` returns, also for a client that go-imap returns with an error. Without `--verbose`, the log goes to `io.Discard`. With `--verbose`, the logger output goes through `termsafe.NewWriter`, because the lines quote raw server responses. The function changes the output of the existing `*log.Logger` with `SetOutput`, because the reader goroutine already runs and a field write would race. Section 6 describes the lines that go-imap logs before `routeErrorLog` runs.
 
 **Known limitation - Ctrl+C blocked inside a literal write.** go-imap sends a synchronizing literal in two steps. First the client sends `{N}\r\n`. Then it waits on `<-w.continues` (`vendor/github.com/emersion/go-imap/write.go:158`) for the `+` reply of the server. Only the response handlers of the reader goroutine send on that channel.
 
@@ -118,6 +121,79 @@ Users can press Ctrl+\ (SIGQUIT) to get an immediate goroutine dump and exit. A 
 `StreamMessagesByUIDs` fetches via `BODY.PEEK[]` (`fullBodyPeekSection`), not `FetchRFC822`. The two are functionally equivalent for transferring the message but `FetchRFC822` sets `\Seen` on every message — a state mutation a sync tool must not introduce on the source. If you add new fetch sites, mirror this choice.
 
 `AppendMessage` passes `msg.GetBody(...)` straight to `cli.Append` — no `io.ReadAll` round-trip — to halve peak RAM with large attachments. The trade-off is that a transient mid-APPEND error cannot be retried (the literal has been partially consumed); the next sync run picks the message up via the Message-Id diff.
+
+### 6. Terminal output (`internal/termsafe`)
+
+An IMAP server can send folder names, error text and Message-Ids that contain control, bidi or invisible characters. On a terminal, such text can move the cursor, clear the screen or make a false status line.
+
+**Rule.** Show text from an IMAP server on the terminal only through `termsafe.Escape`. This covers:
+
+- folder names (LIST, the mailbox cache, plans, and the mappings that come from them);
+- reply text inside errors;
+- envelope Message-Ids;
+- go-imap error-log lines.
+
+Text from the operator (labels, server, user, config path) is trusted, so print it as is. A new output site must follow this rule.
+
+**Existing `%q` sites.** Some output sites in `internal/app/sync.go` quote server text with a `%q` verb. They stay as they are. A new output site must not use `%q` for server text. These sites are:
+
+- the delimiter lines in verbose mode;
+- the delimiter-mismatch lines and the "Fixed source" and "Fixed destination" lines;
+- the "Failed to create folder" and "Created folder" logs;
+- the "Mapping ... skipped" line;
+- the "scan destination folder" error, which `reportError` also escapes.
+
+`strconv.Quote` escapes each rune for which `strconv.IsPrint` is false. These runes are:
+
+- all C0, DEL and C1 controls;
+- all Cf runes, bidi controls too;
+- `\u2028` and `\u2029`, private-use and unassigned code points;
+- each invalid UTF-8 byte.
+
+So `%q` is safe against control sequences.
+
+`%q` keeps graphic but invisible runes, such as `\u3164`. Two different names can look the same in a `%q` line. `Escape` escapes these runes.
+
+Do not replace `%q` with `Escape` at these sites: the output loses the escape of the quote characters. Do not put `Escape` inside `%q`: the output gets two layers of escapes. The verbose Message-Id line in `append.go` also uses `%q`. `Client.log` escapes the whole message, so `Escape` covers that line too.
+
+**What `Escape` does.** `Escape(s)` keeps a rune only if `strconv.IsGraphic` is true and the rune is not in `unicode.Other_Default_Ignorable_Code_Point`. All other runes become a visible Go escape in lowercase hex: `\a \b \f \n \r \t \v`, `\xNN`, `\uNNNN` or `\UNNNNNNNN`. Each invalid UTF-8 byte also gets an escape.
+
+`Escape` escapes these runes:
+
+- C0 (tab, CR and LF too), DEL and C1;
+- Cf runes: all bidi controls (U+202A to U+202E and U+2066 to U+2069), LRM, RLM, ALM, zero-width characters, BOM, soft hyphen and tags;
+- U+2028 and U+2029, private-use and unassigned code points;
+- graphic but invisible runes, such as U+3164 and U+034F.
+
+`Escape` does not change letters of any script, punctuation, symbols, emoji, variation selectors (U+FE0F), spaces (U+00A0 too), backslash and quotes. If nothing needs escaping, it returns the input and does not allocate memory.
+
+Backslash is not escaped, on purpose. A folder named `\x1b` looks the same as a folder that contains an ESC character. Both forms are inert text.
+
+The guarantee holds for UTF-8 terminals. A terminal that acts on 8-bit C1 bytes inside multi-byte runes is out of scope.
+
+`termsafe.Writer` (from `NewWriter`) escapes each `Write` and keeps one trailing newline raw, so each `log.Logger` line stays one line.
+
+**Presentation boundary.** Escape only where the program prints the text. These values stay byte-exact:
+
+- the arguments of SELECT, EXAMINE, STATUS, CREATE and APPEND, which go back to a server;
+- plan data, mappings and map keys;
+- error values. `classifyError` and `isAlreadyExistsErr` match on raw server text.
+
+A tracker line carries our own SGR colour codes. Escape the server parts before you compose the line, never the whole line.
+
+**Where the program escapes.**
+
+- `Client.log` escapes the whole composed message for both sinks. No format of `log` carries colour codes, so every caller of `log` is covered.
+- Two direct sinks escape on their own: the missing-Message-Id warning in `fetch.go` and the per-mailbox tracker line in `mailbox.go`.
+- `internal/app/sync.go` escapes the plan preview, the folders-to-create list, the creation tracker, the "already exists" log, the error text of the "Failed to create folder" log, the waiting and scan trackers, the found-subfolder line and the verbose log of a failed source fetch.
+- `internal/app/show.go` escapes the folder cell of the table.
+- `internal/app/worker.go` escapes every tracker line and log, and the verbose Message-Id line. `trackerReason` escapes the inline error reason first, then cuts it to 40 bytes on a rune boundary.
+- `reportError` in `cmd/imapsync-go/main.go` escapes the final `Error:` line, line breaks too. So a multi-line error prints on one line. A raw line break would let a server make a false line after `Error:`.
+- `cmd/imapsync-go/helpers` escapes the GitHub release tag that the root `--help` shows for builds without `-X main.Version`.
+
+**Known limitation - go-imap logs before `routeErrorLog` runs.** `routeErrorLog` (Section 3) covers the go-imap error log. But `imapclient.New` creates its logger on `os.Stderr`. It also reads the greeting and the implicit CAPABILITY probe before `routeErrorLog` can run. A line that go-imap logs in that window reaches stderr unescaped, in every mode.
+
+In go-imap v1.2.1, such lines are parse errors and network errors. A parse error holds server text in only two places: one of the characters `(`, `{` or `"`, and a literal length that `strconv` quotes. Neither can carry a control sequence. Audit this again on each go-imap upgrade. A full fix needs go-imap v2, or a fork with a logger option. A patch of `vendor/` does not last, because `just deps` rewrites it.
 
 ## Conventions
 

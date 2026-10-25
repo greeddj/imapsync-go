@@ -268,6 +268,15 @@ func imapFullBody(msgID string) string {
 	return fmt.Sprintf("From: sender@test\r\nMessage-Id: <%s>\r\nSubject: test\r\n\r\nBody.\r\n", msgID)
 }
 
+var imapQuoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
+func envelopeFor(m storedMsg) string {
+	if m.envelopeID == "" {
+		return nilEnvelope
+	}
+	return "(NIL NIL NIL NIL NIL NIL NIL NIL NIL \"" + imapQuoteEscaper.Replace(m.envelopeID) + "\")"
+}
+
 // parseLiteralSize extracts n from a `{n}` or `{n+}` literal marker at the
 // end of an IMAP command arg. Returns 0 if none found.
 func parseLiteralSize(arg string) int {
@@ -533,16 +542,19 @@ func uidFetchBodyHandler(srv *fakeServer, mailboxes []string, uidBodies map[stri
 }
 
 // fakeMsg is one message a store-backed server holds. An empty body means
-// imapFullBody(msgID).
+// imapFullBody(msgID). A non-empty envelopeID is the Message-Id its ENVELOPE
+// reports; empty leaves it NIL.
 type fakeMsg struct {
-	msgID string
-	body  string
+	msgID      string
+	body       string
+	envelopeID string
 }
 
 type storedMsg struct {
-	msgID string
-	body  string
-	uid   uint32
+	msgID      string
+	body       string
+	envelopeID string
+	uid        uint32
 }
 
 type appendRecord struct {
@@ -582,16 +594,20 @@ func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg
 			if body == "" {
 				body = imapFullBody(m.msgID)
 			}
-			st.add(name, m.msgID, body)
+			st.addStored(name, storedMsg{msgID: m.msgID, body: body, envelopeID: m.envelopeID})
 		}
 	}
 	return listenFakeServer(t, st)
 }
 
 func (st *mailStore) add(folder, msgID, body string) {
-	uid := st.nextUID[folder]
-	st.nextUID[folder] = uid + 1
-	st.folders[folder] = append(st.folders[folder], storedMsg{uid: uid, msgID: msgID, body: body})
+	st.addStored(folder, storedMsg{msgID: msgID, body: body})
+}
+
+func (st *mailStore) addStored(folder string, m storedMsg) {
+	m.uid = st.nextUID[folder]
+	st.nextUID[folder] = m.uid + 1
+	st.folders[folder] = append(st.folders[folder], m)
 }
 
 func (s *fakeServer) refuseLogin() {
@@ -601,15 +617,27 @@ func (s *fakeServer) refuseLogin() {
 }
 
 func (s *fakeServer) refuseCreate() {
+	s.refuseCreateWith("NO CREATE refused by policy")
+}
+
+// refuseCreateWith makes every CREATE end with reply, which carries its own
+// status word, as the tagged status line.
+func (s *fakeServer) refuseCreateWith(reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.store.createReply = "NO CREATE refused by policy"
+	s.store.createReply = reply
 }
 
 func (s *fakeServer) refuseAppend() {
+	s.refuseAppendWith("NO Quota exceeded")
+}
+
+// refuseAppendWith makes every APPEND end with reply, which carries its own
+// status word, as the tagged status line.
+func (s *fakeServer) refuseAppendWith(reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.store.appendReply = "NO Quota exceeded"
+	s.store.appendReply = reply
 }
 
 // capturedNames returns the mailbox names the clients passed to verb (CREATE
@@ -853,7 +881,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			parts = append(parts, fmt.Sprintf("RFC822.SIZE %d", len(m.body)))
 		}
 		if wantEnvelope {
-			parts = append(parts, "ENVELOPE "+nilEnvelope)
+			parts = append(parts, "ENVELOPE "+envelopeFor(m))
 		}
 		if wantHeader {
 			hdr := imapMsgIDHeader(m.msgID)

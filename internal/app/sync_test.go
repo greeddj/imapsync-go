@@ -2428,6 +2428,300 @@ func TestRunSync_When_TransferIsLimited_Then_WorkersShareOneBudgetPerDirection(t
 	}
 }
 
+const (
+	// hostileWireName is the modified UTF-7 form of hostileName; go-imap decodes
+	// it and encodes it back byte for byte.
+	hostileWireName   = "Evil&ABs-[2J&AA0-x&IC4-gpj"
+	hostileName       = "Evil\x1b[2J\rx\u202egpj"
+	hostileReply      = "\x1b]0;pwned\x07 refused\r now \u202e"
+	hostileShownName  = `Evil\x1b[2J\rx\u202egpj`
+	hostileReplyShown = `\x1b]0;pwned\a refused\r now \u202e`
+)
+
+func TestRunSync_When_SourceFolderNameCarriesControlCharacters_Then_OutputShowsEscapesAndServerGetsExactName(t *testing.T) {
+	t.Parallel()
+
+	const (
+		childWireName  = hostileWireName + "/Sub&ABs-"
+		childShownName = hostileShownName + `/Sub\x1b`
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":         nil,
+		hostileWireName: fakeMsgs("e1@x"),
+		childWireName:   fakeMsgs("e2@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "y\n")
+	opts.verbose = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), hostileWireName, childWireName)
+	assertIDs(t, "dst APPENDs to the folder", dst.appended(hostileWireName), "e1@x")
+	assertIDs(t, "dst APPENDs to the subfolder", dst.appended(childWireName), "e2@x")
+	got := out.String()
+	assertContainsAll(t, got,
+		"• "+hostileShownName+" → "+hostileShownName+" will copy 1 messages",
+		"• "+childShownName+" → "+childShownName+" will copy 1 messages",
+		"• "+hostileShownName+"\n",
+		"• "+childShownName+"\n",
+		"Found subfolder: "+childShownName+" → "+childShownName,
+	)
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J")
+}
+
+func Test_buildSyncPlan_When_FolderNameCarriesControlCharacters_Then_TrackersShowEscapesAndPlanKeepsExactName(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: fakeMsgs("a@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: nil})
+	srcC := newAppClient(t, src, "src")
+	dstC := newAppClient(t, dst, "dst")
+	pw, srcTr, dstTr := makePlanPW()
+	mappings := []config.DirectoryMapping{mapping(hostileName, hostileName)}
+
+	summary, err := buildSyncPlan(t.Context(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+
+	if want := "[src] Scanned " + hostileShownName + " (1/1)"; srcTr.Message != want {
+		t.Errorf("source tracker message = %q, want %q", srcTr.Message, want)
+	}
+	if want := "[dst] Scanned " + hostileShownName + " (1/1)"; dstTr.Message != want {
+		t.Errorf("destination tracker message = %q, want %q", dstTr.Message, want)
+	}
+	if len(summary.Plans) != 1 {
+		t.Fatalf("Plans = %d, want 1", len(summary.Plans))
+	}
+	if p := summary.Plans[0]; p.SourceFolder != hostileName || p.DestinationFolder != hostileName {
+		t.Errorf("plan names = %q -> %q, want the exact name %q on both sides", p.SourceFolder, p.DestinationFolder, hostileName)
+	}
+}
+
+func Test_buildSyncPlan_When_SourceFolderRefusedWithHostileReply_Then_VerboseLogShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(scriptedHandler(srcSrv, []string{hostileWireName}, func(verb string, _ int) (string, bool) {
+		if verb == "EXAMINE" {
+			return "NO " + hostileReply, true
+		}
+		return "", false
+	}))
+	dstSrv := newFakeServer(t)
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+
+	sb := &syncBuffer{}
+	// The sentinel stays active so the render pass Stop triggers still prints the
+	// queued log lines.
+	pw := progress.NewWriter(3, true)
+	pw.SetOutputWriter(sb)
+	pw.Start()
+	pw.AppendTracker(progress.NewTracker("sentinel", 100))
+	srcTr, dstTr := progress.NewTracker("src", 10), progress.NewTracker("dst", 10)
+	pw.AppendTracker(srcTr)
+	pw.AppendTracker(dstTr)
+
+	summary, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping(hostileName, hostileName)}, srcTr, dstTr, pw, "src", "dst", true)
+	pw.Stop()
+	pw.WaitForRenderDone()
+
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+	if len(summary.Plans) != 0 {
+		t.Errorf("Plans = %d, want 0: the refused folder is skipped", len(summary.Plans))
+	}
+	got := sb.String()
+	assertContainsAll(t, got,
+		"Failed to fetch source folder "+hostileShownName+", skipping by error: [src] cannot select folder "+hostileShownName+": "+hostileReplyShown,
+	)
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+}
+
+// The name is short so go-pretty does not snip the tracker line that holds it.
+func hostileFolder(letter string) (wire, name, shown string) {
+	return letter + "&ABs-[2J", letter + "\x1b[2J", letter + `\x1b[2J`
+}
+
+func TestRunSync_When_FolderCreationFails_Then_LogShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantErr     func(error) bool
+		name        string
+		createReply string
+		wantLog     string
+		verbose     bool
+	}{
+		{
+			name:        "refused with a hostile reply",
+			createReply: "NO " + hostileReply,
+			wantLog:     `Failed to create folder "` + hostileShownName + `": [dst] failed to create mailbox ` + hostileShownName + ": ",
+			wantErr:     func(err error) bool { return err != nil && strings.Contains(err.Error(), "failed to create 1 folders") },
+		},
+		{
+			name:        "already exists",
+			createReply: "NO [ALREADYEXISTS] Mailbox already exists",
+			verbose:     true,
+			wantLog:     "Folder " + hostileShownName + " already exists",
+			// The fake CREATE creates nothing, so the APPEND that follows is refused.
+			wantErr: func(err error) bool { return errors.Is(err, ErrSilentExit) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: fakeMsgs("a@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.refuseCreateWith(tt.createReply)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.verbose = tt.verbose
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(hostileName, hostileName)), opts)
+
+			if !tt.wantErr(err) {
+				t.Errorf("error = %v", err)
+			}
+			got := out.String()
+			assertContainsAll(t, got, tt.wantLog)
+			assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+		})
+	}
+}
+
+func TestRunSync_When_CanceledDuringFolderCreation_Then_CreatingLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	wire, name, shown := hostileFolder("A")
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{wire: fakeMsgs("a@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb == "CREATE" {
+			cancel()
+			return "", true
+		}
+		return "", false
+	}))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping(name, name)), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got, "(1/1) Creating "+shown)
+	assertContainsNone(t, got, name)
+}
+
+func TestRunSync_When_CanceledBeforeSecondPlanStarts_Then_WaitingLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	srcWireA, srcA, _ := hostileFolder("A")
+	dstWireB, dstB, _ := hostileFolder("B")
+	srcWireC, srcC, shownC := hostileFolder("C")
+	dstWireD, dstD, shownD := hostileFolder("D")
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{srcWireA: fakeMsgs("a@x"), srcWireC: fakeMsgs("c@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{dstWireB: nil, dstWireD: nil})
+	idle := func(string, int) (string, bool) { return "", false }
+	stallOnAppend := func(verb string, _ int) (string, bool) {
+		if verb == "APPEND" {
+			cancel()
+			return "", true
+		}
+		return "", false
+	}
+	// The first dst connection plans; the second is the only worker's.
+	dst.addConnHandler(scriptedHandler(dst, []string{dstWireB, dstWireD}, idle))
+	dst.addConnHandler(scriptedHandler(dst, []string{dstWireB, dstWireD}, stallOnAppend))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping(srcA, dstB), mapping(srcC, dstD)), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got, "2/2 Waiting: "+shownC+" → "+shownD)
+	assertContainsNone(t, got, srcC, dstD, srcA, dstB)
+}
+
+func Test_buildSyncPlan_When_ScanIsInFlight_Then_TrackerShowsEscapedFolderName(t *testing.T) {
+	t.Parallel()
+
+	for _, held := range []string{"src", "dst"} {
+		t.Run(held+" scan", func(t *testing.T) {
+			t.Parallel()
+
+			arrived, release := make(chan struct{}, 1), make(chan struct{})
+			react := func(label string) func(string, int) (string, bool) {
+				return func(verb string, _ int) (string, bool) {
+					if verb == "EXAMINE" && label == held {
+						arrived <- struct{}{}
+						<-release
+					}
+					return "", false
+				}
+			}
+			srcSrv, dstSrv := newFakeServer(t), newFakeServer(t)
+			srcSrv.addConnHandler(scriptedHandler(srcSrv, []string{hostileWireName}, react("src")))
+			dstSrv.addConnHandler(scriptedHandler(dstSrv, []string{hostileWireName}, react("dst")))
+			srcC, dstC := newAppClient(t, srcSrv, "src"), newAppClient(t, dstSrv, "dst")
+			// Registered after the clients, so it runs first and frees a scan parked in a failed test.
+			t.Cleanup(func() { close(release) })
+			pw, srcTr, dstTr := makePlanPW()
+			done := make(chan error, 1)
+			go func() {
+				_, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping(hostileName, hostileName)}, srcTr, dstTr, pw, "src", "dst", false)
+				done <- err
+			}()
+
+			select {
+			case <-arrived:
+			case <-time.After(e2eTimeout):
+				t.Fatal("the held EXAMINE never arrived")
+			}
+			// The held scan waits for the server, so nothing else writes its tracker.
+			tracker := srcTr
+			if held == "dst" {
+				tracker = dstTr
+			}
+			got := tracker.Message
+			release <- struct{}{}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("buildSyncPlan: %v", err)
+				}
+			case <-time.After(e2eTimeout):
+				t.Fatal("buildSyncPlan did not return after the EXAMINE was released")
+			}
+
+			if want := "[" + held + "] Scanning " + hostileShownName + " (1/1)"; got != want {
+				t.Errorf("tracker message during the scan = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestBuildUploadLimitWarning(t *testing.T) {
 	t.Parallel()
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"golang.org/x/time/rate"
 )
 
@@ -2068,12 +2070,29 @@ func Test_New_ErrorLogFollowsVerbose(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		want    io.Writer
+		check   func(t *testing.T, got io.Writer)
 		name    string
 		verbose bool
 	}{
-		{name: "quiet session discards go-imap error lines", want: io.Discard},
-		{name: "verbose session keeps them on stderr", verbose: true, want: os.Stderr},
+		{
+			name: "quiet session discards go-imap error lines",
+			check: func(t *testing.T, got io.Writer) {
+				t.Helper()
+				if got != io.Discard {
+					t.Errorf("ErrorLog writer = %T, want io.Discard", got)
+				}
+			},
+		},
+		{
+			name:    "verbose session escapes them on the way to stderr",
+			verbose: true,
+			check: func(t *testing.T, got io.Writer) {
+				t.Helper()
+				if _, ok := got.(*termsafe.Writer); !ok {
+					t.Errorf("ErrorLog writer = %T, want *termsafe.Writer", got)
+				}
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2093,11 +2112,121 @@ func Test_New_ErrorLogFollowsVerbose(t *testing.T) {
 			if !ok {
 				t.Fatalf("ErrorLog is %T, want *log.Logger", c.c.Load().ErrorLog)
 			}
-			if got := l.Writer(); got != tt.want {
-				t.Errorf("ErrorLog writer = %T, want %T", got, tt.want)
-			}
+			tt.check(t, l.Writer())
 		})
 	}
+}
+
+func Test_Client_log_When_MessageCarriesControlCharacters_Then_EverySinkGetsEscapedText(t *testing.T) {
+	t.Parallel()
+
+	const (
+		hostile = "Evil\x1b[2J\r\n\u202egpj\xff"
+		want    = `[p] Fetching folder Evil\x1b[2J\r\n\u202egpj\xff...`
+	)
+
+	t.Run("tracker", func(t *testing.T) {
+		t.Parallel()
+
+		c := newTestClient()
+		tr := &recordingTracker{}
+		c.SetProgressTracker(tr)
+
+		c.log("[%s] Fetching folder %s...", "p", hostile)
+
+		if !slices.Equal(tr.messages, []string{want}) {
+			t.Errorf("tracker messages = %q, want [%q]", tr.messages, want)
+		}
+	})
+
+	t.Run("progress writer when verbose", func(t *testing.T) {
+		t.Parallel()
+
+		c := newTestClient()
+		c.verbose = true
+		var logged []string
+		c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+		c.log("[%s] Fetching folder %s...", "p", hostile)
+
+		if !slices.Equal(logged, []string{want}) {
+			t.Errorf("logged = %q, want [%q]", logged, want)
+		}
+	})
+
+	t.Run("percent signs in a name are not read as a format", func(t *testing.T) {
+		t.Parallel()
+
+		c := newTestClient()
+		c.verbose = true
+		var logged []string
+		c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+		c.log("[%s] Fetching folder %s...", "p", "100%s%d")
+
+		if want := "[p] Fetching folder 100%s%d..."; !slices.Equal(logged, []string{want}) {
+			t.Errorf("logged = %q, want [%q]", logged, want)
+		}
+	})
+}
+
+type silentLogger struct{}
+
+func (silentLogger) Printf(string, ...any) {}
+func (silentLogger) Println(...any)        {}
+
+func Test_routeErrorLog(t *testing.T) {
+	t.Parallel()
+
+	t.Run("verbose escapes what go-imap logs and keeps the line break", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+		cli := &imapclient.Client{ErrorLog: log.New(&buf, "", 0)}
+		c := &Client{verbose: true}
+
+		c.routeErrorLog(cli)
+		cli.ErrorLog.Println("cannot handle response ", "\x1b]0;pwned\x07 refused\r now \u202e")
+
+		want := `cannot handle response  \x1b]0;pwned\a refused\r now \u202e` + "\n"
+		if got := buf.String(); got != want {
+			t.Errorf("logged = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("quiet discards what go-imap logs", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+		l := log.New(&buf, "", 0)
+		cli := &imapclient.Client{ErrorLog: l}
+		c := &Client{}
+
+		c.routeErrorLog(cli)
+		l.Println("error reading response:", "boom")
+
+		if l.Writer() != io.Discard {
+			t.Errorf("logger writer = %T, want io.Discard", l.Writer())
+		}
+		if buf.Len() != 0 {
+			t.Errorf("logged %q, want nothing", buf.String())
+		}
+	})
+
+	t.Run("a logger that is not a log.Logger is left alone", func(t *testing.T) {
+		t.Parallel()
+
+		for _, verbose := range []bool{false, true} {
+			cli := &imapclient.Client{ErrorLog: silentLogger{}}
+			c := &Client{verbose: verbose}
+
+			c.routeErrorLog(cli)
+
+			if _, ok := cli.ErrorLog.(silentLogger); !ok {
+				t.Errorf("verbose=%t: ErrorLog is %T, want the original silentLogger", verbose, cli.ErrorLog)
+			}
+		}
+	})
 }
 
 func Test_safeCall_When_WatchdogTrips_Then_LogsWhyItReconnects(t *testing.T) {

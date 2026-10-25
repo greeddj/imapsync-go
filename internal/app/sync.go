@@ -17,6 +17,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
@@ -366,7 +367,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				}
 				if plan.NewMessages > 0 {
 					_, _ = fmt.Fprintf(out, "• %s → %s will copy %d messages (≈ %s)\n",
-						plan.SourceFolder, plan.DestinationFolder, plan.NewMessages, utils.FormatSize(plan.NewSize))
+						termsafe.Escape(plan.SourceFolder), termsafe.Escape(plan.DestinationFolder),
+						plan.NewMessages, utils.FormatSize(plan.NewSize))
 					if verbose {
 						// Dumping every UID before the confirm-prompt
 						// drowns the user in screens of integers — a
@@ -388,7 +390,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			if len(foldersToCreate) > 0 {
 				_, _ = fmt.Fprintf(out, "\n🗂️ Folders to be created on destination:\n")
 				for _, folder := range foldersToCreate {
-					_, _ = fmt.Fprintf(out, "• %s\n", folder)
+					_, _ = fmt.Fprintf(out, "• %s\n", termsafe.Escape(folder))
 				}
 			}
 			_, _ = fmt.Fprintf(out, "\n📨 Total new messages to sync: %d (≈ %s)\n", summary.TotalNew, utils.FormatSize(summary.TotalNewSize))
@@ -453,7 +455,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				creationPW.Stop()
 				return err
 			}
-			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+failedCount+1, len(foldersToCreate), folder))
+			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+failedCount+1, len(foldersToCreate), termsafe.Escape(folder)))
 
 			created, err := dstClient.CreateMailbox(ctx, folder)
 			switch {
@@ -461,7 +463,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				creationPW.Stop()
 				return ctx.Err()
 			case err != nil:
-				creationPW.Log("Failed to create folder %q: %v", folder, err)
+				creationPW.Log("Failed to create folder %q: %s", folder, termsafe.Escape(err.Error()))
 				failedCount++
 			case created:
 				if verbose {
@@ -470,7 +472,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				createdCount++
 			default:
 				if verbose {
-					creationPW.Log("Folder %s already exists", folder)
+					creationPW.Log("Folder %s already exists", termsafe.Escape(folder))
 				}
 				createdCount++
 			}
@@ -510,7 +512,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	trackers := make([]*progress.Tracker, len(activePlans))
 	for i, plan := range activePlans {
 		trackers[i] = progress.NewTracker(
-			fmt.Sprintf("%d/%d Waiting: %s → %s", i+1, len(activePlans), plan.SourceFolder, plan.DestinationFolder),
+			fmt.Sprintf("%d/%d Waiting: %s → %s", i+1, len(activePlans),
+				termsafe.Escape(plan.SourceFolder), termsafe.Escape(plan.DestinationFolder)),
 			100,
 		)
 		traceTracker("plan", trackers[i].Message)
@@ -613,7 +616,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			if err := gCtx.Err(); err != nil {
 				return err
 			}
-			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, m.Source, idx+1, n))
+			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
 			mp, size, err := srcClient.FetchMessageMap(gCtx, m.Source)
 			if err != nil {
 				scans[idx].srcErr = err
@@ -622,7 +625,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				scans[idx].srcFolderSize = size
 				scans[idx].srcFolderCount = len(mp)
 			}
-			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, m.Source, idx+1, n))
+			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
 			srcTracker.Increment(1)
 			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize)
 		}
@@ -634,7 +637,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			if err := gCtx.Err(); err != nil {
 				return err
 			}
-			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", dstLabel, m.Destination, idx+1, n))
+			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", dstLabel, termsafe.Escape(m.Destination), idx+1, n))
 			exists, err := dstClient.MailboxExists(gCtx, m.Destination)
 			switch {
 			case err != nil:
@@ -650,7 +653,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 					scans[idx].dstIDs = ids
 				}
 			}
-			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, m.Destination, idx+1, n))
+			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, termsafe.Escape(m.Destination), idx+1, n))
 			dstTracker.Increment(1)
 			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize)
 			if scans[idx].dstErr != nil {
@@ -671,7 +674,8 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 	for idx := range scans {
 		if scans[idx].srcErr != nil {
 			if verbose {
-				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %v", mappings[idx].Source, scans[idx].srcErr)
+				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %s",
+					termsafe.Escape(mappings[idx].Source), termsafe.Escape(scans[idx].srcErr.Error()))
 			}
 			continue
 		}
@@ -803,7 +807,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 			})
 
 			if verbose && !quiet {
-				_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", subfolder, dstPath)
+				_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", termsafe.Escape(subfolder), termsafe.Escape(dstPath))
 			}
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
@@ -174,7 +175,7 @@ func printAccountInfo(out io.Writer, title, server, user string, mailboxes []*cl
 		totalSize += mbox.Size
 
 		t.AppendRow(table.Row{
-			mbox.Name,
+			termsafe.Escape(mbox.Name),
 			mbox.Messages,
 			utils.FormatSize(mbox.Size),
 		})

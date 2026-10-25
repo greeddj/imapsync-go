@@ -14,6 +14,7 @@ import (
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/commands"
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/helpers"
 	appkg "github.com/greeddj/imapsync-go/internal/app"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 
 	"github.com/urfave/cli/v3"
 )
@@ -65,19 +66,24 @@ func run() int {
 	defer stop()
 
 	if err := app.Run(ctx, os.Args); err != nil {
-		switch {
-		case errors.Is(err, context.Canceled):
-			fmt.Fprintln(os.Stderr, "Cancelled.")
-			return 130
-		case errors.Is(err, appkg.ErrSilentExit):
-			// ActionSync has already printed a human-friendly summary.
-			return 1
-		default:
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
-		}
+		return reportError(os.Stderr, err)
 	}
 	return 0
+}
+
+// The error can quote a reply the IMAP server sent, so the text is escaped.
+func reportError(w io.Writer, err error) int {
+	switch {
+	case errors.Is(err, context.Canceled):
+		_, _ = fmt.Fprintln(w, "Cancelled.")
+		return 130
+	case errors.Is(err, appkg.ErrSilentExit):
+		// ActionSync has already printed a human-friendly summary.
+		return 1
+	default:
+		_, _ = fmt.Fprintf(w, "Error: %s\n", termsafe.Escape(err.Error()))
+		return 1
+	}
 }
 
 // exitQuit is 128 + SIGQUIT, matching the 130 that Ctrl-C returns.

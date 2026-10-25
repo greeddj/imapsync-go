@@ -8,6 +8,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 )
 
 // MailboxInfo describes message counts and sizes for a single folder.
@@ -192,7 +193,7 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 			return nil, err
 		}
 		if tr != nil {
-			tr.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), mbox.Name))
+			tr.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), termsafe.Escape(mbox.Name)))
 		}
 
 		var status *imap.MailboxStatus

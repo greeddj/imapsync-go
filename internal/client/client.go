@@ -21,6 +21,7 @@ import (
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"golang.org/x/time/rate"
 )
 
@@ -343,16 +344,20 @@ func (c *Client) internalContext() (context.Context, context.CancelFunc) {
 // log routes a formatted message to the tracker (preferred) or progress writer.
 func (c *Client) log(format string, args ...any) {
 	// Tracker drives the live UX, so it updates regardless of verbose.
-	// The verbose check below only gates the secondary log-writer fallback.
-	if t := c.progressTracker(); t != nil {
-		t.UpdateMessage(fmt.Sprintf(format, args...))
+	// Verbose only gates the secondary log-writer fallback.
+	t := c.progressTracker()
+	if t == nil && !c.verbose {
 		return
 	}
-	if !c.verbose {
+	// Messages embed folder names and server replies, and no format carries colour
+	// codes, so escaping the whole message covers every caller of log, present and future.
+	msg := termsafe.Escape(fmt.Sprintf(format, args...))
+	if t != nil {
+		t.UpdateMessage(msg)
 		return
 	}
 	if pw := c.progressWriter(); pw != nil {
-		pw.Log(format, args...)
+		pw.Log("%s", msg)
 	}
 }
 
@@ -390,7 +395,6 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.muteErrorLog(cli)
 
 	// Stored before cli so a reader that sees the new cli also sees its watchdog.
 	c.idle.Store(w)
@@ -452,6 +456,11 @@ func (c *Client) greet(ctx context.Context, conn net.Conn) (*imapclient.Client, 
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 
 	cli, err := imapclient.New(conn)
+	if cli != nil {
+		// go-imap returns a non-nil client even on error. A client dropped on the
+		// failure paths below would otherwise keep its reader logging to stderr when not verbose.
+		c.routeErrorLog(cli)
+	}
 
 	// go-imap ignores the error of its CAPABILITY probe, so err alone cannot
 	// tell a closed connection from a good one.
@@ -472,16 +481,20 @@ func (c *Client) greet(ctx context.Context, conn net.Conn) (*imapclient.Client, 
 	}
 }
 
-// muteErrorLog keeps go-imap's read-error lines, which every Terminate causes,
+// routeErrorLog keeps go-imap's read-error lines, which every Terminate causes,
 // off stderr unless verbose. SetOutput locks the logger, so the running reader
 // goroutine does not race.
-func (c *Client) muteErrorLog(cli *imapclient.Client) {
-	if c.verbose {
+func (c *Client) routeErrorLog(cli *imapclient.Client) {
+	l, ok := cli.ErrorLog.(*log.Logger)
+	if !ok {
 		return
 	}
-	if l, ok := cli.ErrorLog.(*log.Logger); ok {
-		l.SetOutput(io.Discard)
+	if c.verbose {
+		// The lines quote raw server responses, so they are escaped.
+		l.SetOutput(termsafe.NewWriter(l.Writer()))
+		return
 	}
+	l.SetOutput(io.Discard)
 }
 
 func (c *Client) cancelErr(ctx context.Context) error {

@@ -8,9 +8,11 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Test_CreateMailbox_walksParents asserts that CreateMailbox creates every
@@ -989,5 +991,61 @@ func Test_MailboxNames_returnsCachedNamesSorted(t *testing.T) {
 	}
 	if n := srv.callCount("LIST"); n != 1 {
 		t.Errorf("LIST count = %d, want 1 (the cache load in New)", n)
+	}
+}
+
+// The wire name is the modified UTF-7 form of hostileName; go-imap decodes it on
+// the way in and encodes it back byte for byte on the way out.
+const (
+	hostileWireName  = "Evil&ABs-[2J&AA0-x&IC4-gpj"
+	hostileName      = "Evil\x1b[2J\rx\u202egpj"
+	hostileShownName = `Evil\x1b[2J\rx\u202egpj`
+)
+
+// assertGraphic fails the test when s holds invalid UTF-8 or a rune that a
+// terminal could act on.
+func assertGraphic(t *testing.T, what, s string) {
+	t.Helper()
+
+	if !utf8.ValidString(s) {
+		t.Errorf("%s %q is not valid UTF-8", what, s)
+		return
+	}
+	for _, r := range s {
+		if !strconv.IsGraphic(r) {
+			t.Errorf("%s %q holds the non-graphic rune %U", what, s, r)
+			return
+		}
+	}
+}
+
+func Test_ListMailboxes_When_FolderNameCarriesControlCharacters_Then_TrackerShowsEscapesAndServerGetsExactName(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newScriptedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: hostileWireName, sizes: []uint32{100, 250}},
+	}})
+	tr := &recordingTracker{}
+	c.SetProgressTracker(tr)
+
+	infos, err := c.ListMailboxes(t.Context())
+	if err != nil {
+		t.Fatalf("ListMailboxes: %v", err)
+	}
+
+	want := []MailboxInfo{{Name: hostileName, Messages: 2, Size: 350}}
+	if len(infos) != 1 || *infos[0] != want[0] {
+		t.Errorf("ListMailboxes = %+v, want %+v (the exact name and the STATUS count prove the server saw the exact name)", infos, want)
+	}
+	for _, verb := range []string{"STATUS", "EXAMINE"} {
+		if got := srv.capturedNames(verb); !slices.Equal(got, []string{hostileWireName}) {
+			t.Errorf("%s names = %q, want [%q]", verb, got, hostileWireName)
+		}
+	}
+	for _, msg := range tr.messages {
+		assertGraphic(t, "tracker message", msg)
+	}
+	if !slices.ContainsFunc(tr.messages, func(msg string) bool { return strings.Contains(msg, hostileShownName) }) {
+		t.Errorf("no tracker message holds %q; got %q", hostileShownName, tr.messages)
 	}
 }

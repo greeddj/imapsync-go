@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
@@ -539,5 +541,297 @@ func TestLogoutAll_When_ServersHoldLogout_Then_ClientsLogOutTogether(t *testing.
 	}
 	if got := srv.callCount("LOGOUT"); got != n {
 		t.Errorf("LOGOUT count = %d, want %d", got, n)
+	}
+}
+
+// assertAllGraphic fails the test when s holds invalid UTF-8 or a rune that a
+// terminal could act on.
+func assertAllGraphic(t *testing.T, what, s string) {
+	t.Helper()
+
+	if !utf8.ValidString(s) {
+		t.Errorf("%s %q is not valid UTF-8", what, s)
+		return
+	}
+	for _, r := range s {
+		if !strconv.IsGraphic(r) {
+			t.Errorf("%s %q holds the non-graphic rune %U", what, s, r)
+			return
+		}
+	}
+}
+
+func Test_runFolderSync_When_NamesCarryControlCharacters_Then_LogsAndTrackerShowEscapes(t *testing.T) {
+	t.Parallel()
+
+	const hostileID = "<m\x1b[2J@x\u202e>"
+	plan := FolderSyncPlan{
+		SourceFolder:            hostileName,
+		DestinationFolder:       hostileName,
+		SrcUIDs:                 []uint32{1},
+		NewMessages:             1,
+		DestinationFolderExists: true,
+	}
+	tests := []struct {
+		setup       func(dst *fakeServer)
+		name        string
+		wantTracker string
+		wantLog     []string
+		wantSynced  int
+	}{
+		{
+			name:  "append refused",
+			setup: func(dst *fakeServer) { dst.refuseAppendWith("NO " + hostileReply) },
+			wantLog: []string{
+				"Failed to append message to " + hostileShownName + ": [dst] append: " + hostileReplyShown,
+			},
+			wantTracker: "1/1 Synced messages 0 (errors: 1) " + hostileShownName + " → " + hostileShownName,
+		},
+		{
+			name:  "append accepted",
+			setup: func(*fakeServer) {},
+			wantLog: []string{
+				"Synced 1/1 to " + hostileShownName + ", processed msg id " + `<m\x1b[2J@x\u202e>`,
+			},
+			wantTracker: "1/1 Synced messages 1 " + hostileShownName + " → " + hostileShownName,
+			wantSynced:  1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				hostileWireName: {{msgID: "e1@x", envelopeID: hostileID}},
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: nil})
+			tt.setup(dst)
+			w := &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}
+
+			sb := &syncBuffer{}
+			// The sentinel stays active so the render pass Stop triggers still prints
+			// the queued log lines.
+			pw := progress.NewWriter(2, true)
+			pw.SetOutputWriter(sb)
+			pw.Start()
+			pw.AppendTracker(progress.NewTracker("sentinel", 100))
+			tr := progress.NewTracker("test", 10)
+			pw.AppendTracker(tr)
+
+			synced, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, true)
+			pw.Stop()
+			pw.WaitForRenderDone()
+
+			if synced != tt.wantSynced {
+				t.Errorf("synced = %d, want %d", synced, tt.wantSynced)
+			}
+			got := sb.String()
+			assertContainsAll(t, got, tt.wantLog...)
+			assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+			if tr.Message != tt.wantTracker {
+				t.Errorf("final tracker message = %q, want %q", tr.Message, tt.wantTracker)
+			}
+			if tt.wantSynced == 1 {
+				assertIDs(t, "dst APPENDs", dst.appended(hostileWireName), "e1@x")
+			}
+		})
+	}
+}
+
+func TestTrackerReason(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "short ASCII reason is unchanged", in: "Quota exceeded", want: "Quota exceeded"},
+		{name: "empty reason stays empty", in: "", want: ""},
+		{name: "control and bidi characters are escaped", in: "\x1b[2J\r\u202e", want: `\x1b[2J\r\u202e`},
+		{name: "40 bytes are kept whole", in: strings.Repeat("a", 40), want: strings.Repeat("a", 40)},
+		{name: "41 bytes are cut to 37 plus an ellipsis", in: strings.Repeat("a", 41), want: strings.Repeat("a", 37) + "..."},
+		{name: "long ASCII reason is cut to 37 plus an ellipsis", in: strings.Repeat("a", 90), want: strings.Repeat("a", 37) + "..."},
+		{
+			name: "long Cyrillic reason is cut on a rune boundary",
+			in:   strings.Repeat("ж", 30),
+			want: strings.Repeat("ж", 18) + "...",
+		},
+		{
+			name: "escapes that push the length over 40 cause the cut",
+			in:   strings.Repeat("\x1b", 11),
+			want: strings.Repeat(`\x1b`, 9) + `\` + "...",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := trackerReason(tt.in)
+
+			if got != tt.want {
+				t.Errorf("trackerReason(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			assertAllGraphic(t, "reason", got)
+			if len(got) > maxTrackerReason {
+				t.Errorf("reason is %d bytes, want at most %d", len(got), maxTrackerReason)
+			}
+		})
+	}
+}
+
+// holdAppends parks each APPEND until the test sends on release. It announces the
+// APPEND number on arrived first, so the test reads worker state mid-command.
+func holdAppends(srv *fakeServer, reply string, arrived chan<- int, release <-chan struct{}) func(net.Conn) {
+	return scriptedHandler(srv, []string{hostileWireName}, func(verb string, nth int) (string, bool) {
+		if verb != "APPEND" {
+			return "", false
+		}
+		arrived <- nth
+		<-release
+		return reply, true
+	})
+}
+
+func Test_runFolderSync_When_PlanIsInFlight_Then_TrackerLinesShowEscapes(t *testing.T) {
+	t.Parallel()
+
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(uidFetchBodyHandler(srcSrv, []string{hostileWireName}, map[string][]struct {
+		body string
+		uid  uint32
+	}{hostileWireName: {{uid: 1, body: imapFullBody("m1@x")}, {uid: 2, body: imapFullBody("m2@x")}}}, ""))
+	dstSrv := newFakeServer(t)
+	arrived, release := make(chan int, 2), make(chan struct{})
+	dstSrv.addConnHandler(holdAppends(dstSrv, "NO "+hostileReply, arrived, release))
+	w := &syncWorker{src: newAppClient(t, srcSrv, "src"), dst: newAppClient(t, dstSrv, "dst")}
+	// Registered after the clients, so it runs first and frees a worker parked in a failed test.
+	t.Cleanup(func() { close(release) })
+	plan := FolderSyncPlan{
+		SourceFolder:            hostileName,
+		DestinationFolder:       hostileName,
+		SrcUIDs:                 []uint32{1, 2},
+		NewMessages:             2,
+		DestinationFolderExists: true,
+	}
+	tr := progress.NewTracker("test", 10)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runFolderSync(t.Context(), w, plan, tr, 0, 1, progress.NewWriter(1, true), false)
+	}()
+	awaitAppend := func(nth int) {
+		t.Helper()
+		select {
+		case got := <-arrived:
+			if got != nth {
+				t.Fatalf("APPEND #%d arrived, want #%d", got, nth)
+			}
+		case <-time.After(e2eTimeout):
+			t.Fatalf("APPEND #%d never arrived", nth)
+		}
+	}
+
+	// The worker waits for the server in both reads, so nothing else writes the tracker.
+	awaitAppend(1)
+	started := tr.Message
+	release <- struct{}{}
+	awaitAppend(2)
+	afterFailure := stripANSI(tr.Message)
+	release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(e2eTimeout):
+		t.Fatal("runFolderSync did not return after the last APPEND")
+	}
+
+	wantStarted := "1/1 " + hostileShownName + " → " + hostileShownName
+	if started != wantStarted {
+		t.Errorf("tracker message while the first append runs = %q, want %q", started, wantStarted)
+	}
+	wantFailure := "1/1 (0↑ Σ2) " + hostileShownName + " → " + hostileShownName + " (1✗ " + `[dst] append: \x1b]0;pwned\a refused\...` + ")"
+	if afterFailure != wantFailure {
+		t.Errorf("tracker message after the first append failed = %q, want %q", afterFailure, wantFailure)
+	}
+	assertAllGraphic(t, "tracker message", started)
+	assertAllGraphic(t, "tracker message", afterFailure)
+}
+
+func Test_runFolderSync_When_CanceledMidStream_Then_CancelLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(scriptedHandler(srcSrv, []string{hostileWireName}, func(verb string, _ int) (string, bool) {
+		if verb == "UID" {
+			cancel()
+			return "", true
+		}
+		return "", false
+	}))
+	w := &syncWorker{src: newAppClient(t, srcSrv, "src"), dst: newAppClient(t, newFakeServer(t), "dst")}
+	plan := FolderSyncPlan{
+		SourceFolder:            hostileName,
+		DestinationFolder:       hostileName,
+		SrcUIDs:                 []uint32{1},
+		NewMessages:             1,
+		DestinationFolderExists: true,
+	}
+	tr := progress.NewTracker("test", 10)
+
+	synced, errs := runFolderSync(ctx, w, plan, tr, 0, 1, progress.NewWriter(1, true), false)
+
+	if synced != 0 || errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 0, 0", synced, errs)
+	}
+	if want := "1/1 Canceled " + hostileShownName + " → " + hostileShownName; tr.Message != want {
+		t.Errorf("tracker message = %q, want %q", tr.Message, want)
+	}
+	if !tr.IsErrored() {
+		t.Error("tracker not marked as errored after the cancel")
+	}
+}
+
+func Test_runFolderSync_When_StreamFailsWithHostileReply_Then_LogAndTrackerShowEscapes(t *testing.T) {
+	t.Parallel()
+
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(scriptedHandler(srcSrv, []string{hostileWireName}, func(verb string, _ int) (string, bool) {
+		if verb == "UID" {
+			return "BAD " + hostileReply, true
+		}
+		return "", false
+	}))
+	w := &syncWorker{src: newAppClient(t, srcSrv, "src"), dst: newAppClient(t, newFakeServer(t), "dst")}
+	plan := FolderSyncPlan{
+		SourceFolder:            hostileName,
+		DestinationFolder:       hostileName,
+		SrcUIDs:                 []uint32{1},
+		NewMessages:             1,
+		DestinationFolderExists: true,
+	}
+	sb := &syncBuffer{}
+	// The sentinel stays active so the render pass Stop triggers still prints the
+	// queued log lines.
+	pw := progress.NewWriter(2, true)
+	pw.SetOutputWriter(sb)
+	pw.Start()
+	pw.AppendTracker(progress.NewTracker("sentinel", 100))
+	tr := progress.NewTracker("test", 10)
+	pw.AppendTracker(tr)
+
+	synced, errs := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
+	pw.Stop()
+	pw.WaitForRenderDone()
+
+	if synced != 0 || errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", synced, errs)
+	}
+	got := sb.String()
+	assertContainsAll(t, got, "Stream error for folder "+hostileShownName+": ", hostileReplyShown)
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+	if want := "1/1 Synced messages 0 (errors: 1) " + hostileShownName + " → " + hostileShownName; tr.Message != want {
+		t.Errorf("final tracker message = %q, want %q", tr.Message, want)
 	}
 }

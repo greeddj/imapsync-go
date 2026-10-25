@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"github.com/jedib0t/go-pretty/v6/text"
 )
+
+// maxTrackerReason counts bytes and includes the trailing ellipsis.
+const maxTrackerReason = 40
 
 // Tracker-line glyph palette. go-pretty does not intercept inline ANSI in the
 // tracker Message, so colouring the counters here just works.
@@ -93,6 +98,9 @@ func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts
 //
 // planIdx is zero-based; planCount is len(activePlans) for human display.
 func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *progress.Tracker, planIdx, planCount int, pw *progress.Writer, verbose bool) (synced, errors int) {
+	// Display only: the IMAP calls below keep the exact names from the plan.
+	srcShown, dstShown := termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)
+
 	if err := ctx.Err(); err != nil {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Canceled", planIdx+1, planCount))
 		tr.MarkAsErrored()
@@ -100,7 +108,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	}
 
 	tr.UpdateTotal(int64(p.NewMessages))
-	tr.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIdx+1, planCount, p.SourceFolder, p.DestinationFolder))
+	tr.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIdx+1, planCount, srcShown, dstShown))
 
 	// lastUpdate throttles the per-message message-string update — it lives
 	// on the worker goroutine, so an unsynchronized time.Time is fine.
@@ -111,23 +119,15 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		syncedPart := trackerSyncedStyle.Sprintf("%d↑", synced)
 		totalPart := trackerTotalStyle.Sprintf("Σ%d", p.NewMessages)
 		base := fmt.Sprintf("%d/%d (%s %s) %s → %s",
-			planIdx+1, planCount, syncedPart, totalPart, p.SourceFolder, p.DestinationFolder)
+			planIdx+1, planCount, syncedPart, totalPart, srcShown, dstShown)
 		if errors == 0 {
 			tr.UpdateMessage(base)
 			return
 		}
-		// Trim the inline reason so a long server message doesn't wrap
-		// the tracker line and break the rendered bar.
-		reason := lastErrMsg
-		if len(reason) > 40 {
-			reason = reason[:37] + "..."
-		}
 		errPart := trackerErrorStyle.Sprintf("%d✗", errors)
-		// reason rendered without Sprintf %q so it reads as the original
-		// server message — no \"escaped\" quoting, no inline colour. The
-		// preceding ANSI reset from errPart hands control back to the
-		// terminal's default foreground.
-		tr.UpdateMessage(fmt.Sprintf("%s (%s %s)", base, errPart, reason))
+		// The reason is escaped but neither %q-quoted nor coloured, so it reads like
+		// the server message. The ANSI reset from errPart restores the default foreground.
+		tr.UpdateMessage(fmt.Sprintf("%s (%s %s)", base, errPart, trackerReason(lastErrMsg)))
 	}
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDs, func(msg client.Message) error {
@@ -143,7 +143,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			// Operators still see the counter and the last reason via the
 			// tracker line below.
 			if verbose {
-				pw.Log("Failed to append message to %s: %v", p.DestinationFolder, err)
+				pw.Log("Failed to append message to %s: %s", dstShown, termsafe.Escape(err.Error()))
 			}
 			if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
 				lastUpdate = now
@@ -159,7 +159,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		}
 		if verbose {
 			pw.Log("Synced %d/%d to %s, processed msg id %s",
-				synced, p.NewMessages, p.DestinationFolder, msg.MessageID())
+				synced, p.NewMessages, dstShown, termsafe.Escape(msg.MessageID()))
 		}
 		// AppendMessage that completed in flight after ctx cancel must not
 		// continue iterating; the next message would race with Cancel() racing
@@ -171,23 +171,36 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	})
 	if ctx.Err() != nil {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Canceled %s → %s",
-			planIdx+1, planCount, p.SourceFolder, p.DestinationFolder))
+			planIdx+1, planCount, srcShown, dstShown))
 		tr.MarkAsErrored()
 		return synced, errors
 	}
 	if streamErr != nil {
-		pw.Log("Stream error for folder %s: %v", p.SourceFolder, streamErr)
+		pw.Log("Stream error for folder %s: %s", srcShown, termsafe.Escape(streamErr.Error()))
 		errors++
 	}
 
 	if errors > 0 {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s",
-			planIdx+1, planCount, synced, errors, p.SourceFolder, p.DestinationFolder))
+			planIdx+1, planCount, synced, errors, srcShown, dstShown))
 		tr.MarkAsErrored()
 	} else {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d %s → %s",
-			planIdx+1, planCount, synced, p.SourceFolder, p.DestinationFolder))
+			planIdx+1, planCount, synced, srcShown, dstShown))
 		tr.MarkAsDone()
 	}
 	return synced, errors
+}
+
+// A long server message would wrap the tracker line and break the rendered bar.
+func trackerReason(msg string) string {
+	reason := termsafe.Escape(msg)
+	if len(reason) <= maxTrackerReason {
+		return reason
+	}
+	cut := maxTrackerReason - len("...")
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut] + "..."
 }

@@ -27,6 +27,9 @@
   - the refusal paths (login, LIST, EXAMINE, CREATE, APPEND);
   - the `ActionSync` and `ActionShow` adapters, which run through a urfave/cli root (the TLS-only dial and the config load errors).
 - **`internal/progress`** — interface compliance against the contract `internal/client` expects.
+- **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
+- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact.
+- **`cmd/imapsync-go`** - `TestReportError` covers the exit code and the escaped `Error:` line. `TestFetchTag` covers `helpers.fetchTag` against an `httptest` server.
 
 ## What we deliberately don't test
 
@@ -55,6 +58,9 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`greet` tie between the context and the timer** - the context and `dialTimeout` can end at the same moment. Both events close the connection, so they race. Both resulting errors describe the failure correctly. No deterministic test can reach the tie. Two tests cover the separate causes:
   - `Test_New_When_ServerNeverGreets_Then_ContextCancelReturns` covers the context;
   - `Test_New_When_ServerNeverGreets_Then_FailsAfterDialTimeout` covers the timer.
+- **`greet` failure paths that route the logger of a dropped client** - `greet` calls `routeErrorLog` also when it drops the client, so the reader of that client does not write to stderr. `imapclient.New` creates its logger on `os.Stderr`, and the dropped client is not reachable from a test. A check needs a capture of `os.Stderr` for the whole process. Two tests cover the routing on the success path:
+  - `Test_New_ErrorLogFollowsVerbose` covers the logger output of a connected client;
+  - `Test_routeErrorLog` covers the escaped lines and the quiet discard.
 - **`idleConn` ordering choices** - each of these four orderings closes a window of a few instructions against a concurrent timer callback:
   - `Read` and `Write` stamp the last activity before they count themselves busy;
   - `begin` stamps before it counts the span;
@@ -79,8 +85,8 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 
 ### Deliberate exclusions in `cmd/imapsync-go`
 
-- **`main` and `run` in `cmd/imapsync-go/main.go`** - the signal-to-context wiring, the exit-code mapping and `os.Exit` need a subprocess and real signals. The tests in `cmd/imapsync-go/commands` cover the command tree. A test sends SIGQUIT to its own process to cover `installQuitDump`, with an injected exit function.
-- **`helpers.latestTag`** - the function makes a live call to the GitHub API. The tests skip it through `IMAPSYNC_OFFLINE` or `CI`. The tests cover only the offline return and the `Version` format.
+- **`main` and `run` in `cmd/imapsync-go/main.go`** - the signal-to-context wiring and `os.Exit` need a subprocess and real signals. `TestReportError` covers the exit-code mapping through `reportError`. The tests in `cmd/imapsync-go/commands` cover the command tree. A test sends SIGQUIT to its own process to cover `installQuitDump`, with an injected exit function.
+- **`helpers.latestTag`** - the function makes a live call to the GitHub API. The tests skip it through `IMAPSYNC_OFFLINE` or `CI`. `TestFetchTag` covers `fetchTag`, which sends the request, against an `httptest` server. The other tests cover only the offline return and the `Version` format.
 
 If the tester finds an untested branch that does not match an existing exclusion, the choice is:
 
