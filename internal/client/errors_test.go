@@ -28,7 +28,6 @@ func TestClassifyError(t *testing.T) {
 		{name: "throttledSession", err: errors.New("BYE Session expired, please login again"), want: ClassThrottled},
 		{name: "throttledBandwidth", err: errors.New("Account exceeded bandwidth limits for IMAP"), want: ClassThrottled},
 		{name: "throttledQuota", err: errors.New("user has exceeded quota"), want: ClassThrottled},
-		{name: "throttledLockout", err: errors.New("Account in lockout state"), want: ClassThrottled},
 
 		{name: "transientNotLoggedIn", err: errors.New("BAD Not logged in"), want: ClassTransient},
 		{name: "transientNotLoggedInLowercase", err: errors.New("nO nOt LoGgEd In"), want: ClassTransient},
@@ -42,8 +41,19 @@ func TestClassifyError(t *testing.T) {
 		{name: "permAuthDovecot", err: errors.New("Authentication failed."), want: ClassPermanent},
 		{name: "permCredsGmail", err: errors.New("Invalid credentials (Failure)"), want: ClassPermanent},
 
+		{name: "permLockout", err: errors.New("Account in lockout state"), want: ClassPermanent},
+		{name: "permTempLocked", err: errors.New("Authentication failed: account temporarily locked"), want: ClassPermanent},
+		{name: "permTempAuthLocked", err: errors.New("Temporary authentication failure: account locked"), want: ClassPermanent},
+		{name: "permTempDisabled", err: errors.New("Authentication failed: account temporarily disabled"), want: ClassPermanent},
+		{name: "permSuspended", err: errors.New("Account temporarily suspended"), want: ClassPermanent},
+		{name: "permBlocked", err: errors.New("Login blocked: too many failed attempts"), want: ClassPermanent},
+		{name: "permAuthTemporarilyFailed", err: errors.New("Authentication temporarily failed"), want: ClassPermanent},
+		{name: "permLockBeatsThrottle", err: errors.New("Account suspended: exceeded bandwidth limit"), want: ClassPermanent},
+		{name: "permLoginDisabled", err: imapclient.ErrLoginDisabled, want: ClassPermanent},
+
 		{name: "transientTempAuthDovecot", err: errors.New("Temporary authentication failure. [mx1:2026-10-25 10:00:00]"), want: ClassTransient},
 		{name: "transientTempAuthUnavailable", err: errors.New("Authentication service temporarily unavailable"), want: ClassTransient},
+		{name: "transientAuthFailedServiceUnavailable", err: errors.New("Authentication failed: service temporarily unavailable"), want: ClassTransient},
 		{name: "unknownTempNonAuth", err: errors.New("Temporary System Problem. Try again later."), want: ClassUnknown},
 		{name: "throttleBeatsTempAuth", err: errors.New("Temporary authentication failure: too many simultaneous connections"), want: ClassThrottled},
 
@@ -76,6 +86,11 @@ func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.
 		{name: "body fetch wrapper over no mailbox selected", err: fmt.Errorf("[src] body fetch: %w", imapclient.ErrNoMailboxSelected), want: ClassTransient},
 		{name: "label holds a throttle phrase over a closed connection", err: fmt.Errorf("[%s] fetch IDs: %w", "bandwidth limit exceeded", errors.New("imap: connection closed")), want: ClassTransient},
 		{name: "exceeded in the leaf and quota in the folder name", err: fmt.Errorf("[src] select folder %s: %w", "Quota", errors.New("NO retry count exceeded")), want: ClassUnknown},
+		{
+			name: "folder name holds an account-state word over a closed connection",
+			err:  fmt.Errorf("[src] cannot select folder %s: %w", "Junk/Blocked senders", errors.New("imap: connection closed")),
+			want: ClassTransient,
+		},
 		{name: "wrapper text never makes an error permanent", err: fmt.Errorf("[src] no such mailbox %s: %w", "Work", errors.New("unrecognized server response")), want: ClassUnknown},
 		{name: "throttled leaf under a plain folder wrapper", err: fmt.Errorf("[src] select folder %s: %w", "Work", errors.New("Too many simultaneous connections")), want: ClassThrottled},
 		{name: "multi-wrap node with a watchdog cause", err: fmt.Errorf("%w: %w", closedUnderFolder, errIdleTimeout), want: ClassTransient},
@@ -168,6 +183,12 @@ func TestCanRevive(t *testing.T) {
 		{name: "transient temporary authentication failure", err: errors.New("Temporary authentication failure."), want: true},
 		{name: "throttled", err: errors.New("Too many simultaneous connections"), want: true},
 		{name: "throttled under a reconnect wrapper", err: fmt.Errorf("[src] failed to reconnect after retries: %w", errors.New("Account exceeded bandwidth limits")), want: true},
+		{
+			name: "account lock under a reconnect wrapper",
+			err:  fmt.Errorf("[src] failed to reconnect after retries: %w", errors.New("Authentication failed: account temporarily locked")),
+			want: false,
+		},
+		{name: "account lockout", err: errors.New("Account in lockout state"), want: false},
 		{name: "permanent authentication failure", err: errors.New("Authentication failed."), want: false},
 		{name: "permanent invalid credentials", err: errors.New("Invalid credentials (Failure)"), want: false},
 		{name: "unknown refusal", err: errors.New("Server busy"), want: false},

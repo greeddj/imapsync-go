@@ -19,11 +19,11 @@ const (
 	// Caller should treat it as non-retryable to avoid loops on novel errors.
 	ClassUnknown ErrClass = iota
 	// ClassTransient indicates a failure a fresh session can clear: a network
-	// failure (EOF, closed conn, timeout), a server-side logout or a temporary
-	// authentication failure. Reconnect-and-retry is appropriate.
+	// failure (EOF, closed conn, timeout), a server-side logout or an
+	// authentication service outage. Reconnect-and-retry is appropriate.
 	ClassTransient
-	// ClassPermanent indicates an authoritative refusal (auth failure, bad
-	// command, missing mailbox). Retry will not help.
+	// ClassPermanent indicates an authoritative refusal (auth failure, locked or
+	// disabled account, bad command, missing mailbox). Retry will not help.
 	ClassPermanent
 	// ClassThrottled indicates a server-signaled rate limit or quota hit.
 	// Reconnecting immediately would compound the problem; back off.
@@ -92,6 +92,15 @@ func classifyLeaves(err error) ErrClass {
 
 func classifyMessage(msg string) ErrClass {
 	switch {
+	// A login to a locked or disabled account can extend the lock, so this state
+	// outranks the throttle and outage phrases and allows no reconnect or revive.
+	case strings.Contains(msg, "locked"),
+		strings.Contains(msg, "lockout"),
+		strings.Contains(msg, "disabled"),
+		strings.Contains(msg, "suspended"),
+		strings.Contains(msg, "blocked"):
+		return ClassPermanent
+
 	// Server-signaled throttling: Gmail and Workspace use these phrasings.
 	case strings.Contains(msg, "too many simultaneous"):
 		return ClassThrottled
@@ -102,8 +111,6 @@ func classifyMessage(msg string) ErrClass {
 			strings.Contains(msg, "limit") ||
 			strings.Contains(msg, "quota")):
 		return ClassThrottled
-	case strings.Contains(msg, "lockout"):
-		return ClassThrottled
 
 	// Server-side session logout (Gmail's idle disconnect, post-quota
 	// kick). The connection is dead but a fresh login will succeed.
@@ -113,9 +120,10 @@ func classifyMessage(msg string) ErrClass {
 	// command; safeCall has already ruled out our own Cancel.
 	case strings.Contains(msg, "imap: connection closed"):
 		return ClassTransient
-	// Dovecot's [UNAVAILABLE] auth-backend outage; go-imap drops the code,
-	// so the text decides. Must precede the permanent auth rule.
-	case strings.Contains(msg, "authentication") && strings.Contains(msg, "temporar"):
+	// Auth-backend outage: Dovecot's [UNAVAILABLE] text or "temporarily unavailable".
+	// go-imap drops the code, so the text decides. Must precede the permanent auth rule.
+	case strings.Contains(msg, "temporary authentication failure"),
+		strings.Contains(msg, "authentication") && strings.Contains(msg, "temporarily unavailable"):
 		return ClassTransient
 
 	// Permanent: authentication or addressing problems.

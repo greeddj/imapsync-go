@@ -2657,8 +2657,8 @@ func Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects(t
 }
 
 // Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt asserts that
-// after a revivable give-up a call makes one attempt with no backoff and skips fn; a permanent
-// refusal sends nothing. Sequential - swaps the package-level sleepCtx var.
+// after a revivable give-up a call makes one attempt without backoff and skips fn; an account
+// lock or other permanent refusal sends nothing. Sequential - swaps sleepCtx.
 func Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -2684,6 +2684,24 @@ func Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAtte
 			refusals:   1,
 			wantLogins: 0,
 			wantWaits:  0,
+			wantClass:  ClassPermanent,
+		},
+		{
+			name:       "account lock",
+			reply:      "NO Authentication failed: account temporarily locked",
+			refusals:   1,
+			wantLogins: 0,
+			wantWaits:  0,
+			wantText:   "account temporarily locked",
+			wantClass:  ClassPermanent,
+		},
+		{
+			name:       "account lockout",
+			reply:      "NO Account in lockout state",
+			refusals:   1,
+			wantLogins: 0,
+			wantWaits:  0,
+			wantText:   "lockout state",
 			wantClass:  ClassPermanent,
 		},
 	}
