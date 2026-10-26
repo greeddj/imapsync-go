@@ -972,21 +972,33 @@ func TestNew_When_AuthIsSupported_Then_LoadsItUnchanged(t *testing.T) {
 	}
 }
 
-func TestNew_When_AuthIsUnsupported_Then_ReturnsErrorNamingSideAndValue(t *testing.T) {
+func TestNew_When_AuthIsUnsupported_Then_ReturnsErrorNamingSideNotValue(t *testing.T) {
 	t.Parallel()
 
-	values := []string{"cram_md5", "crammd5", "xoauth2", "plain", " login", "cram-md5 "}
+	values := []struct {
+		value  string
+		secret bool
+	}{
+		{value: "cram_md5"},
+		{value: "crammd5"},
+		{value: "xoauth2"},
+		{value: "plain"},
+		{value: " login"},
+		{value: "cram-md5 "},
+		{value: "abcdefghijklmnop", secret: true},
+		{value: "abcd efgh ijkl mnop", secret: true},
+	}
 	const hint = `"login" or "cram-md5"`
 
 	for _, ext := range authExtensions {
-		for _, value := range values {
+		for _, v := range values {
 			for _, side := range []string{"src", "dst"} {
-				t.Run(ext+" "+strconv.Quote(value)+" on "+side, func(t *testing.T) {
+				t.Run(ext+" "+strconv.Quote(v.value)+" on "+side, func(t *testing.T) {
 					t.Parallel()
 
-					srcAuth, dstAuth, other := strconv.Quote(value), `"CRAM-MD5"`, "dst"
+					srcAuth, dstAuth, other := strconv.Quote(v.value), `"CRAM-MD5"`, "dst"
 					if side == "dst" {
-						srcAuth, dstAuth, other = `"CRAM-MD5"`, strconv.Quote(value), "src"
+						srcAuth, dstAuth, other = `"CRAM-MD5"`, strconv.Quote(v.value), "src"
 					}
 
 					cfg, err := runNewWithArgs(t, ext, authConfig(ext, srcAuth, dstAuth))
@@ -1001,8 +1013,11 @@ func TestNew_When_AuthIsUnsupported_Then_ReturnsErrorNamingSideAndValue(t *testi
 					if !strings.HasPrefix(msg, side+": ") {
 						t.Errorf("error = %q, want the prefix %q", msg, side+": ")
 					}
-					if !strings.Contains(msg, strconv.Quote(value)) {
-						t.Errorf("error = %q, want the quoted value %s", msg, strconv.Quote(value))
+					if strings.Contains(msg, strconv.Quote(v.value)) {
+						t.Errorf("error = %q, want no quoted value %s", msg, strconv.Quote(v.value))
+					}
+					if v.secret && strings.Contains(msg, v.value) {
+						t.Errorf("error = %q, want no value %q", msg, v.value)
 					}
 					if !strings.Contains(msg, hint) {
 						t.Errorf("error = %q, want the hint %s", msg, hint)

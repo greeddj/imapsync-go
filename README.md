@@ -143,7 +143,7 @@ If omitted or set to an empty string, `login` is used.
 
 The letter case of the value is not important. `CRAM-MD5` and `cram-md5` select the same mechanism.
 
-If the value is any other text, the command stops before it connects to a server. The error shows the block (`src` or `dst`) and the value.
+If the value is any other text, the command stops before it connects to a server. The error shows the block (`src` or `dst`) and the supported values. The error does not show the value from the file.
 
 ### Running with Homebrew
 

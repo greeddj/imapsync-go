@@ -449,9 +449,14 @@ func TestActionShow_When_AuthIsUnsupported_Then_RefusesBeforeConnecting(t *testi
 	if !errors.Is(err, config.ErrAuthUnsupported) {
 		t.Fatalf("error = %v, want %v", err, config.ErrAuthUnsupported)
 	}
-	for _, want := range []string{"load config", "dst: ", `"crammd5"`} {
+	for _, want := range []string{"load config", "dst: "} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %q, want %q", err, want)
+		}
+	}
+	for _, unwanted := range []string{`"crammd5"`, "crammd5"} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Errorf("error = %q, want no value %s", err, unwanted)
 		}
 	}
 	if strings.Contains(err.Error(), e2ePassword) {

@@ -168,7 +168,7 @@ func newDialer(timeout time.Duration) *net.Dialer {
 // ctx alive.
 func New(ctx context.Context, addr, username, password string, opts Options) (*Client, error) {
 	if !supportedAuth(opts.Auth) {
-		return nil, fmt.Errorf("%w %q", errUnsupportedAuth, opts.Auth)
+		return nil, errUnsupportedAuth
 	}
 
 	timeout := opts.DialTimeout

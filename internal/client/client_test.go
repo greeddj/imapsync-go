@@ -938,15 +938,15 @@ func Test_New_cramMD5Succeeds(t *testing.T) {
 	}
 }
 
-// Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing asserts that an
-// unknown mechanism is an error, not a silent LOGIN, and that no connection is
-// made. A dial would run the server handler before New can return.
+// Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing asserts that an unknown
+// mechanism is an error with no value in it, not a silent LOGIN. A dial would
+// run the server handler before New returns.
 func Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing(t *testing.T) {
 	t.Parallel()
 
 	const password = "secret-pass"
 
-	for _, auth := range []string{"cram_md5", "crammd5", "xoauth2", "plain"} {
+	for _, auth := range []string{"cram_md5", "crammd5", "xoauth2", "plain", "abcdefghijklmnop", "abcd efgh ijkl mnop"} {
 		t.Run(auth, func(t *testing.T) {
 			t.Parallel()
 
@@ -970,8 +970,11 @@ func Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing(t *testing.T) {
 			if !errors.Is(err, errUnsupportedAuth) {
 				t.Fatalf("New error = %v, want %v", err, errUnsupportedAuth)
 			}
-			if !strings.Contains(err.Error(), strconv.Quote(auth)) {
-				t.Errorf("New error = %q, want the quoted value %s", err, strconv.Quote(auth))
+			if strings.Contains(err.Error(), strconv.Quote(auth)) {
+				t.Errorf("New error = %q, want no quoted value %s", err, strconv.Quote(auth))
+			}
+			if strings.Contains(err.Error(), auth) {
+				t.Errorf("New error = %q, want no value %q", err, auth)
 			}
 			if strings.Contains(err.Error(), password) {
 				t.Errorf("New error = %q, want no password", err)

@@ -223,14 +223,14 @@ func clampWorkers(n int) int {
 	}
 }
 
-// checkAuth lowers the value the way the client does, so both accept the same
-// inputs. The error carries the value, never a password.
+// checkAuth lowers the value as the client does, so both accept the same inputs.
+// The error omits the value: an operator can paste a secret into auth.
 func checkAuth(side, auth string) error {
 	switch strings.ToLower(auth) {
 	case "", "login", "cram-md5":
 		return nil
 	}
-	return fmt.Errorf("%s: %w %q, use \"login\" or \"cram-md5\"", side, ErrAuthUnsupported, auth)
+	return fmt.Errorf("%s: %w, use \"login\" or \"cram-md5\"", side, ErrAuthUnsupported)
 }
 
 // validate checks the required fields and the values of auth and map items.

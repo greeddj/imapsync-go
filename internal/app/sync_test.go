@@ -2198,6 +2198,7 @@ func TestActionSync_When_AuthIsUnsupported_Then_RefusesBeforeConnecting(t *testi
 	}{
 		{name: "JSON destination", ext: ".json", side: "dst", value: "xoauth2"},
 		{name: "YAML source", ext: ".yaml", side: "src", value: "cram_md5"},
+		{name: "YML destination with a value shaped like an app password", ext: ".yml", side: "dst", value: "abcdefghijklmnop"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2212,9 +2213,14 @@ func TestActionSync_When_AuthIsUnsupported_Then_RefusesBeforeConnecting(t *testi
 			if !errors.Is(err, config.ErrAuthUnsupported) {
 				t.Fatalf("error = %v, want %v", err, config.ErrAuthUnsupported)
 			}
-			for _, want := range []string{"failed to load config", tt.side + ": ", strconv.Quote(tt.value)} {
+			for _, want := range []string{"failed to load config", tt.side + ": "} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error = %q, want %q", err, want)
+				}
+			}
+			for _, unwanted := range []string{strconv.Quote(tt.value), tt.value} {
+				if strings.Contains(err.Error(), unwanted) {
+					t.Errorf("error = %q, want no value %s", err, unwanted)
 				}
 			}
 			if strings.Contains(err.Error(), e2ePassword) {
