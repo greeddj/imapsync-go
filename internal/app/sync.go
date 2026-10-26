@@ -26,7 +26,7 @@ import (
 
 const (
 	skipReasonNoSelect = `the source server marks it \Noselect`
-	skipReasonUnlisted = "the source server lists only its subfolders"
+	skipReasonUnlisted = "the source server lists only its subfolders and refuses to open it"
 )
 
 // verboseUIDLimit caps the per-plan UID dump in --verbose preview so a
@@ -75,6 +75,13 @@ type FolderFailure struct {
 	DestinationFolder string
 }
 
+// FolderSkip names a source folder the plan leaves out without failing the
+// run, and the server refusal behind it.
+type FolderSkip struct {
+	Err          error
+	SourceFolder string
+}
+
 // SyncSummary aggregates the per-folder plans along with total message counts
 // and an estimated total byte volume.
 //
@@ -85,6 +92,7 @@ type FolderFailure struct {
 type SyncSummary struct {
 	Plans        []FolderSyncPlan
 	Failures     []FolderFailure
+	Skipped      []FolderSkip
 	TotalNew     int
 	TotalNewSize uint64
 }
@@ -367,6 +375,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		return err
 	}
 
+	if !quiet && len(summary.Skipped) > 0 {
+		printFolderSkips(out, summary.Skipped)
+	}
+
 	// Quiet mode shows this too: like the final error line, it reports a failure.
 	if len(summary.Failures) > 0 {
 		printFolderFailures(out, summary.Failures)
@@ -609,6 +621,15 @@ func printFolderFailures(out io.Writer, failures []FolderFailure) {
 	}
 }
 
+// printFolderSkips names the folders the plan leaves out. Err carries server
+// text, so every part goes through termsafe.Escape.
+func printFolderSkips(out io.Writer, skips []FolderSkip) {
+	for _, s := range skips {
+		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s: %s\n",
+			termsafe.Escape(s.SourceFolder), skipReasonUnlisted, termsafe.Escape(s.Err.Error()))
+	}
+}
+
 func printSyncErrors(out io.Writer, synced, errs, failedFolders int) {
 	_, _ = fmt.Fprintf(out, "❌ Sync completed with errors. %d messages uploaded, %d errors occurred, %d folders failed\n",
 		synced, errs, failedFolders)
@@ -718,11 +739,23 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 
 	summary := &SyncSummary{Plans: make([]FolderSyncPlan, 0, n)}
 	for idx := range scans {
-		if scans[idx].srcErr != nil {
+		if srcErr := scans[idx].srcErr; srcErr != nil {
+			// An unlisted name with listed children is a hierarchy level that
+			// refuses to open, not a broken folder. Any other refusal stays a failure.
+			if errors.Is(srcErr, client.ErrSelectRefused) {
+				level, err := isHierarchyLevel(ctx, srcClient, mappings[idx].Source)
+				if err != nil {
+					return nil, err
+				}
+				if level {
+					summary.Skipped = append(summary.Skipped, FolderSkip{SourceFolder: mappings[idx].Source, Err: srcErr})
+					continue
+				}
+			}
 			summary.Failures = append(summary.Failures, FolderFailure{
 				SourceFolder:      mappings[idx].Source,
 				DestinationFolder: mappings[idx].Destination,
-				Err:               fmt.Errorf("%w: %w", errSourceScan, scans[idx].srcErr),
+				Err:               fmt.Errorf("%w: %w", errSourceScan, srcErr),
 			})
 			continue
 		}
@@ -820,8 +853,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		return nil, err
 	}
 
-	// A \Noselect source cannot be scanned, and a hierarchy level that LIST leaves
-	// out is no mailbox. Their subfolders still can be scanned.
+	// A \Noselect source cannot be scanned. Its subfolders still can be scanned.
 	var skipped map[string]string
 	skip := func(name, reason string) {
 		if skipped == nil {
@@ -834,23 +866,14 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// The listing and the existence check read the mailbox cache, so they fail
-		// only when ctx ends.
+		// The listing reads the mailbox cache, so it fails only when ctx ends.
 		subfolders, err := getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
 		if err != nil {
 			return nil, err
 		}
-		exists, err := srcClient.MailboxExists(ctx, mapping.Source)
-		if err != nil {
-			return nil, err
-		}
-		// RFC 3501 says INBOX always exists, so an INBOX that LIST leaves out is still scanned.
-		switch {
-		case srcClient.IsNoSelect(mapping.Source):
+		if srcClient.IsNoSelect(mapping.Source) {
 			skip(mapping.Source, skipReasonNoSelect)
-		case !exists && len(subfolders) > 0 && !strings.EqualFold(mapping.Source, "INBOX"):
-			skip(mapping.Source, skipReasonUnlisted)
-		default:
+		} else {
 			expanded = append(expanded, mapping)
 		}
 
@@ -942,6 +965,24 @@ func dedupeMappings(in []config.DirectoryMapping) (out, dropped []config.Directo
 		out = append(out, m)
 	}
 	return out, dropped
+}
+
+// isHierarchyLevel reports whether LIST leaves name out but lists its subfolders. It reads
+// only the mailbox cache, so it fails only when ctx ends.
+func isHierarchyLevel(ctx context.Context, c *client.Client, name string) (bool, error) {
+	// RFC 3501 says INBOX always exists, so an INBOX that LIST leaves out is still a mailbox.
+	if strings.EqualFold(name, "INBOX") {
+		return false, nil
+	}
+	exists, err := c.MailboxExists(ctx, name)
+	if err != nil || exists {
+		return false, err
+	}
+	subfolders, err := getSubfolders(ctx, c, name, "")
+	if err != nil {
+		return false, err
+	}
+	return len(subfolders) > 0, nil
 }
 
 // getSubfolders returns all subfolders of a given folder

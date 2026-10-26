@@ -1445,6 +1445,116 @@ func Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_Rec
 	}
 }
 
+func Test_FetchMessageMap_When_ExamineIsRefused_Then_OnlyServerRefusalsAreMarked(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		folder       string
+		status       string
+		info         string
+		wantClass    ErrClass
+		wantLogins   int
+		wantExamines int
+		dropFirst    bool
+		wantMarked   bool
+	}{
+		{
+			name: "refusal of an unknown mailbox", folder: "Archive", status: "NO", info: "Mailbox doesn't exist: Archive",
+			wantMarked: true, wantClass: ClassUnknown, wantLogins: 1, wantExamines: 1,
+		},
+		{
+			name: "refusal with a permanent phrase", folder: "Archive", status: "NO", info: "No such mailbox",
+			wantMarked: true, wantClass: ClassPermanent, wantLogins: 1, wantExamines: 1,
+		},
+		{
+			name: "bad command reply", folder: "Archive", status: "BAD", info: "Invalid mailbox name",
+			wantMarked: true, wantClass: ClassUnknown, wantLogins: 1, wantExamines: 1,
+		},
+		{
+			name: "throttle reply", folder: "Archive", status: "NO", info: "Too many simultaneous connections",
+			wantMarked: false, wantClass: ClassThrottled, wantLogins: 1, wantExamines: 1,
+		},
+		{
+			name: "transient reply on both sessions", folder: "Not logged in", status: "NO", info: "Mailbox doesn't exist: Not logged in",
+			wantMarked: false, wantClass: ClassTransient, wantLogins: 2, wantExamines: 2,
+		},
+		{
+			name: "first session drops and the second refuses", folder: "Archive", status: "NO", info: "Mailbox doesn't exist: Archive",
+			dropFirst: true, wantMarked: true, wantClass: ClassUnknown, wantLogins: 2, wantExamines: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			refuseExamine := func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+				if cmd.verb != "EXAMINE" {
+					return false, true
+				}
+				writeLine(conn, "%s %s %s", cmd.tag, tt.status, tt.info)
+				return true, true
+			}
+			srv := newFakeServer(t)
+			if tt.dropFirst {
+				srv.addConnHandler(interceptHandler(srv, byeOn(verbIs("EXAMINE"))))
+			}
+			// A second refusing session serves the retry of the transient row.
+			srv.addConnHandler(interceptHandler(srv, refuseExamine))
+			srv.addConnHandler(interceptHandler(srv, refuseExamine))
+			c := newClientWithFake(t, srv)
+
+			_, _, err := c.FetchMessageMap(t.Context(), tt.folder)
+
+			if err == nil {
+				t.Fatal("FetchMessageMap returned nil, want the refusal")
+			}
+			if got := errors.Is(err, ErrSelectRefused); got != tt.wantMarked {
+				t.Errorf("errors.Is(err, ErrSelectRefused) = %t, want %t (error: %v)", got, tt.wantMarked, err)
+			}
+			if want := "cannot select folder " + tt.folder + ": " + tt.info; !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to contain %q", err, want)
+			}
+			if got := classifyError(err); got != tt.wantClass {
+				t.Errorf("classifyError(err) = %s, want %s", got, tt.wantClass)
+			}
+			if got, bare := classifyError(err), classifyError(errors.New(tt.info)); got != bare {
+				t.Errorf("classifyError(err) = %s, want the class of the bare reply, %s", got, bare)
+			}
+			if got := srv.callCount("LOGIN"); got != tt.wantLogins {
+				t.Errorf("LOGIN count = %d, want %d", got, tt.wantLogins)
+			}
+			if got := srv.callCount("EXAMINE"); got != tt.wantExamines {
+				t.Errorf("EXAMINE count = %d, want %d", got, tt.wantExamines)
+			}
+		})
+	}
+}
+
+func Test_FetchMessageMap_When_ExamineDropsAndReconnectIsRefused_Then_ErrorIsNotSelectRefusal(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, byeOn(verbIs("EXAMINE"))))
+	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Invalid credentials"))
+	c := newClientWithFake(t, srv)
+
+	_, _, err := c.FetchMessageMap(t.Context(), "Archive")
+
+	if err == nil {
+		t.Fatal("FetchMessageMap returned nil, want the reconnect failure")
+	}
+	if errors.Is(err, ErrSelectRefused) {
+		t.Errorf("error = %v, want no ErrSelectRefused: the session broke, the server did not refuse the folder", err)
+	}
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(err) = %s, want %s", got, ClassPermanent)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the first session and the refused reconnect)", got)
+	}
+}
+
 // The error class comes from go-imap, not from our wrapper text.
 func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries(t *testing.T) {
 	t.Parallel()

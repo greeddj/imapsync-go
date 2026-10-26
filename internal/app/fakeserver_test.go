@@ -569,6 +569,7 @@ type mailStore struct {
 	folders      map[string][]storedMsg
 	nextUID      map[string]uint32
 	noSelect     map[string]bool
+	hidden       map[string]bool
 	openReply    map[string]string
 	statusReply  map[string]string
 	delimiter    string
@@ -639,6 +640,19 @@ func (s *fakeServer) markNoSelect(names ...string) {
 			s.store.nextUID[name] = 1
 		}
 		s.store.noSelect[name] = true
+	}
+}
+
+// hideFromList leaves each folder out of LIST. The folder stays selectable and
+// keeps its messages, as with a mailbox that has the read right but no lookup right.
+func (s *fakeServer) hideFromList(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.hidden == nil {
+		s.store.hidden = make(map[string]bool, len(names))
+	}
+	for _, name := range names {
+		s.store.hidden[name] = true
 	}
 }
 
@@ -884,8 +898,12 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 	delim := s.store.delimiter
 	names := slices.Sorted(maps.Keys(s.store.folders))
 	noSelect := maps.Clone(s.store.noSelect)
+	hidden := maps.Clone(s.store.hidden)
 	s.mu.Unlock()
 	for _, name := range names {
+		if hidden[name] {
+			continue
+		}
 		attrs := ""
 		if noSelect[name] {
 			attrs = `\HasChildren \Noselect`

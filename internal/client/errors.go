@@ -44,6 +44,10 @@ func (c ErrClass) String() string {
 	}
 }
 
+// ErrSelectRefused marks a FetchMessageMap failure where the server answered
+// SELECT or EXAMINE with NO or BAD on a working session.
+var ErrSelectRefused = errors.New("cannot select folder")
+
 // classifyError inspects err and returns its class.
 func classifyError(err error) ErrClass {
 	if err == nil {

@@ -81,6 +81,11 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		missingCount = 0
 		mbox, err := c.selectIfNeeded(cli, folder)
 		if err != nil {
+			// Only a server answer marks a refusal: a broken session or a throttle
+			// stays a folder failure upstream.
+			if !canRevive(err) {
+				return fmt.Errorf("[%s] %w %s: %w", c.prefix, ErrSelectRefused, folder, err)
+			}
 			return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
 		}
 		// selectIfNeeded skips the round-trip when the folder is already

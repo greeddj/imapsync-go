@@ -2814,6 +2814,100 @@ func Test_buildSyncPlan_When_SourceFolderRefusedWithHostileReply_Then_FailureKee
 	}
 }
 
+func Test_buildSyncPlan_When_SourceScanIsRefused_Then_OnlyAnUnlistedParentIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	archiveMappings := []config.DirectoryMapping{mapping("Archive", "Archive"), mapping("Archive/2024", "Archive/2024")}
+	tests := []struct {
+		folders     map[string][]fakeMsg
+		refuse      map[string]string
+		name        string
+		mappings    []config.DirectoryMapping
+		wantSkipped []string
+		wantFailed  []string
+		wantPlans   []string
+	}{
+		{
+			name:        "unlisted parent with listed children",
+			folders:     map[string][]fakeMsg{"Archive/2024": fakeMsgs("a1@x")},
+			mappings:    archiveMappings,
+			wantSkipped: []string{"Archive"},
+			wantPlans:   []string{"Archive/2024"},
+		},
+		{
+			name:       "unlisted parent that answers with a throttle",
+			folders:    map[string][]fakeMsg{"Archive/2024": fakeMsgs("a1@x")},
+			refuse:     map[string]string{"Archive": "NO Too many simultaneous connections"},
+			mappings:   archiveMappings,
+			wantFailed: []string{"Archive"},
+			wantPlans:  []string{"Archive/2024"},
+		},
+		{
+			name:       "listed parent that refuses to open",
+			folders:    map[string][]fakeMsg{"Archive": nil, "Archive/2024": fakeMsgs("a1@x")},
+			refuse:     map[string]string{"Archive": "NO Permission denied"},
+			mappings:   archiveMappings,
+			wantFailed: []string{"Archive"},
+			wantPlans:  []string{"Archive/2024"},
+		},
+		{
+			name:       "unlisted name without children",
+			folders:    map[string][]fakeMsg{"Archive/2024": fakeMsgs("a1@x")},
+			mappings:   []config.DirectoryMapping{mapping("Archiv", "Archiv")},
+			wantFailed: []string{"Archiv"},
+		},
+		{
+			name:       "unlisted INBOX with children",
+			folders:    map[string][]fakeMsg{"INBOX/Sub": fakeMsgs("s1@x")},
+			mappings:   []config.DirectoryMapping{mapping("INBOX", "INBOX"), mapping("INBOX/Sub", "INBOX/Sub")},
+			wantFailed: []string{"INBOX"},
+			wantPlans:  []string{"INBOX/Sub"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.folders)
+			for folder, reply := range tt.refuse {
+				src.refuseOpenWith(folder, reply)
+			}
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			srcC := newAppClient(t, src, "src")
+			dstC := newAppClient(t, dst, "dst")
+			srcTr, dstTr := makePlanTrackers()
+
+			summary, err := buildSyncPlan(t.Context(), srcC, dstC, tt.mappings, srcTr, dstTr, "src", "dst")
+
+			if err != nil {
+				t.Fatalf("buildSyncPlan: %v", err)
+			}
+			var skipped, failed, planned []string
+			for _, s := range summary.Skipped {
+				skipped = append(skipped, s.SourceFolder)
+				if !errors.Is(s.Err, client.ErrSelectRefused) {
+					t.Errorf("skip error = %v, want client.ErrSelectRefused", s.Err)
+				}
+				if errors.Is(s.Err, errSourceScan) {
+					t.Errorf("skip error = %v, want the raw scan error without errSourceScan", s.Err)
+				}
+			}
+			for _, f := range summary.Failures {
+				failed = append(failed, f.SourceFolder)
+				if !errors.Is(f.Err, errSourceScan) {
+					t.Errorf("failure error = %v, want errSourceScan", f.Err)
+				}
+			}
+			for _, p := range summary.Plans {
+				planned = append(planned, p.SourceFolder)
+			}
+			assertIDs(t, "Skipped", skipped, tt.wantSkipped...)
+			assertIDs(t, "Failures", failed, tt.wantFailed...)
+			assertIDs(t, "Plans", planned, tt.wantPlans...)
+		})
+	}
+}
+
 // The name is short so go-pretty does not snip the tracker line that holds it.
 func hostileFolder(letter string) (wire, name, shown string) {
 	return letter + "&ABs-[2J", letter + "\x1b[2J", letter + `\x1b[2J`
@@ -3431,7 +3525,7 @@ func Test_expandMappingsWithSubfolders_When_SourceIsNoSelect_Then_SkipsItAndKeep
 	}
 }
 
-func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedParent_Then_SkipsItAndKeepsChildren(t *testing.T) {
+func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedParent_Then_KeepsItWithChildren(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -3459,17 +3553,71 @@ func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedParent_Then_SkipsItA
 				pairs[i] = m.Source + "->" + m.Destination
 			}
 			slices.Sort(pairs)
-			if want := []string{"Archive/2024->Old/2024", "Archive/2025->Old/2025"}; !slices.Equal(pairs, want) {
+			if want := []string{"Archive->Old", "Archive/2024->Old/2024", "Archive/2025->Old/2025"}; !slices.Equal(pairs, want) {
 				t.Errorf("expanded = %v, want %v", pairs, want)
-			}
-			note := "Folder Archive skipped - the source server lists only its subfolders\n"
-			if tt.verbose {
-				assertContainsAll(t, out.String(), note)
-				return
 			}
 			assertContainsNone(t, out.String(), "skipped")
 		})
 	}
+}
+
+func Test_isHierarchyLevel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		folders map[string][]fakeMsg
+		name    string
+		query   string
+		hidden  []string
+		want    bool
+	}{
+		{name: "unlisted with listed children", folders: map[string][]fakeMsg{"Archive/2024": nil}, query: "Archive", want: true},
+		{
+			name: "readable but hidden with listed children", folders: map[string][]fakeMsg{"Archive": fakeMsgs("p1@x"), "Archive/2024": nil},
+			hidden: []string{"Archive"}, query: "Archive", want: true,
+		},
+		{name: "listed name", folders: map[string][]fakeMsg{"Archive": nil}, query: "Archive"},
+		{name: "listed name that also has children", folders: map[string][]fakeMsg{"Archive": nil, "Archive/2024": nil}, query: "Archive"},
+		{name: "unlisted without children", folders: map[string][]fakeMsg{"Archive/2024": nil}, query: "Archiv"},
+		{name: "upper case INBOX unlisted with children", folders: map[string][]fakeMsg{"INBOX/Sub": nil}, query: "INBOX"},
+		{name: "mixed case Inbox unlisted with children", folders: map[string][]fakeMsg{"Inbox/Sub": nil}, query: "Inbox"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.folders)
+			src.hideFromList(tt.hidden...)
+			srcC := newAppClient(t, src, "src")
+
+			got, err := isHierarchyLevel(t.Context(), srcC, tt.query)
+
+			if err != nil {
+				t.Fatalf("isHierarchyLevel: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("isHierarchyLevel(%q) = %t, want %t", tt.query, got, tt.want)
+			}
+		})
+	}
+
+	t.Run("context already canceled", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": nil})
+		srcC := newAppClient(t, src, "src")
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		got, err := isHierarchyLevel(ctx, srcC, "Archive")
+
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error = %v, want context.Canceled", err)
+		}
+		if got {
+			t.Error("isHierarchyLevel = true, want false with the error")
+		}
+	})
 }
 
 func Test_expandMappingsWithSubfolders_When_InboxIsUnlistedButHasSubfolders_Then_InboxIsKept(t *testing.T) {
@@ -3767,31 +3915,134 @@ func TestRunSync_When_ContextEndsDuringSourceScan_Then_ReturnsCanceledWithoutFai
 	assertContainsNone(t, out.String(), "cannot be synced", "folders failed")
 }
 
-func TestRunSync_When_MappedSourceIsUnlistedParent_Then_OnlyItsChildrenAreCopied(t *testing.T) {
+func TestRunSync_When_MappedSourceIsReadableButUnlisted_Then_ItAndItsChildrenAreCopied(t *testing.T) {
 	t.Parallel()
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"Archive":      fakeMsgs("p1@x", "p2@x"),
 		"Archive/2024": fakeMsgs("a1@x"),
-		"Archive/2025": fakeMsgs("a2@x"),
 	})
+	src.hideFromList("Archive")
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
 	out := &syncBuffer{}
 	opts := e2eOptions(out, "")
-	opts.autoConfirm, opts.verbose = true, true
+	opts.autoConfirm = true
 
 	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Archive", "Archive")), opts)
 
 	if err != nil {
 		t.Fatalf("runSync: %v", err)
 	}
+	assertIDs(t, "dst Archive", dst.folderMsgIDs("Archive"), "p1@x", "p2@x")
 	assertIDs(t, "dst Archive/2024", dst.folderMsgIDs("Archive/2024"), "a1@x")
-	assertIDs(t, "dst Archive/2025", dst.folderMsgIDs("Archive/2025"), "a2@x")
-	if slices.Contains(src.capturedNames("EXAMINE"), "Archive") {
-		t.Error("source opened Archive, a name its LIST leaves out")
+	if !slices.Contains(src.capturedNames("EXAMINE"), "Archive") {
+		t.Errorf("source EXAMINE names = %v, want Archive among them", src.capturedNames("EXAMINE"))
 	}
-	assertContainsAll(t, out.String(),
-		"Folder Archive skipped - the source server lists only its subfolders",
-		"Sync completed successfully",
+	got := out.String()
+	assertContainsAll(t, got, "Sync completed successfully")
+	assertContainsNone(t, got, "skipped", "cannot be synced")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_UnlistedParentRefusesOpen_Then_SkipsItAndCopiesChildren(t *testing.T) {
+	t.Parallel()
+
+	const skipLine = "Folder Archive skipped - the source server lists only its subfolders and refuses to open it: "
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "normal"},
+		{name: "quiet", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"Archive/2024": fakeMsgs("a1@x"),
+				"Archive/2025": fakeMsgs("a2@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Archive", "Archive")), opts)
+
+			if err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+			assertIDs(t, "dst Archive/2024", dst.folderMsgIDs("Archive/2024"), "a1@x")
+			assertIDs(t, "dst Archive/2025", dst.folderMsgIDs("Archive/2025"), "a2@x")
+			assertIDs(t, "dst APPENDs to Archive", dst.appended("Archive"))
+			got := out.String()
+			assertContainsNone(t, got, "cannot be synced")
+			if tt.quiet {
+				assertContainsNone(t, got, "skipped")
+				return
+			}
+			if !slices.Contains(src.capturedNames("EXAMINE"), "Archive") {
+				t.Errorf("source EXAMINE names = %v, want Archive among them", src.capturedNames("EXAMINE"))
+			}
+			if n := strings.Count(got, skipLine); n != 1 {
+				t.Errorf("output holds the skip line %d times, want 1\noutput: %q", n, got)
+			}
+			assertContainsAll(t, got, "Unknown Mailbox", "Sync completed successfully")
+			assertInOrder(t, got, skipLine, "Messages to be copied to destination")
+		})
+	}
+}
+
+func TestRunSync_When_UnlistedParentDropsSessionAndReconnectIsRefused_Then_ReportsFailure(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": fakeMsgs("a1@x")})
+	// LOGIN 1 is the planning client, LOGIN 2 its reconnect after the drop.
+	src.dropOnceOnOpen("Archive")
+	src.refuseLoginAt(2)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Archive", "Archive")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		folderFailuresHeader,
+		"• Archive → Archive: cannot scan source folder:",
+		"2 folders failed",
 	)
-	assertContainsNone(t, out.String(), "cannot be synced")
+	assertContainsNone(t, got, "skipped")
+}
+
+func TestRunSync_When_UnlistedParentRefusalCarriesControlCharacters_Then_SkipLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName + "/2024": fakeMsgs("e1@x")})
+	src.refuseOpenWith(hostileWireName, "NO "+hostileReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(hostileName, hostileName)), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"Folder "+hostileShownName+" skipped - ",
+		hostileReplyShown,
+	)
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+	if names := src.capturedNames("EXAMINE"); len(names) == 0 || names[0] != hostileWireName {
+		t.Errorf("source EXAMINE names = %q, want the first to be the exact name %q", names, hostileWireName)
+	}
+	assertIDs(t, "dst child folder", dst.folderMsgIDs(hostileWireName+"/2024"), "e1@x")
 }

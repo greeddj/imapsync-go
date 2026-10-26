@@ -125,6 +125,21 @@ func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.
 			err:  fmt.Errorf("[src] failed to reconnect after retries: %w", errors.New("Temporary authentication failure.")),
 			want: ClassTransient,
 		},
+		{
+			name: "select refusal marker over a permanent reply",
+			err:  fmt.Errorf("[src] %w %s: %w", ErrSelectRefused, "Work", errors.New("No such mailbox")),
+			want: ClassPermanent,
+		},
+		{
+			name: "select refusal marker over a throttle reply",
+			err:  fmt.Errorf("[src] %w %s: %w", ErrSelectRefused, "Work", errors.New("Too many simultaneous connections")),
+			want: ClassThrottled,
+		},
+		{
+			name: "select refusal marker over an unrecognized reply",
+			err:  fmt.Errorf("[src] %w %s: %w", ErrSelectRefused, "Work", errors.New("unrecognized server response")),
+			want: ClassUnknown,
+		},
 		{name: "wrap node without a cause is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w", nil), want: ClassThrottled},
 		{name: "multi-wrap node without causes is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w %w", nil, nil), want: ClassThrottled},
 		{
