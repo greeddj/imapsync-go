@@ -130,7 +130,7 @@ The command checks the configuration file when it loads the file.
   (`down_bps`, `up_bps`, `max_connections`).
 - If the file contains a different key at any level, the command stops with an
   error. The error shows the key and the path of the file.
-- A JSON file must contain one object. A YAML file must contain one document.
+- A JSON file must contain one object. A YAML file must contain one document with the settings. After this document, the file can contain only empty documents or null documents, for example `---` or `~`.
 
 ### Authentication
 

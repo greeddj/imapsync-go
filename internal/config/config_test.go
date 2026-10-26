@@ -545,6 +545,13 @@ func TestNew_When_ContentFollowsFirstDocument_Then_ReturnsError(t *testing.T) {
 		{"JSON garbage", ".json", validJSONConfig + "\ngarbage"},
 		{"JSON closing brace", ".json", validJSONConfig + "}"},
 		{"YAML second document", ".yaml", validYAMLConfig + "---\nmap:\n  - src: INBOX\n    dst: INBOX\n"},
+		{"YAML bare scalar document", ".yaml", validYAMLConfig + "---\nfoo\n"},
+		{"YAML sequence document", ".yaml", validYAMLConfig + "---\n- a\n"},
+		{"YAML empty flow mapping document", ".yaml", validYAMLConfig + "---\n{}\n"},
+		{"YAML quoted tilde document", ".yaml", validYAMLConfig + "---\n\"~\"\n"},
+		{"YAML malformed document", ".yaml", validYAMLConfig + "---\n[\n"},
+		{"YAML null document then a document with a key", ".yaml", validYAMLConfig + "---\n~\n---\nmap: []\n"},
+		{"YAML empty document then a document with a key", ".yaml", validYAMLConfig + "---\n---\nmap: []\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -595,6 +602,40 @@ func TestNew_When_TrailingWhitespaceFollowsDocument_Then_Loads(t *testing.T) {
 	}
 }
 
+func TestNew_When_NullOrEmptyDocumentFollowsDocument_Then_Loads(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+	}{
+		{"separator only", ".yaml", validYAMLConfig + "---\n"},
+		{"separator without final newline", ".yaml", validYAMLConfig + "---"},
+		{"comment only document", ".yaml", validYAMLConfig + "---\n# comment\n"},
+		{"tilde null document", ".yaml", validYAMLConfig + "---\n~\n"},
+		{"null word document", ".yaml", validYAMLConfig + "---\nnull\n"},
+		{"tagged null document", ".yaml", validYAMLConfig + "--- !<tag:yaml.org,2002:null>\n"},
+		{"two null documents", ".yaml", validYAMLConfig + "---\n~\n---\n"},
+		{"end marker then separator", ".yaml", validYAMLConfig + "...\n---\n"},
+		{"yml separator only", ".yml", validYAMLConfig + "---\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
+
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if cfg.Src.Server != "src:993" || cfg.RateLimit.MaxConnections != 5 {
+				t.Errorf("Config = %+v, want the file values", cfg)
+			}
+		})
+	}
+}
+
 func TestNew_When_FileIsEmpty_Then_KeepsTheFormatError(t *testing.T) {
 	t.Parallel()
 
@@ -610,6 +651,7 @@ func TestNew_When_FileIsEmpty_Then_KeepsTheFormatError(t *testing.T) {
 		{name: "null JSON", ext: ".json", content: "null", wantIs: ErrSrcServerRequired},
 		{name: "empty YAML", ext: ".yaml", wantIs: ErrSrcServerRequired},
 		{name: "comments only YAML", ext: ".yaml", content: "# nothing here\n", wantIs: ErrSrcServerRequired},
+		{name: "separators only YAML", ext: ".yaml", content: "---\n---\n", wantIs: ErrSrcServerRequired},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -736,6 +778,10 @@ func TestNew_When_MapEntryHasNoFolderName_Then_ReturnsErrorNamingEntryAndKey(t *
 		{
 			name: "yml single quoted empty dst", ext: ".yml", wantEntry: 1, wantErr: ErrMapDstRequired,
 			content: mapTestYAMLCreds + "map:\n  - src: INBOX\n    dst: ''\n",
+		},
+		{
+			name: "YAML null entry before a trailing separator", ext: ".yaml", wantEntry: 2, wantErr: ErrMapSrcRequired,
+			content: mapTestYAMLCreds + "map:\n  - src: A\n    dst: A\n  - ~\n---\n",
 		},
 	}
 	for _, tt := range tests {

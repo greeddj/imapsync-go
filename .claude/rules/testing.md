@@ -8,7 +8,7 @@
 
 ## What we test
 
-- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), the accepted and rejected `auth` values. The tests also cover unknown keys at every level in both formats, content after the first document, empty files, and the load of both example files. A rate-limit flag that the user sets replaces the config value, also when the flag is 0. A rate-limit flag that the user does not set keeps the config value.
+- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), the accepted and rejected `auth` values. The tests also cover unknown keys at every level in both formats, content after the first document, empty and null YAML documents after the first document, empty files, and the load of both example files. A rate-limit flag that the user sets replaces the config value, also when the flag is 0. A rate-limit flag that the user does not set keeps the config value.
 - **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;

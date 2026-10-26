@@ -176,9 +176,16 @@ func decodeYAML(data []byte, cfg *Config) error {
 	case err != nil:
 		return err
 	}
-	// The Decoder reads only the first document, so look for another one.
-	if err := dec.Decode(&yaml.Node{}); !errors.Is(err, io.EOF) {
-		return errTrailingContent
+	// A null or empty document after the config holds no settings, so it is accepted.
+	for {
+		var node yaml.Node
+		err = dec.Decode(&node)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || node.Kind != yaml.DocumentNode || len(node.Content) != 1 || node.Content[0].Tag != "!!null" {
+			return errTrailingContent
+		}
 	}
 	return restoreNullMapEntries(data, cfg)
 }
