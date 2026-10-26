@@ -24,6 +24,11 @@ import (
 	"golang.org/x/time/rate"
 )
 
+const (
+	skipReasonNoSelect = `the source server marks it \Noselect`
+	skipReasonUnlisted = "the source server lists only its subfolders"
+)
+
 // verboseUIDLimit caps the per-plan UID dump in --verbose preview so a
 // large plan (tens of thousands of UIDs) doesn't bury the confirm prompt.
 const verboseUIDLimit = 20
@@ -346,7 +351,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	dstClient.SetProgressWriter(pw)
 	dstClient.SetProgressTracker(dstTracker)
 
-	summary, err := buildSyncPlan(ctx, srcClient, dstClient, mappings, srcTracker, dstTracker, pw, cfg.Src.Label, cfg.Dst.Label, verbose)
+	summary, err := buildSyncPlan(ctx, srcClient, dstClient, mappings, srcTracker, dstTracker, cfg.Src.Label, cfg.Dst.Label)
 	if err != nil {
 		pw.Stop()
 		return err
@@ -581,6 +586,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	totalErrorsN := int(totalErrors.Load())
 
 	if totalErrorsN > 0 || len(summary.Failures) > 0 {
+		if len(summary.Failures) > 0 && !quiet {
+			printFolderFailures(out, summary.Failures)
+		}
 		printSyncErrors(out, totalSyncedN, totalErrorsN, len(summary.Failures))
 		// Friendly summary already printed; signal non-zero exit without
 		// asking main to repeat the same information through stderr.
@@ -625,7 +633,7 @@ type folderScan struct {
 	done           atomic.Int32
 }
 
-func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, pw *progress.Writer, srcLabel, dstLabel string, verbose bool) (*SyncSummary, error) {
+func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, srcLabel, dstLabel string) (*SyncSummary, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -711,10 +719,11 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 	summary := &SyncSummary{Plans: make([]FolderSyncPlan, 0, n)}
 	for idx := range scans {
 		if scans[idx].srcErr != nil {
-			if verbose {
-				pw.Log("⚠️ Failed to fetch source folder %s, skipping by error: %s",
-					termsafe.Escape(mappings[idx].Source), termsafe.Escape(scans[idx].srcErr.Error()))
-			}
+			summary.Failures = append(summary.Failures, FolderFailure{
+				SourceFolder:      mappings[idx].Source,
+				DestinationFolder: mappings[idx].Destination,
+				Err:               fmt.Errorf("%w: %w", errSourceScan, scans[idx].srcErr),
+			})
 			continue
 		}
 		if scans[idx].dstNoSelect {
@@ -811,29 +820,38 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		return nil, err
 	}
 
-	// A \Noselect source cannot be scanned, but its subfolders still can.
-	var skipped map[string]struct{}
-	skip := func(name string) {
+	// A \Noselect source cannot be scanned, and a hierarchy level that LIST leaves
+	// out is no mailbox. Their subfolders still can be scanned.
+	var skipped map[string]string
+	skip := func(name, reason string) {
 		if skipped == nil {
-			skipped = make(map[string]struct{})
+			skipped = make(map[string]string)
 		}
-		skipped[name] = struct{}{}
+		skipped[name] = reason
 	}
 
 	for _, mapping := range mappings {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if srcClient.IsNoSelect(mapping.Source) {
-			skip(mapping.Source)
-		} else {
-			expanded = append(expanded, mapping)
-		}
-
-		// The listing reads the mailbox cache, so it fails only when ctx ends.
+		// The listing and the existence check read the mailbox cache, so they fail
+		// only when ctx ends.
 		subfolders, err := getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
 		if err != nil {
 			return nil, err
+		}
+		exists, err := srcClient.MailboxExists(ctx, mapping.Source)
+		if err != nil {
+			return nil, err
+		}
+		// RFC 3501 says INBOX always exists, so an INBOX that LIST leaves out is still scanned.
+		switch {
+		case srcClient.IsNoSelect(mapping.Source):
+			skip(mapping.Source, skipReasonNoSelect)
+		case !exists && len(subfolders) > 0 && !strings.EqualFold(mapping.Source, "INBOX"):
+			skip(mapping.Source, skipReasonUnlisted)
+		default:
+			expanded = append(expanded, mapping)
 		}
 
 		// Add mapping for each subfolder
@@ -842,7 +860,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				return nil, err
 			}
 			if srcClient.IsNoSelect(subfolder) {
-				skip(subfolder)
+				skip(subfolder, skipReasonNoSelect)
 				continue
 			}
 			// Calculate relative path from source root
@@ -882,7 +900,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 	deduped, dropped := dedupeMappings(expanded)
 	if verbose && !quiet {
 		for _, name := range slices.Sorted(maps.Keys(skipped)) {
-			_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - the source server marks it \\Noselect\n", termsafe.Escape(name))
+			_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), skipped[name])
 		}
 		for _, m := range dropped {
 			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", m.Source)

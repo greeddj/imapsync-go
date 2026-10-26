@@ -569,12 +569,14 @@ type mailStore struct {
 	folders      map[string][]storedMsg
 	nextUID      map[string]uint32
 	noSelect     map[string]bool
+	openReply    map[string]string
 	delimiter    string
 	loginReply   string
 	createReply  string
 	appendReply  string
 	dropOnOpen   string
 	appends      []appendRecord
+	loginRefusal int
 	seenMutating int
 }
 
@@ -645,6 +647,14 @@ func (s *fakeServer) refuseLogin() {
 	s.store.loginReply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
 }
 
+// refuseLoginAt makes only the n-th LOGIN (1-based, counted over the life of the
+// server) end with a refusal. Every other LOGIN succeeds.
+func (s *fakeServer) refuseLoginAt(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.loginRefusal = n
+}
+
 func (s *fakeServer) refuseCreate() {
 	s.refuseCreateWith("NO CREATE refused by policy")
 }
@@ -655,6 +665,17 @@ func (s *fakeServer) refuseCreateWith(reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.createReply = reply
+}
+
+// refuseOpenWith makes every EXAMINE and SELECT of folder end with reply, which
+// carries its own status word, as the tagged status line. The folder stays in LIST.
+func (s *fakeServer) refuseOpenWith(folder, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.openReply == nil {
+		s.store.openReply = make(map[string]string)
+	}
+	s.store.openReply[folder] = reply
 }
 
 func (s *fakeServer) dropOnceOnOpen(folder string) {
@@ -835,6 +856,9 @@ func (s *fakeServer) recordCommand(verb, arg string) {
 func (s *fakeServer) storeLogin(rw replyWriter, tag string) {
 	s.mu.Lock()
 	reply := s.store.loginReply
+	if reply == "" && s.store.loginRefusal > 0 && s.counts["LOGIN"] == s.store.loginRefusal {
+		reply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
+	}
 	s.mu.Unlock()
 	if reply != "" {
 		rw.line("%s %s", tag, reply)
@@ -866,7 +890,12 @@ func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) bool {
 	n := len(msgs)
 	next := s.store.nextUID[name]
 	noSelect := s.store.noSelect[name]
+	refusal := s.store.openReply[name]
 	s.mu.Unlock()
+	if refusal != "" {
+		rw.line("%s %s", tag, refusal)
+		return false
+	}
 	if !ok || noSelect {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return false

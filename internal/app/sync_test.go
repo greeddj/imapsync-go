@@ -245,13 +245,9 @@ func TestDedupeMappings_parentExpandsBeforeExplicitChild(t *testing.T) {
 	}
 }
 
-// makePlanPW creates the progress objects required by buildSyncPlan. quiet=true
-// suppresses all terminal output during tests.
-func makePlanPW() (*progress.Writer, *progress.Tracker, *progress.Tracker) {
-	pw := progress.NewWriter(1, true)
-	srcTr := progress.NewTracker("src", 10)
-	dstTr := progress.NewTracker("dst", 10)
-	return pw, srcTr, dstTr
+// makePlanTrackers creates the progress trackers required by buildSyncPlan.
+func makePlanTrackers() (srcTr, dstTr *progress.Tracker) {
+	return progress.NewTracker("src", 10), progress.NewTracker("dst", 10)
 }
 
 // Test_buildSyncPlan_emptySrc_returnsNoPlans asserts the "already in sync"
@@ -266,10 +262,10 @@ func Test_buildSyncPlan_emptySrc_returnsNoPlans(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
 
-	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
 	}
@@ -313,10 +309,10 @@ func Test_buildSyncPlan_messageIdDiff_correct(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
 
-	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
 	}
@@ -360,10 +356,10 @@ func Test_buildSyncPlan_dstMissing_setsDestinationFolderExistsFalse(t *testing.T
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
 
-	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
 	}
@@ -406,10 +402,10 @@ func Test_buildSyncPlan_dstErrorIsFatal(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
 
-	_, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	_, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -418,10 +414,10 @@ func Test_buildSyncPlan_dstErrorIsFatal(t *testing.T) {
 	}
 }
 
-// Test_buildSyncPlan_srcErrorContinues_dstFineSkipsMapping asserts that a
-// source-side EXAMINE error causes that mapping to be skipped (not fatal),
-// while subsequent mappings are still planned.
-func Test_buildSyncPlan_srcErrorContinues_dstFineSkipsMapping(t *testing.T) {
+// Test_buildSyncPlan_When_SourceScanFails_Then_RecordsFailureAndKeepsOtherPlans
+// asserts that a source-side EXAMINE error fails only that mapping: it lands in
+// Failures, and the following mappings are still planned.
+func Test_buildSyncPlan_When_SourceScanFails_Then_RecordsFailureAndKeepsOtherPlans(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	dstSrv := newFakeServer(t)
 
@@ -435,54 +431,34 @@ func Test_buildSyncPlan_srcErrorContinues_dstFineSkipsMapping(t *testing.T) {
 	dstC := newAppClient(t, dstSrv, "dst")
 	srcC := newAppClient(t, srcSrv, "src")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{
 		{Source: "Missing", Destination: "Missing"},
 		{Source: "INBOX", Destination: "INBOX"},
 	}
 
-	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err != nil {
 		t.Fatalf("buildSyncPlan returned error: %v", err)
 	}
-	if len(summary.Plans) != 1 {
-		t.Fatalf("Plans=%d, want 1 (only INBOX plan)", len(summary.Plans))
+	if len(summary.Plans) != 1 || summary.Plans[0].SourceFolder != "INBOX" {
+		t.Fatalf("Plans = %+v, want only INBOX", summary.Plans)
 	}
-	if summary.Plans[0].SourceFolder != "INBOX" {
-		t.Errorf("plan source=%q, want INBOX", summary.Plans[0].SourceFolder)
+	if summary.TotalNew != 1 {
+		t.Errorf("TotalNew = %d, want 1", summary.TotalNew)
 	}
-}
-
-// Test_buildSyncPlan_srcErrorVerboseLogging asserts that the verbose pw.Log
-// call for a source-side scan error is reached when verbose=true.
-func Test_buildSyncPlan_srcErrorVerboseLogging(t *testing.T) {
-	srcSrv := newFakeServer(t)
-	dstSrv := newFakeServer(t)
-
-	srcMsgs := map[string][]struct {
-		msgID string
-		uid   uint32
-	}{
-		"INBOX": {{uid: 1, msgID: "ok@x"}},
+	if len(summary.Failures) != 1 {
+		t.Fatalf("Failures = %+v, want exactly one", summary.Failures)
 	}
-	srcSrv.addConnHandler(noOnMissingFetchHandler(srcSrv, []string{"INBOX", "Missing"}, srcMsgs))
-	dstC := newAppClient(t, dstSrv, "dst")
-	srcC := newAppClient(t, srcSrv, "src")
-
-	pw, srcTr, dstTr := makePlanPW()
-	mappings := []config.DirectoryMapping{
-		{Source: "Missing", Destination: "Missing"},
-		{Source: "INBOX", Destination: "INBOX"},
+	f := summary.Failures[0]
+	if f.SourceFolder != "Missing" || f.DestinationFolder != "Missing" {
+		t.Errorf("failure names = %q -> %q, want Missing -> Missing", f.SourceFolder, f.DestinationFolder)
 	}
-
-	// verbose=true exercises the pw.Log("⚠️ Failed to fetch source folder...")
-	// branch for the "Missing" folder error.
-	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", true)
-	if err != nil {
-		t.Fatalf("buildSyncPlan returned error: %v", err)
+	if !errors.Is(f.Err, errSourceScan) {
+		t.Errorf("failure error = %v, want errSourceScan", f.Err)
 	}
-	if len(summary.Plans) != 1 {
-		t.Fatalf("Plans=%d, want 1", len(summary.Plans))
+	if !strings.Contains(f.Err.Error(), "cannot select folder Missing") {
+		t.Errorf("failure error = %q, want the select error", f.Err)
 	}
 }
 
@@ -789,10 +765,10 @@ func Test_buildSyncPlan_canceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	_, err := buildSyncPlan(ctx, srcC, dstC, []config.DirectoryMapping{
 		{Source: "INBOX", Destination: "INBOX"},
-	}, srcTr, dstTr, pw, "src", "dst", false)
+	}, srcTr, dstTr, "src", "dst")
 	if err == nil {
 		t.Fatal("expected error from canceled context, got nil")
 	}
@@ -1003,7 +979,7 @@ func Test_buildSyncPlan_srcAdvancesAheadOfDst(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{
 		{Source: "INBOX", Destination: "INBOX"},
 		{Source: "Drafts", Destination: "Drafts"},
@@ -1012,7 +988,7 @@ func Test_buildSyncPlan_srcAdvancesAheadOfDst(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+		_, _ = buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	}()
 
 	// Sample after src should have finished but dst is still sleeping.
@@ -1101,7 +1077,7 @@ func Test_buildSyncPlan_dstErrorMidStream(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{
 		{Source: "A", Destination: "A"},
 		{Source: "B", Destination: "B"},
@@ -1109,7 +1085,7 @@ func Test_buildSyncPlan_dstErrorMidStream(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	_, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1147,7 +1123,7 @@ func Test_buildSyncPlan_cancelHaltsBothSides(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "INBOX"}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1157,7 +1133,7 @@ func Test_buildSyncPlan_cancelHaltsBothSides(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- func() error {
-			_, err := buildSyncPlan(ctx, srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+			_, err := buildSyncPlan(ctx, srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 			return err
 		}()
 	}()
@@ -1262,14 +1238,14 @@ func Test_buildSyncPlan_orderPreserved(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
 
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{
 		{Source: "A", Destination: "A"},
 		{Source: "B", Destination: "B"},
 		{Source: "C", Destination: "C"},
 	}
 
-	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(context.Background(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
 	}
@@ -2772,10 +2748,10 @@ func Test_buildSyncPlan_When_FolderNameCarriesControlCharacters_Then_TrackersSho
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: nil})
 	srcC := newAppClient(t, src, "src")
 	dstC := newAppClient(t, dst, "dst")
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{mapping(hostileName, hostileName)}
 
-	summary, err := buildSyncPlan(t.Context(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(t.Context(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
 	}
@@ -2794,7 +2770,7 @@ func Test_buildSyncPlan_When_FolderNameCarriesControlCharacters_Then_TrackersSho
 	}
 }
 
-func Test_buildSyncPlan_When_SourceFolderRefusedWithHostileReply_Then_VerboseLogShowsEscapes(t *testing.T) {
+func Test_buildSyncPlan_When_SourceFolderRefusedWithHostileReply_Then_FailureKeepsExactNameAndReply(t *testing.T) {
 	t.Parallel()
 
 	srcSrv := newFakeServer(t)
@@ -2807,33 +2783,29 @@ func Test_buildSyncPlan_When_SourceFolderRefusedWithHostileReply_Then_VerboseLog
 	dstSrv := newFakeServer(t)
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
+	srcTr, dstTr := makePlanTrackers()
 
-	sb := &syncBuffer{}
-	// The sentinel stays active so the render pass Stop triggers still prints the
-	// queued log lines.
-	pw := progress.NewWriter(3, true)
-	pw.SetOutputWriter(sb)
-	pw.Start()
-	pw.AppendTracker(progress.NewTracker("sentinel", 100))
-	srcTr, dstTr := progress.NewTracker("src", 10), progress.NewTracker("dst", 10)
-	pw.AppendTracker(srcTr)
-	pw.AppendTracker(dstTr)
-
-	summary, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping(hostileName, hostileName)}, srcTr, dstTr, pw, "src", "dst", true)
-	pw.Stop()
-	pw.WaitForRenderDone()
+	summary, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping(hostileName, hostileName)}, srcTr, dstTr, "src", "dst")
 
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
 	}
 	if len(summary.Plans) != 0 {
-		t.Errorf("Plans = %d, want 0: the refused folder is skipped", len(summary.Plans))
+		t.Errorf("Plans = %d, want 0: the refused folder has no plan", len(summary.Plans))
 	}
-	got := sb.String()
-	assertContainsAll(t, got,
-		"Failed to fetch source folder "+hostileShownName+", skipping by error: [src] cannot select folder "+hostileShownName+": "+hostileReplyShown,
-	)
-	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+	if len(summary.Failures) != 1 {
+		t.Fatalf("Failures = %+v, want exactly one", summary.Failures)
+	}
+	f := summary.Failures[0]
+	if f.SourceFolder != hostileName || f.DestinationFolder != hostileName {
+		t.Errorf("failure names = %q -> %q, want the exact name %q on both sides", f.SourceFolder, f.DestinationFolder, hostileName)
+	}
+	if !strings.Contains(f.Err.Error(), hostileReply) {
+		t.Errorf("failure error = %q, want the raw reply %q", f.Err, hostileReply)
+	}
+	if !errors.Is(f.Err, errSourceScan) {
+		t.Errorf("failure error = %v, want errSourceScan", f.Err)
+	}
 }
 
 // The name is short so go-pretty does not snip the tracker line that holds it.
@@ -2978,10 +2950,10 @@ func Test_buildSyncPlan_When_ScanIsInFlight_Then_TrackerShowsEscapedFolderName(t
 			srcC, dstC := newAppClient(t, srcSrv, "src"), newAppClient(t, dstSrv, "dst")
 			// Registered after the clients, so it runs first and frees a scan parked in a failed test.
 			t.Cleanup(func() { close(release) })
-			pw, srcTr, dstTr := makePlanPW()
+			srcTr, dstTr := makePlanTrackers()
 			done := make(chan error, 1)
 			go func() {
-				_, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping(hostileName, hostileName)}, srcTr, dstTr, pw, "src", "dst", false)
+				_, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping(hostileName, hostileName)}, srcTr, dstTr, "src", "dst")
 				done <- err
 			}()
 
@@ -3309,10 +3281,10 @@ func Test_buildSyncPlan_When_DestinationIsNoSelect_Then_RecordsFailureNotPlan(t 
 	dst.markNoSelect("Projects", "Empty")
 	srcC := newAppClient(t, src, "src")
 	dstC := newAppClient(t, dst, "dst")
-	pw, srcTr, dstTr := makePlanPW()
+	srcTr, dstTr := makePlanTrackers()
 	mappings := []config.DirectoryMapping{mapping("INBOX", "INBOX"), mapping("Projects", "Projects"), mapping("Empty", "Empty")}
 
-	summary, err := buildSyncPlan(t.Context(), srcC, dstC, mappings, srcTr, dstTr, pw, "src", "dst", false)
+	summary, err := buildSyncPlan(t.Context(), srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
 
 	if err != nil {
 		t.Fatalf("buildSyncPlan: %v", err)
@@ -3337,6 +3309,34 @@ func Test_buildSyncPlan_When_DestinationIsNoSelect_Then_RecordsFailureNotPlan(t 
 		t.Errorf("failure error = %q, want the message count", f.Err)
 	}
 	assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "INBOX")
+}
+
+func Test_buildSyncPlan_When_SourceScanFailsAndDestinationIsNoSelect_Then_RecordsOneSourceFailure(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Projects": fakeMsgs("p1@x", "p2@x")})
+	src.refuseOpenWith("Projects", "NO [UNAVAILABLE] Temporary server failure")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{})
+	dst.markNoSelect("Projects")
+	srcC := newAppClient(t, src, "src")
+	dstC := newAppClient(t, dst, "dst")
+	srcTr, dstTr := makePlanTrackers()
+
+	summary, err := buildSyncPlan(t.Context(), srcC, dstC, []config.DirectoryMapping{mapping("Projects", "Projects")}, srcTr, dstTr, "src", "dst")
+
+	if err != nil {
+		t.Fatalf("buildSyncPlan: %v", err)
+	}
+	if len(summary.Failures) != 1 {
+		t.Fatalf("Failures = %+v, want exactly one", summary.Failures)
+	}
+	f := summary.Failures[0]
+	if !errors.Is(f.Err, errSourceScan) {
+		t.Errorf("failure error = %v, want errSourceScan", f.Err)
+	}
+	if errors.Is(f.Err, errDestinationNoSelect) {
+		t.Errorf("failure error = %v, want no errDestinationNoSelect: the source failure comes first", f.Err)
+	}
 }
 
 func Test_maybeDiff_When_DestinationIsNoSelect_Then_NoPlanAndMapsFreed(t *testing.T) {
@@ -3423,4 +3423,369 @@ func Test_expandMappingsWithSubfolders_When_SourceIsNoSelect_Then_SkipsItAndKeep
 			assertContainsNone(t, out.String(), "Found subfolder: a/b →")
 		})
 	}
+}
+
+func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedParent_Then_SkipsItAndKeepsChildren(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verbose bool
+	}{
+		{name: "verbose", verbose: true},
+		{name: "not verbose"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": nil, "Archive/2025": nil})
+			srcC := newAppClient(t, src, "src")
+			var out strings.Builder
+
+			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, []config.DirectoryMapping{mapping("Archive", "Old")}, "/", "/", tt.verbose, false)
+
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			pairs := make([]string, len(got))
+			for i, m := range got {
+				pairs[i] = m.Source + "->" + m.Destination
+			}
+			slices.Sort(pairs)
+			if want := []string{"Archive/2024->Old/2024", "Archive/2025->Old/2025"}; !slices.Equal(pairs, want) {
+				t.Errorf("expanded = %v, want %v", pairs, want)
+			}
+			note := "Folder Archive skipped - the source server lists only its subfolders\n"
+			if tt.verbose {
+				assertContainsAll(t, out.String(), note)
+				return
+			}
+			assertContainsNone(t, out.String(), "skipped")
+		})
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_InboxIsUnlistedButHasSubfolders_Then_InboxIsKept(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		inbox string
+	}{
+		{name: "upper case", inbox: "INBOX"},
+		{name: "mixed case", inbox: "Inbox"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{tt.inbox + "/Sub": fakeMsgs("s1@x")})
+			srcC := newAppClient(t, src, "src")
+
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, []config.DirectoryMapping{mapping(tt.inbox, tt.inbox)}, "/", "/", false, false)
+
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			pairs := make([]string, len(got))
+			for i, m := range got {
+				pairs[i] = m.Source + "->" + m.Destination
+			}
+			slices.Sort(pairs)
+			if want := []string{tt.inbox + "->" + tt.inbox, tt.inbox + "/Sub->" + tt.inbox + "/Sub"}; !slices.Equal(pairs, want) {
+				t.Errorf("expanded = %v, want %v", pairs, want)
+			}
+		})
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedWithoutSubfolders_Then_MappingIsKept(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Sent": nil})
+	srcC := newAppClient(t, src, "src")
+	var out strings.Builder
+
+	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, []config.DirectoryMapping{mapping("Sentt", "Sent")}, "/", "/", true, false)
+
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	}
+	if want := []config.DirectoryMapping{mapping("Sentt", "Sent")}; !slices.Equal(got, want) {
+		t.Errorf("expanded = %v, want %v: the scan must report the missing folder", got, want)
+	}
+	assertContainsNone(t, out.String(), "skipped")
+}
+
+const folderFailuresHeader = "Folders that cannot be synced"
+
+func TestRunSync_When_SourceFolderFlagHasTypo_Then_ReportsFailureAndExitsNonZero(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Sent":  fakeMsgs("s1@x", "s2@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+	opts.srcFolder, opts.dstFolder = "Sentt", "Sent"
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		folderFailuresHeader,
+		"• Sentt → Sent: cannot scan source folder: ",
+		"0 messages uploaded, 0 errors occurred, 1 folders failed",
+	)
+	assertContainsNone(t, got, "All folders already synced!", "Sync completed successfully")
+	if n := strings.Count(got, folderFailuresHeader); n != 1 {
+		t.Errorf("output holds the failure header %d times, want 1\noutput: %q", n, got)
+	}
+	if n := dst.callCount("CREATE"); n != 0 {
+		t.Errorf("dst saw %d CREATE commands, want 0", n)
+	}
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_MappedSourceIsMissing_Then_OtherFoldersCopyAndRunFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		quiet      bool
+		wantHeader int
+	}{
+		{name: "normal", wantHeader: 2},
+		{name: "quiet", quiet: true, wantHeader: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"), mapping("Sent", "Sent Items"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit", err)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+			if dst.hasFolder("Sent Items") {
+				t.Error("dst holds Sent Items, want none: the source folder cannot be scanned")
+			}
+			if slices.Contains(dst.capturedNames("CREATE"), "Sent Items") {
+				t.Error("dst received CREATE for Sent Items")
+			}
+			got := out.String()
+			assertContainsAll(t, got,
+				"• Sent → Sent Items: cannot scan source folder:",
+				"1 messages uploaded, 0 errors occurred, 1 folders failed",
+			)
+			assertContainsNone(t, got, "Sync completed successfully")
+			if n := strings.Count(got, folderFailuresHeader); n != tt.wantHeader {
+				t.Errorf("output holds the failure header %d times, want %d\noutput: %q", n, tt.wantHeader, got)
+			}
+			if !tt.quiet {
+				assertInOrder(t, got, folderFailuresHeader, "Messages to be copied to destination", "Syncing messages", folderFailuresHeader, "1 folders failed")
+			}
+		})
+	}
+}
+
+func TestRunSync_When_SourceRefusesExamineWithoutMapping_Then_FolderIsReported(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":   fakeMsgs("m1@x"),
+		"Unavail": fakeMsgs("u1@x", "u2@x", "u3@x"),
+	})
+	src.refuseOpenWith("Unavail", "NO [UNAVAILABLE] Temporary server failure")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	if dst.hasFolder("Unavail") {
+		t.Error("dst holds Unavail, want none")
+	}
+	assertContainsAll(t, out.String(),
+		"• Unavail → Unavail: cannot scan source folder:",
+		"Temporary server failure",
+		"1 folders failed",
+	)
+}
+
+func TestRunSync_When_PlanningSourceClientGivesUp_Then_EveryLaterFolderIsReported(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": fakeMsgs("a1@x"),
+		"B": fakeMsgs("b1@x"),
+		"C": fakeMsgs("c1@x"),
+	})
+	// LOGIN 1 is the planning client, LOGIN 2 its reconnect after the drop,
+	// LOGIN 3 the worker.
+	src.dropOnceOnOpen("B")
+	src.refuseLoginAt(2)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"), mapping("C", "C")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x")
+	if dst.hasFolder("B") || dst.hasFolder("C") {
+		t.Errorf("dst holds B=%v C=%v, want neither", dst.hasFolder("B"), dst.hasFolder("C"))
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"• B → B: cannot scan source folder:",
+		"• C → C: cannot scan source folder:",
+		"1 messages uploaded, 0 errors occurred, 2 folders failed",
+	)
+	assertContainsNone(t, got, "Sync completed successfully")
+}
+
+func TestRunSync_When_OnlyFailuresAndNothingToCopy_Then_NoPromptAndExitsNonZero(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "Sent": fakeMsgs("s1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.srcFolder, opts.dstFolder = "Sentt", "Sent"
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	if errors.Is(err, io.EOF) {
+		t.Errorf("error = %v, want no read error: nothing is left to confirm", err)
+	}
+	assertContainsAll(t, out.String(), folderFailuresHeader, "1 folders failed")
+	assertContainsNone(t, out.String(), "Proceed with synchronization?", "All folders already synced!")
+}
+
+func TestRunSync_When_SourceRefusalCarriesControlCharacters_Then_FailureLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeServer(t)
+	src.addConnHandler(scriptedHandler(src, []string{hostileWireName}, func(verb string, _ int) (string, bool) {
+		if verb == "EXAMINE" {
+			return "NO " + hostileReply, true
+		}
+		return "", false
+	}))
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(hostileName, hostileName)), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"• "+hostileShownName+" → "+hostileShownName+": cannot scan source folder: ",
+		hostileReplyShown,
+	)
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), hostileWireName)
+}
+
+func TestRunSync_When_ContextEndsDuringSourceScan_Then_ReturnsCanceledWithoutFailureList(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	arrived, release := make(chan struct{}, 1), make(chan struct{})
+	src := newFakeServer(t)
+	src.addConnHandler(scriptedHandler(src, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb == "EXAMINE" {
+			select {
+			case arrived <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		return "", false
+	}))
+	// Registered after the server, so it runs first and frees a handler parked in a failed test.
+	t.Cleanup(func() { close(release) })
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	go func() {
+		select {
+		case <-arrived:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	// An absent destination lets the dst scan finish without I/O, so only the ctx check after the scan stops the failure list.
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("INBOX", "Copy")), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	assertContainsNone(t, out.String(), "cannot be synced", "folders failed")
+}
+
+func TestRunSync_When_MappedSourceIsUnlistedParent_Then_OnlyItsChildrenAreCopied(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"Archive/2024": fakeMsgs("a1@x"),
+		"Archive/2025": fakeMsgs("a2@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Archive", "Archive")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst Archive/2024", dst.folderMsgIDs("Archive/2024"), "a1@x")
+	assertIDs(t, "dst Archive/2025", dst.folderMsgIDs("Archive/2025"), "a2@x")
+	if slices.Contains(src.capturedNames("EXAMINE"), "Archive") {
+		t.Error("source opened Archive, a name its LIST leaves out")
+	}
+	assertContainsAll(t, out.String(),
+		"Folder Archive skipped - the source server lists only its subfolders",
+		"Sync completed successfully",
+	)
+	assertContainsNone(t, out.String(), "cannot be synced")
 }
