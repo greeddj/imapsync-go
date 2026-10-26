@@ -84,7 +84,7 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 			srv := newFakeServer(t)
 			c := newClientWithFake(t, srv)
 			if tt.noSession {
-				loseSession(t, srv, c)
+				_ = loseSession(t, srv, c)
 			}
 			if tt.cancelClient {
 				c.Cancel()
@@ -408,14 +408,13 @@ func Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry(t *testing.T) 
 
 // Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError asserts
 // that a refused login for the retry returns the reconnect error as it is, and that
-// the next call logs in again.
+// the next call returns the same refusal without a new login.
 func Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeServer(t)
 	srv.addConnHandler(interceptHandler(srv, serveNormally))
 	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
-	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
 	c := newClientWithFake(t, srv)
 	endSessionAtClient(t, c)
 
@@ -441,17 +440,15 @@ func Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError(
 		t.Fatal("the client holds a session although the login was refused")
 	}
 
-	err = awaitCall(t, "second AppendMessage", func() error {
+	second := awaitCall(t, "second AppendMessage", func() error {
 		return c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
 	})
-	if err != nil {
-		t.Fatalf("second AppendMessage: %v, want success after a new login", err)
+	checkStoredGiveUp(t, second, err, ClassPermanent)
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want it to stay 2", got)
 	}
-	if got := srv.callCount("LOGIN"); got != 3 {
-		t.Errorf("LOGIN count = %d, want 3", got)
-	}
-	if got := srv.callCount("APPEND"); got != 1 {
-		t.Errorf("APPEND count = %d, want 1", got)
+	if got := srv.callCount("APPEND"); got != 0 {
+		t.Errorf("APPEND count = %d, want 0", got)
 	}
 }
 
@@ -529,21 +526,25 @@ func Test_AppendMessage_When_ContextEndsDuringRetry_Then_ReturnsContextError(t *
 	}
 }
 
-// Test_AppendMessage_When_RepairGaveUp_Then_NextAppendReconnects asserts that an
-// APPEND on a client whose repair gave up logs in again and uploads the message.
-func Test_AppendMessage_When_RepairGaveUp_Then_NextAppendReconnects(t *testing.T) {
+// dropAfterLiteral is an interceptHandler hook that reads the whole APPEND literal and
+// hangs up without a reply, so go-imap has sent the body when the connection fails.
+func dropAfterLiteral(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+	if cmd.verb != "APPEND" {
+		return false, true
+	}
+	_ = readAppendLiteral(conn, rd, cmd)
+	return true, false
+}
+
+// Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoLogin asserts
+// that an APPEND on a client whose repair was refused returns that refusal and sends neither
+// a LOGIN nor an APPEND.
+func Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoLogin(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeServer(t)
-	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
-		if cmd.verb != "APPEND" {
-			return false, true
-		}
-		_ = readAppendLiteral(conn, rd, cmd)
-		return true, false
-	}))
+	srv.addConnHandler(interceptHandler(srv, dropAfterLiteral))
 	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
-	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
 	c := newClientWithFake(t, srv)
 
 	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
@@ -559,15 +560,113 @@ func Test_AppendMessage_When_RepairGaveUp_Then_NextAppendReconnects(t *testing.T
 	if got := srv.callCount("LOGIN"); got != 2 {
 		t.Fatalf("LOGIN count after the first call = %d, want 2 (initial and the refused repair)", got)
 	}
-
-	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {
-		t.Fatalf("second AppendMessage: %v, want success after a new login", err)
+	refusal := c.giveUpErr
+	if refusal == nil {
+		t.Fatal("the refused repair left no give-up")
 	}
-	if got := srv.callCount("LOGIN"); got != 3 {
-		t.Errorf("LOGIN count = %d, want 3", got)
+
+	err = c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	checkStoredGiveUp(t, err, refusal, ClassPermanent)
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want it to stay 2", got)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count = %d, want 1 (only the first connection received one)", got)
+	}
+}
+
+// Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown asserts
+// that APPENDs inside the cool-down return the stored give-up with no LOGIN or APPEND, and that
+// the first one after it logs in once and uploads.
+func Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, dropAfterLiteral))
+	for range maxReconnectAttempts {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	srv.addConnHandler(appendOutcomeHandler(srv, "OK APPEND completed"))
+	c := newClientWithFake(t, srv)
+	c.backoff = 0
+	c.reviveDur = time.Hour
+	dials := countDials(c)
+
+	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
+	}
+	if c.c.Load() != nil {
+		t.Fatal("the client holds a session although every repair login was refused")
+	}
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts; got != want {
+		t.Fatalf("LOGIN count after the first call = %d, want %d", got, want)
+	}
+	giveUp := c.giveUpErr
+	if giveUp == nil {
+		t.Fatal("the repair that gave up left no give-up")
+	}
+	dialsBefore := dials.Load()
+
+	err = c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+	checkStoredGiveUp(t, err, giveUp, ClassTransient)
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts; got != want {
+		t.Errorf("LOGIN count inside the cool-down = %d, want it to stay %d", got, want)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count inside the cool-down = %d, want it to stay 1", got)
+	}
+	if got := dials.Load(); got != dialsBefore {
+		t.Errorf("dial count went from %d to %d inside the cool-down, want no dial", dialsBefore, got)
+	}
+
+	expireCooldown(c)
+	if err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()); err != nil {
+		t.Fatalf("AppendMessage after the cool-down: %v, want success after one login", err)
+	}
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts+1; got != want {
+		t.Errorf("LOGIN count = %d, want %d", got, want)
 	}
 	if got := srv.callCount("APPEND"); got != 2 {
 		t.Errorf("APPEND count = %d, want 2 (one per connection)", got)
+	}
+	if got := dials.Load() - dialsBefore; got != 1 {
+		t.Errorf("the probe dialed %d times, want 1", got)
+	}
+	if c.giveUpErr != nil {
+		t.Errorf("giveUpErr = %v after the login, want nil", c.giveUpErr)
+	}
+}
+
+// Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSendNoLogin asserts
+// that a permanent refusal ends all logins of the client, also when the cool-down is zero.
+func Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSendNoLogin(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	dials := countDials(c)
+	refusal := loseSession(t, srv, c)
+	c.reviveDur = 0
+	// The server would refuse again, so a stray LOGIN shows in the count.
+	for range laterCalls {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+	}
+	dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+	for range laterCalls {
+		err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
+		checkStoredGiveUp(t, err, refusal, ClassPermanent)
+	}
+
+	if got := srv.callCount("APPEND"); got != 0 {
+		t.Errorf("APPEND count = %d, want 0", got)
+	}
+	if got := dials.Load(); got != dialsBefore {
+		t.Errorf("dial count went from %d to %d, want no dial", dialsBefore, got)
+	}
+	if got := srv.callCount("LOGIN"); got != loginsBefore {
+		t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, got)
 	}
 }
 
@@ -579,14 +678,9 @@ func Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnec
 
 	srv := newFakeServer(t)
 	c := newClientWithFake(t, srv)
-	loseSession(t, srv, c)
-	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
-		if cmd.verb != "APPEND" {
-			return false, true
-		}
-		_ = readAppendLiteral(conn, rd, cmd)
-		return true, false
-	}))
+	_ = giveUpOn(t, srv, c, dovecotTempAuthFailure, ClassTransient)
+	c.reviveDur = 0
+	srv.addConnHandler(interceptHandler(srv, dropAfterLiteral))
 
 	err := c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage())
 	if err == nil {
@@ -595,8 +689,8 @@ func Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnec
 	if got := classifyError(err); got != ClassTransient {
 		t.Errorf("classifyError(%q) = %s, want %s", err, got, ClassTransient)
 	}
-	if got := srv.callCount("LOGIN"); got != 3 {
-		t.Errorf("LOGIN count = %d, want 3 (initial, refused, revive) and no repair", got)
+	if got, want := srv.callCount("LOGIN"), 1+maxReconnectAttempts+1; got != want {
+		t.Errorf("LOGIN count = %d, want %d (initial, the refusals, revive) and no repair", got, want)
 	}
 	if got := srv.callCount("APPEND"); got != 1 {
 		t.Errorf("APPEND count = %d, want 1", got)

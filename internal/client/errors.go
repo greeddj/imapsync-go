@@ -137,6 +137,13 @@ func isRetryable(err error) bool {
 	return classifyError(err) == ClassTransient
 }
 
+// canRevive reports a give-up that a later login can clear. Permanent means retry will not help;
+// Unknown stays non-retryable, because servers say "LOGIN failed" for wrong credentials too.
+func canRevive(err error) bool {
+	class := classifyError(err)
+	return class == ClassTransient || class == ClassThrottled
+}
+
 // isAlreadyExistsErr reports whether a CREATE refusal means the mailbox exists.
 // go-imap v1 drops the [ALREADYEXISTS] code, so the text decides; Gmail says
 // "Duplicate folder name".

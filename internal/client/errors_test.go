@@ -154,3 +154,31 @@ func TestIsRetryable(t *testing.T) {
 		t.Error("permanent errors must NOT be retryable")
 	}
 }
+
+func TestCanRevive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		err  error
+		name string
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "transient network failure", err: fmt.Errorf("[src] failed to reconnect after retries: %w", io.EOF), want: true},
+		{name: "transient temporary authentication failure", err: errors.New("Temporary authentication failure."), want: true},
+		{name: "throttled", err: errors.New("Too many simultaneous connections"), want: true},
+		{name: "throttled under a reconnect wrapper", err: fmt.Errorf("[src] failed to reconnect after retries: %w", errors.New("Account exceeded bandwidth limits")), want: true},
+		{name: "permanent authentication failure", err: errors.New("Authentication failed."), want: false},
+		{name: "permanent invalid credentials", err: errors.New("Invalid credentials (Failure)"), want: false},
+		{name: "unknown refusal", err: errors.New("Server busy"), want: false},
+		{name: "unknown refusal under a reconnect wrapper", err: fmt.Errorf("[src] failed to reconnect after retries: %w", errors.New("LOGIN failed.")), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := canRevive(tt.err); got != tt.want {
+				t.Errorf("canRevive(%v) = %v, want %v (class %s)", tt.err, got, tt.want, classifyError(tt.err))
+			}
+		})
+	}
+}

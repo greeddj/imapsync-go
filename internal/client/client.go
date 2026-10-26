@@ -54,6 +54,9 @@ const (
 	// idleTimeout bounds a command's wait on a silent server. Generous: a server
 	// may think for minutes after a large APPEND, and moving bytes never trip it.
 	idleTimeout = 5 * time.Minute
+	// reviveInterval is how long a client that gave up waits before one login attempt,
+	// so a dead server does not get one reconnect per message.
+	reviveInterval = 5 * time.Minute
 )
 
 var errLogoutTimeout = errors.New("imap logout: no reply from server")
@@ -94,6 +97,7 @@ type dialFunc func(ctx context.Context, addr string) (net.Conn, error)
 // withCancel runs.
 type Client struct {
 	lastReconnect  time.Time
+	giveUpErr      error
 	tlsConfig      *tls.Config
 	readLimiter    *rate.Limiter
 	writeLimiter   *rate.Limiter
@@ -116,6 +120,7 @@ type Client struct {
 	dialTimeout    time.Duration
 	logoutDur      time.Duration
 	idleDur        time.Duration
+	reviveDur      time.Duration // zero means no cool-down; test fixtures only
 	mailboxCacheMu sync.RWMutex
 	mu             sync.Mutex
 	folderLocksMu  sync.Mutex
@@ -176,6 +181,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 		dialTimeout:  timeout,
 		logoutDur:    logoutTimeout,
 		idleDur:      idleTimeout,
+		reviveDur:    reviveInterval,
 		verbose:      opts.Verbose,
 		folderLocks:  make(map[string]*sync.Mutex),
 		readLimiter:  opts.ReadLimiter,
@@ -508,15 +514,25 @@ func (c *Client) abortSession(ctx context.Context, cli *imapclient.Client, authE
 	return authErr
 }
 
-// reconnect tears down and rebuilds the underlying IMAP session with backoff.
-// It honours error classification: permanent errors abort immediately, server
-// throttling triggers a long cool-down between attempts.
+// reconnect rebuilds the session with backoff. A permanent or unknown give-up is final. After a
+// transient or throttled one, calls fail until reviveInterval passes, then one attempt runs.
 func (c *Client) reconnect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Waiting for c.mu blocks, so the check follows the lock: the gate must not return a give-up after a Cancel.
 	if c.isCancelled() {
 		return context.Canceled
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	probe := c.giveUpErr != nil
+	attempts := maxReconnectAttempts
+	if probe {
+		if !canRevive(c.giveUpErr) || time.Since(c.lastReconnect) < c.reviveDur {
+			return c.giveUpErr
+		}
+		attempts = 1
+	}
 
 	ctx, cancel := c.internalContext()
 	defer cancel()
@@ -539,7 +555,7 @@ func (c *Client) reconnect() error {
 	var lastErr error
 	delay := c.backoff
 
-	for i := 1; i <= maxReconnectAttempts; i++ {
+	for i := 1; i <= attempts; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -549,14 +565,23 @@ func (c *Client) reconnect() error {
 			c.log("[%s] 🔄 Reconnected successfully", c.prefix)
 			c.lastReconnect = time.Now()
 			c.backoff = initialBackoff
+			c.giveUpErr = nil
 			return nil
+		}
+		// A cancelled reconnect is no give-up, so it must not store one.
+		if cerr := c.cancelErr(ctx); cerr != nil {
+			return cerr
 		}
 		lastErr = err
 
 		class := classifyError(err)
 		// No attempt follows the last failure, so a wait there only delays the error and holds c.mu.
-		if class != ClassPermanent && i == maxReconnectAttempts {
-			c.log("[%s] 🔄 Failed: %v, giving up after %d attempts", c.prefix, err, maxReconnectAttempts)
+		if class != ClassPermanent && i == attempts {
+			if probe {
+				c.log("[%s] 🔄 Failed: %v, giving up", c.prefix, err)
+			} else {
+				c.log("[%s] 🔄 Failed: %v, giving up after %d attempts", c.prefix, err, attempts)
+			}
 			break
 		}
 		switch class {
@@ -564,6 +589,7 @@ func (c *Client) reconnect() error {
 			// Auth fails won't get better with retries; bail out fast.
 			c.log("[%s] 🔄 Permanent error, giving up: %v", c.prefix, err)
 			c.lastReconnect = time.Now()
+			c.giveUpErr = err
 			return err
 		case ClassThrottled:
 			c.log("[%s] 🔄 Server throttled, backing off %s", c.prefix, throttledBackoff)
@@ -580,13 +606,16 @@ func (c *Client) reconnect() error {
 		}
 	}
 
-	// Every give-up stamps, permanent ones too: the next call's reconnect first waits out reconnectInterval.
+	// The stamp starts the cool-down of a revive and keeps the interval wait of the next reconnect.
 	c.lastReconnect = time.Now()
-	return fmt.Errorf("[%s] failed to reconnect after retries: %w", c.prefix, lastErr)
+	c.giveUpErr = fmt.Errorf("[%s] failed to reconnect after retries: %w", c.prefix, lastErr)
+	return c.giveUpErr
 }
 
 // safeCall starts at most one reconnect per call: a transient fn error gets a
 // reconnect and one retry, and without a session fn runs once after the reconnect.
+//
+// After a give-up that reconnect can return the stored error at once, with no dial.
 //
 // The closure must be re-runnable: any state that fn accumulates on the first
 // attempt (slices, maps, counters) has to be reset at the top of the closure.

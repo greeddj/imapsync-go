@@ -1822,6 +1822,32 @@ func TestRunSync_When_AppendRefused_Then_ReportsErrorsAndExitsSilently(t *testin
 	assertContainsAll(t, out.String(), "Sync completed with errors", "0 messages uploaded, 1 errors occurred")
 }
 
+func TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x", "m3@x", "m4@x", "m5@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	// The first dst connection plans; the second is the only worker's.
+	dst.addConnHandler(dst.serveStore)
+	dst.addConnHandler(refuseLoginAfterAppendHandler(dst))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Errorf("error = %v, want ErrSilentExit", err)
+	}
+	if n := dst.callCount("LOGIN"); n != 3 {
+		t.Errorf("dst saw %d LOGIN commands, want 3 (planning, worker and one refused repair)", n)
+	}
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("dst saw %d APPEND commands, want 1", n)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"))
+}
+
 func TestRunSync_When_LoginRefused_Then_NamesTheFailingSide(t *testing.T) {
 	t.Parallel()
 

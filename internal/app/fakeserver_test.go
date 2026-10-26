@@ -1131,3 +1131,50 @@ func listFailsAfterConnectHandler(srv *fakeServer, folders ...string) func(net.C
 		return "", false
 	})
 }
+
+// refuseLoginAfterAppendHandler serves LOGIN and LIST from the store. On the first APPEND it
+// reads the whole literal, makes the server refuse later logins and hangs up without a reply.
+func refuseLoginAfterAppendHandler(srv *fakeServer) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		rw := replyWriter{conn: conn}
+		rw.line("* OK [CAPABILITY IMAP4rev1] fake ready")
+
+		rd := bufio.NewReader(conn)
+		for {
+			raw, err := rd.ReadString('\n')
+			if err != nil {
+				return
+			}
+			raw = strings.TrimRight(raw, "\r\n")
+			if raw == "" {
+				continue
+			}
+			tag, verb, arg := splitCommand(raw)
+			srv.recordCommand(verb, arg)
+
+			switch verb {
+			case "LOGIN":
+				srv.storeLogin(rw, tag)
+			case "LIST":
+				srv.storeList(rw, tag)
+			case "APPEND":
+				rw.line("+ Ready for literal data")
+				if _, err := io.CopyN(io.Discard, rd, int64(parseLiteralSize(arg))); err != nil {
+					return
+				}
+				if _, err := rd.ReadString('\n'); err != nil {
+					return
+				}
+				srv.refuseLogin()
+				return
+			case "LOGOUT":
+				rw.line("* BYE Logging out")
+				rw.line("%s OK LOGOUT completed", tag)
+				return
+			default:
+				rw.line("%s OK %s completed", tag, verb)
+			}
+		}
+	}
+}

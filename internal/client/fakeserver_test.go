@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -963,9 +965,12 @@ func awaitCall(t *testing.T, what string, call func() error) error {
 	}
 }
 
-// loseSession makes the reconnect of c give up on a permanent refusal. The current
-// connection must answer LOGOUT; queue handlers for later connections after this call.
-func loseSession(t *testing.T, srv *fakeServer, c *Client) {
+// laterCalls is how many calls a test makes after a give-up to show that none logs in.
+const laterCalls = 5
+
+// loseSession makes c give up its reconnect on a permanent refusal and returns it. From then
+// on c has no session. The current connection must answer LOGOUT.
+func loseSession(t *testing.T, srv *fakeServer, c *Client) error {
 	t.Helper()
 
 	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
@@ -976,4 +981,49 @@ func loseSession(t *testing.T, srv *fakeServer, c *Client) {
 	if c.c.Load() != nil {
 		t.Fatal("loseSession: the client still holds a session")
 	}
+	if !errors.Is(c.giveUpErr, err) {
+		t.Fatalf("loseSession: stored give-up = %v, want the returned error %v", c.giveUpErr, err)
+	}
+	return err
+}
+
+// giveUpOn makes c give up after maxReconnectAttempts LOGIN refusals with reply, and returns
+// the error. A transient or throttled reply leaves a give-up that a later call can clear.
+func giveUpOn(t *testing.T, srv *fakeServer, c *Client, reply string, want ErrClass) error {
+	t.Helper()
+
+	for range maxReconnectAttempts {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, reply))
+	}
+	// Zero backoff keeps transient retries from sleeping. A throttled reply still waits
+	// through sleepCtx, so its test must swap it with recordSleeps.
+	c.backoff = 0
+	err := c.safeCall(func(*imapclient.Client) error { return io.EOF })
+	if got := classifyError(err); got != want {
+		t.Fatalf("giveUpOn: classifyError(%v) = %s, want %s", err, got, want)
+	}
+	if c.c.Load() != nil {
+		t.Fatal("giveUpOn: the client still holds a session")
+	}
+	if !errors.Is(c.giveUpErr, err) {
+		t.Fatalf("giveUpOn: stored give-up = %v, want the returned error %v", c.giveUpErr, err)
+	}
+	return err
+}
+
+// expireCooldown ends the cool-down after a give-up. Call it only between calls.
+func expireCooldown(c *Client) {
+	c.reviveDur = time.Hour
+	c.lastReconnect = c.lastReconnect.Add(-2 * time.Hour)
+}
+
+// countDials wraps c.dialFn and returns the dial count, so a test can show that a call dialed nothing.
+func countDials(c *Client) *atomic.Int32 {
+	var dials atomic.Int32
+	dial := c.dialFn
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return dial(ctx, addr)
+	}
+	return &dials
 }
