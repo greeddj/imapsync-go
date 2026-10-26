@@ -131,6 +131,13 @@ The command checks the configuration file when it loads the file.
 - If the file contains a different key at any level, the command stops with an
   error. The error shows the key and the path of the file.
 - A JSON file must contain one object. A YAML file must contain one document with the settings. After this document, the file can contain only empty documents or null documents, for example `---` or `~`.
+- If `map` has no items, the command does not stop with an error. The command
+  copies all source folders, the same as for a file without `map`.
+- These values have no items: `"map": []`, `"map": null`, `map: []`, and a
+  `map:` key with all items in comments.
+
+> **Caution:** Make sure that `map` has items before you use `-y`. With `-y`,
+> the command does not ask you before it starts to copy.
 
 ### Authentication
 
