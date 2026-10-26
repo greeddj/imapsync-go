@@ -486,9 +486,59 @@ func Test_ListMailboxes_sumsMessageSizes(t *testing.T) {
 	}
 }
 
-// Test_ListMailboxes_whenStatusRefused asserts that one folder whose STATUS
-// fails is listed without statistics while the others are still populated.
-func Test_ListMailboxes_whenStatusRefused(t *testing.T) {
+// infosByName indexes the result of ListMailboxes by folder name.
+func infosByName(t *testing.T, infos []*MailboxInfo) map[string]*MailboxInfo {
+	t.Helper()
+
+	byName := make(map[string]*MailboxInfo, len(infos))
+	for _, m := range infos {
+		byName[m.Name] = m
+	}
+	return byName
+}
+
+// assertReadable checks a folder whose statistics were read.
+func assertReadable(t *testing.T, got map[string]*MailboxInfo, name string, messages uint32, size uint64) {
+	t.Helper()
+
+	m := got[name]
+	if m == nil {
+		t.Errorf("ListMailboxes has no folder %q", name)
+		return
+	}
+	if m.Err != nil || m.NoSelect || m.Messages != messages || m.Size != size {
+		t.Errorf("folder %q = %+v, want %d messages, size %d and no error", name, *m, messages, size)
+	}
+}
+
+// assertUnreadable checks a folder that carries the reason it could not be read,
+// with zero statistics.
+func assertUnreadable(t *testing.T, got map[string]*MailboxInfo, name string, reasons ...string) {
+	t.Helper()
+
+	m := got[name]
+	if m == nil {
+		t.Errorf("ListMailboxes has no folder %q", name)
+		return
+	}
+	if m.Err == nil {
+		t.Errorf("folder %q has no error, want one that contains %q", name, reasons)
+	} else {
+		for _, reason := range reasons {
+			if !strings.Contains(m.Err.Error(), reason) {
+				t.Errorf("folder %q error = %q, want it to contain %q", name, m.Err, reason)
+			}
+		}
+	}
+	if m.NoSelect || m.Messages != 0 || m.Size != 0 {
+		t.Errorf("folder %q = %+v, want zero statistics and NoSelect false", name, *m)
+	}
+}
+
+// Test_ListMailboxes_When_StatusRefused_Then_FolderCarriesTheReason asserts that a
+// folder whose STATUS fails keeps the reason and no statistics, and the others are
+// still populated.
+func Test_ListMailboxes_When_StatusRefused_Then_FolderCarriesTheReason(t *testing.T) {
 	t.Parallel()
 
 	srv, c := newScriptedClient(t, &mailboxScript{
@@ -505,45 +555,165 @@ func Test_ListMailboxes_whenStatusRefused(t *testing.T) {
 		t.Fatalf("ListMailboxes: %v", err)
 	}
 
-	got := make(map[string]MailboxInfo, len(infos))
-	for _, m := range infos {
-		got[m.Name] = *m
-	}
-	want := map[string]MailboxInfo{
-		"INBOX":  {Name: "INBOX", Messages: 2, Size: 350},
-		"Broken": {Name: "Broken"},
-		"Sent":   {Name: "Sent", Messages: 1, Size: 10},
-	}
-	if !maps.Equal(got, want) {
-		t.Errorf("ListMailboxes = %+v, want %+v", got, want)
-	}
+	got := infosByName(t, infos)
+	assertReadable(t, got, "INBOX", 2, 350)
+	assertUnreadable(t, got, "Broken", "read message count", "status refused")
+	assertReadable(t, got, "Sent", 1, 10)
 	if slices.Contains(srv.capturedNames("EXAMINE"), "Broken") {
 		t.Error("the folder whose STATUS failed was examined anyway")
 	}
 }
 
-// Test_ListMailboxes_whenSizingFails asserts that a folder whose size cannot
-// be read keeps its message count and reports the failure through the log.
-func Test_ListMailboxes_whenSizingFails(t *testing.T) {
+// Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason asserts that
+// a folder whose size cannot be read keeps no message count and carries the
+// reason in Err, with or without log sinks.
+func Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason(t *testing.T) {
 	t.Parallel()
 
-	_, c := newScriptedClient(t, &mailboxScript{
-		examineRefused: map[string]bool{"INBOX": true},
-		folders:        []scriptFolder{{name: "INBOX", sizes: []uint32{100, 250}}},
-	})
-	var logged []string
-	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
-	c.verbose = true
+	tests := []struct {
+		name  string
+		wired bool
+	}{
+		{name: "no writer and no tracker"},
+		{name: "writer, tracker and verbose as show sets them", wired: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, c := newScriptedClient(t, &mailboxScript{
+				examineRefused: map[string]bool{"INBOX": true},
+				folders:        []scriptFolder{{name: "INBOX", sizes: []uint32{100, 250}}},
+			})
+			var logged []string
+			tr := &recordingTracker{}
+			if tt.wired {
+				c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+				c.SetProgressTracker(tr)
+				c.verbose = true
+			}
+
+			infos, err := c.ListMailboxes(t.Context())
+			if err != nil {
+				t.Fatalf("ListMailboxes: %v", err)
+			}
+
+			assertUnreadable(t, infosByName(t, infos), "INBOX", "read folder size", "examine refused")
+			if len(infos) != 1 {
+				t.Errorf("ListMailboxes returned %d folders, want 1", len(infos))
+			}
+			sizingLine := func(msg string) bool { return strings.Contains(msg, "failed to size") }
+			if slices.ContainsFunc(logged, sizingLine) {
+				t.Errorf("writer log = %q, want no line about sizing: the reason is in Err", logged)
+			}
+			if slices.ContainsFunc(tr.messages, sizingLine) {
+				t.Errorf("tracker messages = %q, want no line about sizing: the reason is in Err", tr.messages)
+			}
+		})
+	}
+}
+
+// Test_ListMailboxes_When_ListMarksNoSelect_Then_ContainerIsSkippedWithoutError
+// asserts that a name LIST marks \Noselect or \NonExistent gets no command and no
+// error, and still counts as one step of the tracker.
+func Test_ListMailboxes_When_ListMarksNoSelect_Then_ContainerIsSkippedWithoutError(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newScriptedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "[Gmail]", attrs: `\HasChildren \Noselect`},
+		{name: "Ghost", attrs: `\NonExistent`},
+		{name: "INBOX", sizes: []uint32{100, 250}},
+		{name: "[Gmail]/Sent", sizes: []uint32{10}},
+	}})
+	tr := &recordingTracker{}
+	c.SetProgressTracker(tr)
 
 	infos, err := c.ListMailboxes(t.Context())
 	if err != nil {
 		t.Fatalf("ListMailboxes: %v", err)
 	}
-	if len(infos) != 1 || infos[0].Messages != 2 || infos[0].Size != 0 {
-		t.Errorf("ListMailboxes = %+v, want INBOX with 2 messages and size 0", infos)
+
+	got := infosByName(t, infos)
+	for _, name := range []string{"[Gmail]", "Ghost"} {
+		m := got[name]
+		if m == nil {
+			t.Errorf("ListMailboxes has no folder %q", name)
+			continue
+		}
+		if !m.NoSelect || m.Err != nil || m.Messages != 0 || m.Size != 0 {
+			t.Errorf("folder %q = %+v, want NoSelect with no error and zero statistics", name, *m)
+		}
 	}
-	if !slices.ContainsFunc(logged, func(msg string) bool { return strings.Contains(msg, "failed to size INBOX") }) {
-		t.Errorf("log = %v, want a line about failing to size INBOX", logged)
+	assertReadable(t, got, "INBOX", 2, 350)
+	assertReadable(t, got, "[Gmail]/Sent", 1, 10)
+	if names := srv.capturedNames("STATUS"); !slices.Equal(names, []string{"INBOX", "[Gmail]/Sent"}) {
+		t.Errorf("STATUS names = %q, want only the folders that hold messages", names)
+	}
+	if names := srv.capturedNames("EXAMINE"); !slices.Equal(names, []string{"INBOX", "[Gmail]/Sent"}) {
+		t.Errorf("EXAMINE names = %q, want only the folders that hold messages", names)
+	}
+	if !slices.Equal(tr.increments, []int64{1, 1, 1, 1}) {
+		t.Errorf("Increment calls = %v, want one per folder, containers included", tr.increments)
+	}
+}
+
+// Asserts the give-up path through ListMailboxes. Zero backoff and zero reconnectDur
+// keep the reconnect from sleeping, so the test needs no sleepCtx swap.
+func Test_ListMailboxes_When_ReconnectGivesUpMidList_Then_EveryRemainingFolderCarriesTheGiveUp(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	statusA, statusB := verbOn("STATUS", "A"), verbOn("STATUS", "B")
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		switch {
+		case cmd.verb == "LIST":
+			for _, name := range []string{"A", "B", "C", "D"} {
+				writeLine(conn, `* LIST (\HasNoChildren) "/" "%s"`, name)
+			}
+			writeLine(conn, "%s OK LIST completed", cmd.tag)
+			return true, true
+		case statusA(cmd):
+			writeLine(conn, `* STATUS "A" (MESSAGES 0)`)
+			writeLine(conn, "%s OK STATUS completed", cmd.tag)
+			return true, true
+		case statusB(cmd):
+			return true, false
+		}
+		return false, true
+	}))
+	for range maxReconnectAttempts {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	c := newClientWithFake(t, srv)
+	c.backoff = 0
+	c.reviveDur = time.Hour
+
+	infos, err := c.ListMailboxes(t.Context())
+	if err != nil {
+		t.Fatalf("ListMailboxes: %v", err)
+	}
+
+	if c.giveUpErr == nil {
+		t.Fatal("the client did not give up")
+	}
+	got := infosByName(t, infos)
+	assertReadable(t, got, "A", 0, 0)
+	for _, name := range []string{"B", "C", "D"} {
+		assertUnreadable(t, got, name, "read message count")
+		if m := got[name]; m != nil && m.Err != nil {
+			if !errors.Is(m.Err, c.giveUpErr) {
+				t.Errorf("folder %q error = %v, want it to wrap the give-up error %v", name, m.Err, c.giveUpErr)
+			}
+			if !strings.HasPrefix(m.Err.Error(), "read message count: ") {
+				t.Errorf("folder %q error = %q, want the prefix %q", name, m.Err, "read message count: ")
+			}
+		}
+	}
+	if names := srv.capturedNames("STATUS"); !slices.Equal(names, []string{"A", "B"}) {
+		t.Errorf("STATUS names = %q, want [A B]: the give-up gate stops the rest before the wire", names)
+	}
+	if n := srv.callCount("LOGIN"); n != 1+maxReconnectAttempts {
+		t.Errorf("LOGIN count = %d, want %d (the first session and the whole reconnect budget)", n, 1+maxReconnectAttempts)
 	}
 }
 
@@ -598,7 +768,7 @@ func Test_ListMailboxes_whenListRefused(t *testing.T) {
 }
 
 // Test_ListMailboxes_whenContextExpiresInFlight asserts that a context ending while a
-// LIST or STATUS is pending is returned, not treated as a folder without statistics.
+// LIST, STATUS or size FETCH is pending is returned, not treated as an unreadable folder.
 func Test_ListMailboxes_whenContextExpiresInFlight(t *testing.T) {
 	t.Parallel()
 
@@ -608,6 +778,7 @@ func Test_ListMailboxes_whenContextExpiresInFlight(t *testing.T) {
 	}{
 		{name: "mailbox list is pending", hold: newStall(verbIs("LIST"))},
 		{name: "STATUS is pending", hold: newStall(verbOn("STATUS", "INBOX"))},
+		{name: "size FETCH is pending", hold: newStall(verbIs("FETCH"))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

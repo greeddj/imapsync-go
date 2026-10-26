@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,11 +33,10 @@ func e2eShowOptions(out io.Writer, quiet bool) showOptions {
 	}
 }
 
-// assertFolderRow checks that section has a table row for name showing count
-// messages and the formatted size.
-func assertFolderRow(t *testing.T, section, name string, count int, size uint64) {
+// assertRowCells checks that section has a table row for name whose other cells,
+// joined by single spaces, read want.
+func assertRowCells(t *testing.T, section, name, want string) {
 	t.Helper()
-	want := fmt.Sprintf("%d %s", count, utils.FormatSize(size))
 	for line := range strings.SplitSeq(section, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != name {
@@ -50,10 +50,30 @@ func assertFolderRow(t *testing.T, section, name string, count int, size uint64)
 	t.Errorf("no row for folder %q in\n%s", name, section)
 }
 
-// assertTotalsRow checks the footer row of a folder table.
+// assertFolderRow checks that section has a table row for name showing count
+// messages and the formatted size.
+func assertFolderRow(t *testing.T, section, name string, count int, size uint64) {
+	t.Helper()
+	assertRowCells(t, section, name, fmt.Sprintf("%d %s", count, utils.FormatSize(size)))
+}
+
+// assertMarkedRow checks a row that shows marker in the Messages cell and no size.
+func assertMarkedRow(t *testing.T, section, name, marker string) {
+	t.Helper()
+	assertRowCells(t, section, name, marker+" -")
+}
+
+// assertTotalsRow checks the footer row of a folder table with no unreadable folder.
 func assertTotalsRow(t *testing.T, section string, folders, messages int, size uint64) {
 	t.Helper()
-	want := fmt.Sprintf("TOTAL FOLDERS %d %d %s", folders, messages, utils.FormatSize(size))
+	assertTotalsLabel(t, section, fmt.Sprintf("TOTAL FOLDERS %d", folders), messages, size)
+}
+
+// assertTotalsLabel checks the footer row of a folder table: its label, the message
+// sum and the size sum.
+func assertTotalsLabel(t *testing.T, section, label string, messages int, size uint64) {
+	t.Helper()
+	want := fmt.Sprintf("%s %d %s", label, messages, utils.FormatSize(size))
 	for line := range strings.SplitSeq(section, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 || fields[0] != "TOTAL" {
@@ -105,10 +125,135 @@ func TestRunShow_When_BothAccountsReachable_Then_PrintsFolderTables(t *testing.T
 			assertContainsAll(t, dstSection, dst.ln.Addr().String(), "bob")
 			assertFolderRow(t, dstSection, "INBOX", 1, dstSize)
 			assertTotalsRow(t, dstSection, 1, 1, dstSize)
-			assertContainsNone(t, got, e2ePassword)
+			assertContainsNone(t, got, e2ePassword, "cannot be read", "UNREADABLE")
 			assertReadOnly(t, "source", src)
 			assertReadOnly(t, "destination", dst)
 		})
+	}
+}
+
+func TestRunShow_When_FoldersCannotBeRead_Then_MarksRowsListsReasonsAndFails(t *testing.T) {
+	t.Parallel()
+
+	for _, quiet := range []bool{true, false} {
+		t.Run(fmt.Sprintf("quiet=%v", quiet), func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX":        fakeMsgs("a@x", "b@x"),
+				"Work":         fakeMsgs("c@x", "d@x", "e@x"),
+				"Archive":      fakeMsgs("f@x"),
+				"[Gmail]/Sent": fakeMsgs("g@x"),
+			})
+			src.markNoSelect("[Gmail]")
+			src.refuseStatusWith("Work", "NO [UNAVAILABLE] Temporary failure")
+			src.refuseOpenWith("Archive", "NO [UNAVAILABLE] Archive offline")
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX": fakeMsgs("h@x"),
+				"Junk":  fakeMsgs("i@x"),
+			})
+			dst.refuseStatusWith("Junk", "NO [UNAVAILABLE] Junk offline")
+			out := &syncBuffer{}
+
+			err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, quiet))
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Errorf("runShow error = %v, want ErrSilentExit", err)
+			}
+			got := stripANSI(out.String())
+			_, tables, ok := strings.Cut(got, "Source")
+			if !ok {
+				t.Fatalf("output has no Source title:\n%s", got)
+			}
+			srcSection, dstSection, ok := strings.Cut(tables, "Destination")
+			if !ok {
+				t.Fatalf("output has no Destination title:\n%s", got)
+			}
+
+			msgSize := uint64(len(imapFullBody("a@x")))
+			assertMarkedRow(t, srcSection, "Archive", "unreadable")
+			assertFolderRow(t, srcSection, "INBOX", 2, 2*msgSize)
+			assertMarkedRow(t, srcSection, "Work", "unreadable")
+			assertMarkedRow(t, srcSection, "[Gmail]", "container")
+			assertFolderRow(t, srcSection, "[Gmail]/Sent", 1, msgSize)
+			assertTotalsLabel(t, srcSection, "TOTAL FOLDERS 5 (2 UNREADABLE)", 3, 3*msgSize)
+			assertFolderRow(t, dstSection, "INBOX", 1, msgSize)
+			assertMarkedRow(t, dstSection, "Junk", "unreadable")
+			assertTotalsLabel(t, dstSection, "TOTAL FOLDERS 2 (1 UNREADABLE)", 1, msgSize)
+
+			if n := strings.Count(got, "Folders that cannot be read"); n != 1 {
+				t.Errorf("the reason header appears %d times, want 1", n)
+			}
+			assertInOrder(t, got,
+				"Destination",
+				"Folders that cannot be read",
+				"• Source Archive: read folder size: Archive offline",
+				"• Source Work: read message count: Temporary failure",
+				"• Destination Junk: read message count: Junk offline",
+			)
+			assertContainsNone(t, got, "• Source [Gmail]", "• Source INBOX", "• Destination INBOX", e2ePassword)
+			if slices.Contains(src.capturedNames("STATUS"), "[Gmail]") {
+				t.Error("source sent STATUS for [Gmail], a folder its LIST marks \\Noselect")
+			}
+			assertReadOnly(t, "source", src)
+			assertReadOnly(t, "destination", dst)
+		})
+	}
+}
+
+func TestRunShow_When_AccountHasNoSelectContainer_Then_ShowsContainerAndSucceeds(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":        fakeMsgs("a@x"),
+		"[Gmail]/Sent": fakeMsgs("b@x", "c@x"),
+	})
+	src.markNoSelect("[Gmail]")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+
+	if err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, true)); err != nil {
+		t.Fatalf("runShow: %v", err)
+	}
+
+	got := stripANSI(out.String())
+	srcSection, _, ok := strings.Cut(got, "Destination")
+	if !ok {
+		t.Fatalf("output has no Destination title:\n%s", got)
+	}
+	msgSize := uint64(len(imapFullBody("a@x")))
+	assertFolderRow(t, srcSection, "INBOX", 1, msgSize)
+	assertMarkedRow(t, srcSection, "[Gmail]", "container")
+	assertFolderRow(t, srcSection, "[Gmail]/Sent", 2, 2*msgSize)
+	assertTotalsRow(t, srcSection, 3, 3, 3*msgSize)
+	assertContainsNone(t, got, "UNREADABLE", "cannot be read")
+	if slices.Contains(src.capturedNames("STATUS"), "[Gmail]") || slices.Contains(src.capturedNames("EXAMINE"), "[Gmail]") {
+		t.Error("source sent a command for [Gmail], a folder its LIST marks \\Noselect")
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunShow_When_UnreadableFolderHasHostileNameAndReply_Then_ReasonListShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":         nil,
+		hostileWireName: fakeMsgs("a@x"),
+	})
+	src.refuseStatusWith(hostileWireName, "NO "+hostileReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+
+	err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, false))
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("runShow error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, stripANSI(out.String()),
+		"• Source "+hostileShownName+": read message count: "+hostileReplyShown+"\n")
+	assertContainsNone(t, out.String(), hostileName, "\u202e", "\x1b]0;pwned", "\x1b[2J")
+	if got := src.capturedNames("STATUS"); !slices.Contains(got, hostileWireName) {
+		t.Errorf("STATUS names = %q, want the exact wire name %q among them", got, hostileWireName)
 	}
 }
 
@@ -171,8 +316,10 @@ func TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals(t 
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		mailboxes []*client.MailboxInfo
+		markers    map[string]string
+		name       string
+		mailboxes  []*client.MailboxInfo
+		unreadable int
 	}{
 		{
 			name: "two mailboxes",
@@ -180,6 +327,18 @@ func TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals(t 
 				{Name: "INBOX", Messages: 3, Size: 2048},
 				{Name: "Archive", Messages: 10, Size: 5 * 1024 * 1024},
 			},
+		},
+		{
+			// The unreadable row sets Messages and Size on purpose: the sums must leave
+			// it out because of Err, not because its values are zero.
+			name: "unreadable and container rows stay out of the sums",
+			mailboxes: []*client.MailboxInfo{
+				{Name: "INBOX", Messages: 3, Size: 2048},
+				{Name: "Broken", Messages: 7, Size: 999, Err: errors.New("read message count: status refused")},
+				{Name: "[Gmail]", NoSelect: true},
+			},
+			markers:    map[string]string{"Broken": "unreadable", "[Gmail]": "container"},
+			unreadable: 1,
 		},
 		{name: "no mailboxes"},
 	}
@@ -201,11 +360,20 @@ func TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals(t 
 			var messages int
 			var size uint64
 			for _, mb := range tt.mailboxes {
+				if marker, ok := tt.markers[mb.Name]; ok {
+					assertMarkedRow(t, got, mb.Name, marker)
+					continue
+				}
 				assertFolderRow(t, got, mb.Name, int(mb.Messages), mb.Size)
 				messages += int(mb.Messages)
 				size += mb.Size
 			}
-			assertTotalsRow(t, got, len(tt.mailboxes), messages, size)
+			label := fmt.Sprintf("TOTAL FOLDERS %d", len(tt.mailboxes))
+			if tt.unreadable > 0 {
+				label += fmt.Sprintf(" (%d UNREADABLE)", tt.unreadable)
+			}
+			assertTotalsLabel(t, got, label, messages, size)
+			assertContainsNone(t, got, "status refused")
 		})
 	}
 }

@@ -570,6 +570,7 @@ type mailStore struct {
 	nextUID      map[string]uint32
 	noSelect     map[string]bool
 	openReply    map[string]string
+	statusReply  map[string]string
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -676,6 +677,17 @@ func (s *fakeServer) refuseOpenWith(folder, reply string) {
 		s.store.openReply = make(map[string]string)
 	}
 	s.store.openReply[folder] = reply
+}
+
+// refuseStatusWith makes every STATUS of folder end with reply, which carries its
+// own status word, as the tagged status line. The key is the name on the wire.
+func (s *fakeServer) refuseStatusWith(folder, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.statusReply == nil {
+		s.store.statusReply = make(map[string]string)
+	}
+	s.store.statusReply[folder] = reply
 }
 
 func (s *fakeServer) dropOnceOnOpen(folder string) {
@@ -837,8 +849,8 @@ func splitCommand(line string) (tag, verb, arg string) {
 	return tag, strings.ToUpper(verb), arg
 }
 
-// recordCommand counts verb, plus "UID <SUB>" for UID commands. CREATE, EXAMINE
-// and SELECT names are recorded on arrival, whether or not the server accepts them.
+// recordCommand counts verb, plus "UID <SUB>" for UID commands. CREATE, EXAMINE,
+// SELECT and STATUS names are recorded on arrival, whether or not the server accepts them.
 func (s *fakeServer) recordCommand(verb, arg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -847,7 +859,7 @@ func (s *fakeServer) recordCommand(verb, arg string) {
 	case "UID":
 		sub, _, _ := strings.Cut(arg, " ")
 		s.counts["UID "+strings.ToUpper(sub)]++
-	case "CREATE", "EXAMINE", "SELECT":
+	case "CREATE", "EXAMINE", "SELECT", "STATUS":
 		name, _ := parseMailboxArg(arg)
 		s.names[verb] = append(s.names[verb], name)
 	}
@@ -919,7 +931,12 @@ func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
 	msgs, ok := s.store.folders[name]
 	n := len(msgs)
 	noSelect := s.store.noSelect[name]
+	refusal := s.store.statusReply[name]
 	s.mu.Unlock()
+	if refusal != "" {
+		rw.line("%s %s", tag, refusal)
+		return
+	}
 	if !ok || noSelect {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return

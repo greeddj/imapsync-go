@@ -13,9 +13,15 @@ import (
 
 // MailboxInfo describes message counts and sizes for a single folder.
 type MailboxInfo struct {
+	// Err is the reason the statistics could not be read. Messages and Size
+	// are then zero.
+	Err      error
 	Name     string
-	Messages uint32
 	Size     uint64
+	Messages uint32
+	// NoSelect marks a name that LIST flags \Noselect or \NonExistent. It gets
+	// no command, and Err stays nil.
+	NoSelect bool
 }
 
 // MailboxExists reports whether the per-Client mailbox cache lists name, so
@@ -152,7 +158,9 @@ func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) (
 	return c.listSubfoldersFromCache(folder, delimiter), nil
 }
 
-// ListMailboxes fetches all folders plus lightweight statistics for each.
+// ListMailboxes lists all folders with their statistics. It fails only when
+// ctx ends or LIST fails; a folder whose statistics cannot be read carries
+// the reason in Err.
 func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -172,7 +180,7 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 
 		for m := range mailboxes {
 			if ctx.Err() == nil {
-				result = append(result, &MailboxInfo{Name: m.Name})
+				result = append(result, &MailboxInfo{Name: m.Name, NoSelect: noSelectAttr(m.Attributes)})
 			}
 		}
 		if err := <-done; err != nil {
@@ -205,35 +213,9 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 			tr.UpdateMessage(fmt.Sprintf("[%s] %d/%d %s ", c.prefix, i+1, len(result), termsafe.Escape(mbox.Name)))
 		}
 
-		var status *imap.MailboxStatus
-		err := c.safeCall(func(cli *imapclient.Client) error {
-			s, e := cli.Status(mbox.Name, []imap.StatusItem{imap.StatusMessages})
-			if e != nil {
-				return e
-			}
-			status = s
-			return nil
-		})
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if tr != nil {
-				tr.Increment(1)
-			}
-			continue
-		}
-
-		mbox.Messages = status.Messages
-		if status.Messages > 0 {
-			size, err := c.getFolderSize(ctx, mbox.Name)
-			switch {
-			case err == nil:
-				mbox.Size = size
-			case ctx.Err() != nil:
-				// canceled - outer loop will bail
-			case c.verbose:
-				c.log("[%s] failed to size %s: %v", c.prefix, mbox.Name, err)
+		if !mbox.NoSelect {
+			if err := c.readStats(ctx, mbox); err != nil {
+				return nil, err
 			}
 		}
 
@@ -247,6 +229,42 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 	}
 
 	return result, nil
+}
+
+// readStats fills the message count and size of mbox. A failed read goes to
+// mbox.Err and leaves both at zero; only an ended ctx is returned as an error.
+func (c *Client) readStats(ctx context.Context, mbox *MailboxInfo) error {
+	var status *imap.MailboxStatus
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		s, e := cli.Status(mbox.Name, []imap.StatusItem{imap.StatusMessages})
+		if e != nil {
+			return e
+		}
+		status = s
+		return nil
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		mbox.Err = fmt.Errorf("read message count: %w", err)
+		return nil
+	}
+
+	var size uint64
+	if status.Messages > 0 {
+		size, err = c.getFolderSize(ctx, mbox.Name)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			mbox.Err = fmt.Errorf("read folder size: %w", err)
+			return nil
+		}
+	}
+	mbox.Messages = status.Messages
+	mbox.Size = size
+	return nil
 }
 
 // getFolderSize calculates the total size of all messages in a folder.

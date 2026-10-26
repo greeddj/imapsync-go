@@ -78,7 +78,7 @@ func reportError(w io.Writer, err error) int {
 		_, _ = fmt.Fprintln(w, "Cancelled.")
 		return 130
 	case errors.Is(err, appkg.ErrSilentExit):
-		// ActionSync has already printed a human-friendly summary.
+		// The command has already printed its failures on stdout.
 		return 1
 	default:
 		_, _ = fmt.Fprintf(w, "Error: %s\n", termsafe.Escape(err.Error()))

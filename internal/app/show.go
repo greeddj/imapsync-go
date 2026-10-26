@@ -136,7 +136,35 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 	_, _ = fmt.Fprintln(out)
 	printAccountInfo(out, "Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
 
-	return nil
+	if countUnreadable(srcRes.mailboxes)+countUnreadable(dstRes.mailboxes) == 0 {
+		return nil
+	}
+	_, _ = fmt.Fprint(out, "\n❌ Folders that cannot be read:\n")
+	printUnreadableFolders(out, "Source", srcRes.mailboxes)
+	printUnreadableFolders(out, "Destination", dstRes.mailboxes)
+	return ErrSilentExit
+}
+
+// countUnreadable counts the folders whose statistics could not be read.
+func countUnreadable(mailboxes []*client.MailboxInfo) int {
+	n := 0
+	for _, mbox := range mailboxes {
+		if mbox.Err != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// printUnreadableFolders lists the reason for each unreadable folder. Name and
+// reason can carry server text, so both go through termsafe.Escape.
+func printUnreadableFolders(out io.Writer, title string, mailboxes []*client.MailboxInfo) {
+	for _, mbox := range mailboxes {
+		if mbox.Err == nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "• %s %s: %s\n", title, termsafe.Escape(mbox.Name), termsafe.Escape(mbox.Err.Error()))
+	}
 }
 
 // printAccountInfo displays mailbox information in a formatted table.
@@ -171,18 +199,25 @@ func printAccountInfo(out io.Writer, title, server, user string, mailboxes []*cl
 	var totalSize uint64
 
 	for _, mbox := range mailboxes {
-		totalMessages += mbox.Messages
-		totalSize += mbox.Size
-
-		t.AppendRow(table.Row{
-			termsafe.Escape(mbox.Name),
-			mbox.Messages,
-			utils.FormatSize(mbox.Size),
-		})
+		name := termsafe.Escape(mbox.Name)
+		switch {
+		case mbox.Err != nil:
+			t.AppendRow(table.Row{name, "unreadable", "-"})
+		case mbox.NoSelect:
+			t.AppendRow(table.Row{name, "container", "-"})
+		default:
+			totalMessages += mbox.Messages
+			totalSize += mbox.Size
+			t.AppendRow(table.Row{name, mbox.Messages, utils.FormatSize(mbox.Size)})
+		}
 	}
 
+	label := fmt.Sprintf("total folders %d", len(mailboxes))
+	if unreadable := countUnreadable(mailboxes); unreadable > 0 {
+		label = fmt.Sprintf("total folders %d (%d unreadable)", len(mailboxes), unreadable)
+	}
 	t.AppendFooter(table.Row{
-		text.Bold.Sprint(fmt.Sprintf("total folders %d", len(mailboxes))),
+		text.Bold.Sprint(label),
 		text.Bold.Sprintf("%d", totalMessages),
 		text.Bold.Sprint(utils.FormatSize(totalSize)),
 	})
