@@ -20,6 +20,7 @@ Run through these on every security review:
     - The gate runs under `c.mu`, before any wait, logout or dial. Only `New` and `reconnect` call `connectAndLogin`, so every later login goes through the gate.
     - A `ClassPermanent` or `ClassUnknown` give-up is final for the run. Each later call returns the stored error and does not dial.
     - A reply that reports a locked, disabled, suspended or blocked account is `ClassPermanent`. A login attempt on a locked account can make the lock longer.
+    - A login reply that reports a temporary outage of the authentication service (for example `[UNAVAILABLE] Temporary authentication failure`) is `ClassTransient`. `reconnect` retries it with backoff, up to `maxReconnectAttempts`. The locked-account rule comes first, so a locked-account reply never reaches this rule.
 
     A change to any of these values or rules is a security review point.
 11. **Terminal output** - text from an IMAP server (folder names, reply text in errors, Message-Ids, go-imap log lines) can contain control, bidi and invisible characters. Such text can move the cursor, clear the screen or make a false status line. A new print site must show it through `termsafe.Escape`. A `%q` verb is accepted only at the existing sites, because `%q` keeps graphic invisible runes (see "Known limitations"). Escape where the program prints the text, never in values that go back to a server.
@@ -33,6 +34,8 @@ A change can be safe per-file and unsafe in combination. Look for:
 - New goroutines that don't honour `ctx` - Ctrl-C must terminate the program promptly. Goroutines outliving the program are a DoS on the user's terminal.
 - Per-connection state that should be global (e.g. accidentally creating a per-Client rate limiter - defeats the global cap).
 - A new print site that shows server text without `termsafe.Escape`. A `%q` verb is accepted only at the existing sites in `internal/app/sync.go`. Check `fmt.*`, `log.*`, `pw.Log`, tracker messages and error output.
+- Server text, such as a folder name, in the wrapper text of an error that `classifyError` reads. `classifyError` matches text on the leaf error only, so wrapper text cannot set the class. A folder name that contains `exceeded quota` or `not logged in` must not change a retry decision. Wrap an error with `%w`. A `%v` or `%s` of an error makes a new leaf that holds the wrapper text.
+- A second APPEND after go-imap started to read the body, for example when `AppendMessage` moves into `safeCall`. The server can already have the message, so a second APPEND makes a duplicate on the destination. `AppendMessage` retries one time, only when go-imap did not start to read the body.
 - A server value that reaches IMAP after escaping: a SELECT, EXAMINE, STATUS, CREATE or APPEND argument, plan data, a mapping, a map key, or an error value that `classifyError` or `isAlreadyExistsErr` reads. Escaping changes the bytes, so the name no longer matches the real folder.
 
 ## Known limitations

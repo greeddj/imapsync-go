@@ -1013,9 +1013,6 @@ func byeAfterUIDFetch(log *uidFetchLog, release <-chan struct{}) func(net.Conn, 
 
 func requestedAsSent(requested []uint32) []uint32 { return requested }
 
-// Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest
-// asserts that a BYE after the first batch ends the session, the next batch
-// selects the folder on a new session, and no delivered UID is fetched again.
 func Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest(t *testing.T) {
 	t.Parallel()
 
@@ -1062,9 +1059,6 @@ func Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_Reconnects
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain
-// asserts that a refused EXAMINE, which leaves the server with no selected
-// mailbox, does not let the next stream of the earlier folder skip its EXAMINE.
 func Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain(t *testing.T) {
 	t.Parallel()
 
@@ -1325,9 +1319,6 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered(
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce asserts
-// that all batches of one stream share one EXAMINE, also for a non-ASCII name,
-// which go-imap keeps as given but sends in modified UTF-7.
 func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce(t *testing.T) {
 	t.Parallel()
 
@@ -1377,9 +1368,6 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce(t 
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_ReselectsOnANewSession
-// asserts that a selection made before a BYE does not carry over: the stream
-// logs in, selects again and delivers each UID once.
 func Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_ReselectsOnANewSession(t *testing.T) {
 	t.Parallel()
 
@@ -1423,9 +1411,6 @@ func Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_Reselect
 	}
 }
 
-// Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_ReconnectsOnce
-// asserts that a refusal whose server text holds a transient phrase because it
-// echoes the folder name costs one reconnect, not a loop, and then returns the refusal.
 func Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_ReconnectsOnce(t *testing.T) {
 	t.Parallel()
 
@@ -1460,9 +1445,7 @@ func Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_Rec
 	}
 }
 
-// Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries
-// asserts that a folder name or a label never keeps a dropped connection from
-// being repaired: the error class comes from go-imap, not from our wrapper text.
+// The error class comes from go-imap, not from our wrapper text.
 func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries(t *testing.T) {
 	t.Parallel()
 
@@ -1522,8 +1505,6 @@ func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_Re
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndStreams
-// asserts the same for the copy phase, and that the retry fetches each UID once.
 func Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndStreams(t *testing.T) {
 	t.Parallel()
 

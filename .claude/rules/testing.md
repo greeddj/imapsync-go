@@ -14,8 +14,23 @@
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
   - CRAM-MD5 failure and success;
-  - a very large message count from EXAMINE or STATUS, which must not cause a large allocation;
+  - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
+
+  The error class has these tests:
+  - `TestClassifyError` and `TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides` - the text of a wrapper (a folder name or a label) never changes the class, and a leaf reply keeps its class under each wrapper;
+  - `TestCanRevive` - only a transient or throttled give-up can revive;
+  - `TestIsAlreadyExistsErr` - the CREATE refusal texts, with the Gmail text `Duplicate folder name`;
+  - `Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries` and `Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndStreams` - a folder name that holds a throttle phrase does not stop the reconnect;
+  - `Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_ReconnectsOnce` - a refusal whose text holds a transient phrase because it echoes the folder name costs one reconnect, and then `FetchMessageMap` returns the refusal;
+  - `Test_CreateMailbox_When_RetriedCreateAnswersDuplicateFolderName_Then_ReportsExisting` - a CREATE that the server applied before it dropped the connection does not fail when the retry gets the Gmail reply.
+
+  The reconnect attempts have these tests:
+  - `Test_safeCall_When_ReconnectLoginFailsTemporarily_Then_RetriesAndRecovers` - a temporary authentication failure gets the backoff, and the next attempt restores the session;
+  - `Test_reconnect_When_LoginAlwaysFailsTemporarily_Then_StopsAfterMaxAttempts` - a temporary failure uses all attempts and never waits for the throttle cool-down;
+  - `Test_reconnect_When_LoginFailsWithBadCredentials_Then_GivesUpAfterOneAttempt` - a refusal of the credentials ends `reconnect` at the first attempt;
+  - `Test_reconnect_When_EveryAttemptFails_Then_NoWaitFollowsTheLastAttempt` - `reconnect` waits only between two attempts;
+  - `Test_reconnect_When_LastAttemptFailsPermanently_Then_ReturnsTheRefusal` and `Test_reconnect_When_LastAttemptSucceeds_Then_Reconnects` - the last attempt still runs, and its result is the result of `reconnect`.
 
   The give-up and revive gate has these tests:
   - `Test_safeCall_When_WithinReviveInterval_Then_FailsFastWithoutDial` - inside `reviveInterval`, a call returns the stored give-up with no dial, login attempt, wait or log line;
@@ -24,6 +39,15 @@
   - `Test_safeCall_When_ReconnectWasRefusedPermanently_Then_LaterCallsSendNoLogin` - a permanent give-up is final, also when `reviveDur` is zero;
   - `Test_safeCall_When_ReconnectGaveUpOnUnknownRefusal_Then_LaterCallsSendNoLogin` - an unknown-class give-up is final;
   - `Test_safeCall_When_CancelledDuringReviveProbe_Then_ReturnsCanceledAndKeepsGiveUp` - a cancelled login attempt returns `context.Canceled` and keeps the earlier give-up;
+  - `Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects` - after a give-up that can revive, the next call waits until the reconnect interval ends, logs in once and runs `fn` once;
+  - `Test_safeCall_When_ReviveProbeIsRefusedPermanently_Then_NoFurtherLogin` - a permanent refusal of the login attempt is final;
+  - `Test_safeCall_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain` - a call that reconnected first runs `fn` one time, and the transient error goes to the caller;
+  - `Test_safeCall_When_CancelledWithoutSession_Then_ReturnsCanceledWithoutDial`, `Test_reconnect_When_CancelledWhileWaitingForLock_Then_ReturnsCanceledNotTheGiveUp` and `Test_safeCall_When_CancelledDuringWaitBeforeReconnect_Then_ReturnsCanceledWithoutLogin` - a cancel comes before the stored give-up, ends the wait, and no LOGIN follows;
+  - `Test_safeCall_When_CancelledDuringReconnectWait_Then_ReturnsCanceledWithoutAnotherLogin` - a cancel ends the wait between two reconnect attempts, no LOGIN follows, `fn` does not run again and `c.mu` is free;
+  - `Test_reconnect_When_ClientIsCancelled_Then_ReturnsCanceledWithoutDial` - a cancelled Client neither dials nor logs in, and `c.mu` is free;
+  - `Test_safeCall_When_CancelledRightAfterReconnect_Then_ReturnsCanceledWithoutRunningFn` and `Test_AppendMessage_When_CancelledRightAfterReconnect_Then_SendsNoAppend` - a cancel that comes right after a reconnect returns `context.Canceled`, `safeCall` does not run `fn` again, and `AppendMessage` sends no APPEND;
+  - `Test_safeCall_When_SessionMissingAfterReconnect_Then_ReturnsErrorWithoutRunningFn` - when a reconnect leaves no session, `safeCall` returns an error and does not run `fn` again;
+  - `Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect` - each public operation that uses `safeCall` logs in again on a Client that has no session;
   - the "account lock" and "account lockout" cases of `Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt` - after an account-lock reply, the Client sends no further login;
   - `Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown` - `AppendMessage` goes through the same gate.
 
@@ -33,14 +57,24 @@
   - `Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit` - after a BYE, the call does not use the old selection;
   - `Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain` - after a failed EXAMINE of another folder, the earlier folder gets a new EXAMINE;
   - `Test_selectIfNeeded_afterReconnect_reSelects` - the session after a reconnect gets a new EXAMINE;
-  - `Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries` - a BYE between the EXAMINE and the FETCH gets a reconnect, and the retry selects again.
+  - `Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries` - a BYE between the EXAMINE and the FETCH gets a reconnect, and the retry selects again;
+  - `Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest` - a BYE after the first batch gets a reconnect, the next batch selects the folder on the new session, and the stream does not fetch a delivered UID again;
+  - `Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce` - all batches of one stream share one EXAMINE, also for a non-ASCII name that go-imap sends in modified UTF-7;
+  - `Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_ReselectsOnANewSession` - the new session does not keep a selection made before a BYE: the stream logs in again, selects again and delivers each UID once.
 
   The APPEND retry has these tests:
   - `Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends` - a session that ended with a BYE or a closed socket gets a reconnect before the APPEND;
   - `Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce` - a transient failure before go-imap reads the body gets one reconnect and one APPEND, and the first connection gets no APPEND;
   - `Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry` - after go-imap read the body (an empty body too), the call repairs the session and sends no second APPEND;
   - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` - a failure in the middle of the literal gets a repair and no second APPEND;
-  - `Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain` and `Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect` - one call reconnects a maximum of one time.
+  - `Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain`, `Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain` and `Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect` - one call reconnects a maximum of one time;
+  - `Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError` - a refused login for the retry returns the reconnect error, and the next call returns the same refusal with no new login;
+  - `Test_AppendMessage_When_ReconnectBeforeAppendIsRefused_Then_ReturnsReconnectError` - when the server ended the session while idle and refuses each login attempt, `AppendMessage` returns the reconnect error and sends no APPEND;
+  - `Test_AppendMessage_When_ContextEndsDuringRetry_Then_ReturnsContextError` - a context that ends while the retry waits returns its error, with no further reconnect;
+  - `Test_AppendMessage_When_ContextEndsDuringReconnectBeforeAppend_Then_ReturnsContextError` and `Test_AppendMessage_When_ContextEndsDuringRetryReconnect_Then_ReturnsContextError` - a context that ends while a login waits returns the context error, not the reconnect error, and no APPEND reaches a session;
+  - `Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectAppend` - the retry sends the same flags, date and bytes as an APPEND that needed no retry, and exactly one complete literal reaches the server;
+  - `Test_readTracker` - `readTracker` marks a body as read only through `Read`, and it does not offer `WriteTo`, so `io.Copy` cannot move the body without a `Read`;
+  - `Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoLogin` and `Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSendNoLogin` - after a permanent refusal, `AppendMessage` sends no LOGIN and no APPEND.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (Message-Id intersection), subfolder expansion, delimiter reconciliation, worker pool dispatch.
@@ -51,6 +85,9 @@
   - a read-only source (no write commands, no `\Seen` change);
   - a cancel at each boundary between sync phases;
   - the refusal paths (login, LIST, EXAMINE, CREATE, APPEND);
+  - a source that drops the connection on a folder with a throttle phrase in its name, where the folder is still copied (`TestRunSync_When_SourceDropsOnFolderNamedLikeThrottle_Then_FolderIsStillCopied`);
+  - a CREATE that gets the Gmail reply `Duplicate folder name`, where the sync completes (`TestRunSync_When_CreateAnswersDuplicateFolderName_Then_SyncCompletes`);
+  - a destination that refuses LOGIN in the middle of a run, where the worker sends one refused LOGIN (`TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin`);
   - the `ActionSync` and `ActionShow` adapters, which run through a urfave/cli root (the TLS-only dial and the config load errors).
 - **`internal/progress`** - interface compliance against the contract `internal/client` expects.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
@@ -71,7 +108,6 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`Client.SetPrefix`, `Client.GetDelimiter`** - trivial one-liners; observable in all fake-server tests that set a delimiter.
 - **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
 - **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
-- **`safeCall` post-reconnect `isCancelled()` branch** - exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
   - `StreamMessagesByUIDs`, at the top of the second and later batches;
   - `CreateMailbox`, after the parent walk;
@@ -90,7 +126,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
   - `fire` uses `CompareAndSwap` to move the state from open to tripped;
   - `connectAndLogin` stores `c.idle` before `c.c`.
 
-  A deterministic test needs a production hook between two atomic operations. The reason is the same as for the `safeCall` post-reconnect `isCancelled()` branch. The tests cover the behaviour on both sides of each ordering.
+  A deterministic test needs a production hook between two atomic operations. The tests cover the behaviour on both sides of each ordering.
 - **`AppendMessage` with a server that is silent between the `{N}` line and the `+` continuation** - go-imap blocks the caller on `<-w.continues`, and a closed socket does not release it. A test of this window would hang. The cause is the same as in the Known limitation in `CLAUDE.md`. Two nearby paths have tests:
   - `Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAndRepairs` covers a server that is silent after the literal;
   - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` covers a server that stops reading the literal.

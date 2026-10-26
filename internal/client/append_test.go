@@ -18,9 +18,6 @@ import (
 	"github.com/emersion/go-imap"
 )
 
-// Test_AppendMessage_rejectsWithoutAppend asserts that every precondition
-// failure of AppendMessage is reported without an APPEND or a LOGIN reaching the
-// server, also when the client has no session.
 func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 	t.Parallel()
 
@@ -166,7 +163,6 @@ func Test_AppendMessage_logsWhenVerbose(t *testing.T) {
 	}
 }
 
-// testMessage returns a message whose full body is body.
 func testMessage(body string) Message {
 	msg := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
 	msg.Body[&imap.BodySectionName{}] = strings.NewReader(body)
@@ -174,7 +170,6 @@ func testMessage(body string) Message {
 	return Message{m: msg}
 }
 
-// testMessageBody returns the body that buildTestIMAPMessage sends.
 func testMessageBody(t *testing.T) string {
 	t.Helper()
 
@@ -185,7 +180,6 @@ func testMessageBody(t *testing.T) string {
 	return string(body)
 }
 
-// awaitAppend returns the next APPEND that appendCaptureHandler reported.
 func awaitAppend(t *testing.T, appends <-chan capturedAppend) capturedAppend {
 	t.Helper()
 
@@ -243,9 +237,6 @@ func wrapDialedConn(c *Client, nth int32, marker string) *resetConn {
 	return target
 }
 
-// Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends asserts
-// that an APPEND on a session the server ended, with or without a BYE, logs in
-// again and sends the message in the same call.
 func Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends(t *testing.T) {
 	t.Parallel()
 
@@ -306,9 +297,6 @@ func Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends(t *
 	}
 }
 
-// Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce asserts that an
-// APPEND that fails with a retryable error before go-imap reads the body reconnects
-// once and sends the message, and that the first connection received no APPEND.
 func Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce(t *testing.T) {
 	t.Parallel()
 
@@ -359,9 +347,7 @@ func Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce(t *testing.T
 	}
 }
 
-// Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry asserts that a
-// connection that drops after go-imap sent the body is repaired but not retried,
-// so the destination gets no duplicate. An empty body counts as sent.
+// A retry after the body was sent would duplicate the message. An empty body counts as sent.
 func Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry(t *testing.T) {
 	t.Parallel()
 
@@ -406,9 +392,6 @@ func Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry(t *testing.T) 
 	}
 }
 
-// Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError asserts
-// that a refused login for the retry returns the reconnect error as it is, and that
-// the next call returns the same refusal without a new login.
 func Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError(t *testing.T) {
 	t.Parallel()
 
@@ -452,9 +435,6 @@ func Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError(
 	}
 }
 
-// Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect
-// asserts that the retry runs under the new session's watchdog, that its failure
-// starts no further reconnect, and that the next call detects the ended session.
 func Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect(t *testing.T) {
 	t.Parallel()
 
@@ -497,9 +477,6 @@ func Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherRec
 	}
 }
 
-// Test_AppendMessage_When_ContextEndsDuringRetry_Then_ReturnsContextError asserts
-// that a context that ends while the retry waits for the server returns its error,
-// without a further reconnect.
 func Test_AppendMessage_When_ContextEndsDuringRetry_Then_ReturnsContextError(t *testing.T) {
 	t.Parallel()
 
@@ -539,9 +516,6 @@ func dropAfterLiteral(conn net.Conn, rd *bufio.Reader, cmd command) (handled, ke
 	return true, false
 }
 
-// Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoLogin asserts
-// that an APPEND on a client whose repair was refused returns that refusal and sends neither
-// a LOGIN nor an APPEND.
 func Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoLogin(t *testing.T) {
 	t.Parallel()
 
@@ -578,9 +552,6 @@ func Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoL
 	}
 }
 
-// Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown asserts
-// that APPENDs inside the cool-down return the stored give-up with no LOGIN or APPEND, and that
-// the first one after it logs in once and uploads.
 func Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -641,8 +612,6 @@ func Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterC
 	}
 }
 
-// Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSendNoLogin asserts
-// that a permanent refusal ends all logins of the client, also when the cool-down is zero.
 func Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSendNoLogin(t *testing.T) {
 	t.Parallel()
 
@@ -673,9 +642,6 @@ func Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSen
 	}
 }
 
-// Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain
-// asserts that an APPEND that had to reconnect first does not reconnect again after a
-// transient failure.
 func Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain(t *testing.T) {
 	t.Parallel()
 
@@ -700,9 +666,6 @@ func Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnec
 	}
 }
 
-// Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain
-// asserts that an APPEND that reconnected first does not reconnect a second time to
-// retry when the new session fails before go-imap reads the body.
 func Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain(t *testing.T) {
 	t.Parallel()
 
@@ -919,9 +882,6 @@ func Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepa
 	}
 }
 
-// Test_AppendMessage_When_ReconnectBeforeAppendIsRefused_Then_ReturnsReconnectError
-// asserts that a session the server ended while idle, whose reconnect every
-// attempt refuses, returns the reconnect error and sends no APPEND.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_AppendMessage_When_ReconnectBeforeAppendIsRefused_Then_ReturnsReconnectError(t *testing.T) {
 	release := make(chan struct{})
@@ -967,9 +927,6 @@ func Test_AppendMessage_When_ReconnectBeforeAppendIsRefused_Then_ReturnsReconnec
 	c.mu.Unlock()
 }
 
-// Test_AppendMessage_When_ContextEndsDuringReconnectBeforeAppend_Then_ReturnsContextError
-// asserts that a context that ends while the login before the APPEND waits for
-// the server returns the context error, not the reconnect error.
 func Test_AppendMessage_When_ContextEndsDuringReconnectBeforeAppend_Then_ReturnsContextError(t *testing.T) {
 	t.Parallel()
 
@@ -1005,9 +962,6 @@ func Test_AppendMessage_When_ContextEndsDuringReconnectBeforeAppend_Then_Returns
 	}
 }
 
-// Test_AppendMessage_When_ContextEndsDuringRetryReconnect_Then_ReturnsContextError
-// asserts that a context that ends while the reconnect of the retry waits for
-// the server returns the context error, and that no APPEND reaches any session.
 func Test_AppendMessage_When_ContextEndsDuringRetryReconnect_Then_ReturnsContextError(t *testing.T) {
 	t.Parallel()
 
@@ -1036,9 +990,6 @@ func Test_AppendMessage_When_ContextEndsDuringRetryReconnect_Then_ReturnsContext
 	}
 }
 
-// Test_AppendMessage_When_CancelledRightAfterReconnect_Then_SendsNoAppend asserts
-// that a client cancelled between the login before the APPEND and the APPEND
-// itself puts nothing on the new session.
 func Test_AppendMessage_When_CancelledRightAfterReconnect_Then_SendsNoAppend(t *testing.T) {
 	t.Parallel()
 
@@ -1070,9 +1021,6 @@ func Test_AppendMessage_When_CancelledRightAfterReconnect_Then_SendsNoAppend(t *
 	}
 }
 
-// Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectAppend
-// asserts that the retry sends the same flags, date and bytes as an APPEND that
-// needed no retry, and that exactly one complete literal reaches the server.
 func Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectAppend(t *testing.T) {
 	t.Parallel()
 
@@ -1124,9 +1072,6 @@ func Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectApp
 	}
 }
 
-// Test_readTracker asserts that readTracker marks a body as read only through
-// Read, and that it does not offer WriteTo, which would let io.Copy move the
-// body without a Read.
 func Test_readTracker(t *testing.T) {
 	t.Parallel()
 

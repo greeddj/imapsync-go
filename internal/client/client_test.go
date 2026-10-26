@@ -159,9 +159,6 @@ func Test_reconnect_throttledBackoff(t *testing.T) {
 
 const dovecotTempAuthFailure = "NO [UNAVAILABLE] Temporary authentication failure. [mx1:2026-10-25 10:00:00]"
 
-// Test_safeCall_When_ReconnectLoginFailsTemporarily_Then_RetriesAndRecovers
-// asserts that a temporary authentication failure during the reconnect LOGIN
-// takes the transient backoff branch and the next attempt restores the session.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_ReconnectLoginFailsTemporarily_Then_RetriesAndRecovers(t *testing.T) {
 	srv := newFakeServer(t)
@@ -206,9 +203,6 @@ func Test_safeCall_When_ReconnectLoginFailsTemporarily_Then_RetriesAndRecovers(t
 	}
 }
 
-// Test_reconnect_When_LoginAlwaysFailsTemporarily_Then_StopsAfterMaxAttempts
-// asserts that a temporary authentication failure uses the whole attempt
-// budget and never waits for the throttle cool-down.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_When_LoginAlwaysFailsTemporarily_Then_StopsAfterMaxAttempts(t *testing.T) {
 	srv := newFakeServer(t)
@@ -246,9 +240,6 @@ func Test_reconnect_When_LoginAlwaysFailsTemporarily_Then_StopsAfterMaxAttempts(
 	}
 }
 
-// Test_reconnect_When_LoginFailsWithBadCredentials_Then_GivesUpAfterOneAttempt
-// asserts that a real credential refusal stops reconnect at the first attempt,
-// so a wrong password is never sent twice.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_When_LoginFailsWithBadCredentials_Then_GivesUpAfterOneAttempt(t *testing.T) {
 	var recorded []time.Duration
@@ -328,9 +319,6 @@ func transientBackoffs() []time.Duration {
 	return waits
 }
 
-// Test_reconnect_When_EveryAttemptFails_Then_NoWaitFollowsTheLastAttempt
-// asserts that reconnect returns at once after the last failed attempt,
-// waits only between attempts, and says so on the tracker.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_When_EveryAttemptFails_Then_NoWaitFollowsTheLastAttempt(t *testing.T) {
 	transientWaits := transientBackoffs()
@@ -415,9 +403,6 @@ func Test_reconnect_When_EveryAttemptFails_Then_NoWaitFollowsTheLastAttempt(t *t
 	}
 }
 
-// Test_reconnect_When_LastAttemptFailsPermanently_Then_ReturnsTheRefusal
-// asserts that a permanent refusal on the last attempt is returned as it
-// is, not as an exhausted budget.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_When_LastAttemptFailsPermanently_Then_ReturnsTheRefusal(t *testing.T) {
 	srv := newFakeServer(t)
@@ -458,9 +443,6 @@ func Test_reconnect_When_LastAttemptFailsPermanently_Then_ReturnsTheRefusal(t *t
 	}
 }
 
-// Test_reconnect_When_LastAttemptSucceeds_Then_Reconnects asserts that the
-// last attempt still runs after maxReconnectAttempts-1 failures and that its
-// success resets the backoff.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_reconnect_When_LastAttemptSucceeds_Then_Reconnects(t *testing.T) {
 	srv := newFakeServer(t)
@@ -519,8 +501,6 @@ func Test_selectIfNeeded_shortCircuitsOnNetwork(t *testing.T) {
 	}
 }
 
-// Test_selectIfNeeded_afterReconnect_reSelects asserts that after a reconnect,
-// selectIfNeeded issues a fresh EXAMINE.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_selectIfNeeded_afterReconnect_reSelects(t *testing.T) {
 	srv := newFakeServer(t)
@@ -562,8 +542,6 @@ func Test_selectIfNeeded_afterReconnect_reSelects(t *testing.T) {
 	}
 }
 
-// Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit asserts that
-// a session the server ended is not treated as still holding its selection.
 func Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit(t *testing.T) {
 	t.Parallel()
 
@@ -597,8 +575,6 @@ func Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit(t *test
 	}
 }
 
-// Test_selectIfNeeded_When_FolderDiffers_Then_SelectsAgain asserts that a
-// selection of one folder never stands in for another folder on the same session.
 func Test_selectIfNeeded_When_FolderDiffers_Then_SelectsAgain(t *testing.T) {
 	t.Parallel()
 
@@ -618,9 +594,6 @@ func Test_selectIfNeeded_When_FolderDiffers_Then_SelectsAgain(t *testing.T) {
 	}
 }
 
-// Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries
-// asserts that a BYE after the EXAMINE and before the FETCH ends the attempt with
-// an error safeCall repairs by reconnecting, and that the retry selects again.
 func Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries(t *testing.T) {
 	t.Parallel()
 
@@ -2577,7 +2550,6 @@ func Test_noteIdleTrip_When_ErrorIsNotATrip_Then_LogsNothing(t *testing.T) {
 	}
 }
 
-// checkStoredGiveUp fails the test unless err is the stored give-up and has the class want.
 func checkStoredGiveUp(t *testing.T, err, stored error, want ErrClass) {
 	t.Helper()
 
@@ -2589,9 +2561,7 @@ func checkStoredGiveUp(t *testing.T, err, stored error, want ErrClass) {
 	}
 }
 
-// Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects asserts that after
-// a revivable give-up the next call waits out the reconnect interval, logs in once and runs fn
-// once. Sequential - swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -2657,9 +2627,7 @@ func Test_safeCall_When_EarlierReconnectGaveUp_Then_NextCallWaitsAndReconnects(t
 	}
 }
 
-// Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt asserts that
-// after a revivable give-up a call makes one attempt without backoff and skips fn; an account
-// lock or other permanent refusal sends nothing. Sequential - swaps sleepCtx.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -2767,8 +2735,6 @@ func Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAtte
 	}
 }
 
-// Test_safeCall_When_ReconnectWasRefusedPermanently_Then_LaterCallsSendNoLogin asserts that
-// a permanent refusal ends all logins of the client, also when the cool-down is zero.
 func Test_safeCall_When_ReconnectWasRefusedPermanently_Then_LaterCallsSendNoLogin(t *testing.T) {
 	t.Parallel()
 
@@ -2803,8 +2769,7 @@ func Test_safeCall_When_ReconnectWasRefusedPermanently_Then_LaterCallsSendNoLogi
 	}
 }
 
-// Test_safeCall_When_ReconnectGaveUpOnUnknownRefusal_Then_LaterCallsSendNoLogin asserts that
-// a refusal of unknown class is final too, because a credential refusal can use words that no rule matches.
+// Unknown class is final too: a credential refusal can use words that no rule matches.
 func Test_safeCall_When_ReconnectGaveUpOnUnknownRefusal_Then_LaterCallsSendNoLogin(t *testing.T) {
 	t.Parallel()
 
@@ -2835,9 +2800,7 @@ func Test_safeCall_When_ReconnectGaveUpOnUnknownRefusal_Then_LaterCallsSendNoLog
 	}
 }
 
-// Test_safeCall_When_WithinReviveInterval_Then_FailsFastWithoutDial asserts that calls inside
-// the cool-down return the stored give-up with no dial, LOGIN, wait or log, and keep the
-// cool-down. Sequential - swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_WithinReviveInterval_Then_FailsFastWithoutDial(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -2895,9 +2858,7 @@ func Test_safeCall_When_WithinReviveInterval_Then_FailsFastWithoutDial(t *testin
 	}
 }
 
-// Test_safeCall_When_ReviveIntervalPassed_Then_OneLoginRestoresTheSession asserts that the
-// first call after the cool-down dials and logs in once, and restores the whole reconnect
-// budget. Sequential - swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_ReviveIntervalPassed_Then_OneLoginRestoresTheSession(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newClientWithFake(t, srv)
@@ -2948,8 +2909,6 @@ func Test_safeCall_When_ReviveIntervalPassed_Then_OneLoginRestoresTheSession(t *
 	}
 }
 
-// Test_safeCall_When_ReviveProbeFails_Then_OneAttemptAndCooldownRestarts asserts that a
-// failed probe is one LOGIN with no backoff, and that the cool-down starts again from it.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_ReviveProbeFails_Then_OneAttemptAndCooldownRestarts(t *testing.T) {
 	srv := newFakeServer(t)
@@ -3010,8 +2969,6 @@ func Test_safeCall_When_ReviveProbeFails_Then_OneAttemptAndCooldownRestarts(t *t
 	}
 }
 
-// Test_safeCall_When_ReviveProbeIsRefusedPermanently_Then_NoFurtherLogin asserts that a
-// permanent refusal of the probe is final, also after another cool-down has passed.
 func Test_safeCall_When_ReviveProbeIsRefusedPermanently_Then_NoFurtherLogin(t *testing.T) {
 	t.Parallel()
 
@@ -3056,8 +3013,6 @@ func Test_safeCall_When_ReviveProbeIsRefusedPermanently_Then_NoFurtherLogin(t *t
 	}
 }
 
-// Test_safeCall_When_CancelledDuringReviveProbe_Then_ReturnsCanceledAndKeepsGiveUp asserts
-// that Ctrl-C during the one-attempt probe returns the cancellation and records no new give-up.
 func Test_safeCall_When_CancelledDuringReviveProbe_Then_ReturnsCanceledAndKeepsGiveUp(t *testing.T) {
 	t.Parallel()
 
@@ -3081,9 +3036,6 @@ func Test_safeCall_When_CancelledDuringReviveProbe_Then_ReturnsCanceledAndKeepsG
 	}
 }
 
-// Test_safeCall_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain
-// asserts that a call that had to reconnect first runs fn once. Its transient
-// error returns to the caller, because the call already spent its reconnect.
 func Test_safeCall_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain(t *testing.T) {
 	t.Parallel()
 
@@ -3111,9 +3063,6 @@ func Test_safeCall_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgai
 	}
 }
 
-// Test_safeCall_When_CancelledWithoutSession_Then_ReturnsCanceledWithoutDial
-// asserts that a cancelled client does not revive a lost session, and that the
-// cancellation comes before the stored give-up.
 func Test_safeCall_When_CancelledWithoutSession_Then_ReturnsCanceledWithoutDial(t *testing.T) {
 	t.Parallel()
 
@@ -3147,9 +3096,6 @@ func Test_safeCall_When_CancelledWithoutSession_Then_ReturnsCanceledWithoutDial(
 	}
 }
 
-// Test_reconnect_When_CancelledWhileWaitingForLock_Then_ReturnsCanceledNotTheGiveUp asserts
-// that a Cancel that lands while reconnect waits for c.mu returns the cancellation, not the
-// stored give-up.
 func Test_reconnect_When_CancelledWhileWaitingForLock_Then_ReturnsCanceledNotTheGiveUp(t *testing.T) {
 	t.Parallel()
 
@@ -3183,9 +3129,6 @@ func Test_reconnect_When_CancelledWhileWaitingForLock_Then_ReturnsCanceledNotThe
 	}
 }
 
-// Test_safeCall_When_CancelledDuringWaitBeforeReconnect_Then_ReturnsCanceledWithoutLogin
-// asserts that Ctrl-C ends the interval wait that precedes a revive, and that no
-// LOGIN follows.
 func Test_safeCall_When_CancelledDuringWaitBeforeReconnect_Then_ReturnsCanceledWithoutLogin(t *testing.T) {
 	t.Parallel()
 
@@ -3226,9 +3169,6 @@ func Test_safeCall_When_CancelledDuringWaitBeforeReconnect_Then_ReturnsCanceledW
 	}
 }
 
-// Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect asserts that
-// each public operation that goes through safeCall logs in again on a client that
-// has no session, and then sends its command on the new connection.
 func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing.T) {
 	t.Parallel()
 
@@ -3340,9 +3280,6 @@ func blockSleeps(t *testing.T) *blockedSleep {
 	return b
 }
 
-// Test_safeCall_When_CancelledDuringReconnectWait_Then_ReturnsCanceledWithoutAnotherLogin
-// asserts that Ctrl-C ends a wait between reconnect attempts: no LOGIN follows,
-// fn does not run again and c.mu is free.
 // Sequential - swaps the package-level sleepCtx var.
 func Test_safeCall_When_CancelledDuringReconnectWait_Then_ReturnsCanceledWithoutAnotherLogin(t *testing.T) {
 	tests := []struct {
@@ -3399,8 +3336,7 @@ func Test_safeCall_When_CancelledDuringReconnectWait_Then_ReturnsCanceledWithout
 	}
 }
 
-// cancelOnReconnect cancels its client when reconnect reports a new session. That
-// is the point between a successful login and the first use of the session.
+// The cancel lands between a successful login and the first use of the session.
 type cancelOnReconnect struct{ c *Client }
 
 func (r cancelOnReconnect) UpdateMessage(msg string) {
@@ -3412,9 +3348,6 @@ func (cancelOnReconnect) UpdateTotal(int64) {}
 func (cancelOnReconnect) Increment(int64)   {}
 func (cancelOnReconnect) MarkAsErrored()    {}
 
-// Test_safeCall_When_CancelledRightAfterReconnect_Then_ReturnsCanceledWithoutRunningFn
-// asserts that a client cancelled between a successful reconnect and the retry
-// does not run fn on the new session.
 func Test_safeCall_When_CancelledRightAfterReconnect_Then_ReturnsCanceledWithoutRunningFn(t *testing.T) {
 	t.Parallel()
 
@@ -3443,8 +3376,6 @@ func Test_safeCall_When_CancelledRightAfterReconnect_Then_ReturnsCanceledWithout
 	c.mu.Unlock()
 }
 
-// Test_reconnect_When_ClientIsCancelled_Then_ReturnsCanceledWithoutDial asserts
-// that a cancelled client neither dials nor logs in again, and keeps c.mu free.
 func Test_reconnect_When_ClientIsCancelled_Then_ReturnsCanceledWithoutDial(t *testing.T) {
 	t.Parallel()
 
@@ -3475,8 +3406,7 @@ func Test_reconnect_When_ClientIsCancelled_Then_ReturnsCanceledWithoutDial(t *te
 	c.mu.Unlock()
 }
 
-// dropSessionOnReconnect removes the new session when reconnect reports it. That
-// is the point between a successful login and the check of the session.
+// The session disappears between a successful login and the check of the session.
 type dropSessionOnReconnect struct{ c *Client }
 
 func (r dropSessionOnReconnect) UpdateMessage(msg string) {
@@ -3492,9 +3422,6 @@ func (dropSessionOnReconnect) UpdateTotal(int64) {}
 func (dropSessionOnReconnect) Increment(int64)   {}
 func (dropSessionOnReconnect) MarkAsErrored()    {}
 
-// Test_safeCall_When_SessionMissingAfterReconnect_Then_ReturnsErrorWithoutRunningFn
-// asserts that a reconnect without a stored session ends in a plain error: fn
-// does not run again, the error is no cancellation and c.mu is free.
 func Test_safeCall_When_SessionMissingAfterReconnect_Then_ReturnsErrorWithoutRunningFn(t *testing.T) {
 	t.Parallel()
 

@@ -613,8 +613,6 @@ func appendOutcomeHandler(srv *fakeServer, appendReply string) func(net.Conn) {
 	return appendCaptureHandler(srv, appendReply, nil)
 }
 
-// capturedAppend is the command arguments and the literal of one APPEND that a
-// server received.
 type capturedAppend struct {
 	arg     string
 	literal []byte

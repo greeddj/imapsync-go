@@ -335,9 +335,8 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 	}
 }
 
-// Test_CreateMailbox_When_RetriedCreateAnswersDuplicateFolderName_Then_ReportsExisting
-// asserts that a CREATE the server applied before it dropped the connection
-// does not fail when safeCall sends it again and Gmail refuses the duplicate.
+// The server applied the CREATE before it dropped the connection, so the retry
+// gets Gmail's duplicate refusal.
 func Test_CreateMailbox_When_RetriedCreateAnswersDuplicateFolderName_Then_ReportsExisting(t *testing.T) {
 	t.Parallel()
 

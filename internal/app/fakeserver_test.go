@@ -639,16 +639,14 @@ func (s *fakeServer) refuseCreateWith(reply string) {
 	s.store.createReply = reply
 }
 
-// dropOnceOnOpen makes the next EXAMINE or SELECT of folder end with an untagged
-// BYE and a closed connection. Later opens of folder are served normally.
 func (s *fakeServer) dropOnceOnOpen(folder string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.dropOnOpen = folder
 }
 
-// takeDropOnOpen reports whether the open of name must drop the connection. It
-// clears the knob and counts the drop as the synthetic event "DROP".
+// takeDropOnOpen reports whether the open of name must drop. Only on a match does
+// it clear the knob and count the synthetic event "DROP".
 func (s *fakeServer) takeDropOnOpen(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1132,8 +1130,6 @@ func listFailsAfterConnectHandler(srv *fakeServer, folders ...string) func(net.C
 	})
 }
 
-// refuseLoginAfterAppendHandler serves LOGIN and LIST from the store. On the first APPEND it
-// reads the whole literal, makes the server refuse later logins and hangs up without a reply.
 func refuseLoginAfterAppendHandler(srv *fakeServer) func(net.Conn) {
 	return func(conn net.Conn) {
 		defer func() { _ = conn.Close() }()

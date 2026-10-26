@@ -42,7 +42,7 @@ When proceeding, write a brief for `developer` that contains, in this order:
 2. **Files to touch** - explicit paths. If a file is to be created, say so.
 3. **Contracts to preserve** - list of invariants the change must not break, cited from [architecture.md](../rules/architecture.md) where possible.
 4. **Design** - the chosen approach, with rejected alternatives in one line each so the developer knows you've already thought about and discarded them.
-5. **Tests required** - list of test cases the developer must add. Be specific: "a test that `selectIfNeeded` short-circuits on the second call with the same folder name within the same `connGen`".
+5. **Tests required** - list of test cases the developer must add. Be specific: "a test that `selectIfNeeded` sends no EXAMINE on the second call with the same folder name on the same session".
 6. **Out of scope** - what the developer must NOT touch in this change. Always include this section.
 7. **Done means** - the explicit acceptance criteria.
 

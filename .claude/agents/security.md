@@ -27,7 +27,7 @@ You are the security reviewer. You audit code defensively, against a threat mode
    - Does the change touch credentials? Any new `fmt.*` / `log.*` call near credential handling?
    - Does the change introduce filesystem writes from server-supplied strings (folder names, headers)?
    - Does the change introduce `os/exec`, `unsafe`, `reflect`?
-5. **Reconnect-storm review** - if `reconnectInterval`, `maxReconnectAttempts`, or `throttledBackoff` were touched, is the new value still protective?
+5. **Reconnect-storm review** - if `reconnectInterval`, `maxReconnectAttempts`, `throttledBackoff` or `reviveInterval` were touched, or if the give-up and revive gate in `reconnect` changed, is the change still protective?
 
 ## What you do not do
 

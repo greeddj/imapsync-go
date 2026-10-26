@@ -66,8 +66,8 @@ func classifyError(err error) ErrClass {
 	return classifyLeaves(err)
 }
 
-// classifyLeaves matches text only on leaf errors. Wrappers add our folder
-// names and labels, which must not choose the class.
+// Only leaf errors decide: wrappers add our folder names and labels, which
+// must not choose the class.
 func classifyLeaves(err error) ErrClass {
 	if child := errors.Unwrap(err); child != nil {
 		return classifyLeaves(child)
@@ -145,14 +145,12 @@ func isRetryable(err error) bool {
 	return classifyError(err) == ClassTransient
 }
 
-// canRevive reports a give-up that a later login can clear. Permanent means retry will not help;
-// Unknown stays non-retryable, because servers say "LOGIN failed" for wrong credentials too.
+// canRevive excludes Unknown, because servers say "LOGIN failed" for wrong credentials too.
 func canRevive(err error) bool {
 	class := classifyError(err)
 	return class == ClassTransient || class == ClassThrottled
 }
 
-// isAlreadyExistsErr reports whether a CREATE refusal means the mailbox exists.
 // go-imap v1 drops the [ALREADYEXISTS] code, so the text decides; Gmail says
 // "Duplicate folder name".
 func isAlreadyExistsErr(err error) bool {

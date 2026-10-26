@@ -20,16 +20,20 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch - servers reject longer arg lists.
 6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state. Do not store the selected folder in the Client: a stored copy can differ from the real session.
 7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
+8. **`FetchMessageMap` limits the size hint of its map to `maxMessageMapHint`.** The server sets the message count, and a very large count must not cause a large allocation.
 
 ## Connection resilience
 
 - Every IMAP op goes through `safeCall`. New ops must follow.
 - `classifyError` is the single source of error policy: `Transient` → reconnect+retry, `Throttled` → backoff `throttledBackoff = 5m`, `Permanent` → surface.
+- `classifyError` matches text on the leaf error only. Text that our wrappers add, such as a folder name or a label, never sets the class. Wrap an error with `%w`. A `%v` of an error makes a new leaf that holds the wrapper text.
+- `safeCall` starts at most one `reconnect` for each call. After a `reconnect` that returns nil, `safeCall` and `AppendMessage` check again whether `Cancel()` ran. They return an error and send no command when `reconnect` leaves no session.
 - All sleeps in the reconnect path use `sleepCtx` so Ctrl-C is honoured.
 - The give-up and revive gate in `reconnect` holds the give-up of a Client. A `Permanent` or `Unknown` give-up is final. After a `Transient` or `Throttled` give-up, a Client makes at most one login attempt per `reviveInterval = 5m`.
   - The gate runs under `c.mu`, after the cancellation check and before any wait, logout or dial.
   - Only `New` and `reconnect` call `connectAndLogin`. A new caller would bypass the gate.
   - A reply that reports a locked, disabled, suspended or blocked account is `Permanent`.
+  - A login reply that reports a temporary outage of the authentication service is `Transient`. The locked-account rule comes first.
   - A change to the gate is a security review point. See [security.md](security.md) item 10.
 - Every long-running public `Client` method runs `defer c.withCancel(ctx)()` and checks `ctx.Err()` after each blocking step.
 - `c.pw` / `c.tracker` are `atomic.Pointer`. Read via `progressWriter()` / `progressTracker()`. Direct field access is a bug.

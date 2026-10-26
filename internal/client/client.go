@@ -45,8 +45,8 @@ const (
 	// uidFetchBatchSize limits UID FETCH requests to avoid "Too long argument" errors.
 	uidFetchBatchSize  = 500
 	tcpKeepAlivePeriod = 30 * time.Second
-	// maxMessageMapHint caps the map pre-size in FetchMessageMap. The count comes
-	// from the server, so it must not size an allocation alone.
+	// maxMessageMapHint caps the FetchMessageMap pre-size, because the server
+	// sets the message count.
 	maxMessageMapHint = 1 << 16
 	// logoutTimeout bounds the wait for the LOGOUT reply. LOGOUT is the last
 	// command of a session, so closing the socket early loses nothing.
@@ -612,13 +612,8 @@ func (c *Client) reconnect() error {
 	return c.giveUpErr
 }
 
-// safeCall starts at most one reconnect per call: a transient fn error gets a
-// reconnect and one retry, and without a session fn runs once after the reconnect.
-//
-// After a give-up that reconnect can return the stored error at once, with no dial.
-//
-// The closure must be re-runnable: any state that fn accumulates on the first
-// attempt (slices, maps, counters) has to be reset at the top of the closure.
+// safeCall can run fn twice, around one reconnect, so fn must be re-runnable:
+// reset any state it accumulates at the top of the closure.
 func (c *Client) safeCall(fn func(cli *imapclient.Client) error) error {
 	if c.isCancelled() {
 		return context.Canceled

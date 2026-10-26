@@ -51,6 +51,7 @@ If `internal/client/client.go` changed:
 - `reconnectInterval` still ≥ 10s?
 - `maxReconnectAttempts` still ≤ 5?
 - `throttledBackoff` still ≥ 5m?
+- `reviveInterval` still ≥ 5m, and a `ClassPermanent` or `ClassUnknown` give-up still final?
 
 Any weakening makes the binary look like an attacker to the remote - that's both a security and a reputation issue.
 

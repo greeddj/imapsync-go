@@ -9,8 +9,8 @@ import (
 	imapclient "github.com/emersion/go-imap/client"
 )
 
-// readTracker records whether go-imap read the literal. A body that go-imap never
-// read never reached the server, so another session can send it without a duplicate.
+// A body that go-imap never read never reached the server, so another
+// session can send it without a duplicate.
 type readTracker struct {
 	imap.Literal
 	read bool
@@ -32,8 +32,8 @@ func sessionEnded(cli *imapclient.Client) bool {
 	}
 }
 
-// AppendMessage streams the body with no copy. A failure before go-imap reads it
-// gets one reconnect and one retry. A later failure is left to the next run's Message-Id diff.
+// AppendMessage streams the body with no copy, so only a failure before go-imap
+// reads it is retried; the next run's Message-Id diff covers the rest.
 func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -54,8 +54,8 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 	}
 
 	cli := c.c.Load()
-	// An earlier reconnect gave up, or the server ended the session while it was idle.
-	// Either way reconnect decides: it logs in again or returns the stored give-up.
+	// After a give-up, or a BYE or closed socket while idle, no session is usable.
+	// reconnect logs in again or returns the stored give-up.
 	reconnected := cli == nil || sessionEnded(cli)
 	if reconnected {
 		var err error
