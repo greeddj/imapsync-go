@@ -20,7 +20,7 @@ This is a sync tool. The single most important property is "running it again doe
 4. **Unbatched UID FETCH.** `uidFetchBatchSize = 500` exists because some servers reject longer arg lists with "Too long argument". Do not unbatch.
 5. **Streaming APPEND retry.** `AppendMessage` consumes the message body once. A transient mid-APPEND error cannot be retried inside this run - the literal is gone. The diff catches it on the next run. Do not "fix" this by adding `io.ReadAll` - that doubles peak RAM.
 6. **Per-connection rate limiters.** The limiters are global by design (one per direction, shared across all Clients on that side). Per-connection limiters would defeat the BPS cap. Don't introduce them.
-7. **Reconnect storms.** `reconnectInterval = 10s`, `maxReconnectAttempts = 5`, `throttledBackoff = 5m`. Don't weaken these "for testing" without reverting before commit.
+7. **Reconnect storms.** `reconnectInterval = 10s`, `maxReconnectAttempts = 5`, `throttledBackoff = 5m`, `reviveInterval = 5m`. Don't weaken these "for testing" without reverting before commit.
 8. **Mailbox cache.** Populated by one `LIST "" "*"` per Client. Invalidated only on `CreateMailbox`. Re-LISTing on every check is a regression.
 9. **`atomic.Pointer` fields.** `c.pw`, `c.tracker`. Always read via `c.progressWriter()` / `c.progressTracker()`. Direct field access is a data race.
 10. **Worker pool is persistent.** One src + one dst `Client` per worker, for the whole sync. Do not reconnect per plan.

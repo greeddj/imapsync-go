@@ -18,7 +18,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 3. **`BODY.PEEK[...]` everywhere a body or header is fetched** - `FetchRFC822` sets `\Seen` on the source, which is a write a sync tool must not perform.
 4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. Transient mid-APPEND failures are tolerated because the next run re-diffs.
 5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch - servers reject longer arg lists.
-6. **`selectIfNeeded` over `cli.Select`.** Generation-aware caching saves a round-trip per batch and is invalidated correctly on reconnect.
+6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state.
 7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
 
 ## Connection resilience
@@ -26,6 +26,11 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 - Every IMAP op goes through `safeCall`. New ops must follow.
 - `classifyError` is the single source of error policy: `Transient` → reconnect+retry, `Throttled` → backoff `throttledBackoff = 5m`, `Permanent` → surface.
 - All sleeps in the reconnect path use `sleepCtx` so Ctrl-C is honoured.
+- The give-up and revive gate in `reconnect` holds the give-up of a Client. A `Permanent` or `Unknown` give-up is final. After a `Transient` or `Throttled` give-up, a Client makes at most one login attempt per `reviveInterval = 5m`.
+  - The gate runs under `c.mu`, after the cancellation check and before any wait, logout or dial.
+  - Only `New` and `reconnect` call `connectAndLogin`. A new caller would bypass the gate.
+  - A reply that reports a locked, disabled, suspended or blocked account is `Permanent`.
+  - A change to the gate is a security review point. See [security.md](security.md) item 10.
 - Every long-running public `Client` method runs `defer c.withCancel(ctx)()` and checks `ctx.Err()` after each blocking step.
 - `c.pw` / `c.tracker` are `atomic.Pointer`. Read via `progressWriter()` / `progressTracker()`. Direct field access is a bug.
 - A go-imap call outside `safeCall` opens its own watchdog span, as `AppendMessage` and `connectAndLogin` do. Without a span, a silent server can hold that call forever.

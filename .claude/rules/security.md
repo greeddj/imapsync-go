@@ -15,7 +15,13 @@ Run through these on every security review:
 7. **Network surface** - the binary connects out to user-configured IMAP servers. It does not listen. If a listening socket is added, that is a major architectural change that needs an explicit threat model.
 8. **Input parsing** - IMAP responses come from a partially-trusted server. The `go-imap` library does the parsing; trust boundary is at that library's API. Any code that interprets server-supplied strings (folder names, message ids, headers) must not pass them to anything sensitive unsanitised. The terminal counts as sensitive: see item 11.
 9. **Resource exhaustion** - rate limits and worker clamps are the defence. Any code path that allocates per-message must be bounded by the batch size (`uidFetchBatchSize = 500`). A message count from the server, such as EXISTS or STATUS MESSAGES, must not set the size of an allocation without a limit. `FetchMessageMap` limits the size hint of its map to `maxMessageMapHint`.
-10. **Reconnect storms** - `reconnectInterval = 10s`, `maxReconnectAttempts = 5`, `throttledBackoff = 5m` are the protections. Any change weakens defence-in-depth against being treated as an attacker by the remote.
+10. **Reconnect storms** - `reconnectInterval = 10s`, `maxReconnectAttempts = 5`, `throttledBackoff = 5m` and `reviveInterval = 5m` are the protections. Any change makes it more likely that the remote server treats the client as an attacker. The give-up and revive gate in `reconnect` has these rules:
+    - Each Client makes at most one login attempt per `reviveInterval` after a `ClassTransient` or `ClassThrottled` give-up. During `sync`, one side has at most 11 Clients: one planning Client and at most 10 workers.
+    - The gate runs under `c.mu`, before any wait, logout or dial. Only `New` and `reconnect` call `connectAndLogin`, so every later login goes through the gate.
+    - A `ClassPermanent` or `ClassUnknown` give-up is final for the run. Each later call returns the stored error and does not dial.
+    - A reply that reports a locked, disabled, suspended or blocked account is `ClassPermanent`. A login attempt on a locked account can make the lock longer.
+
+    A change to any of these values or rules is a security review point.
 11. **Terminal output** - text from an IMAP server (folder names, reply text in errors, Message-Ids, go-imap log lines) can contain control, bidi and invisible characters. Such text can move the cursor, clear the screen or make a false status line. A new print site must show it through `termsafe.Escape`. A `%q` verb is accepted only at the existing sites, because `%q` keeps graphic invisible runes (see "Known limitations"). Escape where the program prints the text, never in values that go back to a server.
 
 ## Combined-surface review

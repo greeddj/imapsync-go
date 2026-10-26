@@ -9,13 +9,23 @@
 ## What we test
 
 - **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), env interpolation.
-- **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries, reconnect generation bump, Select-cache short-circuit, AppendMessage streaming (no ReadAll).
+- **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll). Select tests cover the `selectIfNeeded` short-circuit and the new EXAMINE after a BYE or a failed EXAMINE.
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
   - CRAM-MD5 failure and success;
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation;
   - `withCancel` after stop, and shared limiters that draw from one budget.
+
+  The give-up and revive gate has these tests:
+  - `Test_safeCall_When_WithinReviveInterval_Then_FailsFastWithoutDial` - inside `reviveInterval`, a call returns the stored give-up with no dial, login attempt, wait or log line;
+  - `Test_safeCall_When_ReviveIntervalPassed_Then_OneLoginRestoresTheSession` - after `reviveInterval`, one login attempt restores the session and the full reconnect budget;
+  - `Test_safeCall_When_ReviveProbeFails_Then_OneAttemptAndCooldownRestarts` - a failed attempt is one login with no backoff, and `reviveInterval` starts again;
+  - `Test_safeCall_When_ReconnectWasRefusedPermanently_Then_LaterCallsSendNoLogin` - a permanent give-up is final, also when `reviveDur` is zero;
+  - `Test_safeCall_When_ReconnectGaveUpOnUnknownRefusal_Then_LaterCallsSendNoLogin` - an unknown-class give-up is final;
+  - `Test_safeCall_When_CancelledDuringReviveProbe_Then_ReturnsCanceledAndKeepsGiveUp` - a cancelled login attempt returns `context.Canceled` and keeps the earlier give-up;
+  - the "account lock" and "account lockout" cases of `Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt` - after an account-lock reply, the Client sends no further login;
+  - `Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown` - `AppendMessage` goes through the same gate.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (Message-Id intersection), subfolder expansion, delimiter reconciliation, worker pool dispatch.
@@ -47,7 +57,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
 - **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
 - **`AppendMessage` mid-APPEND transient retry** - the code hands `msg.GetBody(...)` straight to `cli.Append`, with no `io.ReadAll`. The client consumes part of the literal before it detects a mid-APPEND error, so nothing remains to retry. The next sync run recovers through the Message-Id diff. A test of this path needs a mock that fails in the middle of a literal. Such a mock does not test real go-imap behaviour. Two nearby paths have tests:
-  - `Test_AppendMessage_repairsConnectionAfterServerLogout` covers the reconnect after a failed APPEND;
+  - `Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry` covers the reconnect after a failed APPEND whose body was sent;
   - `Test_AppendMessage_whenContextExpiresMidAppend` covers a context that ends mid-APPEND.
 - **`safeCall` post-reconnect `isCancelled()` branch** - exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
