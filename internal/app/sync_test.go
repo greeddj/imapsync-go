@@ -2178,6 +2178,61 @@ func TestActionSync_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *tes
 	}
 }
 
+func TestActionSync_When_MapEntryHasNoFolderName_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantErr   error
+		name      string
+		ext       string
+		extra     string
+		args      []string
+		wantEntry int
+	}{
+		{
+			name: "JSON absent dst", ext: ".json", args: []string{"-y"},
+			extra: `,"map":[{"src":"INBOX"}]`, wantEntry: 1, wantErr: config.ErrMapDstRequired,
+		},
+		{
+			name: "YAML empty src in second entry", ext: ".yaml", args: []string{"-y"},
+			extra:     "map:\n  - src: INBOX\n    dst: INBOX\n  - src: \"\"\n    dst: Archive\n",
+			wantEntry: 2, wantErr: config.ErrMapSrcRequired,
+		},
+		{
+			name: "YAML null entry", ext: ".yaml", args: []string{"-y"},
+			extra: "map:\n  - ~\n", wantEntry: 1, wantErr: config.ErrMapSrcRequired,
+		},
+		{
+			name: "folder flags do not replace the file check", ext: ".json",
+			args:  []string{"-y", "-s", "INBOX", "-d", "INBOX"},
+			extra: `,"map":[{"src":"","dst":""}]`, wantEntry: 1, wantErr: config.ErrMapSrcRequired,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst := newFakeServer(t), newFakeServer(t)
+			srcDialed, dstDialed := watchDials(src), watchDials(dst)
+			cfgPath := writeRawConfig(t, tt.ext, src, dst, tt.extra)
+
+			err := runCLIAction(t, ActionSync, "sync", syncFlags(), append([]string{"-c", cfgPath, "sync"}, tt.args...)...)
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if want := fmt.Sprintf("map entry %d: ", tt.wantEntry); !strings.Contains(err.Error(), "failed to load config") ||
+				!strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want %q and %q", err, "failed to load config", want)
+			}
+			if srcDialed.Load() || dstDialed.Load() {
+				t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())
+			}
+			assertNoLogin(t, src, dst)
+		})
+	}
+}
+
 func TestActionSync_When_QuietWithoutConfirm_Then_RefusesBeforeConnecting(t *testing.T) {
 	t.Parallel()
 

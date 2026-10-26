@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/greeddj/imapsync-go/internal/client"
+	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/utils"
 	"github.com/urfave/cli/v3"
 )
@@ -261,6 +262,27 @@ func TestActionShow_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *tes
 	}
 	if msg := strings.ReplaceAll(err.Error(), cfgPath, ""); !strings.Contains(msg, "maps") {
 		t.Errorf("error = %q, want the key %q", msg, "maps")
+	}
+	if srcDialed.Load() || dstDialed.Load() {
+		t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())
+	}
+	assertNoLogin(t, src, dst)
+}
+
+func TestActionShow_When_MapEntryHasNoFolderName_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	src, dst := newFakeServer(t), newFakeServer(t)
+	srcDialed, dstDialed := watchDials(src), watchDials(dst)
+	cfgPath := writeRawConfig(t, ".json", src, dst, `,"map":[{"src":"INBOX","dst":""}]`)
+
+	err := runCLIAction(t, ActionShow, "show", showFlags(), "-c", cfgPath, "show", "-q")
+
+	if !errors.Is(err, config.ErrMapDstRequired) {
+		t.Fatalf("error = %v, want %v", err, config.ErrMapDstRequired)
+	}
+	if !strings.Contains(err.Error(), "load config") || !strings.Contains(err.Error(), "map entry 1: ") {
+		t.Errorf("error = %q, want %q and %q", err, "load config", "map entry 1: ")
 	}
 	if srcDialed.Load() || dstDialed.Load() {
 		t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())

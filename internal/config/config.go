@@ -24,6 +24,8 @@ var (
 	ErrDstServerRequired = errors.New("destination server is required")
 	ErrDstUserRequired   = errors.New("destination user is required")
 	ErrDstPassRequired   = errors.New("destination password is required")
+	ErrMapSrcRequired    = errors.New(`"src" folder name is required`)
+	ErrMapDstRequired    = errors.New(`"dst" folder name is required`)
 )
 
 var errTrailingContent = errors.New("unexpected content after the first document")
@@ -179,6 +181,27 @@ func decodeYAML(data []byte, cfg *Config) error {
 	if err := dec.Decode(&yaml.Node{}); !errors.Is(err, io.EOF) {
 		return errTrailingContent
 	}
+	return restoreNullMapEntries(data, cfg)
+}
+
+// yaml.v3 drops a null sequence item. Keep it as an empty entry, so validate
+// rejects it and reports its position in the file.
+func restoreNullMapEntries(data []byte, cfg *Config) error {
+	var raw struct {
+		Map []*DirectoryMapping `yaml:"map"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.Map) == len(cfg.Map) {
+		return nil
+	}
+	cfg.Map = make([]DirectoryMapping, len(raw.Map))
+	for i, p := range raw.Map {
+		if p != nil {
+			cfg.Map[i] = *p
+		}
+	}
 	return nil
 }
 
@@ -213,6 +236,14 @@ func (c *Config) validate() error {
 	}
 	if c.Dst.Pass == "" {
 		return ErrDstPassRequired
+	}
+	for i := range c.Map {
+		if c.Map[i].Source == "" {
+			return fmt.Errorf("map entry %d: %w", i+1, ErrMapSrcRequired)
+		}
+		if c.Map[i].Destination == "" {
+			return fmt.Errorf("map entry %d: %w", i+1, ErrMapDstRequired)
+		}
 	}
 	return nil
 }

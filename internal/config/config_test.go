@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,6 +236,35 @@ func TestValidate(t *testing.T) {
 		{
 			ErrDstPassRequired, "missing destination password",
 			Config{Src: valid, Dst: Credentials{Server: valid.Server, User: valid.User}},
+		},
+		{
+			nil, "two valid map items",
+			Config{Src: valid, Dst: valid, Map: []DirectoryMapping{
+				{Source: "INBOX", Destination: "INBOX"},
+				{Source: "Sent", Destination: "Sent Items"},
+			}},
+		},
+		{
+			ErrMapSrcRequired, "first map item has no source",
+			Config{Src: valid, Dst: valid, Map: []DirectoryMapping{{Destination: "INBOX"}}},
+		},
+		{
+			ErrMapDstRequired, "second map item has no destination",
+			Config{Src: valid, Dst: valid, Map: []DirectoryMapping{
+				{Source: "INBOX", Destination: "INBOX"},
+				{Source: "Sent"},
+			}},
+		},
+		{
+			ErrMapSrcRequired, "map item with neither folder reports the source",
+			Config{Src: valid, Dst: valid, Map: []DirectoryMapping{{}}},
+		},
+		{
+			ErrSrcServerRequired, "missing source server together with a bad map item",
+			Config{
+				Src: Credentials{User: valid.User, Pass: valid.Pass}, Dst: valid,
+				Map: []DirectoryMapping{{Source: "INBOX"}},
+			},
 		},
 	}
 
@@ -556,5 +586,194 @@ func TestNew_When_ExampleConfigIsLoaded_Then_Succeeds(t *testing.T) {
 				t.Errorf("Map[2] = %+v, want %+v", cfg.Map[2], want)
 			}
 		})
+	}
+}
+
+const (
+	mapTestJSONCreds = `"src":{"server":"s:993","user":"u","pass":"p"},"dst":{"server":"d:993","user":"u","pass":"p"}`
+	mapTestYAMLCreds = "src: {server: 's:993', user: u, pass: p}\ndst: {server: 'd:993', user: u, pass: p}\n"
+)
+
+func jsonWithMap(mapJSON string) string {
+	return "{" + mapTestJSONCreds + "," + mapJSON + "}"
+}
+
+func TestNew_When_MapEntryHasNoFolderName_Then_ReturnsErrorNamingEntryAndKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantErr   error
+		name      string
+		ext       string
+		content   string
+		wantEntry int
+	}{
+		{
+			name: "JSON empty dst", ext: ".json", wantEntry: 1, wantErr: ErrMapDstRequired,
+			content: jsonWithMap(`"map":[{"src":"INBOX","dst":""}]`),
+		},
+		{
+			name: "JSON absent dst in second entry", ext: ".json", wantEntry: 2, wantErr: ErrMapDstRequired,
+			content: jsonWithMap(`"map":[{"src":"INBOX","dst":"INBOX"},{"src":"Sent"}]`),
+		},
+		{
+			name: "JSON empty src", ext: ".json", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: jsonWithMap(`"map":[{"src":"","dst":"Archive"}]`),
+		},
+		{
+			name: "JSON null src", ext: ".json", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: jsonWithMap(`"map":[{"src":null,"dst":"Archive"}]`),
+		},
+		{
+			name: "JSON both empty reports src", ext: ".json", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: jsonWithMap(`"map":[{"src":"","dst":""}]`),
+		},
+		{
+			name: "JSON empty object as third entry", ext: ".json", wantEntry: 3, wantErr: ErrMapSrcRequired,
+			content: jsonWithMap(`"map":[{"src":"A","dst":"A"},{"src":"B","dst":"B"},{}]`),
+		},
+		{
+			name: "JSON null entry", ext: ".json", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: jsonWithMap(`"map":[null]`),
+		},
+		{
+			name: "YAML empty dst", ext: ".yaml", wantEntry: 1, wantErr: ErrMapDstRequired,
+			content: mapTestYAMLCreds + "map:\n  - src: INBOX\n    dst: \"\"\n",
+		},
+		{
+			name: "YAML absent dst", ext: ".yaml", wantEntry: 1, wantErr: ErrMapDstRequired,
+			content: mapTestYAMLCreds + "map:\n  - src: INBOX\n",
+		},
+		{
+			name: "YAML src without value", ext: ".yaml", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: mapTestYAMLCreds + "map:\n  - src:\n    dst: Archive\n",
+		},
+		{
+			name: "YAML null src", ext: ".yaml", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: mapTestYAMLCreds + "map:\n  - src: ~\n    dst: Archive\n",
+		},
+		{
+			name: "YAML empty flow mapping as second entry", ext: ".yaml", wantEntry: 2, wantErr: ErrMapSrcRequired,
+			content: mapTestYAMLCreds + "map:\n  - {src: INBOX, dst: INBOX}\n  - {}\n",
+		},
+		{
+			name: "YAML null entry", ext: ".yaml", wantEntry: 1, wantErr: ErrMapSrcRequired,
+			content: mapTestYAMLCreds + "map:\n  - ~\n",
+		},
+		{
+			name: "YAML bare dash keeps its position", ext: ".yaml", wantEntry: 2, wantErr: ErrMapSrcRequired,
+			content: mapTestYAMLCreds + "map:\n  - src: A\n    dst: A\n  -\n  - src: B\n    dst: B\n",
+		},
+		{
+			name: "yml single quoted empty dst", ext: ".yml", wantEntry: 1, wantErr: ErrMapDstRequired,
+			content: mapTestYAMLCreds + "map:\n  - src: INBOX\n    dst: ''\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
+
+			if cfg != nil {
+				t.Errorf("Config = %+v, want nil", cfg)
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			other, key := ErrMapSrcRequired, `"dst"`
+			if errors.Is(tt.wantErr, ErrMapSrcRequired) {
+				other, key = ErrMapDstRequired, `"src"`
+			}
+			if errors.Is(err, other) {
+				t.Errorf("error = %v, also matches %v", err, other)
+			}
+			if want := fmt.Sprintf("map entry %d: ", tt.wantEntry); !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want the text %q", err, want)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error = %q, want the key %s", err, key)
+			}
+		})
+	}
+}
+
+func TestNew_When_MapFolderNameHasSpaces_Then_LoadsItUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+	}{
+		{
+			name: "JSON", ext: ".json",
+			content: jsonWithMap(`"map":[{"src":" Sent Items ","dst":" "}]`),
+		},
+		{
+			name: "YAML", ext: ".yaml",
+			content: mapTestYAMLCreds + "map:\n  - src: \" Sent Items \"\n    dst: \" \"\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
+
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if len(cfg.Map) != 1 {
+				t.Fatalf("len(Map) = %d, want 1", len(cfg.Map))
+			}
+			if want := (DirectoryMapping{Source: " Sent Items ", Destination: " "}); cfg.Map[0] != want {
+				t.Errorf("Map[0] = %q, want %q", cfg.Map[0], want)
+			}
+		})
+	}
+}
+
+func TestNew_When_MapIsEmptyOrNull_Then_LoadsWithNoEntries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+	}{
+		{"JSON empty array", ".json", jsonWithMap(`"map":[]`)},
+		{"JSON null", ".json", jsonWithMap(`"map":null`)},
+		{"YAML empty sequence", ".yaml", mapTestYAMLCreds + "map: []\n"},
+		{"YAML key without value", ".yaml", mapTestYAMLCreds + "map:\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
+
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if len(cfg.Map) != 0 {
+				t.Errorf("Map = %+v, want no entries", cfg.Map)
+			}
+		})
+	}
+}
+
+func Test_restoreNullMapEntries_When_YAMLIsMalformed_Then_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	var cfg Config
+
+	err := restoreNullMapEntries([]byte("map: ["), &cfg)
+
+	if err == nil {
+		t.Fatal("restoreNullMapEntries returned nil error, want a YAML error")
+	}
+	if cfg.Map != nil {
+		t.Errorf("Map = %+v, want nil", cfg.Map)
 	}
 }
