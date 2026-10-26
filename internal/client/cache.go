@@ -3,18 +3,36 @@ package client
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
 )
 
+// nonExistentAttr is the RFC 5258 attribute for a name that cannot be selected.
+// go-imap v1 has no constant for it.
+const nonExistentAttr = `\NonExistent`
+
 // mailboxCache holds the result of a single LIST "" "*" call so that the
 // many existence checks we do during sync planning don't each cost a
 // round-trip. New loads it before returning the Client and CreateMailbox
 // adds to it, so readers never see an unloaded cache.
+//
+// noSelect holds the names that LIST marked as unable to hold messages. Each of
+// them also stays in folders, so parent creation never sends CREATE for it.
 type mailboxCache struct {
 	folders   map[string]struct{}
+	noSelect  map[string]struct{}
 	delimiter string
+}
+
+// noSelectAttr reports whether a LIST attribute list marks a name that cannot
+// hold messages. RFC 3501 makes attributes case-insensitive.
+func noSelectAttr(attrs []string) bool {
+	return slices.ContainsFunc(attrs, func(attr string) bool {
+		return strings.EqualFold(attr, imap.NoSelectAttr) || strings.EqualFold(attr, nonExistentAttr)
+	})
 }
 
 // loadMailboxCache fills the mailbox cache and the hierarchy delimiter from one
@@ -28,16 +46,24 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	}
 
 	folders := make(map[string]struct{})
+	var noSelect map[string]struct{}
 	delim := ""
 
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		folders = make(map[string]struct{})
+		noSelect = nil
 		delim = ""
 		mboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
 		done := make(chan error, 1)
 		go func() { done <- cli.List("", "*", mboxes) }()
 		for m := range mboxes {
 			folders[m.Name] = struct{}{}
+			if noSelectAttr(m.Attributes) {
+				if noSelect == nil {
+					noSelect = make(map[string]struct{})
+				}
+				noSelect[m.Name] = struct{}{}
+			}
 			if delim == "" && m.Delimiter != "" {
 				delim = m.Delimiter
 			}
@@ -62,6 +88,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 
 	c.mailboxCacheMu.Lock()
 	c.mailboxCache.folders = folders
+	c.mailboxCache.noSelect = noSelect
 	c.mailboxCache.delimiter = delim
 	c.mailboxCacheMu.Unlock()
 	return nil

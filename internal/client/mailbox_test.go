@@ -1109,3 +1109,29 @@ func Test_ListMailboxes_When_FolderNameCarriesControlCharacters_Then_TrackerShow
 		t.Errorf("no tracker message holds %q; got %q", hostileShownName, tr.messages)
 	}
 }
+
+func Test_CreateMailbox_When_ParentIsNoSelect_Then_CreatesOnlyTheChild(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "[Gmail]", attrs: `\HasChildren \Noselect`},
+	}})
+
+	created, err := c.CreateMailbox(t.Context(), "[Gmail]/New")
+
+	if err != nil {
+		t.Fatalf("CreateMailbox: %v", err)
+	}
+	if !created {
+		t.Error("CreateMailbox returned created=false, want true")
+	}
+	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"[Gmail]/New"}) {
+		t.Errorf("CREATE names = %q, want only the child: the listed parent exists", got)
+	}
+	if !c.IsNoSelect("[Gmail]") {
+		t.Error("IsNoSelect([Gmail]) = false after the create")
+	}
+	if c.IsNoSelect("[Gmail]/New") {
+		t.Error("IsNoSelect([Gmail]/New) = true for a folder this client created")
+	}
+}

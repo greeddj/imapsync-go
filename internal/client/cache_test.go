@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
 	"slices"
 	"sync"
 	"testing"
@@ -220,5 +222,158 @@ func Test_loadMailboxCache_When_ServerListsNoMailboxes_Then_DelimiterDefaultsToS
 	}
 	if len(c.mailboxCache.folders) != 0 {
 		t.Errorf("folders = %v, want none", c.mailboxCache.folders)
+	}
+}
+
+// newLoadedClient connects through New, so the mailbox cache comes from the LIST
+// that production code sends.
+func newLoadedClient(t *testing.T, script *mailboxScript) (*fakeServer, *Client) {
+	t.Helper()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(script.handler(srv))
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+	return srv, c
+}
+
+func Test_noSelectAttr(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		attrs []string
+		want  bool
+	}{
+		{name: "no attributes"},
+		{name: "empty list", attrs: []string{}},
+		{name: "only unrelated attributes", attrs: []string{`\HasNoChildren`, `\Marked`, `\Sent`}},
+		{name: "Noselect", attrs: []string{`\Noselect`}, want: true},
+		{name: "Noselect in another case", attrs: []string{`\NoSelect`}, want: true},
+		{name: "NonExistent", attrs: []string{`\NonExistent`}, want: true},
+		{name: "NonExistent in lower case", attrs: []string{`\nonexistent`}, want: true},
+		{name: "Noselect among others", attrs: []string{`\HasChildren`, `\Noselect`}, want: true},
+		{name: "a custom attribute that only starts alike", attrs: []string{`\NoselectLater`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := noSelectAttr(tt.attrs); got != tt.want {
+				t.Errorf("noSelectAttr(%q) = %t, want %t", tt.attrs, got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_loadMailboxCache_When_ListMarksNoSelect_Then_IsNoSelectReportsIt(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "[Gmail]", attrs: `\HasChildren \Noselect`},
+		{name: "Dir", attrs: `\NoSelect`},
+		{name: "Ghost", attrs: `\NonExistent \Noselect`},
+		{name: "ghost2", attrs: `\nonexistent`},
+		{name: "INBOX", attrs: `\HasNoChildren`},
+		{name: "Plain"},
+	}})
+
+	for name, want := range map[string]bool{
+		"[Gmail]": true, "Dir": true, "Ghost": true, "ghost2": true,
+		"INBOX": false, "Plain": false, "Unlisted": false,
+	} {
+		if got := c.IsNoSelect(name); got != want {
+			t.Errorf("IsNoSelect(%q) = %t, want %t", name, got, want)
+		}
+	}
+	listed := []string{"Dir", "Ghost", "INBOX", "Plain", "[Gmail]", "ghost2"}
+	for _, name := range listed {
+		if !c.hasMailbox(name) {
+			t.Errorf("hasMailbox(%q) = false, want true: a \\Noselect name stays in the cache", name)
+		}
+	}
+	if got := c.MailboxNames(); !slices.Equal(got, listed) {
+		t.Errorf("MailboxNames = %v, want %v", got, listed)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1: the attributes come from the same LIST", n)
+	}
+}
+
+func Test_loadMailboxCache_When_NoNameIsMarked_Then_NoSelectSetStaysNil(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}, {name: "Sent"}}})
+
+	if c.mailboxCache.noSelect != nil {
+		t.Errorf("noSelect = %v, want nil when the server marks no name", c.mailboxCache.noSelect)
+	}
+	if c.IsNoSelect("INBOX") {
+		t.Error("IsNoSelect(INBOX) = true, want false")
+	}
+}
+
+func Test_loadMailboxCache_When_Reloaded_Then_NoSelectSetIsReplaced(t *testing.T) {
+	t.Parallel()
+
+	_, c := newScriptedClient(t, &mailboxScript{folders: []scriptFolder{{name: "Old"}}})
+	c.mailboxCache = mailboxCache{
+		folders:   map[string]struct{}{"Old": {}},
+		noSelect:  map[string]struct{}{"Old": {}},
+		delimiter: "/",
+	}
+	if !c.IsNoSelect("Old") {
+		t.Fatal("precondition: IsNoSelect(Old) = false")
+	}
+
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("loadMailboxCache: %v", err)
+	}
+
+	if c.IsNoSelect("Old") {
+		t.Error("IsNoSelect(Old) = true after a reload that lists it without attributes")
+	}
+	if !c.hasMailbox("Old") {
+		t.Error("hasMailbox(Old) = false after the reload")
+	}
+}
+
+func Test_loadMailboxCache_When_ListIsRetried_Then_NamesOfTheFailedAttemptAreDropped(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		// The connection drops after one marked name, before the tagged reply.
+		writeLine(conn, `* LIST (\Noselect) "/" "Stale"`)
+		return true, false
+	}))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if n := srv.callCount("LIST"); n != 2 {
+		t.Fatalf("LIST count = %d, want 2 (the dropped attempt and its retry)", n)
+	}
+	if c.IsNoSelect("Stale") || c.hasMailbox("Stale") {
+		t.Error("the cache holds Stale from the attempt that failed")
+	}
+	if !c.hasMailbox("INBOX") {
+		t.Error("hasMailbox(INBOX) = false after the retry")
 	}
 }

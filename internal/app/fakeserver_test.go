@@ -568,6 +568,7 @@ type appendRecord struct {
 type mailStore struct {
 	folders      map[string][]storedMsg
 	nextUID      map[string]uint32
+	noSelect     map[string]bool
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -619,6 +620,23 @@ func (s *fakeServer) addFolder(name string) {
 	}
 	s.store.folders[name] = nil
 	s.store.nextUID[name] = 1
+}
+
+// markNoSelect adds each folder that is missing and lists it as \Noselect, the
+// way a server lists a container such as Gmail's "[Gmail]".
+func (s *fakeServer) markNoSelect(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.noSelect == nil {
+		s.store.noSelect = make(map[string]bool, len(names))
+	}
+	for _, name := range names {
+		if _, ok := s.store.folders[name]; !ok {
+			s.store.folders[name] = nil
+			s.store.nextUID[name] = 1
+		}
+		s.store.noSelect[name] = true
+	}
 }
 
 func (s *fakeServer) refuseLogin() {
@@ -798,8 +816,8 @@ func splitCommand(line string) (tag, verb, arg string) {
 	return tag, strings.ToUpper(verb), arg
 }
 
-// recordCommand counts verb, plus "UID <SUB>" for UID commands. CREATE names
-// are recorded on arrival, whether or not the server accepts them.
+// recordCommand counts verb, plus "UID <SUB>" for UID commands. CREATE, EXAMINE
+// and SELECT names are recorded on arrival, whether or not the server accepts them.
 func (s *fakeServer) recordCommand(verb, arg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -808,7 +826,7 @@ func (s *fakeServer) recordCommand(verb, arg string) {
 	case "UID":
 		sub, _, _ := strings.Cut(arg, " ")
 		s.counts["UID "+strings.ToUpper(sub)]++
-	case "CREATE":
+	case "CREATE", "EXAMINE", "SELECT":
 		name, _ := parseMailboxArg(arg)
 		s.names[verb] = append(s.names[verb], name)
 	}
@@ -829,9 +847,14 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 	s.mu.Lock()
 	delim := s.store.delimiter
 	names := slices.Sorted(maps.Keys(s.store.folders))
+	noSelect := maps.Clone(s.store.noSelect)
 	s.mu.Unlock()
 	for _, name := range names {
-		rw.line(`* LIST () "%s" "%s"`, delim, name)
+		attrs := ""
+		if noSelect[name] {
+			attrs = `\HasChildren \Noselect`
+		}
+		rw.line(`* LIST (%s) "%s" "%s"`, attrs, delim, name)
 	}
 	rw.line("%s OK LIST completed", tag)
 }
@@ -842,8 +865,9 @@ func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) bool {
 	msgs, ok := s.store.folders[name]
 	n := len(msgs)
 	next := s.store.nextUID[name]
+	noSelect := s.store.noSelect[name]
 	s.mu.Unlock()
-	if !ok {
+	if !ok || noSelect {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return false
 	}
@@ -865,8 +889,9 @@ func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
 	s.mu.Lock()
 	msgs, ok := s.store.folders[name]
 	n := len(msgs)
+	noSelect := s.store.noSelect[name]
 	s.mu.Unlock()
-	if !ok {
+	if !ok || noSelect {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return
 	}
@@ -971,6 +996,10 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	}
 	if _, ok := s.store.folders[name]; !ok {
 		rw.line("%s NO [TRYCREATE] Mailbox does not exist", tag)
+		return true
+	}
+	if s.store.noSelect[name] {
+		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return true
 	}
 	msgID := ""

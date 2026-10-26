@@ -63,6 +63,13 @@ type FolderSyncPlan struct {
 	DestinationFolderExists bool
 }
 
+// FolderFailure names a mapping that the plan cannot copy, and why.
+type FolderFailure struct {
+	Err               error
+	SourceFolder      string
+	DestinationFolder string
+}
+
 // SyncSummary aggregates the per-folder plans along with total message counts
 // and an estimated total byte volume.
 //
@@ -72,6 +79,7 @@ type FolderSyncPlan struct {
 // the round-trips for what is only a preview number.
 type SyncSummary struct {
 	Plans        []FolderSyncPlan
+	Failures     []FolderFailure
 	TotalNew     int
 	TotalNewSize uint64
 }
@@ -354,6 +362,11 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		return err
 	}
 
+	// Quiet mode shows this too: like the final error line, it reports a failure.
+	if len(summary.Failures) > 0 {
+		printFolderFailures(out, summary.Failures)
+	}
+
 	if summary.TotalNew > 0 {
 		if !quiet {
 			_, _ = fmt.Fprintf(out, "📤 Messages to be copied to destination:\n")
@@ -410,6 +423,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			}
 		}
 	} else {
+		if len(summary.Failures) > 0 {
+			printSyncErrors(out, 0, 0, len(summary.Failures))
+			return ErrSilentExit
+		}
 		if !quiet {
 			_, _ = fmt.Fprintln(out, "✅ All folders already synced!")
 		}
@@ -563,8 +580,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	totalSyncedN := int(totalSynced.Load())
 	totalErrorsN := int(totalErrors.Load())
 
-	if totalErrorsN > 0 {
-		_, _ = fmt.Fprintf(out, "❌ Sync completed with errors. %d messages uploaded, %d errors occurred\n", totalSyncedN, totalErrorsN)
+	if totalErrorsN > 0 || len(summary.Failures) > 0 {
+		printSyncErrors(out, totalSyncedN, totalErrorsN, len(summary.Failures))
 		// Friendly summary already printed; signal non-zero exit without
 		// asking main to repeat the same information through stderr.
 		return ErrSilentExit
@@ -572,6 +589,21 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 
 	_, _ = fmt.Fprintln(out, "✨ Sync completed successfully. ✨")
 	return nil
+}
+
+// printFolderFailures lists the mappings the plan cannot copy. Err can carry
+// server text, so every part goes through termsafe.Escape.
+func printFolderFailures(out io.Writer, failures []FolderFailure) {
+	_, _ = fmt.Fprint(out, "\n❌ Folders that cannot be synced:\n")
+	for _, f := range failures {
+		_, _ = fmt.Fprintf(out, "• %s → %s: %s\n",
+			termsafe.Escape(f.SourceFolder), termsafe.Escape(f.DestinationFolder), termsafe.Escape(f.Err.Error()))
+	}
+}
+
+func printSyncErrors(out io.Writer, synced, errs, failedFolders int) {
+	_, _ = fmt.Fprintf(out, "❌ Sync completed with errors. %d messages uploaded, %d errors occurred, %d folders failed\n",
+		synced, errs, failedFolders)
 }
 
 // folderScan holds the per-slot results from the parallel src and dst scans.
@@ -588,6 +620,7 @@ type folderScan struct {
 	srcFolderSize  uint64
 	srcFolderCount int
 	dstExists      bool
+	dstNoSelect    bool
 	mu             sync.Mutex
 	done           atomic.Int32
 }
@@ -644,6 +677,11 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				scans[idx].dstErr = err
 			case !exists:
 				// dstExists stays false, dstIDs stays nil - benign; folder will be created.
+			case dstClient.IsNoSelect(m.Destination):
+				// A \Noselect folder is listed but refuses EXAMINE, so scanning it would
+				// abort the whole plan. The summary reports it as a failed mapping.
+				scans[idx].dstExists = true
+				scans[idx].dstNoSelect = true
 			default:
 				scans[idx].dstExists = true
 				ids, err := dstClient.FetchMessageIDSet(gCtx, m.Destination)
@@ -679,6 +717,16 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			}
 			continue
 		}
+		if scans[idx].dstNoSelect {
+			if scans[idx].srcFolderCount > 0 {
+				summary.Failures = append(summary.Failures, FolderFailure{
+					SourceFolder:      mappings[idx].Source,
+					DestinationFolder: mappings[idx].Destination,
+					Err:               fmt.Errorf("%d messages not copied: %w", scans[idx].srcFolderCount, errDestinationNoSelect),
+				})
+			}
+			continue
+		}
 		if plans[idx].SourceFolder == "" {
 			continue
 		}
@@ -707,7 +755,7 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	// goroutine and read here without synchronisation unless we take the lock.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.srcErr != nil || s.dstErr != nil {
+	if s.srcErr != nil || s.dstErr != nil || s.dstNoSelect {
 		s.srcMap, s.dstIDs = nil, nil
 		return true
 	}
@@ -763,12 +811,24 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		return nil, err
 	}
 
+	// A \Noselect source cannot be scanned, but its subfolders still can.
+	var skipped map[string]struct{}
+	skip := func(name string) {
+		if skipped == nil {
+			skipped = make(map[string]struct{})
+		}
+		skipped[name] = struct{}{}
+	}
+
 	for _, mapping := range mappings {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// Add the original mapping
-		expanded = append(expanded, mapping)
+		if srcClient.IsNoSelect(mapping.Source) {
+			skip(mapping.Source)
+		} else {
+			expanded = append(expanded, mapping)
+		}
 
 		// The listing reads the mailbox cache, so it fails only when ctx ends.
 		subfolders, err := getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
@@ -780,6 +840,10 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		for _, subfolder := range subfolders {
 			if err := ctx.Err(); err != nil {
 				return nil, err
+			}
+			if srcClient.IsNoSelect(subfolder) {
+				skip(subfolder)
+				continue
 			}
 			// Calculate relative path from source root
 			var relativePath string
@@ -817,6 +881,9 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 	// duplicate entries that scan and copy the folder twice.
 	deduped, dropped := dedupeMappings(expanded)
 	if verbose && !quiet {
+		for _, name := range slices.Sorted(maps.Keys(skipped)) {
+			_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - the source server marks it \\Noselect\n", termsafe.Escape(name))
+		}
 		for _, m := range dropped {
 			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", m.Source)
 		}

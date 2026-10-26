@@ -18,9 +18,9 @@ type MailboxInfo struct {
 	Size     uint64
 }
 
-// MailboxExists reports whether a mailbox with the given name exists on the
-// server. Backed by the per-Client mailbox cache so that the many existence
-// checks done at planning time amortize to a single LIST.
+// MailboxExists reports whether the per-Client mailbox cache lists name, so
+// planning costs one LIST. A \Noselect name counts as existing; IsNoSelect
+// tells whether it can hold messages.
 func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -116,8 +116,9 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 	return nil
 }
 
-// MailboxNames returns every mailbox name in the cache, sorted. New loads the
-// cache, so this costs no round-trip.
+// MailboxNames returns every cached mailbox name, sorted, \Noselect names
+// included. IsNoSelect tells whether a name can hold messages. It costs no
+// round-trip.
 func (c *Client) MailboxNames() []string {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
@@ -127,6 +128,15 @@ func (c *Client) MailboxNames() []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// IsNoSelect reports whether the mailbox cache lists name as \Noselect or
+// \NonExistent.
+func (c *Client) IsNoSelect(name string) bool {
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	_, ok := c.mailboxCache.noSelect[name]
+	return ok
 }
 
 // ListSubfolders returns subfolders of folder, derived from the cached
