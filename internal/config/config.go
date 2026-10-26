@@ -2,9 +2,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +25,8 @@ var (
 	ErrDstUserRequired   = errors.New("destination user is required")
 	ErrDstPassRequired   = errors.New("destination password is required")
 )
+
+var errTrailingContent = errors.New("unexpected content after the first document")
 
 const (
 	// minWorkers is the lower bound on the parallel worker count.
@@ -94,11 +98,11 @@ func New(c *cli.Command) (*Config, error) {
 
 	switch ext {
 	case ".json":
-		if err := json.Unmarshal(data, &cfg); err != nil {
+		if err := decodeJSON(data, &cfg); err != nil {
 			return nil, fmt.Errorf("invalid JSON in config file %q: %w", filePath, err)
 		}
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
+		if err := decodeYAML(data, &cfg); err != nil {
 			return nil, fmt.Errorf("invalid YAML in config file %q: %w", filePath, err)
 		}
 	default:
@@ -139,6 +143,43 @@ func New(c *cli.Command) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// decodeJSON rejects unknown keys: a misspelled map or rate_limit key would
+// otherwise be dropped and change what is synced.
+func decodeJSON(data []byte, cfg *Config) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
+		if errors.Is(err, io.EOF) {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	// The Decoder reads only the first value, so look for anything after it.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errTrailingContent
+	}
+	return nil
+}
+
+// decodeYAML rejects unknown keys: a misspelled map or rate_limit key would
+// otherwise be dropped and change what is synced.
+func decodeYAML(data []byte, cfg *Config) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	err := dec.Decode(cfg)
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err != nil:
+		return err
+	}
+	// The Decoder reads only the first document, so look for another one.
+	if err := dec.Decode(&yaml.Node{}); !errors.Is(err, io.EOF) {
+		return errTrailingContent
+	}
+	return nil
 }
 
 // clampWorkers bounds the worker count to [minWorkers, maxWorkers].

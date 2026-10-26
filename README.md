@@ -123,6 +123,15 @@ map:
 > folder. You can also use `--src-folder` / `--dest-folder` to sync a single
 > folder without a config file `map` section.
 
+The command checks the configuration file when it loads the file.
+
+- The file can contain only these keys: `src` and `dst` (`label`, `server`,
+  `user`, `pass`, `auth`), `map` (items with `src` and `dst`), and `rate_limit`
+  (`down_bps`, `up_bps`, `max_connections`).
+- If the file contains a different key at any level, the command stops with an
+  error. The error shows the key and the path of the file.
+- A JSON file must contain one object. A YAML file must contain one document.
+
 ### Authentication
 
 The `auth` field in `src` or `dst` blocks is optional and specifies the authentication mechanism:

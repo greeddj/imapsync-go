@@ -13,17 +13,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// runNewWithArgs writes content to a temp file with the given extension and
-// drives config.New through a urfave/cli/v3 Command parsed from extraArgs.
-// Returns whatever Config / error New produced.
-func runNewWithArgs(t *testing.T, ext, content string, extraArgs ...string) (*Config, error) {
+// writeConfigFile writes content to a temp file with the given extension and
+// returns its absolute path.
+func writeConfigFile(t *testing.T, ext, content string) string {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config"+ext)
+	path := filepath.Join(t.TempDir(), "config"+ext)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write temp config: %v", err)
 	}
+	return path
+}
 
+// runNewAt drives config.New through a urfave/cli/v3 Command parsed from
+// extraArgs, with the config flag set to path.
+// Returns whatever Config / error New produced.
+func runNewAt(t *testing.T, path string, extraArgs ...string) (*Config, error) {
+	t.Helper()
 	var (
 		gotCfg *Config
 		gotErr error
@@ -46,6 +51,13 @@ func runNewWithArgs(t *testing.T, ext, content string, extraArgs ...string) (*Co
 		t.Fatalf("app.Run: %v", err)
 	}
 	return gotCfg, gotErr
+}
+
+// runNewWithArgs writes content to a temp file with the given extension and
+// runs config.New on it.
+func runNewWithArgs(t *testing.T, ext, content string, extraArgs ...string) (*Config, error) {
+	t.Helper()
+	return runNewAt(t, writeConfigFile(t, ext, content), extraArgs...)
 }
 
 const validJSONConfig = `{
@@ -321,5 +333,228 @@ func TestRateLimitOmittedJSON(t *testing.T) {
 	}
 	if cfg.RateLimit != (RateLimit{}) {
 		t.Errorf("RateLimit = %+v, want zero value", cfg.RateLimit)
+	}
+}
+
+func TestNew_When_ConfigHasUnknownKey_Then_ReturnsErrorNamingKeyAndFile(t *testing.T) {
+	t.Parallel()
+
+	const (
+		jsonSrc = `"src":{"server":"s:993","user":"u","pass":"p"}`
+		jsonDst = `"dst":{"server":"d:993","user":"u","pass":"p"}`
+		yamlSrc = "src: {server: 's:993', user: u, pass: p}\n"
+		yamlDst = "dst: {server: 'd:993', user: u, pass: p}\n"
+	)
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+		key     string
+	}{
+		{
+			name: "JSON top level maps", ext: ".json", key: "maps",
+			content: `{` + jsonSrc + `,` + jsonDst + `,"maps":[{"src":"INBOX","dst":"INBOX"}]}`,
+		},
+		{
+			name: "JSON top level rate-limit", ext: ".json", key: "rate-limit",
+			content: `{` + jsonSrc + `,` + jsonDst + `,"rate-limit":{"down_bps":300000}}`,
+		},
+		{
+			name: "JSON src host", ext: ".json", key: "host",
+			content: `{"src":{"server":"s:993","user":"u","pass":"p","host":"x"},` + jsonDst + `}`,
+		},
+		{
+			name: "JSON dst password", ext: ".json", key: "password",
+			content: `{` + jsonSrc + `,"dst":{"server":"d:993","user":"u","pass":"p","password":"x"}}`,
+		},
+		{
+			name: "JSON rate_limit down", ext: ".json", key: "down",
+			content: `{` + jsonSrc + `,` + jsonDst + `,"rate_limit":{"down":300000}}`,
+		},
+		{
+			name: "JSON map entry source", ext: ".json", key: "source",
+			content: `{` + jsonSrc + `,` + jsonDst + `,"map":[{"source":"INBOX","dst":"INBOX"}]}`,
+		},
+		{
+			name: "JSON top level workers", ext: ".json", key: "workers",
+			content: `{` + jsonSrc + `,` + jsonDst + `,"workers":8}`,
+		},
+		{
+			name: "YAML top level mapping", ext: ".yaml", key: "mapping",
+			content: yamlSrc + yamlDst + "mapping:\n  - src: INBOX\n    dst: INBOX\n",
+		},
+		{
+			name: "YAML top level ratelimit", ext: ".yaml", key: "ratelimit",
+			content: yamlSrc + yamlDst + "ratelimit:\n  down_bps: 300000\n",
+		},
+		{
+			name: "YAML src host", ext: ".yaml", key: "host",
+			content: "src: {server: 's:993', user: u, pass: p, host: x}\n" + yamlDst,
+		},
+		{
+			name: "YAML rate_limit downbps", ext: ".yaml", key: "downbps",
+			content: yamlSrc + yamlDst + "rate_limit:\n  downbps: 300000\n",
+		},
+		{
+			name: "YAML map entry source", ext: ".yaml", key: "source",
+			content: yamlSrc + yamlDst + "map:\n  - source: INBOX\n    dst: INBOX\n",
+		},
+		{
+			name: "YAML top level workers", ext: ".yaml", key: "workers",
+			content: yamlSrc + yamlDst + "workers: 8\n",
+		},
+		{
+			name: "yml top level maps", ext: ".yml", key: "maps",
+			content: yamlSrc + yamlDst + "maps:\n  - src: INBOX\n    dst: INBOX\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := writeConfigFile(t, tt.ext, tt.content)
+
+			cfg, err := runNewAt(t, path)
+
+			if cfg != nil {
+				t.Errorf("Config = %+v, want nil", cfg)
+			}
+			if err == nil {
+				t.Fatal("New returned nil error, want an unknown key error")
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("error = %q, want the config path %q", err, path)
+			}
+			// The temp dir name carries the subtest name, so match the key
+			// on the text without the path.
+			if msg := strings.ReplaceAll(err.Error(), path, ""); !strings.Contains(msg, tt.key) {
+				t.Errorf("error = %q, want the key %q", msg, tt.key)
+			}
+		})
+	}
+}
+
+func TestNew_When_ContentFollowsFirstDocument_Then_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+	}{
+		{"JSON second object", ".json", validJSONConfig + `{"map":[{"src":"INBOX","dst":"INBOX"}]}`},
+		{"JSON garbage", ".json", validJSONConfig + "\ngarbage"},
+		{"JSON closing brace", ".json", validJSONConfig + "}"},
+		{"YAML second document", ".yaml", validYAMLConfig + "---\nmap:\n  - src: INBOX\n    dst: INBOX\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := writeConfigFile(t, tt.ext, tt.content)
+
+			cfg, err := runNewAt(t, path)
+
+			if cfg != nil {
+				t.Errorf("Config = %+v, want nil", cfg)
+			}
+			if !errors.Is(err, errTrailingContent) {
+				t.Fatalf("error = %v, want errTrailingContent", err)
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("error = %q, want the config path %q", err, path)
+			}
+		})
+	}
+}
+
+func TestNew_When_TrailingWhitespaceFollowsDocument_Then_Loads(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+	}{
+		{"JSON trailing whitespace", ".json", validJSONConfig + "\n\n  "},
+		{"YAML document end marker", ".yaml", validYAMLConfig + "...\n"},
+		{"YAML document start marker", ".yaml", "---\n" + validYAMLConfig},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
+
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if cfg.Src.Server != "src:993" || cfg.RateLimit.MaxConnections != 5 {
+				t.Errorf("Config = %+v, want the file values", cfg)
+			}
+		})
+	}
+}
+
+func TestNew_When_FileIsEmpty_Then_KeepsTheFormatError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantIs  error
+		name    string
+		ext     string
+		content string
+		wantMsg string
+	}{
+		{name: "empty JSON", ext: ".json", wantMsg: "invalid JSON in config file"},
+		{name: "whitespace only JSON", ext: ".json", content: " \n\t\n", wantMsg: "invalid JSON in config file"},
+		{name: "null JSON", ext: ".json", content: "null", wantIs: ErrSrcServerRequired},
+		{name: "empty YAML", ext: ".yaml", wantIs: ErrSrcServerRequired},
+		{name: "comments only YAML", ext: ".yaml", content: "# nothing here\n", wantIs: ErrSrcServerRequired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
+
+			if cfg != nil {
+				t.Errorf("Config = %+v, want nil", cfg)
+			}
+			if err == nil {
+				t.Fatal("New returned nil error")
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Errorf("error = %v, want %v", err, tt.wantIs)
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error = %v, want substring %q", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestNew_When_ExampleConfigIsLoaded_Then_Succeeds(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"config.example.json", "config.example.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewAt(t, filepath.Join("..", "..", name))
+
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if cfg.Src.Label != "old" || cfg.Dst.Label != "new" {
+				t.Errorf("labels = %q/%q, want old/new", cfg.Src.Label, cfg.Dst.Label)
+			}
+			if len(cfg.Map) != 3 {
+				t.Fatalf("len(Map) = %d, want 3", len(cfg.Map))
+			}
+			if want := (DirectoryMapping{Source: "Archive.2023", Destination: "Archive/2023"}); cfg.Map[2] != want {
+				t.Errorf("Map[2] = %+v, want %+v", cfg.Map[2], want)
+			}
+		})
 	}
 }

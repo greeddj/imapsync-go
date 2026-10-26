@@ -8,7 +8,7 @@
 
 ## What we test
 
-- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), env interpolation.
+- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case). The tests also cover unknown keys at every level in both formats, content after the first document, empty files, and the load of both example files.
 - **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;

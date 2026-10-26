@@ -245,7 +245,7 @@ In go-imap v1.2.1, such lines are parse errors and network errors. A parse error
 
 ## Conventions
 
-- Configuration format is detected from the file extension: `.json` / `.yaml` / `.yml` (see `internal/config/config.New`). The CLI accepts either; sample files are `config.example.json` / `config.example.yaml`.
+- Configuration format is detected from the file extension: `.json` / `.yaml` / `.yml` (see `internal/config/config.New`). The CLI accepts either; sample files are `config.example.json` / `config.example.yaml`. The loader rejects a key that `Config` does not define. This applies at all levels, in both formats. The error names the key and the file. The loader also rejects content after the first JSON value or YAML document.
 - Workers are clamped to `[1, 10]` in `config.New`. A value out of range changes to the nearest limit.
 - Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it.
 - `client.New(ctx, addr, user, pass, Options{...})` - keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation.

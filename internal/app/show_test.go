@@ -243,6 +243,31 @@ func TestActionShow_When_ConfigIsMissing_Then_ReportsLoadFailure(t *testing.T) {
 	}
 }
 
+func TestActionShow_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	src, dst := newFakeServer(t), newFakeServer(t)
+	srcDialed, dstDialed := watchDials(src), watchDials(dst)
+	cfgPath := writeRawConfig(t, ".json", src, dst,
+		`,"maps":[{"src":"INBOX","dst":"INBOX"}],"rate-limit":{"down_bps":300000}`)
+
+	err := runCLIAction(t, ActionShow, "show", showFlags(), "-c", cfgPath, "show", "-q")
+
+	if err == nil {
+		t.Fatal("error = nil, want a config load failure")
+	}
+	if !strings.Contains(err.Error(), "load config") || !strings.Contains(err.Error(), cfgPath) {
+		t.Errorf("error = %v, want %q and the config path", err, "load config")
+	}
+	if msg := strings.ReplaceAll(err.Error(), cfgPath, ""); !strings.Contains(msg, "maps") {
+		t.Errorf("error = %q, want the key %q", msg, "maps")
+	}
+	if srcDialed.Load() || dstDialed.Load() {
+		t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())
+	}
+	assertNoLogin(t, src, dst)
+}
+
 func TestRunShow_When_ListingMailboxesFails_Then_NamesTheFailingAccount(t *testing.T) {
 	t.Parallel()
 

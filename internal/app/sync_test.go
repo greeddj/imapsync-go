@@ -2099,6 +2099,85 @@ func TestActionSync_When_ConfigIsMissing_Then_ReportsLoadFailure(t *testing.T) {
 	}
 }
 
+// writeRawConfig stores a config for the given servers with extra after the
+// known keys. Unlike writeJSONConfig, it can hold a key that config.Config
+// does not define.
+func writeRawConfig(t *testing.T, ext string, src, dst *fakeServer, extra string) string {
+	t.Helper()
+
+	var content string
+	switch ext {
+	case ".json":
+		content = fmt.Sprintf(
+			`{"src":{"server":%q,"user":"alice","pass":%q},"dst":{"server":%q,"user":"bob","pass":%q}%s}`,
+			src.ln.Addr().String(), e2ePassword, dst.ln.Addr().String(), e2ePassword, extra)
+	default:
+		content = fmt.Sprintf(
+			"src: {server: %q, user: alice, pass: %q}\ndst: {server: %q, user: bob, pass: %q}\n%s",
+			src.ln.Addr().String(), e2ePassword, dst.ln.Addr().String(), e2ePassword, extra)
+	}
+	path := filepath.Join(t.TempDir(), "config"+ext)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// watchDials makes srv report the first connection it accepts. The handler
+// closes the connection, so the client sees a failed dial.
+func watchDials(srv *fakeServer) *atomic.Bool {
+	var dialed atomic.Bool
+	srv.addConnHandler(func(conn net.Conn) {
+		dialed.Store(true)
+		_ = conn.Close()
+	})
+	return &dialed
+}
+
+func TestActionSync_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		ext   string
+		extra string
+	}{
+		{
+			name: "JSON misspelled map and rate_limit", ext: ".json",
+			extra: `,"maps":[{"src":"INBOX","dst":"INBOX"}],"rate-limit":{"down_bps":300000}`,
+		},
+		{
+			name: "YAML misspelled map and rate_limit", ext: ".yaml",
+			extra: "maps:\n  - src: INBOX\n    dst: INBOX\nratelimit:\n  down_bps: 300000\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst := newFakeServer(t), newFakeServer(t)
+			srcDialed, dstDialed := watchDials(src), watchDials(dst)
+			cfgPath := writeRawConfig(t, tt.ext, src, dst, tt.extra)
+
+			err := runCLIAction(t, ActionSync, "sync", syncFlags(), "-c", cfgPath, "sync", "-y")
+
+			if err == nil {
+				t.Fatal("error = nil, want a config load failure")
+			}
+			if !strings.Contains(err.Error(), "failed to load config") || !strings.Contains(err.Error(), cfgPath) {
+				t.Errorf("error = %v, want %q and the config path", err, "failed to load config")
+			}
+			if msg := strings.ReplaceAll(err.Error(), cfgPath, ""); !strings.Contains(msg, "maps") {
+				t.Errorf("error = %q, want the key %q", msg, "maps")
+			}
+			if srcDialed.Load() || dstDialed.Load() {
+				t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())
+			}
+			assertNoLogin(t, src, dst)
+		})
+	}
+}
+
 func TestActionSync_When_QuietWithoutConfirm_Then_RefusesBeforeConnecting(t *testing.T) {
 	t.Parallel()
 
