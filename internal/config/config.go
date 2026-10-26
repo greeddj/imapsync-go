@@ -126,19 +126,11 @@ func New(c *cli.Command) (*Config, error) {
 	// out-of-range value is corrected without silently falling back to 1.
 	cfg.Workers = clampWorkers(c.Int("workers"))
 
-	// CLI flags take precedence when the user explicitly sets them; config
-	// values fill in only the unset fields. We use 0 as "unset" - that also
-	// happens to be the "unlimited" sentinel, which is fine: a config-set
-	// value of 0 means the same thing.
-	if v := c.Int("bps-down"); v != 0 {
-		cfg.RateLimit.DownBPS = v
-	}
-	if v := c.Int("bps-up"); v != 0 {
-		cfg.RateLimit.UpBPS = v
-	}
-	if v := c.Int("max-connections"); v != 0 {
-		cfg.RateLimit.MaxConnections = v
-	}
+	// IsSet, not a non-zero test: a 0 from a flag or its env var means no limit
+	// and must replace the config value.
+	overrideInt(c, "bps-down", &cfg.RateLimit.DownBPS)
+	overrideInt(c, "bps-up", &cfg.RateLimit.UpBPS)
+	overrideInt(c, "max-connections", &cfg.RateLimit.MaxConnections)
 
 	// Validate required fields.
 	if err := cfg.validate(); err != nil {
@@ -146,6 +138,12 @@ func New(c *cli.Command) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func overrideInt(c *cli.Command, name string, dst *int) {
+	if c.IsSet(name) {
+		*dst = c.Int(name)
+	}
 }
 
 // decodeJSON rejects unknown keys: a misspelled map or rate_limit key would

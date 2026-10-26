@@ -166,27 +166,95 @@ func TestNew_defaultLabelsAppliedWhenAbsent(t *testing.T) {
 	}
 }
 
-func TestNew_CLIOverridesConfigBPSDown(t *testing.T) {
+func TestNew_When_RateLimitFlagIsSet_Then_OverridesConfigValue(t *testing.T) {
 	t.Parallel()
-	cfg, err := runNewWithArgs(t, ".json", validJSONConfig, "--bps-down=200000")
-	if err != nil {
-		t.Fatalf("New: %v", err)
+
+	allZero := []string{"--bps-down=0", "--bps-up=0", "--max-connections=0"}
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+		args    []string
+		want    RateLimit
+	}{
+		{
+			name: "no rate flags keeps the config values", ext: ".json", content: validJSONConfig,
+			want: RateLimit{DownBPS: 100000, UpBPS: 50000, MaxConnections: 5},
+		},
+		{
+			name: "bps-down of 0 lifts the config limit", ext: ".json", content: validJSONConfig,
+			args: []string{"--bps-down=0"},
+			want: RateLimit{DownBPS: 0, UpBPS: 50000, MaxConnections: 5},
+		},
+		{
+			name: "bps-up of 0 lifts the config limit", ext: ".json", content: validJSONConfig,
+			args: []string{"--bps-up=0"},
+			want: RateLimit{DownBPS: 100000, UpBPS: 0, MaxConnections: 5},
+		},
+		{
+			name: "max-connections of 0 lifts the config cap", ext: ".json", content: validJSONConfig,
+			args: []string{"--max-connections=0"},
+			want: RateLimit{DownBPS: 100000, UpBPS: 50000, MaxConnections: 0},
+		},
+		{
+			name: "all three flags of 0 lift every config limit", ext: ".json", content: validJSONConfig,
+			args: allZero,
+			want: RateLimit{},
+		},
+		{
+			name: "bps-down above 0 replaces the config value", ext: ".json", content: validJSONConfig,
+			args: []string{"--bps-down=200000"},
+			want: RateLimit{DownBPS: 200000, UpBPS: 50000, MaxConnections: 5},
+		},
+		{
+			name: "all three flags of 0 lift every limit of a YAML config", ext: ".yaml", content: validYAMLConfig,
+			args: allZero,
+			want: RateLimit{},
+		},
 	}
-	if cfg.RateLimit.DownBPS != 200000 {
-		t.Errorf("DownBPS = %d, want 200000 (CLI override of config 100000)", cfg.RateLimit.DownBPS)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := runNewWithArgs(t, tt.ext, tt.content, tt.args...)
+
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if cfg.RateLimit != tt.want {
+				t.Errorf("RateLimit = %+v, want %+v", cfg.RateLimit, tt.want)
+			}
+		})
 	}
 }
 
-// TestNew_CLIZeroDoesNotOverride pins the documented "0 = unset" semantic:
-// passing --bps-up=0 (or omitting it) must leave the config value intact.
-func TestNew_CLIZeroDoesNotOverride(t *testing.T) {
+func TestNew_When_CommandDeclaresNoRateLimitFlags_Then_KeepsConfigValues(t *testing.T) {
 	t.Parallel()
-	cfg, err := runNewWithArgs(t, ".json", validJSONConfig, "--bps-up=0")
-	if err != nil {
-		t.Fatalf("New: %v", err)
+
+	var (
+		gotCfg *Config
+		gotErr error
+	)
+	app := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: writeConfigFile(t, ".json", validJSONConfig)},
+			&cli.IntFlag{Name: "workers", Value: 4},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			gotCfg, gotErr = New(c)
+			return nil
+		},
 	}
-	if cfg.RateLimit.UpBPS != 50000 {
-		t.Errorf("UpBPS = %d, want 50000 (config value preserved when CLI=0)", cfg.RateLimit.UpBPS)
+
+	if err := app.Run(context.Background(), []string{"app"}); err != nil {
+		t.Fatalf("app.Run: %v", err)
+	}
+
+	if gotErr != nil {
+		t.Fatalf("New: %v", gotErr)
+	}
+	if want := (RateLimit{DownBPS: 100000, UpBPS: 50000, MaxConnections: 5}); gotCfg.RateLimit != want {
+		t.Errorf("RateLimit = %+v, want %+v", gotCfg.RateLimit, want)
 	}
 }
 

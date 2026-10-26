@@ -8,7 +8,7 @@
 
 ## What we test
 
-- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), the accepted and rejected `auth` values. The tests also cover unknown keys at every level in both formats, content after the first document, empty files, and the load of both example files.
+- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), the accepted and rejected `auth` values. The tests also cover unknown keys at every level in both formats, content after the first document, empty files, and the load of both example files. A rate-limit flag that the user sets replaces the config value, also when the flag is 0. A rate-limit flag that the user does not set keeps the config value.
 - **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
@@ -145,7 +145,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 
 ### Deliberate exclusions in `cmd/imapsync-go`
 
-- **`main` and `run` in `cmd/imapsync-go/main.go`** - the signal-to-context wiring and `os.Exit` need a subprocess and real signals. `TestReportError` covers the exit-code mapping through `reportError`. The tests in `cmd/imapsync-go/commands` cover the command tree. A test sends SIGQUIT to its own process to cover `installQuitDump`, with an injected exit function.
+- **`main` and `run` in `cmd/imapsync-go/main.go`** - the signal-to-context wiring and `os.Exit` need a subprocess and real signals. `TestReportError` covers the exit-code mapping through `reportError`. The tests in `cmd/imapsync-go/commands` cover the command tree. One test uses the real `sync` flags, with their environment variables, to check that a rate-limit value of 0 replaces the config value. A test sends SIGQUIT to its own process to cover `installQuitDump`, with an injected exit function.
 - **`helpers.latestTag`** - the function makes a live call to the GitHub API. The tests skip it through `IMAPSYNC_OFFLINE` or `CI`. `TestFetchTag` covers `fetchTag`, which sends the request, against an `httptest` server. The other tests cover only the offline return and the `Version` format.
 
 If the tester finds an untested branch that does not match an existing exclusion, the choice is:
