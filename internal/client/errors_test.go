@@ -72,6 +72,16 @@ func TestClassifyError(t *testing.T) {
 	}
 }
 
+// multiError is an error whose Unwrap() []error result the test picks. The fmt
+// package never builds one with a nil child, so a test needs its own type.
+type multiError struct {
+	msg      string
+	children []error
+}
+
+func (e *multiError) Error() string   { return e.msg }
+func (e *multiError) Unwrap() []error { return e.children }
+
 func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.T) {
 	t.Parallel()
 
@@ -117,6 +127,16 @@ func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.
 		},
 		{name: "wrap node without a cause is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w", nil), want: ClassThrottled},
 		{name: "multi-wrap node without causes is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w %w", nil, nil), want: ClassThrottled},
+		{
+			name: "multi-wrap node skips a nil child and reads the leaf after it",
+			err:  &multiError{msg: "Too many simultaneous connections", children: []error{nil, errors.New("imap: connection closed")}},
+			want: ClassTransient,
+		},
+		{
+			name: "multi-wrap node whose children are all nil is a leaf",
+			err:  &multiError{msg: "Too many simultaneous connections", children: []error{nil, nil}},
+			want: ClassThrottled,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3308,4 +3309,219 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 			}
 		})
 	}
+}
+
+// blockedSleep stands in for sleepCtx. It reports its first wait, then blocks
+// until the context ends, as a real wait does.
+type blockedSleep struct {
+	reached chan struct{}
+	wait    time.Duration
+	calls   atomic.Int32
+	once    sync.Once
+}
+
+// blockSleeps swaps the package-level sleepCtx var, so the caller must be
+// sequential. The swap is undone when the test ends.
+func blockSleeps(t *testing.T) *blockedSleep {
+	t.Helper()
+
+	b := &blockedSleep{reached: make(chan struct{})}
+	orig := sleepCtx
+	sleepCtx = func(ctx context.Context, d time.Duration) error {
+		b.calls.Add(1)
+		b.once.Do(func() {
+			b.wait = d
+			close(b.reached)
+		})
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	t.Cleanup(func() { sleepCtx = orig })
+	return b
+}
+
+// Test_safeCall_When_CancelledDuringReconnectWait_Then_ReturnsCanceledWithoutAnotherLogin
+// asserts that Ctrl-C ends a wait between reconnect attempts: no LOGIN follows,
+// fn does not run again and c.mu is free.
+// Sequential - swaps the package-level sleepCtx var.
+func Test_safeCall_When_CancelledDuringReconnectWait_Then_ReturnsCanceledWithoutAnotherLogin(t *testing.T) {
+	tests := []struct {
+		name     string
+		reply    string
+		wantWait time.Duration
+	}{
+		{name: "throttle cool-down", reply: "NO [ALERT] Too many simultaneous connections", wantWait: throttledBackoff},
+		{name: "transient backoff", reply: dovecotTempAuthFailure, wantWait: initialBackoff},
+		{name: "unknown backoff", reply: "NO [UNAVAILABLE] Server busy", wantWait: initialBackoff},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFakeServer(t)
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			srv.addConnHandler(connHandlerWithLoginReply(srv, tt.reply))
+			// A LOGIN that must never happen: it would succeed.
+			srv.addConnHandler(connHandlerWithLoginReply(srv, "OK LOGIN completed"))
+			c := newClientWithFake(t, srv)
+			sleep := blockSleeps(t)
+
+			runs := 0
+			errc := make(chan error, 1)
+			go func() {
+				errc <- c.safeCall(func(*imapclient.Client) error {
+					runs++
+					return io.EOF
+				})
+			}()
+			awaitSignal(t, sleep.reached, "the reconnect to wait before its next attempt")
+			c.Cancel()
+
+			err := awaitError(t, errc, "safeCall")
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("safeCall error = %v, want context.Canceled", err)
+			}
+			if runs != 1 {
+				t.Errorf("fn ran %d times, want 1 (no session was restored)", runs)
+			}
+			if sleep.wait != tt.wantWait {
+				t.Errorf("wait = %s, want %s", sleep.wait, tt.wantWait)
+			}
+			if got := sleep.calls.Load(); got != 1 {
+				t.Errorf("sleepCtx ran %d times, want 1", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2 (the initial login and the refused attempt)", got)
+			}
+			if !c.mu.TryLock() {
+				t.Fatal("c.mu is still held after the cancelled reconnect returned")
+			}
+			c.mu.Unlock()
+		})
+	}
+}
+
+// cancelOnReconnect cancels its client when reconnect reports a new session. That
+// is the point between a successful login and the first use of the session.
+type cancelOnReconnect struct{ c *Client }
+
+func (r cancelOnReconnect) UpdateMessage(msg string) {
+	if strings.Contains(msg, "Reconnected successfully") {
+		r.c.Cancel()
+	}
+}
+func (cancelOnReconnect) UpdateTotal(int64) {}
+func (cancelOnReconnect) Increment(int64)   {}
+func (cancelOnReconnect) MarkAsErrored()    {}
+
+// Test_safeCall_When_CancelledRightAfterReconnect_Then_ReturnsCanceledWithoutRunningFn
+// asserts that a client cancelled between a successful reconnect and the retry
+// does not run fn on the new session.
+func Test_safeCall_When_CancelledRightAfterReconnect_Then_ReturnsCanceledWithoutRunningFn(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	c.SetProgressTracker(cancelOnReconnect{c: c})
+
+	runs := 0
+	err := c.safeCall(func(*imapclient.Client) error {
+		runs++
+		return io.EOF
+	})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("safeCall error = %v, want context.Canceled", err)
+	}
+	if runs != 1 {
+		t.Errorf("fn ran %d times, want 1 (the first attempt only)", runs)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the reconnect did log in)", got)
+	}
+	if !c.mu.TryLock() {
+		t.Fatal("c.mu is still held after safeCall returned")
+	}
+	c.mu.Unlock()
+}
+
+// Test_reconnect_When_ClientIsCancelled_Then_ReturnsCanceledWithoutDial asserts
+// that a cancelled client neither dials nor logs in again, and keeps c.mu free.
+func Test_reconnect_When_ClientIsCancelled_Then_ReturnsCanceledWithoutDial(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	var dials atomic.Int32
+	dial := c.dialFn
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return dial(ctx, addr)
+	}
+	c.Cancel()
+
+	err := c.reconnect()
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("reconnect error = %v, want context.Canceled", err)
+	}
+	if got := dials.Load(); got != 0 {
+		t.Errorf("dial count = %d, want 0", got)
+	}
+	if got := srv.callCount("LOGIN"); got != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (the initial login only)", got)
+	}
+	if !c.mu.TryLock() {
+		t.Fatal("c.mu is still held after reconnect returned")
+	}
+	c.mu.Unlock()
+}
+
+// dropSessionOnReconnect removes the new session when reconnect reports it. That
+// is the point between a successful login and the check of the session.
+type dropSessionOnReconnect struct{ c *Client }
+
+func (r dropSessionOnReconnect) UpdateMessage(msg string) {
+	if !strings.Contains(msg, "Reconnected successfully") {
+		return
+	}
+	// Terminate keeps the reader goroutine of the dropped session from leaking.
+	if cli := r.c.c.Swap(nil); cli != nil {
+		_ = cli.Terminate()
+	}
+}
+func (dropSessionOnReconnect) UpdateTotal(int64) {}
+func (dropSessionOnReconnect) Increment(int64)   {}
+func (dropSessionOnReconnect) MarkAsErrored()    {}
+
+// Test_safeCall_When_SessionMissingAfterReconnect_Then_ReturnsErrorWithoutRunningFn
+// asserts that a reconnect without a stored session ends in a plain error: fn
+// does not run again, the error is no cancellation and c.mu is free.
+func Test_safeCall_When_SessionMissingAfterReconnect_Then_ReturnsErrorWithoutRunningFn(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	c.SetProgressTracker(dropSessionOnReconnect{c: c})
+
+	runs := 0
+	err := c.safeCall(func(*imapclient.Client) error {
+		runs++
+		return io.EOF
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "imap client not connected after reconnect") {
+		t.Errorf("safeCall error = %v, want text %q", err, "imap client not connected after reconnect")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("safeCall error = %v, must not be context.Canceled", err)
+	}
+	if runs != 1 {
+		t.Errorf("fn ran %d times, want 1 (the first attempt only)", runs)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the reconnect did log in)", got)
+	}
+	if !c.mu.TryLock() {
+		t.Fatal("c.mu is still held after safeCall returned")
+	}
+	c.mu.Unlock()
 }

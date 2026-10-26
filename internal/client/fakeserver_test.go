@@ -613,10 +613,16 @@ func appendOutcomeHandler(srv *fakeServer, appendReply string) func(net.Conn) {
 	return appendCaptureHandler(srv, appendReply, nil)
 }
 
-// appendCaptureHandler is appendOutcomeHandler that also sends the bytes of each
-// APPEND literal to literals before it replies. literals must be buffered, and nil
-// drops the bytes.
-func appendCaptureHandler(srv *fakeServer, appendReply string, literals chan<- []byte) func(net.Conn) {
+// capturedAppend is the command arguments and the literal of one APPEND that a
+// server received.
+type capturedAppend struct {
+	arg     string
+	literal []byte
+}
+
+// appendCaptureHandler is appendOutcomeHandler that also sends each APPEND it
+// receives to appends before it replies. appends must be buffered, and nil drops them.
+func appendCaptureHandler(srv *fakeServer, appendReply string, appends chan<- capturedAppend) func(net.Conn) {
 	return func(conn net.Conn) {
 		serveCommands(srv, conn, scriptedGreeting, func(rd *bufio.Reader, cmd command) bool {
 			switch cmd.verb {
@@ -634,8 +640,8 @@ func appendCaptureHandler(srv *fakeServer, appendReply string, literals chan<- [
 				if _, err := rd.ReadString('\n'); err != nil {
 					return false
 				}
-				if literals != nil {
-					literals <- got.Bytes()
+				if appends != nil {
+					appends <- capturedAppend{arg: cmd.arg, literal: got.Bytes()}
 				}
 				writeLine(conn, "%s %s", cmd.tag, appendReply)
 			case "LOGOUT":

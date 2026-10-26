@@ -1325,6 +1325,141 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered(
 	}
 }
 
+// Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce asserts
+// that all batches of one stream share one EXAMINE, also for a non-ASCII name,
+// which go-imap keeps as given but sends in modified UTF-7.
+func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		folder   string
+		wireName string
+	}{
+		{name: "ASCII name", folder: "INBOX", wireName: "INBOX"},
+		{name: "non-ASCII name", folder: "Entw\u00fcrfe", wireName: "Entw&APw-rfe"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fetches := new(uidFetchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+			c := newClientWithFake(t, srv)
+
+			uids := make([]uint32, 2*uidFetchBatchSize+1)
+			for i := range uids {
+				uids[i] = uint32(i + 1)
+			}
+			var got []uint32
+			err := c.StreamMessagesByUIDs(t.Context(), tt.folder, uids, func(msg Message) error {
+				got = append(got, msg.m.Uid)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("StreamMessagesByUIDs: %v", err)
+			}
+
+			if !slices.Equal(got, uids) {
+				t.Errorf("callback ran %d times, want %d, once per UID in order", len(got), len(uids))
+			}
+			if got, want := srv.capturedNames("EXAMINE"), []string{tt.wireName}; !slices.Equal(got, want) {
+				t.Errorf("EXAMINE names = %v, want %v (one EXAMINE for all batches)", got, want)
+			}
+			if got := srv.callCount("UID FETCH"); got != 3 {
+				t.Errorf("UID FETCH count = %d, want 3 (500 + 500 + 1)", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 1 {
+				t.Errorf("LOGIN count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_ReselectsOnANewSession
+// asserts that a selection made before a BYE does not carry over: the stream
+// logs in, selects again and delivers each UID once.
+func Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_ReselectsOnANewSession(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, byeAfterExamine(release)))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+	first := c.c.Load()
+	if _, err := c.selectIfNeeded(first, "INBOX"); err != nil {
+		t.Fatalf("selectIfNeeded: %v", err)
+	}
+	releaseOnce()
+	awaitSignal(t, first.LoggedOut(), "the first session to end after the BYE")
+
+	uids := []uint32{1, 2, 3}
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", uids, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success after the reconnect", err)
+	}
+
+	if !slices.Equal(got, uids) {
+		t.Errorf("callback got UIDs %v, want each of %v exactly once", got, uids)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one fresh session after the BYE)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the new session selects the folder)", got)
+	}
+	if gotSets, want := fetches.all(), [][]uint32{uids}; !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH asked for %v, want %v (only the new session fetches)", gotSets, want)
+	}
+}
+
+// Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_ReconnectsOnce
+// asserts that a refusal whose server text holds a transient phrase because it
+// echoes the folder name costs one reconnect, not a loop, and then returns the refusal.
+func Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_ReconnectsOnce(t *testing.T) {
+	t.Parallel()
+
+	const folder = "Not logged in"
+	refuseExamine := func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "EXAMINE" {
+			return false, true
+		}
+		writeLine(conn, "%s NO Mailbox doesn't exist: %s", cmd.tag, firstArg(cmd.arg))
+		return true, true
+	}
+	srv := newFakeServer(t)
+	// More connections than the single reconnect may use, all serving the same refusal.
+	for range 4 {
+		srv.addConnHandler(interceptHandler(srv, refuseExamine))
+	}
+	c := newClientWithFake(t, srv)
+
+	_, _, err := c.FetchMessageMap(t.Context(), folder)
+
+	if err == nil {
+		t.Fatal("FetchMessageMap returned nil, want the refusal")
+	}
+	if want := "Mailbox doesn't exist: " + folder; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err, want)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (one reconnect and no more)", got)
+	}
+	if got := srv.callCount("EXAMINE"); got != 2 {
+		t.Errorf("EXAMINE count = %d, want 2 (the first attempt and its single retry)", got)
+	}
+}
+
 // Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries
 // asserts that a folder name or a label never keeps a dropped connection from
 // being repaired: the error class comes from go-imap, not from our wrapper text.

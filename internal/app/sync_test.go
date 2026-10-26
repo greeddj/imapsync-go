@@ -1801,6 +1801,11 @@ func TestRunSync_When_CreateAnswersDuplicateFolderName_Then_SyncCompletes(t *tes
 	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
 	assertContainsAll(t, out.String(), "Folder Work already exists")
 	assertContainsNone(t, out.String(), "Failed to create folder", "failed to create")
+	// One LIST per connected client: the planning client and the single worker.
+	// The duplicate-folder reply must not make either of them list again.
+	if n := dst.callCount("LIST"); n != 2 {
+		t.Errorf("dst LIST count = %d, want 2", n)
+	}
 }
 
 func TestRunSync_When_AppendRefused_Then_ReportsErrorsAndExitsSilently(t *testing.T) {
