@@ -34,7 +34,7 @@ cmd/imapsync-go/commands/       - thin subcommand definitions (sync, show); they
 internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, builds the plan, confirms, dispatches to worker pool
 internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table
 internal/app/worker.go          - syncWorker pool + runFolderSync helper consumed by sync.go
-internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect with the give-up and revive gate, Select that trusts the session state
+internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect with the give-up and revive gate, Select that trusts the go-imap session state
 internal/client/watchdog.go     - idleConn: inactivity watchdog for commands in flight
 internal/client/fetch.go        - single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH, a retry fetches only the UIDs not yet delivered)
 internal/client/mailbox.go      - MailboxExists / ListSubfolders / CreateMailbox via the cache
@@ -102,14 +102,14 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
   - no byte moved in either direction for `idleDur`.
 - Any byte in either direction resets the idle time to zero. The watchdog limits inactivity, not total time, so a transfer that moves bytes is never cut. A session that is idle between commands is never closed.
 - When the watchdog trips, the pending call fails. `idleErr` wraps its error with `errIdleTimeout` (`no data from server`) and `os.ErrDeadlineExceeded`, so `classifyError` returns `ClassTransient`. `safeCall` then reconnects and retries once, inside the `reconnectInterval`, `maxReconnectAttempts` and backoff limits. Example error text: `imap: connection closed: no data from server within 5m0s: i/o timeout`. Before the reconnect, `noteIdleTrip` writes one line with the reason to the progress writer, or to the tracker when no writer is set. It does this also without `--verbose`, because a trip is rare.
-- A LOGIN that gets no reply during a reconnect trips too, so `reconnect` never holds `c.mu` without a limit. `AppendMessage` returns the error and repairs the connection (existing behaviour). The next run copies that message through the Message-Id diff.
+- A LOGIN that gets no reply during a reconnect trips too, so `reconnect` never holds `c.mu` without a limit. A trip during an APPEND follows the `AppendMessage` rules in Section 5.
 - A trip never calls `Cancel` and never sets the cancelled flag. Each cancellation check runs before the error handling. So Ctrl-C returns `context.Canceled`, also after a trip.
 - `StreamMessagesByUIDs` ends the span while `onMessage` runs, because that time is our own work (usually the destination APPEND). At the end of a batch the source is done and silent. Code that runs caller work inside a `safeCall` closure must also end the span, and open it again after. A wait for read tokens runs outside `idleConn`, so it never counts.
 - Accepted edge: the watchdog cannot see a wait for write tokens. If one literal write (up to 32 KiB) waits `idleTimeout` or more for tokens, the watchdog trips. This needs an upload limit below about 110 bytes per second for each worker that uploads at the same time. The limiter is shared between the workers. `runSync` prints a warning before the plan when `--bps-up` is below `client.MinUploadBPS(workers)`, which computes that floor from `maxLiteralWrite` and `idleTimeout`.
 - Each connection has one timer, and `Close` stops it. Without an open span the timer does not run. A timer that is pending when a span ends fires once, finds no span and stops.
-- `selectIfNeeded(cli, folder)` sends no EXAMINE when the go-imap session reports `folder` as selected. A BYE, a failed EXAMINE and a reconnect each clear that state, so the check never relies on a wrong folder. **Use it instead of `cli.Select` directly** - `StreamMessagesByUIDs` saves one round-trip per 500-message batch this way.
+- `selectIfNeeded(cli, folder)` sends no EXAMINE only when `cli.State()` is `imap.SelectedState` and `cli.Mailbox()` has the name `folder`. go-imap clears the selected mailbox after a BYE and after a failed EXAMINE. A new session after a reconnect has no selected mailbox. The Client does not store a copy of the selected folder, because a copy can differ from the session. **Use it instead of `cli.Select` directly** - `StreamMessagesByUIDs` saves one round-trip per 500-message batch this way.
 - `StreamMessagesByUIDs` batches `UID FETCH` in chunks of `uidFetchBatchSize = 500` to avoid IMAP "Too long argument" errors. Don't unbatch.
-- A retry of a `StreamMessagesByUIDs` batch (after a transient error, through `safeCall`) fetches only the UIDs whose body `onMessage` did not receive. If `onMessage` received all of them, the retry sends no SELECT or FETCH command. The code does not deliver a second response with the body for the same UID. So a retry creates no duplicate APPEND on the destination. A response without a body does not mark its UID.
+- A retry of a `StreamMessagesByUIDs` batch (after a transient error, through `safeCall`) fetches only the UIDs whose body `onMessage` did not receive. If `onMessage` received all of them, the retry sends no EXAMINE or FETCH command. The code does not deliver a second response with the body for the same UID. So a retry creates no duplicate APPEND on the destination. A response without a body does not mark its UID.
 - Folder creation uses a per-path `sync.Mutex` (`folderLocks` map) to make concurrent `CreateMailbox` calls for nested paths race-free; parents are created walking down the hierarchy.
 - `c.pw` and `c.tracker` are `atomic.Pointer[progressWriterRef|progressTrackerRef]`. Read via `c.progressWriter()` / `c.progressTracker()`; do not access the fields directly.
 - go-imap writes every read error to stderr, including the error that each `Terminate` causes. `greet` calls `routeErrorLog` right after `imapclient.New` returns, also for a client that go-imap returns with an error. Without `--verbose`, the log goes to `io.Discard`. With `--verbose`, the logger output goes through `termsafe.NewWriter`, because the lines quote raw server responses. The function changes the output of the existing `*log.Logger` with `SetOutput`, because the reader goroutine already runs and a field write would race. Section 6 describes the lines that go-imap logs before `routeErrorLog` runs.
@@ -132,7 +132,27 @@ Users can press Ctrl+\ (SIGQUIT) to get an immediate goroutine dump and exit. A 
 
 `StreamMessagesByUIDs` fetches via `BODY.PEEK[]` (`fullBodyPeekSection`), not `FetchRFC822`. The two are functionally equivalent for transferring the message but `FetchRFC822` sets `\Seen` on every message - a state mutation a sync tool must not introduce on the source. If you add new fetch sites, mirror this choice.
 
-`AppendMessage` passes `msg.GetBody(...)` straight to `cli.Append` - no `io.ReadAll` round-trip - to halve peak RAM with large attachments. The trade-off is that a transient mid-APPEND error cannot be retried (the literal has been partially consumed); the next sync run picks the message up via the Message-Id diff.
+`AppendMessage` passes `msg.GetBody(...)` straight to `cli.Append` - no `io.ReadAll` round-trip - to halve peak RAM with large attachments. go-imap reads the body one time.
+
+Before the APPEND, `AppendMessage` calls `reconnectSession` in these cases:
+
+- the Client holds no session;
+- `sessionEnded` reports that `cli.LoggedOut()` is closed, after a BYE or a closed socket.
+
+After a BYE, go-imap refuses the APPEND with `Not logged in`. After a closed socket without a BYE, an APPEND can wait for the `+` continuation with no time limit (see the Known limitation in Section 3).
+
+`readTracker` records the first `Read` call of go-imap on the body. The APPEND gets one retry when all these conditions are true:
+
+- the error is `ClassTransient`;
+- go-imap did not start to read the body, so the server did not get the message;
+- this call did not reconnect before;
+- the context did not end, and `Cancel()` did not run.
+
+For the retry, `AppendMessage` calls `reconnectSession` one time and sends the APPEND again.
+
+After go-imap started to read the body, `AppendMessage` does not send the APPEND again. The server can already have the message, and a second APPEND can make a duplicate. If the context ended, `AppendMessage` returns the context error and does not repair the session. If not, it calls `reconnect` to repair the session when the error is `ClassTransient`, this call did not reconnect before, and `Cancel()` did not run. Then it returns the APPEND error. The next sync run copies the message through the Message-Id diff.
+
+One `AppendMessage` call reconnects a maximum of one time. `AppendMessage` does not use `safeCall`, because `safeCall` sends a command again after a transient error also when go-imap read the body. Each attempt runs through `call`, so each attempt has its own watchdog span.
 
 ### 6. Terminal output (`internal/termsafe`)
 

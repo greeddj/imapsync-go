@@ -9,7 +9,7 @@
 ## What we test
 
 - **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), env interpolation.
-- **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll). Select tests cover the `selectIfNeeded` short-circuit and the new EXAMINE after a BYE or a failed EXAMINE.
+- **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
@@ -26,6 +26,21 @@
   - `Test_safeCall_When_CancelledDuringReviveProbe_Then_ReturnsCanceledAndKeepsGiveUp` - a cancelled login attempt returns `context.Canceled` and keeps the earlier give-up;
   - the "account lock" and "account lockout" cases of `Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt` - after an account-lock reply, the Client sends no further login;
   - `Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown` - `AppendMessage` goes through the same gate.
+
+  The `selectIfNeeded` check has these tests:
+  - `Test_selectIfNeeded_shortCircuitsOnNetwork` - a second call for the selected folder sends no EXAMINE;
+  - `Test_selectIfNeeded_When_FolderDiffers_Then_SelectsAgain` - a different folder gets a new EXAMINE;
+  - `Test_selectIfNeeded_When_SessionEndedByBye_Then_DoesNotShortCircuit` - after a BYE, the call does not use the old selection;
+  - `Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain` - after a failed EXAMINE of another folder, the earlier folder gets a new EXAMINE;
+  - `Test_selectIfNeeded_afterReconnect_reSelects` - the session after a reconnect gets a new EXAMINE;
+  - `Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries` - a BYE between the EXAMINE and the FETCH gets a reconnect, and the retry selects again.
+
+  The APPEND retry has these tests:
+  - `Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends` - a session that ended with a BYE or a closed socket gets a reconnect before the APPEND;
+  - `Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce` - a transient failure before go-imap reads the body gets one reconnect and one APPEND, and the first connection gets no APPEND;
+  - `Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry` - after go-imap read the body (an empty body too), the call repairs the session and sends no second APPEND;
+  - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` - a failure in the middle of the literal gets a repair and no second APPEND;
+  - `Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain` and `Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect` - one call reconnects a maximum of one time.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (Message-Id intersection), subfolder expansion, delimiter reconciliation, worker pool dispatch.
@@ -56,9 +71,6 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`Client.SetPrefix`, `Client.GetDelimiter`** - trivial one-liners; observable in all fake-server tests that set a delimiter.
 - **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
 - **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
-- **`AppendMessage` mid-APPEND transient retry** - the code hands `msg.GetBody(...)` straight to `cli.Append`, with no `io.ReadAll`. The client consumes part of the literal before it detects a mid-APPEND error, so nothing remains to retry. The next sync run recovers through the Message-Id diff. A test of this path needs a mock that fails in the middle of a literal. Such a mock does not test real go-imap behaviour. Two nearby paths have tests:
-  - `Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry` covers the reconnect after a failed APPEND whose body was sent;
-  - `Test_AppendMessage_whenContextExpiresMidAppend` covers a context that ends mid-APPEND.
 - **`safeCall` post-reconnect `isCancelled()` branch** - exercising it requires `Cancel()` to race between reconnect-completion and retry-fn dispatch. The window is a single `c.isCancelled()` call; deterministic coverage would require a production hook (e.g. an injected callback between reconnect and retry), which adds test-only complexity with no safety benefit beyond the existing `Cancel` interrupt tests.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
   - `StreamMessagesByUIDs`, at the top of the second and later batches;

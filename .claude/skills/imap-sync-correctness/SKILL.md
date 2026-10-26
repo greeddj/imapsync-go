@@ -16,9 +16,9 @@ This is a sync tool. The single most important property is "running it again doe
 
 1. **`FetchRFC822` sets `\Seen`.** Use `BODY.PEEK[...]` everywhere. A sync tool must not mutate source state. If you see `FetchRFC822` anywhere outside a test, that's a bug.
 2. **Bypassing `safeCall`.** Direct `c.Client.<method>` calls skip the reconnect+classify+cancel pipeline. New IMAP ops always go through `safeCall`.
-3. **Skipping `selectIfNeeded`.** Calling `cli.Select` directly costs a round-trip per batch and races with reconnect. Always use `selectIfNeeded`.
+3. **Skipping `selectIfNeeded`.** Calling `cli.Select` directly costs one round-trip per batch. `selectIfNeeded` reads only the go-imap session state, which a BYE, a failed EXAMINE and a reconnect clear. Always use `selectIfNeeded`. Do not store the selected folder in the Client, because a stored copy can differ from the session.
 4. **Unbatched UID FETCH.** `uidFetchBatchSize = 500` exists because some servers reject longer arg lists with "Too long argument". Do not unbatch.
-5. **Streaming APPEND retry.** `AppendMessage` consumes the message body once. A transient mid-APPEND error cannot be retried inside this run - the literal is gone. The diff catches it on the next run. Do not "fix" this by adding `io.ReadAll` - that doubles peak RAM.
+5. **Streaming APPEND retry.** `AppendMessage` streams the body, and go-imap reads it one time. It reconnects and sends the APPEND again one time, only when a `ClassTransient` failure came before go-imap started to read the body. After go-imap started to read the body, a second APPEND can make a duplicate, so the next run's Message-Id diff copies the message. Do not "fix" this with `io.ReadAll`, which doubles peak RAM, or with `safeCall`, which retries also after a partial read.
 6. **Per-connection rate limiters.** The limiters are global by design (one per direction, shared across all Clients on that side). Per-connection limiters would defeat the BPS cap. Don't introduce them.
 7. **Reconnect storms.** `reconnectInterval = 10s`, `maxReconnectAttempts = 5`, `throttledBackoff = 5m`, `reviveInterval = 5m`. Don't weaken these "for testing" without reverting before commit.
 8. **Mailbox cache.** Populated by one `LIST "" "*"` per Client. Invalidated only on `CreateMailbox`. Re-LISTing on every check is a regression.

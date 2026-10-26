@@ -16,9 +16,9 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 1. **Plan, confirm, execute** - never stream-as-you-go. The Message-Id diff must be computed and shown before any write to the destination. `--quiet` hides the plan, so it requires `--confirm`.
 2. **Idempotency = Message-Id diff**, not UID bookkeeping. Do not add a state store.
 3. **`BODY.PEEK[...]` everywhere a body or header is fetched** - `FetchRFC822` sets `\Seen` on the source, which is a write a sync tool must not perform.
-4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. Transient mid-APPEND failures are tolerated because the next run re-diffs.
+4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. After a `ClassTransient` failure, it reconnects and sends the APPEND again one time, only when go-imap did not start to read the body. After go-imap started to read the body, it sends no second APPEND, because the server can already have the message. The next run's Message-Id diff copies it. Do not move `AppendMessage` into `safeCall`, because `safeCall` retries also after a partial read.
 5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch - servers reject longer arg lists.
-6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state.
+6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state. Do not store the selected folder in the Client: a stored copy can differ from the real session.
 7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
 
 ## Connection resilience
