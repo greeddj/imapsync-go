@@ -2178,6 +2178,80 @@ func TestActionSync_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *tes
 	}
 }
 
+// writeAuthConfig stores a config for the given servers. The auth value sits on
+// the given side, either "src" or "dst", and the other side has no auth key.
+func writeAuthConfig(t *testing.T, ext string, src, dst *fakeServer, side, value string) string {
+	t.Helper()
+
+	authFor := func(forSide string) string {
+		switch {
+		case forSide != side:
+			return ""
+		case ext == ".json":
+			return fmt.Sprintf(`,"auth":%q`, value)
+		default:
+			return fmt.Sprintf("  auth: %q\n", value)
+		}
+	}
+
+	var content string
+	if ext == ".json" {
+		content = fmt.Sprintf(
+			`{"src":{"server":%q,"user":"alice","pass":%q%s},"dst":{"server":%q,"user":"bob","pass":%q%s}}`,
+			src.ln.Addr().String(), e2ePassword, authFor("src"), dst.ln.Addr().String(), e2ePassword, authFor("dst"))
+	} else {
+		content = fmt.Sprintf(
+			"src:\n  server: %q\n  user: alice\n  pass: %q\n%sdst:\n  server: %q\n  user: bob\n  pass: %q\n%s",
+			src.ln.Addr().String(), e2ePassword, authFor("src"), dst.ln.Addr().String(), e2ePassword, authFor("dst"))
+	}
+	path := filepath.Join(t.TempDir(), "config"+ext)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func TestActionSync_When_AuthIsUnsupported_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		ext   string
+		side  string
+		value string
+	}{
+		{name: "JSON destination", ext: ".json", side: "dst", value: "xoauth2"},
+		{name: "YAML source", ext: ".yaml", side: "src", value: "cram_md5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst := newFakeServer(t), newFakeServer(t)
+			srcDialed, dstDialed := watchDials(src), watchDials(dst)
+			cfgPath := writeAuthConfig(t, tt.ext, src, dst, tt.side, tt.value)
+
+			err := runCLIAction(t, ActionSync, "sync", syncFlags(), "-c", cfgPath, "sync", "-y")
+
+			if !errors.Is(err, config.ErrAuthUnsupported) {
+				t.Fatalf("error = %v, want %v", err, config.ErrAuthUnsupported)
+			}
+			for _, want := range []string{"failed to load config", tt.side + ": ", strconv.Quote(tt.value)} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), e2ePassword) {
+				t.Errorf("error = %q, want no password", err)
+			}
+			if srcDialed.Load() || dstDialed.Load() {
+				t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())
+			}
+			assertNoLogin(t, src, dst)
+		})
+	}
+}
+
 func TestActionSync_When_MapEntryHasNoFolderName_Then_RefusesBeforeConnecting(t *testing.T) {
 	t.Parallel()
 

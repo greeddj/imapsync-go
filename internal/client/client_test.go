@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -932,6 +933,91 @@ func Test_New_cramMD5Succeeds(t *testing.T) {
 			}
 			if got := srv.callCount("LIST"); got != 1 {
 				t.Errorf("LIST count = %d, want 1 (mailbox cache load after authentication)", got)
+			}
+		})
+	}
+}
+
+// Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing asserts that an
+// unknown mechanism is an error, not a silent LOGIN, and that no connection is
+// made. A dial would run the server handler before New can return.
+func Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing(t *testing.T) {
+	t.Parallel()
+
+	const password = "secret-pass"
+
+	for _, auth := range []string{"cram_md5", "crammd5", "xoauth2", "plain"} {
+		t.Run(auth, func(t *testing.T) {
+			t.Parallel()
+
+			var dialed atomic.Bool
+			srv := newFakeServer(t)
+			serve := cramMD5Handler(srv, "user", password)
+			srv.addConnHandler(func(conn net.Conn) {
+				dialed.Store(true)
+				serve(conn)
+			})
+
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", password, Options{
+				Auth:        auth,
+				DialTimeout: 5 * time.Second,
+			})
+
+			if c != nil {
+				c.Cancel()
+				t.Fatal("New returned a client, want nil")
+			}
+			if !errors.Is(err, errUnsupportedAuth) {
+				t.Fatalf("New error = %v, want %v", err, errUnsupportedAuth)
+			}
+			if !strings.Contains(err.Error(), strconv.Quote(auth)) {
+				t.Errorf("New error = %q, want the quoted value %s", err, strconv.Quote(auth))
+			}
+			if strings.Contains(err.Error(), password) {
+				t.Errorf("New error = %q, want no password", err)
+			}
+			if dialed.Load() {
+				t.Error("server accepted a connection, want no dial")
+			}
+			if got := srv.callCount("LOGIN"); got != 0 {
+				t.Errorf("LOGIN count = %d, want 0", got)
+			}
+			if got := srv.callCount("AUTHENTICATE"); got != 0 {
+				t.Errorf("AUTHENTICATE count = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// Test_New_When_AuthIsLoginInAnyCase_Then_SendsLogin asserts that an empty value
+// and every letter case of "login" select LOGIN.
+func Test_New_When_AuthIsLoginInAnyCase_Then_SendsLogin(t *testing.T) {
+	t.Parallel()
+
+	for _, auth := range []string{"", "login", "LOGIN", "Login"} {
+		t.Run(strconv.Quote(auth), func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(cramMD5Handler(srv, "user", "pass"))
+
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{
+				Auth:        auth,
+				DialTimeout: 5 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if got := srv.callCount("LOGIN"); got != 1 {
+				t.Errorf("LOGIN count = %d, want 1", got)
+			}
+			if got := srv.callCount("AUTHENTICATE"); got != 0 {
+				t.Errorf("AUTHENTICATE count = %d, want 0", got)
 			}
 		})
 	}

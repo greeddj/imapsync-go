@@ -16,7 +16,7 @@ import (
 )
 
 // Sentinel errors returned by Config.validate. Callers can match on these
-// with errors.Is to distinguish missing fields from other failures.
+// with errors.Is to distinguish missing or unsupported fields from other failures.
 var (
 	ErrSrcServerRequired = errors.New("source server is required")
 	ErrSrcUserRequired   = errors.New("source user is required")
@@ -26,6 +26,7 @@ var (
 	ErrDstPassRequired   = errors.New("destination password is required")
 	ErrMapSrcRequired    = errors.New(`"src" folder name is required`)
 	ErrMapDstRequired    = errors.New(`"dst" folder name is required`)
+	ErrAuthUnsupported   = errors.New("unsupported auth mechanism")
 )
 
 var errTrailingContent = errors.New("unexpected content after the first document")
@@ -217,7 +218,17 @@ func clampWorkers(n int) int {
 	}
 }
 
-// validate checks that all required configuration fields are present.
+// checkAuth lowers the value the way the client does, so both accept the same
+// inputs. The error carries the value, never a password.
+func checkAuth(side, auth string) error {
+	switch strings.ToLower(auth) {
+	case "", "login", "cram-md5":
+		return nil
+	}
+	return fmt.Errorf("%s: %w %q, use \"login\" or \"cram-md5\"", side, ErrAuthUnsupported, auth)
+}
+
+// validate checks the required fields and the values of auth and map items.
 func (c *Config) validate() error {
 	if c.Src.Server == "" {
 		return ErrSrcServerRequired
@@ -228,6 +239,9 @@ func (c *Config) validate() error {
 	if c.Src.Pass == "" {
 		return ErrSrcPassRequired
 	}
+	if err := checkAuth("src", c.Src.Auth); err != nil {
+		return err
+	}
 	if c.Dst.Server == "" {
 		return ErrDstServerRequired
 	}
@@ -236,6 +250,9 @@ func (c *Config) validate() error {
 	}
 	if c.Dst.Pass == "" {
 		return ErrDstPassRequired
+	}
+	if err := checkAuth("dst", c.Dst.Auth); err != nil {
+		return err
 	}
 	for i := range c.Map {
 		if c.Map[i].Source == "" {

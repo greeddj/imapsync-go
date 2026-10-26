@@ -269,6 +269,32 @@ func TestActionShow_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *tes
 	assertNoLogin(t, src, dst)
 }
 
+func TestActionShow_When_AuthIsUnsupported_Then_RefusesBeforeConnecting(t *testing.T) {
+	t.Parallel()
+
+	src, dst := newFakeServer(t), newFakeServer(t)
+	srcDialed, dstDialed := watchDials(src), watchDials(dst)
+	cfgPath := writeAuthConfig(t, ".json", src, dst, "dst", "crammd5")
+
+	err := runCLIAction(t, ActionShow, "show", showFlags(), "-c", cfgPath, "show", "-q")
+
+	if !errors.Is(err, config.ErrAuthUnsupported) {
+		t.Fatalf("error = %v, want %v", err, config.ErrAuthUnsupported)
+	}
+	for _, want := range []string{"load config", "dst: ", `"crammd5"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), e2ePassword) {
+		t.Errorf("error = %q, want no password", err)
+	}
+	if srcDialed.Load() || dstDialed.Load() {
+		t.Errorf("dialed source = %v, destination = %v, want no connection", srcDialed.Load(), dstDialed.Load())
+	}
+	assertNoLogin(t, src, dst)
+}
+
 func TestActionShow_When_MapEntryHasNoFolderName_Then_RefusesBeforeConnecting(t *testing.T) {
 	t.Parallel()
 

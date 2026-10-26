@@ -59,7 +59,10 @@ const (
 	reviveInterval = 5 * time.Minute
 )
 
-var errLogoutTimeout = errors.New("imap logout: no reply from server")
+var (
+	errLogoutTimeout   = errors.New("imap logout: no reply from server")
+	errUnsupportedAuth = errors.New("unsupported auth mechanism")
+)
 
 // ProgressWriter is a minimal interface for progress tracking and logging.
 // This avoids circular dependency with the progress package.
@@ -82,7 +85,7 @@ type Options struct {
 	TLSConfig    *tls.Config
 	ReadLimiter  *rate.Limiter
 	WriteLimiter *rate.Limiter
-	Auth         string
+	Auth         string // "", "login" or "cram-md5" in any letter case; New refuses other values
 	DialTimeout  time.Duration
 	UseTLS       bool
 	Verbose      bool
@@ -164,6 +167,10 @@ func newDialer(timeout time.Duration) *net.Dialer {
 // mailbox list. Afterwards reconnects stop on Cancel, so callers need not keep
 // ctx alive.
 func New(ctx context.Context, addr, username, password string, opts Options) (*Client, error) {
+	if !supportedAuth(opts.Auth) {
+		return nil, fmt.Errorf("%w %q", errUnsupportedAuth, opts.Auth)
+	}
+
 	timeout := opts.DialTimeout
 	if timeout == 0 {
 		timeout = defaultDialTimeout
@@ -219,6 +226,16 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	c.delimiter = c.mailboxCache.delimiter
 
 	return c, nil
+}
+
+// supportedAuth lowers the value as connectAndLogin does, so the default branch
+// of its switch sees only an empty value or login.
+func supportedAuth(mech string) bool {
+	switch strings.ToLower(mech) {
+	case "", "login", "cram-md5":
+		return true
+	}
+	return false
 }
 
 // selectIfNeeded trusts only cli's own state: a BYE, a failed SELECT and a

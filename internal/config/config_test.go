@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -775,5 +776,209 @@ func Test_restoreNullMapEntries_When_YAMLIsMalformed_Then_ReturnsError(t *testin
 	}
 	if cfg.Map != nil {
 		t.Errorf("Map = %+v, want nil", cfg.Map)
+	}
+}
+
+const authTestPass = "s3cret-auth-pass"
+
+// authConfig builds a config file of the given format. Each auth value is a raw
+// JSON or YAML scalar, and an empty one leaves the key out.
+func authConfig(ext, srcAuth, dstAuth string) string {
+	if ext == ".json" {
+		key := func(raw string) string {
+			if raw == "" {
+				return ""
+			}
+			return `,"auth":` + raw
+		}
+		return `{"src":{"server":"s:993","user":"u","pass":"` + authTestPass + `"` + key(srcAuth) + `},` +
+			`"dst":{"server":"d:993","user":"u","pass":"` + authTestPass + `"` + key(dstAuth) + `}}`
+	}
+	line := func(raw string) string {
+		if raw == "" {
+			return ""
+		}
+		return "  auth: " + raw + "\n"
+	}
+	return "src:\n  server: s:993\n  user: u\n  pass: " + authTestPass + "\n" + line(srcAuth) +
+		"dst:\n  server: d:993\n  user: u\n  pass: " + authTestPass + "\n" + line(dstAuth)
+}
+
+var authExtensions = []string{".json", ".yaml", ".yml"}
+
+func TestNew_When_AuthIsSupported_Then_LoadsItUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		raw      string
+		want     string
+		yamlOnly bool
+	}{
+		{name: "key absent"},
+		{name: "empty string", raw: `""`},
+		{name: "null", raw: "null"},
+		{name: "YAML tilde", raw: "~", yamlOnly: true},
+		{name: "lower case login", raw: `"login"`, want: "login"},
+		{name: "upper case login", raw: `"LOGIN"`, want: "LOGIN"},
+		{name: "mixed case login", raw: `"Login"`, want: "Login"},
+		{name: "lower case cram-md5", raw: `"cram-md5"`, want: "cram-md5"},
+		{name: "upper case cram-md5", raw: `"CRAM-MD5"`, want: "CRAM-MD5"},
+		{name: "mixed case cram-md5", raw: `"Cram-Md5"`, want: "Cram-Md5"},
+	}
+	for _, ext := range authExtensions {
+		for _, tt := range tests {
+			if tt.yamlOnly && ext == ".json" {
+				continue
+			}
+			for _, side := range []string{"src", "dst"} {
+				t.Run(ext+" "+tt.name+" on "+side, func(t *testing.T) {
+					t.Parallel()
+
+					srcAuth, dstAuth := tt.raw, ""
+					if side == "dst" {
+						srcAuth, dstAuth = "", tt.raw
+					}
+
+					cfg, err := runNewWithArgs(t, ext, authConfig(ext, srcAuth, dstAuth))
+
+					if err != nil {
+						t.Fatalf("New: %v", err)
+					}
+					wantSrc, wantDst := tt.want, ""
+					if side == "dst" {
+						wantSrc, wantDst = "", tt.want
+					}
+					if cfg.Src.Auth != wantSrc || cfg.Dst.Auth != wantDst {
+						t.Errorf("Auth = %q/%q, want %q/%q", cfg.Src.Auth, cfg.Dst.Auth, wantSrc, wantDst)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestNew_When_AuthIsUnsupported_Then_ReturnsErrorNamingSideAndValue(t *testing.T) {
+	t.Parallel()
+
+	values := []string{"cram_md5", "crammd5", "xoauth2", "plain", " login", "cram-md5 "}
+	const hint = `"login" or "cram-md5"`
+
+	for _, ext := range authExtensions {
+		for _, value := range values {
+			for _, side := range []string{"src", "dst"} {
+				t.Run(ext+" "+strconv.Quote(value)+" on "+side, func(t *testing.T) {
+					t.Parallel()
+
+					srcAuth, dstAuth, other := strconv.Quote(value), `"CRAM-MD5"`, "dst"
+					if side == "dst" {
+						srcAuth, dstAuth, other = `"CRAM-MD5"`, strconv.Quote(value), "src"
+					}
+
+					cfg, err := runNewWithArgs(t, ext, authConfig(ext, srcAuth, dstAuth))
+
+					if cfg != nil {
+						t.Errorf("Config = %+v, want nil", cfg)
+					}
+					if !errors.Is(err, ErrAuthUnsupported) {
+						t.Fatalf("error = %v, want %v", err, ErrAuthUnsupported)
+					}
+					msg := err.Error()
+					if !strings.HasPrefix(msg, side+": ") {
+						t.Errorf("error = %q, want the prefix %q", msg, side+": ")
+					}
+					if !strings.Contains(msg, strconv.Quote(value)) {
+						t.Errorf("error = %q, want the quoted value %s", msg, strconv.Quote(value))
+					}
+					if !strings.Contains(msg, hint) {
+						t.Errorf("error = %q, want the hint %s", msg, hint)
+					}
+					if strings.Contains(msg, authTestPass) {
+						t.Errorf("error = %q, want no password", msg)
+					}
+					if strings.Contains(msg, other+": ") {
+						t.Errorf("error = %q, want no mention of %q", msg, other)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestValidate_When_AuthIsUnsupported_Then_ChecksBlocksInOrder(t *testing.T) {
+	t.Parallel()
+
+	valid := Credentials{Server: "imap.example.com:993", User: "user@example.com", Pass: "password"}
+	withAuth := func(c Credentials, auth string) Credentials {
+		c.Auth = auth
+		return c
+	}
+	badSrc, badDst := withAuth(valid, "xoauth2"), withAuth(valid, "plain")
+
+	tests := []struct {
+		wantErr    error
+		name       string
+		wantPrefix string
+		config     Config
+	}{
+		{
+			name:    "bad source auth with a missing source server",
+			wantErr: ErrSrcServerRequired,
+			config:  Config{Src: Credentials{User: "u", Pass: "p", Auth: "xoauth2"}, Dst: valid},
+		},
+		{
+			name:    "bad source auth with a missing source user",
+			wantErr: ErrSrcUserRequired,
+			config:  Config{Src: Credentials{Server: "s:993", Pass: "p", Auth: "xoauth2"}, Dst: valid},
+		},
+		{
+			name:    "bad source auth with a missing source password",
+			wantErr: ErrSrcPassRequired,
+			config:  Config{Src: Credentials{Server: "s:993", User: "u", Auth: "xoauth2"}, Dst: valid},
+		},
+		{
+			name: "bad source auth with a missing destination server", wantErr: ErrAuthUnsupported, wantPrefix: "src: ",
+			config: Config{Src: badSrc, Dst: Credentials{User: "u", Pass: "p"}},
+		},
+		{
+			name: "bad source auth with a bad destination auth", wantErr: ErrAuthUnsupported, wantPrefix: "src: ",
+			config: Config{Src: badSrc, Dst: badDst},
+		},
+		{
+			name:    "bad destination auth with a missing destination password",
+			wantErr: ErrDstPassRequired,
+			config:  Config{Src: valid, Dst: Credentials{Server: "d:993", User: "u", Auth: "plain"}},
+		},
+		{
+			name: "bad destination auth with a map item without a source", wantErr: ErrAuthUnsupported, wantPrefix: "dst: ",
+			config: Config{Src: valid, Dst: badDst, Map: []DirectoryMapping{{Destination: "INBOX"}}},
+		},
+		{
+			name:   "CRAM-MD5 on both sides",
+			config: Config{Src: withAuth(valid, "CRAM-MD5"), Dst: withAuth(valid, "CRAM-MD5")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.config.validate()
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("validate() error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr == nil {
+				return
+			}
+			if !errors.Is(tt.wantErr, ErrAuthUnsupported) {
+				if errors.Is(err, ErrAuthUnsupported) {
+					t.Errorf("validate() error = %v, also matches %v", err, ErrAuthUnsupported)
+				}
+				return
+			}
+			if !strings.HasPrefix(err.Error(), tt.wantPrefix) {
+				t.Errorf("validate() error = %q, want the prefix %q", err, tt.wantPrefix)
+			}
+		})
 	}
 }

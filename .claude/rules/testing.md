@@ -8,12 +8,13 @@
 
 ## What we test
 
-- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case). The tests also cover unknown keys at every level in both formats, content after the first document, empty files, and the load of both example files.
+- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), the accepted and rejected `auth` values. The tests also cover unknown keys at every level in both formats, content after the first document, empty files, and the load of both example files.
 - **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
   - CRAM-MD5 failure and success;
+  - an unknown auth mechanism that `New` refuses before it dials;
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
 
