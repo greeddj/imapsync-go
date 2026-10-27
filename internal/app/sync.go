@@ -193,7 +193,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	case opts.srcFolder != "" || opts.dstFolder != "":
 		return errors.New("both --src-folder and --dest-folder must be specified")
 	case len(cfg.Map) > 0:
-		mappings = cfg.Map
+		// A delimiter rewrite edits entries in place, and cfg.Map belongs to the caller.
+		mappings = slices.Clone(cfg.Map)
 	}
 
 	if !quiet && verbose {
@@ -236,17 +237,19 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		return err
 	}
 
-	// No mapping from flags or config: mirror every source folder. The names
-	// come from the planning client's mailbox cache, so no extra session opens.
-	if len(mappings) == 0 {
-		for _, name := range srcClient.MailboxNames() {
-			mappings = append(mappings, config.DirectoryMapping{Source: name, Destination: name})
-		}
-	}
-
-	// Check delimiters
+	typed := len(mappings) > 0
 	srcDelimiter := srcClient.GetDelimiter()
 	dstDelimiter := dstClient.GetDelimiter()
+	// No mapping from flags or config: mirror every source folder. The names
+	// come from the planning client's mailbox cache, so no extra session opens.
+	if !typed {
+		for _, name := range srcClient.MailboxNames() {
+			mappings = append(mappings, config.DirectoryMapping{
+				Source:      name,
+				Destination: mirrorDestination(name, srcDelimiter, dstDelimiter),
+			})
+		}
+	}
 
 	if !quiet && verbose {
 		_, _ = fmt.Fprintf(out, "📁 Server delimiters:\n")
@@ -254,78 +257,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		_, _ = fmt.Fprintf(out, "  Destination [%s]: %q\n\n", cfg.Dst.Label, dstDelimiter)
 	}
 
-	// Validate folder paths compatibility with server delimiters
-	var validationErrors []string
-	needsFix := false
-	for i, mapping := range mappings {
-		if err := ctx.Err(); err != nil {
+	if typed {
+		if err := offerDelimiterFixes(ctx, out, in, srcClient, dstClient, mappings, autoConfirm); err != nil {
 			return err
 		}
-		// Check source folder compatibility
-		if srcDelimiter != "" {
-			if oldDelim, ok := folderDelimiter(mapping.Source, srcDelimiter); !ok {
-				validationErrors = append(validationErrors,
-					fmt.Sprintf("Mapping %d: Source folder %q uses delimiter %q, server expects %q",
-						i+1, mapping.Source, oldDelim, srcDelimiter))
-				needsFix = true
-			}
-		}
-
-		// Check destination folder compatibility
-		if dstDelimiter != "" {
-			if oldDelim, ok := folderDelimiter(mapping.Destination, dstDelimiter); !ok {
-				validationErrors = append(validationErrors,
-					fmt.Sprintf("Mapping %d: Destination folder %q uses delimiter %q, server expects %q",
-						i+1, mapping.Destination, oldDelim, dstDelimiter))
-				needsFix = true
-			}
-		}
-	}
-
-	if needsFix {
-		_, _ = fmt.Fprintf(out, "⚠️  Folder path delimiter mismatch detected:\n")
-		for _, err := range validationErrors {
-			_, _ = fmt.Fprintf(out, "  • %s\n", err)
-		}
-		_, _ = fmt.Fprintln(out)
-
-		var shouldFix bool
-		if autoConfirm {
-			shouldFix = true
-			_, _ = fmt.Fprintln(out, "✅ Auto-confirming delimiter fix...")
-		} else {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			confirmed, err := utils.AskConfirm(ctx, in, out, "🔧 Fix folder delimiters to match server configuration?")
-			if err != nil {
-				return err
-			}
-			shouldFix = confirmed
-		}
-
-		if shouldFix {
-			for i := range mappings {
-				if srcDelimiter != "" {
-					if oldDelim, _ := folderDelimiter(mappings[i].Source, srcDelimiter); oldDelim != "none" && oldDelim != srcDelimiter {
-						oldPath := mappings[i].Source
-						mappings[i].Source = strings.ReplaceAll(mappings[i].Source, oldDelim, srcDelimiter)
-						_, _ = fmt.Fprintf(out, "  ✓ Fixed source: %q → %q\n", oldPath, mappings[i].Source)
-					}
-				}
-				if dstDelimiter != "" {
-					if oldDelim, _ := folderDelimiter(mappings[i].Destination, dstDelimiter); oldDelim != "none" && oldDelim != dstDelimiter {
-						oldPath := mappings[i].Destination
-						mappings[i].Destination = strings.ReplaceAll(mappings[i].Destination, oldDelim, dstDelimiter)
-						_, _ = fmt.Fprintf(out, "  ✓ Fixed destination: %q → %q\n", oldPath, mappings[i].Destination)
-					}
-				}
-			}
-		} else {
-			_, _ = fmt.Fprintln(out)
-			_, _ = fmt.Fprintln(out, "⚠️ Please note if delimiter is not corresponding to the server configuration, the folder structure may not be correctly interpreted.")
-		}
-		_, _ = fmt.Fprintln(out)
 	}
 
 	// Expand mappings to include subfolders
@@ -828,20 +763,127 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	return true
 }
 
-// folderDelimiter inspects path and reports which of the common IMAP
-// hierarchy delimiters it appears to use, plus whether that delimiter agrees
-// with the server's. ok is true also when path contains no delimiter at all
-// (there is nothing to mismatch).
-//
-// "none" is returned for the detected value when the path is flat - callers
-// rely on that string to skip rewrite logic in the fix-up loop.
-func folderDelimiter(path, serverDelimiter string) (detected string, ok bool) {
-	for _, d := range [...]string{"/", ".", "\\"} {
-		if strings.Contains(path, d) {
-			return d, serverDelimiter == "" || d == serverDelimiter
+// delimiterFix is one rewrite that delimiterRewrite offered for a typed name.
+type delimiterFix struct {
+	typed     string
+	rewritten string
+	used      string
+	index     int
+	source    bool
+}
+
+// mirrorDestination applies the conversion that the subfolder expansion uses for relative paths.
+// A flat side has no hierarchy, so the name then stays as it is.
+func mirrorDestination(name, srcDelimiter, dstDelimiter string) string {
+	if srcDelimiter == "" || dstDelimiter == "" || srcDelimiter == dstDelimiter {
+		return name
+	}
+	return strings.ReplaceAll(name, srcDelimiter, dstDelimiter)
+}
+
+// delimiterRewrite never rewrites a listed name, because a delimiter character can be name text. It offers only a listed rewrite, one foreign delimiter at a time.
+func delimiterRewrite(ctx context.Context, c *client.Client, typed string) (rewritten, used string, err error) {
+	serverDelimiter := c.GetDelimiter()
+	if serverDelimiter == "" {
+		return "", "", nil
+	}
+	exists, err := c.MailboxExists(ctx, typed)
+	if err != nil || exists {
+		return "", "", err
+	}
+	for _, d := range [...]string{"/", ".", `\`} {
+		if d == serverDelimiter || !strings.Contains(typed, d) {
+			continue
+		}
+		candidate := strings.ReplaceAll(typed, d, serverDelimiter)
+		exists, err := c.MailboxExists(ctx, candidate)
+		if err != nil {
+			return "", "", err
+		}
+		if exists {
+			return candidate, d, nil
 		}
 	}
-	return "none", true
+	return "", "", nil
+}
+
+func collectDelimiterFixes(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping) ([]delimiterFix, error) {
+	var fixes []delimiterFix
+	for i, m := range mappings {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rewritten, used, err := delimiterRewrite(ctx, srcClient, m.Source)
+		if err != nil {
+			return nil, err
+		}
+		if rewritten != "" {
+			fixes = append(fixes, delimiterFix{index: i, source: true, typed: m.Source, rewritten: rewritten, used: used})
+		}
+		rewritten, used, err = delimiterRewrite(ctx, dstClient, m.Destination)
+		if err != nil {
+			return nil, err
+		}
+		if rewritten != "" {
+			fixes = append(fixes, delimiterFix{index: i, typed: m.Destination, rewritten: rewritten, used: used})
+		}
+	}
+	return fixes, nil
+}
+
+// offerDelimiterFixes asks one question for all rewrites, so piped input needs one answer however many mappings change. It prints nothing when it offers no rewrite.
+func offerDelimiterFixes(ctx context.Context, out io.Writer, in *bufio.Reader, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, autoConfirm bool) error {
+	fixes, err := collectDelimiterFixes(ctx, srcClient, dstClient, mappings)
+	if err != nil {
+		return err
+	}
+	if len(fixes) == 0 {
+		return nil
+	}
+
+	_, _ = fmt.Fprintf(out, "⚠️  Folder path delimiter mismatch detected:\n")
+	for _, f := range fixes {
+		if f.source {
+			_, _ = fmt.Fprintf(out, "  • Mapping %d: Source folder %q uses delimiter %q, server expects %q\n",
+				f.index+1, f.typed, f.used, srcClient.GetDelimiter())
+		} else {
+			_, _ = fmt.Fprintf(out, "  • Mapping %d: Destination folder %q uses delimiter %q, server expects %q\n",
+				f.index+1, f.typed, f.used, dstClient.GetDelimiter())
+		}
+	}
+	_, _ = fmt.Fprintln(out)
+
+	var shouldFix bool
+	if autoConfirm {
+		shouldFix = true
+		_, _ = fmt.Fprintln(out, "✅ Auto-confirming delimiter fix...")
+	} else {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		confirmed, err := utils.AskConfirm(ctx, in, out, "🔧 Fix folder delimiters to match server configuration?")
+		if err != nil {
+			return err
+		}
+		shouldFix = confirmed
+	}
+
+	if shouldFix {
+		for _, f := range fixes {
+			if f.source {
+				mappings[f.index].Source = f.rewritten
+				_, _ = fmt.Fprintf(out, "  ✓ Fixed source: %q → %q\n", f.typed, f.rewritten)
+			} else {
+				mappings[f.index].Destination = f.rewritten
+				_, _ = fmt.Fprintf(out, "  ✓ Fixed destination: %q → %q\n", f.typed, f.rewritten)
+			}
+		}
+	} else {
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, "⚠️ Please note if delimiter is not corresponding to the server configuration, the folder structure may not be correctly interpreted.")
+	}
+	_, _ = fmt.Fprintln(out)
+	return nil
 }
 
 // expandMappingsWithSubfolders expands each mapping to include all subfolders

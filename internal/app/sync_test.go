@@ -108,34 +108,110 @@ func TestBuildProviderWarning_gmailDst_nilLimiter_recommendsBPSUp(t *testing.T) 
 	}
 }
 
-func TestFolderDelimiter(t *testing.T) {
+func Test_delimiterRewrite(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		path      string
-		server    string
-		wantDelim string
-		wantOK    bool
+		name          string
+		serverDelim   string
+		typed         string
+		wantRewritten string
+		wantUsed      string
+		listed        []string
+		noSelect      []string
 	}{
-		{name: "flatPathNoServer", path: "INBOX", server: "", wantDelim: "none", wantOK: true},
-		{name: "flatPathWithServer", path: "INBOX", server: "/", wantDelim: "none", wantOK: true},
-		{name: "slashMatches", path: "Archive/2023", server: "/", wantDelim: "/", wantOK: true},
-		{name: "slashMismatchOnDot", path: "Archive/2023", server: ".", wantDelim: "/", wantOK: false},
-		{name: "dotMatches", path: "Archive.2023", server: ".", wantDelim: ".", wantOK: true},
-		{name: "dotMismatchOnSlash", path: "Archive.2023", server: "/", wantDelim: ".", wantOK: false},
-		{name: "backslashMatches", path: `Archive\2023`, server: `\`, wantDelim: `\`, wantOK: true},
-		{name: "backslashMismatchOnSlash", path: `Archive\2023`, server: "/", wantDelim: `\`, wantOK: false},
-		{name: "noServerMeansAnyOK", path: "Archive/2023", server: "", wantDelim: "/", wantOK: true},
-		{name: "firstDelimWins", path: "a/b.c", server: "/", wantDelim: "/", wantOK: true},
+		{name: "listed name with a dot is kept", serverDelim: "/", listed: []string{"example.com"}, typed: "example.com"},
+		{name: "listed name with a dot and a space is kept", serverDelim: "/", listed: []string{"Mr. Smith"}, typed: "Mr. Smith"},
+		{name: "unlisted name with no listed rewrite is kept", serverDelim: "/", listed: []string{"INBOX"}, typed: "v1.2"},
+		{
+			name: "dot path is rewritten to a listed slash path", serverDelim: "/", listed: []string{"Archive/2024"},
+			typed: "Archive.2024", wantRewritten: "Archive/2024", wantUsed: ".",
+		},
+		{
+			name: "backslash path is rewritten to a listed slash path", serverDelim: "/", listed: []string{"Archive/2024"},
+			typed: `Archive\2024`, wantRewritten: "Archive/2024", wantUsed: `\`,
+		},
+		{
+			name: "slash path is rewritten to a listed dot path", serverDelim: ".", listed: []string{"Work.Sub"},
+			typed: "Work/Sub", wantRewritten: "Work.Sub", wantUsed: "/",
+		},
+		{name: "listed name with a slash on a dot server is kept", serverDelim: ".", listed: []string{"INBOX.AC/DC"}, typed: "INBOX.AC/DC"},
+		{
+			name: "later delimiter is tried when the first rewrite is not listed", serverDelim: "/", listed: []string{"a.b/c"},
+			typed: `a.b\c`, wantRewritten: "a.b/c", wantUsed: `\`,
+		},
+		{
+			name: "listed noselect rewrite counts as existing", serverDelim: ".", noSelect: []string{"Work.Sub"},
+			typed: "Work/Sub", wantRewritten: "Work.Sub", wantUsed: "/",
+		},
+		{name: "flat server offers no rewrite", serverDelim: "", listed: []string{"Archive/2024"}, typed: "Archive.2024"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			gotDelim, gotOK := folderDelimiter(tt.path, tt.server)
-			if gotDelim != tt.wantDelim || gotOK != tt.wantOK {
-				t.Errorf("folderDelimiter(%q, %q) = (%q, %v), want (%q, %v)",
-					tt.path, tt.server, gotDelim, gotOK, tt.wantDelim, tt.wantOK)
+
+			folders := make(map[string][]fakeMsg, len(tt.listed))
+			for _, name := range tt.listed {
+				folders[name] = nil
+			}
+			srv := newStoreServer(t, tt.serverDelim, folders)
+			srv.markNoSelect(tt.noSelect...)
+			c := newAppClient(t, srv, "srv")
+
+			rewritten, used, err := delimiterRewrite(e2eContext(t), c, tt.typed)
+
+			if err != nil {
+				t.Fatalf("delimiterRewrite(%q): %v", tt.typed, err)
+			}
+			if rewritten != tt.wantRewritten || used != tt.wantUsed {
+				t.Errorf("delimiterRewrite(%q) = (%q, %q), want (%q, %q)",
+					tt.typed, rewritten, used, tt.wantRewritten, tt.wantUsed)
+			}
+		})
+	}
+}
+
+func Test_delimiterRewrite_When_ContextEnded_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	srv := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": nil})
+	c := newAppClient(t, srv, "srv")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rewritten, used, err := delimiterRewrite(ctx, c, "Archive.2024")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if rewritten != "" || used != "" {
+		t.Errorf("delimiterRewrite = (%q, %q), want no rewrite", rewritten, used)
+	}
+}
+
+func Test_mirrorDestination(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		folder       string
+		srcDelimiter string
+		dstDelimiter string
+		want         string
+	}{
+		{name: "same delimiter keeps a dot", folder: "example.com", srcDelimiter: "/", dstDelimiter: "/", want: "example.com"},
+		{name: "slash path takes the destination delimiter", folder: "Work/Sub", srcDelimiter: "/", dstDelimiter: ".", want: "Work.Sub"},
+		{name: "text with the other delimiter is not touched", folder: "Mr. Smith", srcDelimiter: "/", dstDelimiter: ".", want: "Mr. Smith"},
+		{name: "dot path takes the destination delimiter", folder: "INBOX.Work", srcDelimiter: ".", dstDelimiter: "/", want: "INBOX/Work"},
+		{name: "flat destination keeps the source delimiter as text", folder: "Work/Sub", srcDelimiter: "/", dstDelimiter: "", want: "Work/Sub"},
+		{name: "flat source keeps the name", folder: "Mr. Smith", srcDelimiter: "", dstDelimiter: "/", want: "Mr. Smith"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := mirrorDestination(tt.folder, tt.srcDelimiter, tt.dstDelimiter); got != tt.want {
+				t.Errorf("mirrorDestination(%q, %q, %q) = %q, want %q",
+					tt.folder, tt.srcDelimiter, tt.dstDelimiter, got, tt.want)
 			}
 		})
 	}
@@ -1536,7 +1612,7 @@ func TestRunSync_When_ConfirmationAnswered_Then_WritesOnlyAfterYes(t *testing.T)
 	}
 }
 
-func TestRunSync_When_DelimitersDiffer_Then_PathIsRewrittenAfterConfirmation(t *testing.T) {
+func TestRunSync_When_DestinationListsTheRewrittenPath_Then_PathIsRewrittenAfterConfirmation(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -1553,7 +1629,6 @@ func TestRunSync_When_DelimitersDiffer_Then_PathIsRewrittenAfterConfirmation(t *
 			autoConfirm: true,
 			wantOutput:  []string{"Folder path delimiter mismatch detected", "Auto-confirming delimiter fix", "Fixed destination"},
 			wantFolder:  "Archive.2024",
-			wantCreates: []string{"Archive", "Archive.2024"},
 		},
 		{
 			name:  "both prompts are answered from one input stream",
@@ -1563,8 +1638,7 @@ func TestRunSync_When_DelimitersDiffer_Then_PathIsRewrittenAfterConfirmation(t *
 				"Proceed with synchronization? [y/N]",
 				"Fixed destination",
 			},
-			wantFolder:  "Archive.2024",
-			wantCreates: []string{"Archive", "Archive.2024"},
+			wantFolder: "Archive.2024",
 		},
 		{
 			name:        "declined fix keeps the path and warns",
@@ -1580,8 +1654,7 @@ func TestRunSync_When_DelimitersDiffer_Then_PathIsRewrittenAfterConfirmation(t *
 			t.Parallel()
 
 			src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")})
-			// The destination needs a folder to report its "." delimiter.
-			dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+			dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil, "Archive.2024": nil})
 			cfg := e2eConfig(src, dst, 1, mapping("Archive/2024", "Archive/2024"))
 			out := &syncBuffer{}
 			opts := e2eOptions(out, tt.input)
@@ -1599,11 +1672,29 @@ func TestRunSync_When_DelimitersDiffer_Then_PathIsRewrittenAfterConfirmation(t *
 	}
 }
 
+func TestRunSync_When_DelimiterIsRewritten_Then_ConfigMapKeepsTheTypedNames(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, ".", map[string][]fakeMsg{"Work.Sub": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("Work/Sub", "Work/Sub"))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	if want := []config.DirectoryMapping{mapping("Work/Sub", "Work/Sub")}; !slices.Equal(cfg.Map, want) {
+		t.Errorf("cfg.Map = %+v, want %+v", cfg.Map, want)
+	}
+}
+
 func TestRunSync_When_InputEndsAtDelimiterPrompt_Then_ReturnsReadErrorBeforeAnyWrite(t *testing.T) {
 	t.Parallel()
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")})
-	dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+	dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil, "Archive.2024": nil})
 	cfg := e2eConfig(src, dst, 1, mapping("Archive/2024", "Archive/2024"))
 	out := &syncBuffer{}
 
@@ -1615,6 +1706,203 @@ func TestRunSync_When_InputEndsAtDelimiterPrompt_Then_ReturnsReadErrorBeforeAnyW
 	assertContainsAll(t, out.String(), "Fix folder delimiters to match server configuration? [y/N]")
 	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
 		t.Errorf("dst saw %d CREATE or APPEND commands, want 0", n)
+	}
+}
+
+func TestRunSync_When_MirroredNameHoldsDelimiterText_Then_FolderIsCopiedUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		folder       string
+		srcDelimiter string
+		dstDelimiter string
+	}{
+		{name: "domain name on slash servers", folder: "example.com", srcDelimiter: "/", dstDelimiter: "/"},
+		{name: "dot and space on slash servers", folder: "Mr. Smith", srcDelimiter: "/", dstDelimiter: "/"},
+		{name: "slash on dot servers", folder: "AC/DC", srcDelimiter: ".", dstDelimiter: "."},
+		{name: "dot and space on a flat source", folder: "Mr. Smith", srcDelimiter: "", dstDelimiter: "/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, tt.srcDelimiter, map[string][]fakeMsg{
+				"INBOX":   fakeMsgs("m1@x"),
+				tt.folder: fakeMsgs("m2@x", "m3@x"),
+			})
+			dst := newStoreServer(t, tt.dstDelimiter, map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+
+			assertIDs(t, "dst "+tt.folder, dst.folderMsgIDs(tt.folder), "m2@x", "m3@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.folder)
+			for _, name := range src.capturedNames("EXAMINE") {
+				if name != "INBOX" && name != tt.folder {
+					t.Errorf("source EXAMINE of %q, want only INBOX or %q", name, tt.folder)
+				}
+			}
+			assertContainsNone(t, out.String(), "delimiter mismatch", "Fixed source", "Fixed destination")
+
+			appends := dst.callCount("APPEND")
+			if appends != 3 {
+				t.Fatalf("first run did %d APPEND commands, want 3", appends)
+			}
+			second := &syncBuffer{}
+			again := e2eOptions(second, "")
+			again.autoConfirm = true
+			if err := runSync(e2eContext(t), cfg, again); err != nil {
+				t.Fatalf("second runSync: %v", err)
+			}
+			assertContainsAll(t, second.String(), "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != appends {
+				t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_TypedNameIsListed_Then_NoDelimiterPrompt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		folder    string
+		delimiter string
+		viaFlags  bool
+	}{
+		{name: "config map with a dot on slash servers", folder: "example.com", delimiter: "/"},
+		{name: "folder flags with a dot on slash servers", folder: "example.com", delimiter: "/", viaFlags: true},
+		{name: "config map with a slash on dot servers", folder: "AC/DC", delimiter: "."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, tt.delimiter, map[string][]fakeMsg{
+				"INBOX":   nil,
+				tt.folder: fakeMsgs("m1@x", "m2@x"),
+			})
+			dst := newStoreServer(t, tt.delimiter, map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping(tt.folder, tt.folder))
+			out := &syncBuffer{}
+			// The only answer is for the "Proceed" prompt: a delimiter prompt would take it.
+			opts := e2eOptions(out, "y\n")
+			if tt.viaFlags {
+				cfg.Map = nil
+				opts.srcFolder, opts.dstFolder = tt.folder, tt.folder
+			}
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+
+			assertContainsAll(t, out.String(), "Proceed with synchronization? [y/N]")
+			assertContainsNone(t, out.String(), "Fix folder delimiters", "delimiter mismatch")
+			assertIDs(t, "dst "+tt.folder, dst.folderMsgIDs(tt.folder), "m1@x", "m2@x")
+		})
+	}
+}
+
+func TestRunSync_When_TypedNameAndItsRewriteAreMissing_Then_NameIsKeptWithoutPrompt(t *testing.T) {
+	t.Parallel()
+
+	t.Run("source", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+		cfg := e2eConfig(src, dst, 1, mapping("Archive.2024", "Archive.2024"))
+		out := &syncBuffer{}
+
+		err := runSync(e2eContext(t), cfg, e2eOptions(out, ""))
+
+		if !errors.Is(err, ErrSilentExit) {
+			t.Fatalf("error = %v, want ErrSilentExit", err)
+		}
+		assertContainsAll(t, out.String(), "Folders that cannot be synced", "Archive.2024", "cannot scan source folder")
+		assertContainsNone(t, out.String(), "Fix folder delimiters")
+		examined := src.capturedNames("EXAMINE")
+		if !slices.Contains(examined, "Archive.2024") {
+			t.Errorf("source EXAMINE names = %v, want them to contain Archive.2024", examined)
+		}
+		if slices.Contains(examined, "Archive/2024") {
+			t.Errorf("source EXAMINE names = %v, want no rewritten name", examined)
+		}
+	})
+
+	t.Run("destination", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")})
+		dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+		cfg := e2eConfig(src, dst, 1, mapping("Archive/2024", "Archive/2024"))
+		out := &syncBuffer{}
+
+		if err := runSync(e2eContext(t), cfg, e2eOptions(out, "y\n")); err != nil {
+			t.Fatalf("runSync: %v", err)
+		}
+
+		assertContainsNone(t, out.String(), "Fix folder delimiters")
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Archive/2024")
+		assertIDs(t, "dst Archive/2024", dst.folderMsgIDs("Archive/2024"), "m1@x")
+	})
+}
+
+func TestRunSync_When_MirrorCrossesDelimiters_Then_DestinationUsesItsDelimiterWithoutPrompt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src         map[string][]fakeMsg
+		wantDst     map[string][]string
+		name        string
+		wantSrcOpen []string
+		wantCreates []string
+	}{
+		{
+			name:        "listed parent",
+			src:         map[string][]fakeMsg{"Work": fakeMsgs("a@x"), "Work/Sub": fakeMsgs("b@x")},
+			wantDst:     map[string][]string{"Work": {"a@x"}, "Work.Sub": {"b@x"}},
+			wantSrcOpen: []string{"Work", "Work/Sub"},
+			wantCreates: []string{"Work", "Work.Sub"},
+		},
+		{
+			name:        "unlisted parent",
+			src:         map[string][]fakeMsg{"Work/Sub": fakeMsgs("b@x")},
+			wantDst:     map[string][]string{"Work.Sub": {"b@x"}},
+			wantSrcOpen: []string{"Work/Sub"},
+			wantCreates: []string{"Work", "Work.Sub"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), e2eOptions(out, "y\n")); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+
+			assertContainsNone(t, out.String(), "Fix folder delimiters", "delimiter mismatch")
+			for folder, ids := range tt.wantDst {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), ids...)
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantCreates...)
+			for _, name := range src.capturedNames("EXAMINE") {
+				if !slices.Contains(tt.wantSrcOpen, name) {
+					t.Errorf("source EXAMINE of %q, want only %v", name, tt.wantSrcOpen)
+				}
+			}
+		})
 	}
 }
 
@@ -2403,7 +2691,7 @@ func TestRunSync_When_CanceledAtPhaseBoundary_Then_NothingMoreIsSent(t *testing.
 			marker:       "delimiter mismatch detected",
 			input:        "y\ny\n",
 			src:          map[string][]fakeMsg{"Archive/2024": fakeMsgs("m1@x")},
-			dst:          map[string][]fakeMsg{"INBOX": nil},
+			dst:          map[string][]fakeMsg{"INBOX": nil, "Archive.2024": nil},
 			mapping:      mapping("Archive/2024", "Archive/2024"),
 			srcDelimiter: "/",
 			dstDelimiter: ".",
