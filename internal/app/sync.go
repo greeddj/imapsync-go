@@ -240,16 +240,6 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	typed := len(mappings) > 0
 	srcDelimiter := srcClient.GetDelimiter()
 	dstDelimiter := dstClient.GetDelimiter()
-	// No mapping from flags or config: mirror every source folder. The names
-	// come from the planning client's mailbox cache, so no extra session opens.
-	if !typed {
-		for _, name := range srcClient.MailboxNames() {
-			mappings = append(mappings, config.DirectoryMapping{
-				Source:      name,
-				Destination: mirrorDestination(name, srcDelimiter, dstDelimiter),
-			})
-		}
-	}
 
 	if !quiet && verbose {
 		_, _ = fmt.Fprintf(out, "📁 Server delimiters:\n")
@@ -257,24 +247,32 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		_, _ = fmt.Fprintf(out, "  Destination [%s]: %q\n\n", cfg.Dst.Label, dstDelimiter)
 	}
 
+	var roots []folderMapping
 	if typed {
 		if err := offerDelimiterFixes(ctx, out, in, srcClient, dstClient, mappings, autoConfirm); err != nil {
 			return err
 		}
+		roots = typedMappings(mappings)
+	} else {
+		// No mapping from flags or config: mirror every source folder. The names
+		// come from the planning client's mailbox cache, so no extra session opens.
+		roots = mirrorMappings(srcClient.MailboxNames(), srcDelimiter, dstDelimiter)
 	}
 
 	// Expand mappings to include subfolders
 	if !quiet && verbose {
 		_, _ = fmt.Fprintln(out, "Checking for subfolders...")
 	}
-	expandedMappings, err := expandMappingsWithSubfolders(ctx, out, srcClient, mappings, srcDelimiter, dstDelimiter, verbose, quiet)
+	expanded, err := expandMappingsWithSubfolders(ctx, out, srcClient, roots, srcDelimiter, dstDelimiter, verbose, quiet)
 	if err != nil {
 		return fmt.Errorf("failed to expand mappings: %w", err)
 	}
-	if len(expandedMappings) > len(mappings) && !quiet && verbose {
-		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expandedMappings)-len(mappings), len(expandedMappings))
+	if len(expanded) > len(roots) && !quiet && verbose {
+		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expanded)-len(roots), len(expanded))
 	}
-	mappings = expandedMappings
+	planned, clashes := splitDestinationClashes(expanded)
+	printFolderRenames(out, planned, dstDelimiter)
+	mappings = directoryMappings(planned)
 
 	// Setup progress writer for scanning phase
 	pw := newProgressWriter(2, quiet, out)
@@ -309,6 +307,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	summary.Failures = slices.Concat(clashes, summary.Failures)
 
 	if !quiet && len(summary.Skipped) > 0 {
 		printFolderSkips(out, summary.Skipped)
@@ -772,13 +771,117 @@ type delimiterFix struct {
 	source    bool
 }
 
-// mirrorDestination applies the conversion that the subfolder expansion uses for relative paths.
-// A flat side has no hierarchy, so the name then stays as it is.
-func mirrorDestination(name, srcDelimiter, dstDelimiter string) string {
-	if srcDelimiter == "" || dstDelimiter == "" || srcDelimiter == dstDelimiter {
-		return name
+type folderMapping struct {
+	config.DirectoryMapping
+	// renamed marks a derived destination name in which the conversion replaced a destination delimiter.
+	renamed bool
+}
+
+func typedMappings(in []config.DirectoryMapping) []folderMapping {
+	out := make([]folderMapping, len(in))
+	for i, m := range in {
+		out[i] = folderMapping{DirectoryMapping: m}
 	}
-	return strings.ReplaceAll(name, srcDelimiter, dstDelimiter)
+	return out
+}
+
+func mirrorMappings(names []string, srcDelimiter, dstDelimiter string) []folderMapping {
+	out := make([]folderMapping, len(names))
+	for i, name := range names {
+		destination, renamed := convertFolderPath(name, srcDelimiter, dstDelimiter)
+		out[i] = folderMapping{DirectoryMapping: config.DirectoryMapping{Source: name, Destination: destination}, renamed: renamed}
+	}
+	return out
+}
+
+func directoryMappings(in []folderMapping) []config.DirectoryMapping {
+	out := make([]config.DirectoryMapping, len(in))
+	for i, m := range in {
+		out[i] = m.DirectoryMapping
+	}
+	return out
+}
+
+// A destination delimiter inside a source segment is name text, so it must not create a level.
+func convertFolderPath(path, srcDelimiter, dstDelimiter string) (converted string, renamed bool) {
+	if dstDelimiter == "" || srcDelimiter == dstDelimiter {
+		return path, false
+	}
+	if !strings.Contains(path, dstDelimiter) {
+		if srcDelimiter == "" {
+			return path, false
+		}
+		return strings.ReplaceAll(path, srcDelimiter, dstDelimiter), false
+	}
+	substitute := "_"
+	if dstDelimiter == "_" {
+		substitute = "-"
+	}
+	if srcDelimiter == "" {
+		return strings.ReplaceAll(path, dstDelimiter, substitute), true
+	}
+	segments := strings.Split(path, srcDelimiter)
+	for i, segment := range segments {
+		segments[i] = strings.ReplaceAll(segment, dstDelimiter, substitute)
+	}
+	return strings.Join(segments, dstDelimiter), true
+}
+
+// Every mapping in a rename clash fails: a winner could take a folder that an earlier run filled from another source.
+func splitDestinationClashes(in []folderMapping) (kept []folderMapping, clashes []FolderFailure) {
+	type group struct {
+		first, second string
+		count         int
+		renamed       bool
+	}
+	groups := make(map[string]group, len(in))
+	for _, m := range in {
+		g := groups[m.Destination]
+		switch g.count {
+		case 0:
+			g.first = m.Source
+		case 1:
+			g.second = m.Source
+		}
+		g.count++
+		g.renamed = g.renamed || m.renamed
+		groups[m.Destination] = g
+	}
+
+	kept = make([]folderMapping, 0, len(in))
+	for _, m := range in {
+		g := groups[m.Destination]
+		if g.count < 2 || !g.renamed {
+			kept = append(kept, m)
+			continue
+		}
+		other := g.first
+		if m.Source == g.first {
+			other = g.second
+		}
+		clashes = append(clashes, FolderFailure{
+			SourceFolder:      m.Source,
+			DestinationFolder: m.Destination,
+			Err:               fmt.Errorf("%w %s", errDestinationClash, other),
+		})
+	}
+	return kept, clashes
+}
+
+// The names and the delimiter come from the servers, so every part goes through termsafe.Escape.
+func printFolderRenames(out io.Writer, mappings []folderMapping, dstDelimiter string) {
+	printed := false
+	for _, m := range mappings {
+		if !m.renamed {
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "⚠️  Folder %s is renamed to %s: the destination server uses \"%s\" as its hierarchy delimiter\n",
+			termsafe.Escape(m.Source), termsafe.Escape(m.Destination), termsafe.Escape(dstDelimiter))
+		printed = true
+	}
+	if printed {
+		_, _ = fmt.Fprintln(out)
+	}
 }
 
 // delimiterRewrite never rewrites a listed name, because a delimiter character can be name text. It offers only a listed rewrite, one foreign delimiter at a time.
@@ -887,8 +990,8 @@ func offerDelimiterFixes(ctx context.Context, out io.Writer, in *bufio.Reader, s
 }
 
 // expandMappingsWithSubfolders expands each mapping to include all subfolders
-func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient *client.Client, mappings []config.DirectoryMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]config.DirectoryMapping, error) {
-	expanded := make([]config.DirectoryMapping, 0, len(mappings))
+func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient *client.Client, roots []folderMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]folderMapping, error) {
+	expanded := make([]folderMapping, 0, len(roots))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -902,7 +1005,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		skipped[name] = reason
 	}
 
-	for _, mapping := range mappings {
+	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -912,15 +1015,17 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		if srcDelimiter != "" {
 			// The listing reads the mailbox cache, so it fails only when ctx ends.
 			var err error
-			subfolders, err = getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
+			subfolders, err = getSubfolders(ctx, srcClient, root.Source, srcDelimiter)
 			if err != nil {
 				return nil, err
 			}
+			// The cache lists names in map order. A fixed order keeps the plans and the failure lines the same on each run.
+			slices.Sort(subfolders)
 		}
-		if srcClient.IsNoSelect(mapping.Source) {
-			skip(mapping.Source, skipReasonNoSelect)
+		if srcClient.IsNoSelect(root.Source) {
+			skip(root.Source, skipReasonNoSelect)
 		} else {
-			expanded = append(expanded, mapping)
+			expanded = append(expanded, root)
 		}
 
 		// Add mapping for each subfolder
@@ -933,25 +1038,24 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				continue
 			}
 			// Calculate relative path from source root
-			relativePath := strings.TrimPrefix(subfolder, mapping.Source+srcDelimiter)
+			relativePath := strings.TrimPrefix(subfolder, root.Source+srcDelimiter)
 
 			// Build destination path
 			var dstPath string
+			renamed := root.renamed
 			if dstDelimiter != "" {
-				// Convert delimiter if needed
-				if srcDelimiter != dstDelimiter {
-					relativePath = strings.ReplaceAll(relativePath, srcDelimiter, dstDelimiter)
-				}
-				dstPath = mapping.Destination + dstDelimiter + relativePath
+				converted, relRenamed := convertFolderPath(relativePath, srcDelimiter, dstDelimiter)
+				dstPath = root.Destination + dstDelimiter + converted
+				renamed = renamed || relRenamed
 			} else {
 				// A flat destination has no hierarchy, so the source delimiter is ordinary
 				// name text. Merging into the parent would join distinct folders.
-				dstPath = mapping.Destination + srcDelimiter + relativePath
+				dstPath = root.Destination + srcDelimiter + relativePath
 			}
 
-			expanded = append(expanded, config.DirectoryMapping{
-				Source:      subfolder,
-				Destination: dstPath,
+			expanded = append(expanded, folderMapping{
+				DirectoryMapping: config.DirectoryMapping{Source: subfolder, Destination: dstPath},
+				renamed:          renamed,
 			})
 
 			if verbose && !quiet {
@@ -996,8 +1100,8 @@ func computeEffectiveWorkers(workers, maxConn, planCount int) int {
 // dedupeMappings keeps the first occurrence of each Source. The second return
 // value lists every dropped entry so callers can surface them under verbose
 // without coupling the dedup to a logger.
-func dedupeMappings(in []config.DirectoryMapping) (out, dropped []config.DirectoryMapping) {
-	out = make([]config.DirectoryMapping, 0, len(in))
+func dedupeMappings(in []folderMapping) (out, dropped []folderMapping) {
+	out = make([]folderMapping, 0, len(in))
 	seen := make(map[string]struct{}, len(in))
 	for _, m := range in {
 		if _, ok := seen[m.Source]; ok {

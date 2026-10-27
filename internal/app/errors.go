@@ -17,3 +17,6 @@ var errDestinationNoSelect = errors.New(`destination folder cannot hold messages
 
 // errSourceScan fails one mapping alone: the rest of the sync still runs, and the run ends non-zero.
 var errSourceScan = errors.New("cannot scan source folder")
+
+// errDestinationClash fails one mapping alone: the rest of the sync still runs, and the run ends non-zero.
+var errDestinationClash = errors.New("same destination folder as source folder")
