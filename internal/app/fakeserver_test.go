@@ -606,6 +606,33 @@ func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg
 	return listenFakeServer(t, st)
 }
 
+// RFC 3501 makes INBOX case-insensitive, also as the first level of a name. The caller holds the server mu.
+func (st *mailStore) resolve(name string) string {
+	if _, ok := st.folders[name]; ok {
+		return name
+	}
+	rest, isInbox := inboxRest(name, st.delimiter)
+	if !isInbox {
+		return name
+	}
+	for _, key := range slices.Sorted(maps.Keys(st.folders)) {
+		if keyRest, ok := inboxRest(key, st.delimiter); ok && keyRest == rest {
+			return key
+		}
+	}
+	return "INBOX" + rest
+}
+
+func inboxRest(name, delimiter string) (rest string, isInbox bool) {
+	level := name
+	if delimiter != "" {
+		if i := strings.Index(name, delimiter); i >= 0 {
+			level, rest = name[:i], name[i:]
+		}
+	}
+	return rest, strings.EqualFold(level, "INBOX")
+}
+
 func (st *mailStore) add(folder, msgID, body string) {
 	st.addStored(folder, storedMsg{msgID: msgID, body: body})
 }
@@ -690,7 +717,7 @@ func (s *fakeServer) refuseOpenWith(folder, reply string) {
 	s.store.openReply[folder] = reply
 }
 
-// reply carries its own status word, as the tagged status line. The key is the name on the wire.
+// reply carries its own status word, as the tagged status line. The key is the store name the wire name resolves to.
 func (s *fakeServer) refuseStatusWith(folder, reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -711,7 +738,7 @@ func (s *fakeServer) dropOnceOnOpen(folder string) {
 func (s *fakeServer) takeDropOnOpen(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.store.dropOnOpen == "" || s.store.dropOnOpen != name {
+	if s.store.dropOnOpen == "" || s.store.dropOnOpen != s.store.resolve(name) {
 		return false
 	}
 	s.store.dropOnOpen = ""
@@ -826,8 +853,8 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 				rw.line("* BYE Autologout")
 				return
 			}
-			if s.storeSelect(rw, tag, verb, name) {
-				selected = name
+			if key, ok := s.storeSelect(rw, tag, verb, name); ok {
+				selected = key
 			}
 		case "STATUS":
 			s.storeStatus(rw, tag, arg)
@@ -912,22 +939,23 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 	rw.line("%s OK LIST completed", tag)
 }
 
-// storeSelect reports whether the folder exists and is now selected.
-func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) bool {
+// storeSelect returns the store key of the folder and true when the folder exists and is now selected.
+func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) (string, bool) {
 	s.mu.Lock()
-	msgs, ok := s.store.folders[name]
+	key := s.store.resolve(name)
+	msgs, ok := s.store.folders[key]
 	n := len(msgs)
-	next := s.store.nextUID[name]
-	noSelect := s.store.noSelect[name]
-	refusal := s.store.openReply[name]
+	next := s.store.nextUID[key]
+	noSelect := s.store.noSelect[key]
+	refusal := s.store.openReply[key]
 	s.mu.Unlock()
 	if refusal != "" {
 		rw.line("%s %s", tag, refusal)
-		return false
+		return "", false
 	}
 	if !ok || noSelect {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
-		return false
+		return "", false
 	}
 	access := "READ-ONLY"
 	if verb == "SELECT" {
@@ -939,16 +967,17 @@ func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) bool {
 	rw.line("* OK [UIDVALIDITY 1] UIDs valid")
 	rw.line("* OK [UIDNEXT %d] Predicted next UID", next)
 	rw.line("%s OK [%s] %s completed", tag, access, verb)
-	return true
+	return key, true
 }
 
 func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
 	name, _ := parseMailboxArg(arg)
 	s.mu.Lock()
-	msgs, ok := s.store.folders[name]
+	key := s.store.resolve(name)
+	msgs, ok := s.store.folders[key]
 	n := len(msgs)
-	noSelect := s.store.noSelect[name]
-	refusal := s.store.statusReply[name]
+	noSelect := s.store.noSelect[key]
+	refusal := s.store.statusReply[key]
 	s.mu.Unlock()
 	if refusal != "" {
 		rw.line("%s %s", tag, refusal)
@@ -1025,12 +1054,13 @@ func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {
 		rw.line("%s %s", tag, s.store.createReply)
 		return
 	}
-	if _, ok := s.store.folders[name]; ok {
+	key := s.store.resolve(name)
+	if _, ok := s.store.folders[key]; ok {
 		rw.line("%s NO [ALREADYEXISTS] Mailbox already exists", tag)
 		return
 	}
-	s.store.folders[name] = nil
-	s.store.nextUID[name] = 1
+	s.store.folders[key] = nil
+	s.store.nextUID[key] = 1
 	rw.line("%s OK CREATE completed", tag)
 }
 
@@ -1057,11 +1087,12 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 		rw.line("%s %s", tag, s.store.appendReply)
 		return true
 	}
-	if _, ok := s.store.folders[name]; !ok {
+	key := s.store.resolve(name)
+	if _, ok := s.store.folders[key]; !ok {
 		rw.line("%s NO [TRYCREATE] Mailbox does not exist", tag)
 		return true
 	}
-	if s.store.noSelect[name] {
+	if s.store.noSelect[key] {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return true
 	}
@@ -1069,8 +1100,8 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	if m, err := mail.ReadMessage(bytes.NewReader(lit)); err == nil {
 		msgID = strings.Trim(m.Header.Get("Message-Id"), "<>")
 	}
-	s.store.add(name, msgID, string(lit))
-	s.store.appends = append(s.store.appends, appendRecord{folder: name, msgID: msgID})
+	s.store.add(key, msgID, string(lit))
+	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID})
 	rw.line("%s OK APPEND completed", tag)
 	return true
 }

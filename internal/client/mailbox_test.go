@@ -1433,3 +1433,149 @@ func Test_ListMailboxes_When_ReconnectGivesUpWhileSizing_Then_ErrWrapsTheGiveUpE
 		t.Errorf("error = %v, want it to wrap the give-up error %v", m.Err, c.giveUpErr)
 	}
 }
+
+func Test_MailboxExists_When_NameIsInboxInAnyCase_Then_CacheFindsIt(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}, {name: "INBOX/Work"}}})
+
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "Inbox", want: true},
+		{name: "inbox", want: true},
+		{name: "iNbOx", want: true},
+		{name: "inbox/Work", want: true},
+		{name: "Inbox/Work", want: true},
+		{name: "inbox.Work"},
+		{name: "INBOX/work"},
+		{name: "INBOXWork"},
+	}
+	for _, tt := range tests {
+		got, err := c.MailboxExists(t.Context(), tt.name)
+		if err != nil {
+			t.Fatalf("MailboxExists(%q): %v", tt.name, err)
+		}
+		if got != tt.want {
+			t.Errorf("MailboxExists(%q) = %t, want %t", tt.name, got, tt.want)
+		}
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1: the cache serves each lookup", n)
+	}
+}
+
+func Test_ListSubfolders_When_ParentIsInboxInAnyCase_Then_ReturnsInboxChildren(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "INBOX"},
+		{name: "INBOX/Work"},
+		{name: "INBOX/Work/Deep"},
+		{name: "Archive/2024"},
+	}})
+
+	tests := []struct {
+		parent string
+		want   []string
+	}{
+		{parent: "INBOX", want: []string{"INBOX/Work", "INBOX/Work/Deep"}},
+		{parent: "inbox", want: []string{"INBOX/Work", "INBOX/Work/Deep"}},
+		{parent: "Inbox", want: []string{"INBOX/Work", "INBOX/Work/Deep"}},
+		{parent: "inbox/Work", want: []string{"INBOX/Work/Deep"}},
+		{parent: "Archive", want: []string{"Archive/2024"}},
+		{parent: "archive"},
+	}
+	for _, tt := range tests {
+		got, err := c.ListSubfolders(t.Context(), tt.parent, "")
+		if err != nil {
+			t.Fatalf("ListSubfolders(%q): %v", tt.parent, err)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, tt.want) {
+			t.Errorf("ListSubfolders(%q) = %q, want %q", tt.parent, got, tt.want)
+		}
+	}
+}
+
+func Test_IsNoSelect_When_NameDiffersOnlyInInboxCase_Then_ReportsIt(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "INBOX"},
+		{name: "INBOX/Container", attrs: `\Noselect`},
+	}})
+
+	for name, want := range map[string]bool{
+		"INBOX/Container": true,
+		"inbox/Container": true,
+		"Inbox/Container": true,
+		"INBOX/container": false,
+		"inbox":           false,
+	} {
+		if got := c.IsNoSelect(name); got != want {
+			t.Errorf("IsNoSelect(%q) = %t, want %t", name, got, want)
+		}
+	}
+}
+
+func Test_CreateMailbox_When_NameIsInboxInAnotherCase_Then_SendsNoCreateForInbox(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}}})
+
+	created, err := c.CreateMailbox(t.Context(), "Inbox")
+	if err != nil {
+		t.Fatalf("CreateMailbox(Inbox): %v", err)
+	}
+	if created {
+		t.Error("CreateMailbox(Inbox) returned created=true, want false: INBOX exists")
+	}
+	if got := srv.capturedNames("CREATE"); len(got) != 0 {
+		t.Fatalf("CREATE names = %q after CreateMailbox(Inbox), want none", got)
+	}
+
+	created, err = c.CreateMailbox(t.Context(), "inbox/New")
+	if err != nil {
+		t.Fatalf("CreateMailbox(inbox/New): %v", err)
+	}
+	if !created {
+		t.Error("CreateMailbox(inbox/New) returned created=false, want true")
+	}
+	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"inbox/New"}) {
+		t.Errorf("CREATE names = %q, want only the child, byte for byte: INBOX is the existing parent", got)
+	}
+	exists, err := c.MailboxExists(t.Context(), "INBOX/New")
+	if err != nil {
+		t.Fatalf("MailboxExists: %v", err)
+	}
+	if !exists {
+		t.Error("MailboxExists(INBOX/New) = false after the create")
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+}
+
+func Test_MailboxExists_When_ServerIsFlat_Then_OnlyTheBareInboxNameFolds(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "INBOX", delim: "NIL"},
+		{name: "inbox/Work", delim: "NIL"},
+	}})
+
+	if got, want := c.MailboxNames(), []string{"INBOX", "inbox/Work"}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %q, want %q: a flat name keeps its letter case", got, want)
+	}
+	for name, want := range map[string]bool{"inbox": true, "INBOX/Work": false, "inbox/Work": true} {
+		got, err := c.MailboxExists(t.Context(), name)
+		if err != nil {
+			t.Fatalf("MailboxExists(%q): %v", name, err)
+		}
+		if got != want {
+			t.Errorf("MailboxExists(%q) = %t, want %t", name, got, want)
+		}
+	}
+}

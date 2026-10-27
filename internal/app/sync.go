@@ -252,6 +252,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err := offerDelimiterFixes(ctx, out, in, srcClient, dstClient, mappings, autoConfirm); err != nil {
 			return err
 		}
+		// The caches hold INBOX in canonical form, and dedup, the clash check and the subfolder prefix compare bytes.
+		canonicalMappings(mappings, srcClient, dstClient)
 		roots = typedMappings(mappings)
 	} else {
 		// No mapping from flags or config: mirror every source folder. The names
@@ -777,6 +779,13 @@ type folderMapping struct {
 	renamed bool
 }
 
+func canonicalMappings(mappings []config.DirectoryMapping, srcClient, dstClient *client.Client) {
+	for i := range mappings {
+		mappings[i].Source = srcClient.CanonicalName(mappings[i].Source)
+		mappings[i].Destination = dstClient.CanonicalName(mappings[i].Destination)
+	}
+}
+
 func typedMappings(in []config.DirectoryMapping) []folderMapping {
 	out := make([]folderMapping, len(in))
 	for i, m := range in {
@@ -1037,7 +1046,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				skip(subfolder, skipReasonNoSelect)
 				continue
 			}
-			// Calculate relative path from source root
+			// Roots and cached subfolders are both canonical, so the prefix matches byte for byte.
 			relativePath := strings.TrimPrefix(subfolder, root.Source+srcDelimiter)
 
 			// Build destination path

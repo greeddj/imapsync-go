@@ -422,3 +422,96 @@ func Test_loadMailboxCache_When_ListIsRetried_Then_NamesOfTheFailedAttemptAreDro
 		t.Error("hasMailbox(INBOX) = false after the retry")
 	}
 }
+
+func Test_loadMailboxCache_When_ListGivesMixedCaseInboxChild_Then_CacheHoldsCanonicalName(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "INBOX"},
+		{name: "Inbox/Work"},
+		{name: "Inbox Archive"},
+	}})
+
+	if got, want := c.MailboxNames(), []string{"INBOX", "INBOX/Work", "Inbox Archive"}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %q, want %q: only the INBOX level changes", got, want)
+	}
+	got, err := c.ListSubfolders(t.Context(), "INBOX", "")
+	if err != nil {
+		t.Fatalf("ListSubfolders: %v", err)
+	}
+	if want := []string{"INBOX/Work"}; !slices.Equal(got, want) {
+		t.Errorf("ListSubfolders(INBOX) = %q, want %q", got, want)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+}
+
+func Test_canonicalName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		delimiter string
+		want      string
+	}{
+		{name: "upper case on a slash server", input: "INBOX", delimiter: "/", want: "INBOX"},
+		{name: "lower case on a slash server", input: "inbox", delimiter: "/", want: "INBOX"},
+		{name: "title case on a dot server", input: "Inbox", delimiter: ".", want: "INBOX"},
+		{name: "mixed case on a flat server", input: "iNbOx", delimiter: "", want: "INBOX"},
+		{name: "child after the delimiter", input: "inbox/Work", delimiter: "/", want: "INBOX/Work"},
+		{name: "child of a dot server", input: "inbox.Work", delimiter: ".", want: "INBOX.Work"},
+		{name: "child that uses the other delimiter", input: "inbox/Work", delimiter: ".", want: "inbox/Work"},
+		{name: "child on a flat server", input: "inbox/Work", delimiter: "", want: "inbox/Work"},
+		{name: "delimiter with nothing after it", input: "inbox/", delimiter: "/", want: "INBOX/"},
+		{name: "second level keeps its letter case", input: "inbox/work", delimiter: "/", want: "INBOX/work"},
+		{name: "name that continues the word", input: "INBOXES", delimiter: "/", want: "INBOXES"},
+		{name: "lower case name that continues the word", input: "inboxes", delimiter: "/", want: "inboxes"},
+		{name: "name with a space after INBOX", input: "Inbox Archive", delimiter: "/", want: "Inbox Archive"},
+		{name: "INBOX below another folder", input: "Archive/inbox", delimiter: "/", want: "Archive/inbox"},
+		{name: "name shorter than INBOX", input: "inbo", delimiter: "/", want: "inbo"},
+		{name: "empty name", input: "", delimiter: "/", want: ""},
+		{name: "dotless i", input: "ınbox", delimiter: "/", want: "ınbox"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := canonicalName(tt.input, tt.delimiter); got != tt.want {
+				t.Errorf("canonicalName(%q, %q) = %q, want %q", tt.input, tt.delimiter, got, tt.want)
+			}
+		})
+	}
+}
+
+// Not parallel: AllocsPerRun counts allocations of the whole process.
+func Test_canonicalName_When_NameNeedsNoChange_Then_AllocatesNothing(t *testing.T) {
+	for _, name := range []string{"INBOX", "INBOX/Work", "Archive/2024"} {
+		var got string
+		allocs := testing.AllocsPerRun(100, func() { got = canonicalName(name, "/") })
+		if allocs != 0 {
+			t.Errorf("canonicalName(%q) allocates %v times, want 0", name, allocs)
+		}
+		if got != name {
+			t.Errorf("canonicalName(%q) = %q, want the input", name, got)
+		}
+	}
+}
+
+func Test_CanonicalName_When_ServerUsesDot_Then_OnlyDotLevelsFold(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX", delim: `"."`}}})
+
+	tests := []struct{ input, want string }{
+		{input: "inbox.Work", want: "INBOX.Work"},
+		{input: "inbox/Work", want: "inbox/Work"},
+		{input: "Inbox", want: "INBOX"},
+	}
+	for _, tt := range tests {
+		if got := c.CanonicalName(tt.input); got != tt.want {
+			t.Errorf("CanonicalName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}

@@ -3541,3 +3541,16 @@ func Test_safeCall_When_SessionMissingAfterReconnect_Then_ReturnsErrorWithoutRun
 	}
 	c.mu.Unlock()
 }
+
+func Test_folderLock_When_NamesDifferOnlyInInboxCase_Then_ShareOneMutex(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}}})
+
+	if c.folderLock("inbox/X") != c.folderLock("INBOX/X") {
+		t.Error("folderLock gave two mutexes for names that the cache treats as one mailbox")
+	}
+	if c.folderLock("Archive") == c.folderLock("archive") {
+		t.Error("folderLock gave one mutex for two names that differ in letter case outside INBOX")
+	}
+}

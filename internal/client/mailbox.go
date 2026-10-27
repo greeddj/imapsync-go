@@ -122,9 +122,9 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 	return nil
 }
 
-// MailboxNames returns every cached mailbox name, sorted, \Noselect names
-// included. IsNoSelect tells whether a name can hold messages. It costs no
-// round-trip.
+// MailboxNames returns every cached mailbox name with INBOX in upper case,
+// sorted, \Noselect names included. IsNoSelect tells whether a name can hold
+// messages. It costs no round-trip.
 func (c *Client) MailboxNames() []string {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
@@ -141,7 +141,7 @@ func (c *Client) MailboxNames() []string {
 func (c *Client) IsNoSelect(name string) bool {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	_, ok := c.mailboxCache.noSelect[name]
+	_, ok := c.mailboxCache.noSelect[canonicalName(name, c.mailboxCache.delimiter)]
 	return ok
 }
 

@@ -4197,7 +4197,9 @@ func Test_expandMappingsWithSubfolders_When_InboxIsUnlistedButHasSubfolders_Then
 			src := newStoreServer(t, "/", map[string][]fakeMsg{tt.inbox + "/Sub": fakeMsgs("s1@x")})
 			srcC := newAppClient(t, src, "src")
 
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, rootMappings(mapping(tt.inbox, tt.inbox)), "/", "/", false, false)
+			typed := []config.DirectoryMapping{mapping(tt.inbox, tt.inbox)}
+			canonicalMappings(typed, srcC, srcC)
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, typedMappings(typed), "/", "/", false, false)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -4207,7 +4209,7 @@ func Test_expandMappingsWithSubfolders_When_InboxIsUnlistedButHasSubfolders_Then
 				pairs[i] = m.Source + "->" + m.Destination
 			}
 			slices.Sort(pairs)
-			if want := []string{tt.inbox + "->" + tt.inbox, tt.inbox + "/Sub->" + tt.inbox + "/Sub"}; !slices.Equal(pairs, want) {
+			if want := []string{"INBOX->INBOX", "INBOX/Sub->INBOX/Sub"}; !slices.Equal(pairs, want) {
 				t.Errorf("expanded = %v, want %v", pairs, want)
 			}
 		})
@@ -5507,4 +5509,204 @@ func TestRunSync_When_TypedDestinationHoldsDestinationDelimiter_Then_NameIsNotRe
 		t.Error("destination holds Docs.v1_2, but the operator typed the destination name")
 	}
 	assertContainsNone(t, out.String(), "is renamed to")
+}
+
+// runSyncConfirmed runs one sync with -y and returns what it printed. A non-empty
+// srcFolder and dstFolder replace the configured mappings, as the folder flags do.
+func runSyncConfirmed(t *testing.T, cfg *config.Config, srcFolder, dstFolder string) string {
+	t.Helper()
+
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+	opts.srcFolder, opts.dstFolder = srcFolder, dstFolder
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+	return out.String()
+}
+
+func TestRunSync_When_DestinationNamesInboxInAnotherCase_Then_NothingIsCopiedTwice(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		srcFolder    string
+		dstFolder    string
+		srcIDs       []string
+		dstIDs       []string
+		wantIDs      []string
+		wantAppended []string
+		viaFlags     bool
+	}{
+		{
+			name: "map to Inbox", srcFolder: "INBOX", dstFolder: "Inbox",
+			srcIDs: []string{"m1@x", "m2@x"}, dstIDs: []string{"m1@x", "m2@x"}, wantIDs: []string{"m1@x", "m2@x"},
+		},
+		{
+			name: "map to inbox", srcFolder: "INBOX", dstFolder: "inbox",
+			srcIDs: []string{"m1@x", "m2@x"}, dstIDs: []string{"m1@x", "m2@x"}, wantIDs: []string{"m1@x", "m2@x"},
+		},
+		{
+			name: "folder flags with another case on each side", srcFolder: "inbox", dstFolder: "Inbox", viaFlags: true,
+			srcIDs: []string{"m1@x", "m2@x"}, dstIDs: []string{"m1@x", "m2@x"}, wantIDs: []string{"m1@x", "m2@x"},
+		},
+		{
+			name: "one message is missing", srcFolder: "INBOX", dstFolder: "Inbox",
+			srcIDs: []string{"m1@x", "m2@x", "m3@x"}, dstIDs: []string{"m1@x", "m2@x"},
+			wantIDs: []string{"m1@x", "m2@x", "m3@x"}, wantAppended: []string{"m3@x"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs(tt.srcIDs...)})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs(tt.dstIDs...)})
+			cfg := e2eConfig(src, dst, 1, mapping(tt.srcFolder, tt.dstFolder))
+			srcFlag, dstFlag := "", ""
+			if tt.viaFlags {
+				cfg.Map = nil
+				srcFlag, dstFlag = tt.srcFolder, tt.dstFolder
+			}
+
+			first := runSyncConfirmed(t, cfg, srcFlag, dstFlag)
+			second := runSyncConfirmed(t, cfg, srcFlag, dstFlag)
+
+			if len(tt.wantAppended) == 0 {
+				assertContainsAll(t, first, "All folders already synced!")
+			}
+			assertContainsAll(t, second, "All folders already synced!")
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), tt.wantIDs...)
+			assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), tt.wantAppended...)
+			if n := dst.callCount("APPEND"); n != len(tt.wantAppended) {
+				t.Errorf("dst APPEND count = %d, want %d", n, len(tt.wantAppended))
+			}
+			if n := dst.callCount("CREATE"); n != 0 {
+				t.Errorf("dst CREATE count = %d (%q), want 0: INBOX exists", n, dst.capturedNames("CREATE"))
+			}
+		})
+	}
+}
+
+func TestRunSync_When_SourceNamesInboxInAnotherCase_Then_SubfoldersAreCopied(t *testing.T) {
+	t.Parallel()
+
+	for _, typed := range []string{"Inbox", "inbox"} {
+		t.Run(typed, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "INBOX/Sub": fakeMsgs("s1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping(typed, "INBOX"))
+
+			runSyncConfirmed(t, cfg, "", "")
+			appends := dst.callCount("APPEND")
+			second := runSyncConfirmed(t, cfg, "", "")
+
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+			assertIDs(t, "dst INBOX/Sub", dst.folderMsgIDs("INBOX/Sub"), "s1@x")
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != appends {
+				t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_SourceListsInboxChildInMixedCase_Then_ChildIsCopiedOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "typed mapping", mappings: []config.DirectoryMapping{mapping("INBOX", "INBOX")}},
+		{name: "mirror"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "Inbox/Sub": fakeMsgs("s1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, tt.mappings...)
+
+			runSyncConfirmed(t, cfg, "", "")
+			second := runSyncConfirmed(t, cfg, "", "")
+
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "INBOX/Sub")
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+			assertIDs(t, "dst INBOX/Sub", dst.folderMsgIDs("INBOX/Sub"), "s1@x")
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != 2 {
+				t.Errorf("dst APPEND count = %d, want 2: one message for each folder, none on the second run", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_TwoSourcesDifferOnlyInInboxCase_Then_TheyAreOneSource(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("inbox", "A"), mapping("INBOX", "B"))
+
+	runSyncConfirmed(t, cfg, "", "")
+
+	assertIDs(t, "dst A", dst.folderMsgIDs("A"), "m1@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A")
+	if dst.hasFolder("B") {
+		t.Error("dst holds folder B: both mappings name the same source, so only the first applies")
+	}
+}
+
+func TestRunSync_When_DestinationNameDiffersInCaseFromAnotherFolder_Then_ItStaysASeparateFolder(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Sent": fakeMsgs("s1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Sent": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("Sent", "sent"))
+
+	runSyncConfirmed(t, cfg, "", "")
+
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "sent")
+	assertIDs(t, "dst sent", dst.folderMsgIDs("sent"), "s1@x")
+	assertIDs(t, "dst Sent", dst.folderMsgIDs("Sent"))
+}
+
+func Test_canonicalMappings(t *testing.T) {
+	t.Parallel()
+
+	slash := newAppClient(t, newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil}), "slash")
+	dot := newAppClient(t, newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil}), "dot")
+	flat := newAppClient(t, newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil}), "flat")
+
+	tests := []struct {
+		name string
+		src  *client.Client
+		dst  *client.Client
+		in   config.DirectoryMapping
+		want config.DirectoryMapping
+	}{
+		{name: "bare INBOX on both sides", src: slash, dst: dot, in: mapping("inbox", "Inbox"), want: mapping("INBOX", "INBOX")},
+		{name: "INBOX level in front of a child", src: slash, dst: dot, in: mapping("Inbox/Work", "inbox.Work"), want: mapping("INBOX/Work", "INBOX.Work")},
+		{name: "delimiter of the other server", src: slash, dst: dot, in: mapping("inbox.Work", "inbox/Work"), want: mapping("inbox.Work", "inbox/Work")},
+		{name: "another folder keeps its letter case", src: slash, dst: dot, in: mapping("Sent", "sent"), want: mapping("Sent", "sent")},
+		{name: "child of a flat destination", src: slash, dst: flat, in: mapping("inbox/Work", "inbox/Work"), want: mapping("INBOX/Work", "inbox/Work")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mappings := []config.DirectoryMapping{tt.in}
+
+			canonicalMappings(mappings, tt.src, tt.dst)
+
+			if mappings[0] != tt.want {
+				t.Errorf("mapping = %+v, want %+v", mappings[0], tt.want)
+			}
+		})
+	}
 }

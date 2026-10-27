@@ -143,14 +143,16 @@ type progressTrackerRef struct{ t ProgressTracker }
 // Locks are per-Client; concurrent CreateMailbox calls on the same instance
 // for nested paths can race on parent creation without this.
 func (c *Client) folderLock(path string) *sync.Mutex {
+	key := c.CanonicalName(path)
+
 	c.folderLocksMu.Lock()
 	defer c.folderLocksMu.Unlock()
 
-	if lock, ok := c.folderLocks[path]; ok {
+	if lock, ok := c.folderLocks[key]; ok {
 		return lock
 	}
 	lock := &sync.Mutex{}
-	c.folderLocks[path] = lock
+	c.folderLocks[key] = lock
 	return lock
 }
 

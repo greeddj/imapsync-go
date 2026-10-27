@@ -26,6 +26,29 @@ type mailboxCache struct {
 	delimiter string
 }
 
+// RFC 3501 makes INBOX case-insensitive, and a leading INBOX level follows the same rule, so cache keys and lookups agree.
+func canonicalName(name, delimiter string) string {
+	n := len(imap.InboxName)
+	if len(name) < n || !strings.EqualFold(name[:n], imap.InboxName) {
+		return name
+	}
+	rest := name[n:]
+	if rest != "" && (delimiter == "" || !strings.HasPrefix(rest, delimiter)) {
+		return name
+	}
+	if name[:n] == imap.InboxName {
+		return name
+	}
+	return imap.InboxName + rest
+}
+
+// CanonicalName returns name as the mailbox cache holds it: INBOX in upper case, including a leading INBOX level.
+func (c *Client) CanonicalName(name string) string {
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	return canonicalName(name, c.mailboxCache.delimiter)
+}
+
 // RFC 3501 makes attributes case-insensitive.
 func noSelectAttr(attrs []string) bool {
 	return slices.ContainsFunc(attrs, func(attr string) bool {
@@ -55,12 +78,13 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 		done := make(chan error, 1)
 		go func() { done <- cli.List("", "*", mboxes) }()
 		for m := range mboxes {
-			folders[m.Name] = struct{}{}
+			key := canonicalName(m.Name, m.Delimiter)
+			folders[key] = struct{}{}
 			if noSelectAttr(m.Attributes) {
 				if noSelect == nil {
 					noSelect = make(map[string]struct{})
 				}
-				noSelect[m.Name] = struct{}{}
+				noSelect[key] = struct{}{}
 			}
 			if delim == "" && m.Delimiter != "" {
 				delim = m.Delimiter
@@ -93,7 +117,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 func (c *Client) hasMailbox(name string) bool {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	_, ok := c.mailboxCache.folders[name]
+	_, ok := c.mailboxCache.folders[canonicalName(name, c.mailboxCache.delimiter)]
 	return ok
 }
 
@@ -104,7 +128,7 @@ func (c *Client) addMailboxToCache(name string) {
 	if c.mailboxCache.folders == nil {
 		c.mailboxCache.folders = make(map[string]struct{})
 	}
-	c.mailboxCache.folders[name] = struct{}{}
+	c.mailboxCache.folders[canonicalName(name, c.mailboxCache.delimiter)] = struct{}{}
 }
 
 // listSubfoldersFromCache returns mailboxes that look like children of parent.
@@ -120,10 +144,11 @@ func (c *Client) listSubfoldersFromCache(parent, delimiter string) []string {
 	}
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	prefix := parent + delimiter
+	canonicalParent := canonicalName(parent, delimiter)
+	prefix := canonicalParent + delimiter
 	out := make([]string, 0)
 	for name := range c.mailboxCache.folders {
-		if name == parent {
+		if name == canonicalParent {
 			continue
 		}
 		if len(name) > len(prefix) && name[:len(prefix)] == prefix {
