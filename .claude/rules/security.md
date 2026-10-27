@@ -9,7 +9,7 @@ Run through these on every security review:
 1. **`go tool govulncheck ./...`** - must be clean. If a finding is unreachable, document why (file + line) rather than ignoring silently. Part of `just check`.
 2. **Dependency surface** - `go.mod` direct deps reviewed. Any new direct dep needs justification: what does it do, who maintains it, does it have a CVE history. Vendored, so the source is always inspectable under `vendor/`.
 3. **TLS** - connections to IMAP must verify the server cert by default. Any `InsecureSkipVerify` requires an opt-in config flag *and* a runtime warning.
-4. **Credentials** - passwords come from config or env. Never logged, never printed to stdout, never included in error messages routed back to the user. Audit `fmt.*` / `log.*` call sites near credential handling.
+4. **Credentials** - passwords come from config or env. Never logged, never printed to stdout, never included in error messages routed back to the user. Audit `fmt.*` / `log.*` call sites near credential handling. The error for an unsupported `auth` value must not show the value, because an operator can paste a secret into this field. `config.New` names the block and the supported values. `client.New` returns a fixed error. Neither error shows the value.
 5. **Path handling** - folder names come from remote IMAP servers. They must never be used to construct local filesystem paths without sanitisation. Today the binary does not write user-controlled paths to disk; if that changes, this is a hard review point.
 6. **Command exec** - there is no `os/exec` in the runtime path. Adding any is a review trigger.
 7. **Network surface** - the binary connects out to user-configured IMAP servers. It does not listen. If a listening socket is added, that is a major architectural change that needs an explicit threat model.
@@ -23,7 +23,7 @@ Run through these on every security review:
     - A login reply that reports a temporary outage of the authentication service (for example `[UNAVAILABLE] Temporary authentication failure`) is `ClassTransient`. `reconnect` retries it with backoff, up to `maxReconnectAttempts`. The locked-account rule comes first, so a locked-account reply never reaches this rule.
 
     A change to any of these values or rules is a security review point.
-11. **Terminal output** - text from an IMAP server (folder names, reply text in errors, Message-Ids, go-imap log lines) can contain control, bidi and invisible characters. Such text can move the cursor, clear the screen or make a false status line. A new print site must show it through `termsafe.Escape`. A `%q` verb is accepted only at the existing sites, because `%q` keeps graphic invisible runes (see "Known limitations"). Escape where the program prints the text, never in values that go back to a server.
+11. **Terminal output** - text from an IMAP server (folder names, reply text in errors, Message-Ids, go-imap log lines) can contain control, bidi and invisible characters. Such text can move the cursor, clear the screen or make a false status line. A new print site must show it through `termsafe.Escape`. A `%q` verb is accepted only at the existing sites, because `%q` keeps graphic invisible runes (see "Known limitations"). Escape where the program prints the text, never in values that go back to a server. The list of folders that cannot be synced, the skip lines and the list of folders that `show` cannot read hold reply text. Their print sites escape the folder name and the reason.
 
 ## Combined-surface review
 

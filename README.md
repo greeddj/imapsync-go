@@ -130,6 +130,12 @@ The command checks the configuration file when it loads the file.
   (`down_bps`, `up_bps`, `max_connections`).
 - If the file contains a different key at any level, the command stops with an
   error. The error shows the key and the path of the file.
+- If a `map` item has no `src` or no `dst`, or one of them is empty, the
+  command stops with an error. The error shows the number of the item, counted
+  from 1, and the key.
+- In a JSON file, the letter case of a key is not important. For example,
+  `SRC` and `src` are the same key. In a YAML file, a key must have the same
+  letter case as in this list. For example, `Src` causes an error.
 - A JSON file must contain one object. A YAML file must contain one document with the settings. After this document, the file can contain only empty documents or null documents, for example `---` or `~`.
 - If `map` has no items, the command does not stop with an error. The command
   copies all source folders, the same as for a file without `map`.
@@ -206,12 +212,39 @@ sync -w 4
 - `-w, --workers` - Number of parallel workers (default: 4, max: 10) (env: `IMAPSYNC_WORKERS`)
 - `-y, --confirm, --yes` - Auto-confirm without prompt. The `-q` option needs this option. (env: `IMAPSYNC_CONFIRM`)
 - `-V, --verbose` - Enable verbose output (env: `IMAPSYNC_VERBOSE`)
-- `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the final line of a sync that copies messages still show. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
+- `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the list `Folders that cannot be synced` still show. The final line also shows when the sync copies messages or has a failed folder. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
 - `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
 - `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`). The limit is shared by all workers. Below about 110 bytes/sec for each worker, an upload can wait so long that the 5-minute idle limit closes the connection, so `sync` prints a warning before the plan.
 - `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
 
 The same `bps-down`, `bps-up`, and `max-connections` values can be set in config under a `rate_limit` block (`down_bps`, `up_bps`, `max_connections`). CLI flags take precedence when both are set. This is also true when the value is 0. For example, `--bps-down 0` or `IMAPSYNC_BPS_DOWN=0` removes the `down_bps` limit of the config file.
+
+## Folders that `sync` cannot copy or `show` cannot read
+
+Some servers list a folder that cannot hold messages. For example, Gmail lists `[Gmail]`. The server marks such a folder `\Noselect`.
+
+- `sync` does not scan a source folder that the server marks `\Noselect`. It copies the subfolders of this folder.
+- With `--verbose` and without `-q`, `sync` shows one line for each such folder.
+- If a destination folder is `\Noselect` and the source folder has at least one message with a `Message-Id`, `sync` cannot copy the messages. `sync` adds the mapping to the list `Folders that cannot be synced`.
+- `show` shows `container` in the Messages column for such a folder.
+
+### Failed folders in `sync`
+
+If `sync` cannot scan a source folder, it does not stop. It copies the other folders.
+
+- The command prints the list `Folders that cannot be synced`. Each line shows the source folder, the destination folder and the reason.
+- The `-q` option does not hide the list.
+- After the copy, the final line shows the number of failed folders, and the command ends with exit code 1.
+- If no folder has new messages and a folder failed, the command asks no question. It prints the list and ends with exit code 1.
+- If you answer no to the question before the copy, the command copies no messages and ends with exit code 0. This is also true when a folder failed.
+
+Some servers list the subfolders of a folder, but not the folder. If such a folder refuses to open, `sync` skips it and copies the subfolders. The command prints one line for the folder, and the `-q` option hides this line. The exit code does not change. `sync` never skips INBOX in this way.
+
+### Unreadable folders in `show`
+
+If `show` cannot read a folder, it shows `unreadable` in the Messages column and `-` in the Size column. The message total and the size total do not include this folder. The folder total includes it. The footer also shows the number of unreadable folders.
+
+After the tables, the command prints the list `Folders that cannot be read`. Each line shows the account (`Source` or `Destination`), the folder and the reason. The `-q` option does not hide the list. The command ends with exit code 1.
 
 ## Provider quotas (Gmail)
 
@@ -243,6 +276,7 @@ mailboxes.
 
 ## Notes
 
+- **Exit code 1** - `sync` ends with code 1 when a message or a folder fails. If you answer no to the question before the copy, `sync` ends with code 0, also when a folder failed. `show` ends with code 1 when it cannot read a folder. Any other error, except a cancel with Ctrl-C, prints `Error:` and ends with code 1.
 - **Ctrl-C** exits with code 130 and prints `Cancelled.` - this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
 - **Ctrl+\\** (SIGQUIT) writes the stacks of all goroutines to stderr and exits with code 131.
 - **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default. Other commands and `--help` make no request.

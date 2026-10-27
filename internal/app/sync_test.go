@@ -245,7 +245,6 @@ func TestDedupeMappings_parentExpandsBeforeExplicitChild(t *testing.T) {
 	}
 }
 
-// makePlanTrackers creates the progress trackers required by buildSyncPlan.
 func makePlanTrackers() (srcTr, dstTr *progress.Tracker) {
 	return progress.NewTracker("src", 10), progress.NewTracker("dst", 10)
 }
@@ -253,8 +252,7 @@ func makePlanTrackers() (srcTr, dstTr *progress.Tracker) {
 // Test_buildSyncPlan_emptySrc_returnsNoPlans asserts the "already in sync"
 // short-circuit: when src has zero messages, the plan list is empty.
 func Test_buildSyncPlan_emptySrc_returnsNoPlans(t *testing.T) {
-	// Not t.Parallel() - per-connection handler state is shared with the
-	// fakeServer acceptLoop, and parallel tests would race on connHandlerIdx.
+	t.Parallel()
 
 	srcSrv := newFakeServer(t)
 	dstSrv := newFakeServer(t)
@@ -414,9 +412,6 @@ func Test_buildSyncPlan_dstErrorIsFatal(t *testing.T) {
 	}
 }
 
-// Test_buildSyncPlan_When_SourceScanFails_Then_RecordsFailureAndKeepsOtherPlans
-// asserts that a source-side EXAMINE error fails only that mapping: it lands in
-// Failures, and the following mappings are still planned.
 func Test_buildSyncPlan_When_SourceScanFails_Then_RecordsFailureAndKeepsOtherPlans(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	dstSrv := newFakeServer(t)
@@ -2075,9 +2070,7 @@ func TestActionSync_When_ConfigIsMissing_Then_ReportsLoadFailure(t *testing.T) {
 	}
 }
 
-// writeRawConfig stores a config for the given servers with extra after the
-// known keys. Unlike writeJSONConfig, it can hold a key that config.Config
-// does not define.
+// Unlike writeJSONConfig, the config that writeRawConfig writes can hold a key that config.Config does not define.
 func writeRawConfig(t *testing.T, ext string, src, dst *fakeServer, extra string) string {
 	t.Helper()
 
@@ -2099,8 +2092,6 @@ func writeRawConfig(t *testing.T, ext string, src, dst *fakeServer, extra string
 	return path
 }
 
-// watchDials makes srv report the first connection it accepts. The handler
-// closes the connection, so the client sees a failed dial.
 func watchDials(srv *fakeServer) *atomic.Bool {
 	var dialed atomic.Bool
 	srv.addConnHandler(func(conn net.Conn) {
@@ -2154,8 +2145,6 @@ func TestActionSync_When_ConfigHasUnknownKey_Then_RefusesBeforeConnecting(t *tes
 	}
 }
 
-// writeAuthConfig stores a config for the given servers. The auth value sits on
-// the given side, either "src" or "dst", and the other side has no auth key.
 func writeAuthConfig(t *testing.T, ext string, src, dst *fakeServer, side, value string) string {
 	t.Helper()
 
@@ -2963,8 +2952,7 @@ func Test_buildSyncPlan_When_ContextEndsBeforeHierarchyCheck_Then_ReturnsContext
 	}
 }
 
-// endsAfterFirstErr passes the first Err check and ends the context right after it.
-// Everything derived from the context is then already done.
+// Everything derived from the context, such as the errgroup context, is already done after the first Err call.
 type endsAfterFirstErr struct {
 	context.Context
 	end   context.CancelFunc
@@ -3315,7 +3303,6 @@ func TestRunSync_When_MappedSourceIsNoSelect_Then_OnlyItsChildrenAreCopied(t *te
 	}
 }
 
-// assertInOrder checks that each part appears in got, each after the one before.
 func assertInOrder(t *testing.T, got string, parts ...string) {
 	t.Helper()
 	offset := 0
@@ -4159,8 +4146,6 @@ func TestRunSync_When_UnlistedParentRefusalCarriesControlCharacters_Then_SkipLin
 	assertIDs(t, "dst child folder", dst.folderMsgIDs(hostileWireName+"/2024"), "e1@x")
 }
 
-// assertNoCommandFor checks that srv never received a command that names a folder
-// its LIST marks \Noselect.
 func assertNoCommandFor(t *testing.T, what string, srv *fakeServer, folder string) {
 	t.Helper()
 	for _, verb := range []string{"EXAMINE", "SELECT", "STATUS", "CREATE"} {

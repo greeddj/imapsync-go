@@ -611,8 +611,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	return nil
 }
 
-// printFolderFailures lists the mappings the plan cannot copy. Err can carry
-// server text, so every part goes through termsafe.Escape.
+// Folder names and Err can carry server text, so every part goes through termsafe.Escape.
 func printFolderFailures(out io.Writer, failures []FolderFailure) {
 	_, _ = fmt.Fprint(out, "\n❌ Folders that cannot be synced:\n")
 	for _, f := range failures {
@@ -621,8 +620,7 @@ func printFolderFailures(out io.Writer, failures []FolderFailure) {
 	}
 }
 
-// printFolderSkips names the folders the plan leaves out. Err carries server
-// text, so every part goes through termsafe.Escape.
+// The folder name and Err can carry server text, so both go through termsafe.Escape.
 func printFolderSkips(out io.Writer, skips []FolderSkip) {
 	for _, s := range skips {
 		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s: %s\n",
@@ -708,7 +706,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				// dstExists stays false, dstIDs stays nil - benign; folder will be created.
 			case dstClient.IsNoSelect(m.Destination):
 				// A \Noselect folder is listed but refuses EXAMINE, so scanning it would
-				// abort the whole plan. The summary reports it as a failed mapping.
+				// abort the whole plan.
 				scans[idx].dstExists = true
 				scans[idx].dstNoSelect = true
 			default:

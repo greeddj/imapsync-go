@@ -8,13 +8,29 @@
 
 ## What we test
 
-- **`internal/config`** - JSON+YAML loading (both extensions), validation, defaults (worker clamp, rate-limit nil case), the accepted and rejected `auth` values. The tests also cover unknown keys at every level in both formats, content after the first document, empty and null YAML documents after the first document, empty files, and the load of both example files. A rate-limit flag that the user sets replaces the config value, also when the flag is 0. A rate-limit flag that the user does not set keeps the config value.
+- **`internal/config`** - the configuration loader.
+  These tests cover:
+  - loading and validation in both extensions, the defaults (worker clamp, rate-limit nil case) and the accepted and rejected `auth` values;
+  - unknown keys at every level in both formats;
+  - content after the first document, and empty and null YAML documents after the first document;
+  - empty files, and the load of both example files;
+  - rejected `map` items (an empty or missing `src` or `dst`, and a null YAML item), where the error names the item and the key;
+  - a folder name with spaces, which loads without change, and an empty or null `map`, which loads with no items;
+  - a rate-limit flag that the user sets, which replaces the config value also when the flag is 0;
+  - a rate-limit flag that the user does not set, which keeps the config value.
 - **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
   - CRAM-MD5 failure and success;
   - an unknown auth mechanism that `New` refuses before it dials;
+  - a mailbox cache that keeps the names that LIST marks `\Noselect` or `\NonExistent`, in any letter case;
+  - a reload of the mailbox cache or a retried LIST, which replaces the set of `\Noselect` names;
+  - `CreateMailbox` for a child of a `\Noselect` parent, which sends CREATE for the child only;
+  - `ListMailboxes` for a folder whose STATUS or size read fails: the folder carries the reason in `Err`, and the other folders keep their values;
+  - `ListMailboxes` for a `\Noselect` name, which gets no command and no error;
+  - `ListMailboxes` for a reconnect that gives up in the middle of the list;
+  - `FetchMessageMap`, which marks only a server refusal of EXAMINE with `ErrSelectRefused` and does not mark a dropped session;
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
 
@@ -89,10 +105,24 @@
   - a source that drops the connection on a folder with a throttle phrase in its name, where the folder is still copied (`TestRunSync_When_SourceDropsOnFolderNamedLikeThrottle_Then_FolderIsStillCopied`);
   - a CREATE that gets the Gmail reply `Duplicate folder name`, where the sync completes (`TestRunSync_When_CreateAnswersDuplicateFolderName_Then_SyncCompletes`);
   - a destination that refuses LOGIN in the middle of a run, where the worker sends one refused LOGIN (`TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin`);
-  - the `ActionSync` and `ActionShow` adapters, which run through a urfave/cli root (the TLS-only dial and the config load errors).
+  - a source folder that fails its scan: a refused EXAMINE, a mapping with a typo, a missing folder and a planning client that gives up;
+  - a source scan failure, where the other folders still copy, the failure list shows also with `--quiet`, and the run returns `ErrSilentExit`;
+  - a run with failed folders and nothing to copy, where the sync asks no question and ends non-zero;
+  - a `\Noselect` source folder, where only the subfolders copy;
+  - a `\Noselect` destination, where a source message with a Message-Id gives a folder failure and an empty source folder gives none;
+  - a mirror run where both servers list the Gmail container `[Gmail]`;
+  - a readable source folder that LIST leaves out, where the folder and its subfolders copy;
+  - an unlisted parent that refuses to open, where the plan skips it, prints one line and keeps the exit code (`isHierarchyLevel`);
+  - an unlisted INBOX with subfolders that refuses to open, which stays a failure;
+  - an unlisted parent whose session drops, which stays a failure;
+  - a context that ends before either scan of `buildSyncPlan` starts, where `buildSyncPlan` returns `context.Canceled` (`Test_buildSyncPlan_When_ContextEndsAfterEntryCheck_Then_NeitherScanStarts`);
+  - a context that ends before the hierarchy check of a refused source folder, where `buildSyncPlan` returns `context.Canceled` (`Test_buildSyncPlan_When_ContextEndsBeforeHierarchyCheck_Then_ReturnsContextError`);
+  - `runShow` with unreadable folders (marked rows, the reason list and a non-zero exit) and with a `\Noselect` container (a `container` row and exit code 0);
+  - the `ActionSync` and `ActionShow` adapters, which run through a urfave/cli root (the TLS-only dial and the config load errors);
+  - a config with an unknown key, an unsupported `auth` value or a `map` item with no folder name, which both adapters refuse before they connect.
 - **`internal/progress`** - interface compliance against the contract `internal/client` expects.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
-- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact.
+- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read.
 - **`cmd/imapsync-go`** - `TestReportError` covers the exit code and the escaped `Error:` line. `TestFetchTag` covers `helpers.fetchTag` against an `httptest` server.
 
 ## What we deliberately don't test
@@ -137,11 +167,12 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`runFolderSync` post-append `ctx.Err()` check** - The check stops the loop when an APPEND finishes after the context is canceled. `withCancel` registers a `context.AfterFunc` that calls `Cancel()`, and `Cancel()` terminates the connection asynchronously. An APPEND that finishes at the same time can return nil, not an error. This is a race window, and the test has no deterministic hook to reach it. The `(synced, errors)` result is the same with or without the check. The check saves at most one extra iteration.
 - **`app.traceTracker`** - a diagnostic that writes to stderr. It is active only when `IMAPSYNC_TRACE` is set.
 - **`ActionSync` verbose `Fetching config...` line** - `ActionSync` writes it to `os.Stdout` before the config loads. It is the only output that does not go through the injected writer.
-- **Boundary `ctx.Err()` re-checks** - a cancel must land between two statements with no observable event, so a deterministic test is not possible. `TestRunSync_When_CanceledAtPhaseBoundary_Then_NothingMoreIsSent` and `TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted` test the end-to-end property. The re-checks are in these places:
+- **Boundary `ctx.Err()` re-checks** - each check reads the context of the caller between two calls that give no observable event. A test can reach such a check only with a context that ends on a given call of `Err`. That test depends on the number of `Err` calls in `internal/client` and in the code before the check, so a refactor that keeps the behaviour breaks it. `TestRunSync_When_CanceledAtPhaseBoundary_Then_NothingMoreIsSent` and `TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted` test the end-to-end property. The re-checks are in these places:
   - `runSync`, after the connect errgroup;
-  - `runSync`, after the scan progress writer stops;
   - `runSync`, at the top of the dispatch loop;
-  - `expandMappingsWithSubfolders`, in the per-mapping loop, after `getSubfolders` and in the per-subfolder loop.
+  - `expandMappingsWithSubfolders`, in the per-mapping loop, after `getSubfolders` and in the per-subfolder loop;
+  - `isHierarchyLevel`, the error return after `getSubfolders`.
+- **`buildSyncPlan`, the `MailboxExists` error in the destination goroutine** - `MailboxExists` reads the mailbox cache, so it fails only when the context ends. The `gCtx.Err()` check at the top of the loop runs first. `gCtx` comes from `errgroup.WithContext`, so a test cannot replace its `Err`. So the error needs a cancel in the short time between the two calls. A deterministic test needs a production hook there. `Test_buildSyncPlan_When_ContextEndsAfterEntryCheck_Then_NeitherScanStarts` covers the check at the top of the loop.
 
 ### Deliberate exclusions in `cmd/imapsync-go`
 

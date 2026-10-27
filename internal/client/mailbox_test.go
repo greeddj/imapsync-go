@@ -486,7 +486,6 @@ func Test_ListMailboxes_sumsMessageSizes(t *testing.T) {
 	}
 }
 
-// infosByName indexes the result of ListMailboxes by folder name.
 func infosByName(t *testing.T, infos []*MailboxInfo) map[string]*MailboxInfo {
 	t.Helper()
 
@@ -497,7 +496,6 @@ func infosByName(t *testing.T, infos []*MailboxInfo) map[string]*MailboxInfo {
 	return byName
 }
 
-// assertReadable checks a folder whose statistics were read.
 func assertReadable(t *testing.T, got map[string]*MailboxInfo, name string, messages uint32, size uint64) {
 	t.Helper()
 
@@ -511,8 +509,6 @@ func assertReadable(t *testing.T, got map[string]*MailboxInfo, name string, mess
 	}
 }
 
-// assertUnreadable checks a folder that carries the reason it could not be read,
-// with zero statistics.
 func assertUnreadable(t *testing.T, got map[string]*MailboxInfo, name string, reasons ...string) {
 	t.Helper()
 
@@ -535,9 +531,6 @@ func assertUnreadable(t *testing.T, got map[string]*MailboxInfo, name string, re
 	}
 }
 
-// Test_ListMailboxes_When_StatusRefused_Then_FolderCarriesTheReason asserts that a
-// folder whose STATUS fails keeps the reason and no statistics, and the others are
-// still populated.
 func Test_ListMailboxes_When_StatusRefused_Then_FolderCarriesTheReason(t *testing.T) {
 	t.Parallel()
 
@@ -564,9 +557,6 @@ func Test_ListMailboxes_When_StatusRefused_Then_FolderCarriesTheReason(t *testin
 	}
 }
 
-// Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason asserts that
-// a folder whose size cannot be read keeps no message count and carries the
-// reason in Err, with or without log sinks.
 func Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason(t *testing.T) {
 	t.Parallel()
 
@@ -598,8 +588,9 @@ func Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason(t *testing.
 				t.Fatalf("ListMailboxes: %v", err)
 			}
 
-			assertUnreadable(t, infosByName(t, infos), "INBOX", "read folder size", "examine refused")
-			if m := infosByName(t, infos)["INBOX"]; m != nil {
+			got := infosByName(t, infos)
+			assertUnreadable(t, got, "INBOX", "read folder size", "examine refused")
+			if m := got["INBOX"]; m != nil {
 				found := false
 				for e := m.Err; e != nil; e = errors.Unwrap(e) {
 					if e.Error() == "examine refused" {
@@ -625,9 +616,6 @@ func Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason(t *testing.
 	}
 }
 
-// Test_ListMailboxes_When_ListMarksNoSelect_Then_ContainerIsSkippedWithoutError
-// asserts that a name LIST marks \Noselect or \NonExistent gets no command and no
-// error, and still counts as one step of the tracker.
 func Test_ListMailboxes_When_ListMarksNoSelect_Then_ContainerIsSkippedWithoutError(t *testing.T) {
 	t.Parallel()
 
@@ -669,8 +657,7 @@ func Test_ListMailboxes_When_ListMarksNoSelect_Then_ContainerIsSkippedWithoutErr
 	}
 }
 
-// Asserts the give-up path through ListMailboxes. Zero backoff and zero reconnectDur
-// keep the reconnect from sleeping, so the test needs no sleepCtx swap.
+// Zero backoff and zero reconnectDur keep the reconnect from sleeping, so the test needs no sleepCtx swap.
 func Test_ListMailboxes_When_ReconnectGivesUpMidList_Then_EveryRemainingFolderCarriesTheGiveUp(t *testing.T) {
 	t.Parallel()
 
@@ -779,8 +766,6 @@ func Test_ListMailboxes_whenListRefused(t *testing.T) {
 	}
 }
 
-// Test_ListMailboxes_whenContextExpiresInFlight asserts that a context ending while a
-// LIST, STATUS or size FETCH is pending is returned, not treated as an unreadable folder.
 func Test_ListMailboxes_whenContextExpiresInFlight(t *testing.T) {
 	t.Parallel()
 
@@ -1319,9 +1304,6 @@ func Test_CreateMailbox_When_ParentIsNoSelect_Then_CreatesOnlyTheChild(t *testin
 	}
 }
 
-// Test_IsNoSelect_When_CacheListsNoSelectNames_Then_CacheReadsSendNoCommand
-// asserts that the cache reads for \Noselect names add no command after the one
-// LIST that New sends.
 func Test_IsNoSelect_When_CacheListsNoSelectNames_Then_CacheReadsSendNoCommand(t *testing.T) {
 	t.Parallel()
 
@@ -1365,9 +1347,6 @@ func Test_IsNoSelect_When_CacheListsNoSelectNames_Then_CacheReadsSendNoCommand(t
 	}
 }
 
-// Test_ListMailboxes_When_ReconnectGivesUpWhileSizing_Then_ErrWrapsTheGiveUpError
-// asserts that a folder whose sizing ends in a reconnect that gives up carries
-// an error that wraps the give-up error.
 func Test_ListMailboxes_When_ReconnectGivesUpWhileSizing_Then_ErrWrapsTheGiveUpError(t *testing.T) {
 	t.Parallel()
 

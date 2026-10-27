@@ -456,8 +456,7 @@ func cramMD5Handler(srv *fakeServer, user, pass string) func(net.Conn) {
 }
 
 // scriptFolder is one mailbox of a mailboxScript; each entry of sizes is the
-// RFC822.SIZE of one message. A non-empty attrs is the LIST attribute list, else
-// the folder lists as \HasNoChildren.
+// RFC822.SIZE of one message.
 type scriptFolder struct {
 	name  string
 	attrs string

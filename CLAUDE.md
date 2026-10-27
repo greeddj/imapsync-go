@@ -32,17 +32,17 @@ Single-binary IMAP-to-IMAP sync tool. Six things to internalize before making ch
 cmd/imapsync-go/main.go         - urfave/cli/v3 wiring, version flags, signal-to-context
 cmd/imapsync-go/commands/       - thin subcommand definitions (sync, show); they only declare flags and call into internal/app
 internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, builds the plan, confirms, dispatches to worker pool
-internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table
+internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table, then a list of the folders it cannot read (ErrSilentExit)
 internal/app/worker.go          - syncWorker pool + runFolderSync helper consumed by sync.go
 internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect with the give-up and revive gate, Select that trusts the go-imap session state
 internal/client/watchdog.go     - idleConn: inactivity watchdog for commands in flight
 internal/client/fetch.go        - single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH, a retry fetches only the UIDs not yet delivered)
-internal/client/mailbox.go      - MailboxExists / ListSubfolders / CreateMailbox via the cache
-internal/client/cache.go        - per-Client mailboxCache (one LIST "" "*"), a created mailbox is added to it
+internal/client/mailbox.go      - MailboxExists / IsNoSelect / ListSubfolders / CreateMailbox via the cache, ListMailboxes (a folder that cannot be read carries its reason in MailboxInfo.Err)
+internal/client/cache.go        - per-Client mailboxCache (one LIST "" "*"), a created mailbox is added to it, the names that LIST marks \Noselect or \NonExistent are kept
 internal/client/append.go       - AppendMessage streaming the literal directly from the fetched body, one retry only before go-imap reads the body
-internal/client/errors.go       - classifyError: Transient / Permanent / Throttled, text matched on leaf errors only; canRevive; isAlreadyExistsErr
+internal/client/errors.go       - classifyError: Transient / Permanent / Throttled, text matched on leaf errors only; canRevive; isAlreadyExistsErr; ErrSelectRefused marks a server refusal of SELECT or EXAMINE
 internal/client/provider.go     - DetectProvider, used by sync.go to print quota warnings
-internal/config/                - JSON+YAML config loader (extension-driven), validation
+internal/config/                - JSON+YAML config loader (extension-driven, unknown keys rejected), validation
 internal/progress/              - go-pretty progress writer/tracker abstraction (interfaces consumed by client)
 internal/ratelimit/             - net.Conn wrapper applying golang.org/x/time/rate, installed by guardConn
 internal/termsafe/              - Escape and Writer: make text from IMAP servers safe to print on a UTF-8 terminal (stdlib only)
@@ -62,9 +62,32 @@ internal/utils/                 - `AskConfirm(ctx, in *bufio.Reader, out io.Writ
 The sync flow is **plan, confirm, execute** - not stream-as-you-go:
 
 1. **Expand mappings**: each configured mapping is expanded with subfolders. `expandMappingsWithSubfolders` calls `client.ListSubfolders`, which serves the answer from the per-Client mailbox cache (one `LIST "" "*"` populates it on first connect).
+   - The expansion skips each source name that `Client.IsNoSelect` reports. This applies to the mapped name and to each subfolder.
+   - `IsNoSelect` reads the mailbox cache. The cache marks a name when the same `LIST "" "*"` gives it the `\Noselect` or `\NonExistent` attribute. The attribute can have any letter case.
+   - The expansion keeps the subfolders of a skipped name.
+   - With `--verbose` and without `--quiet`, the expansion prints one escaped "Folder ... skipped" line for each skipped name, in name order.
+   - A mapped source name that LIST leaves out stays in the expansion, also when LIST shows its subfolders. Step 3 scans it.
 2. **Delimiter reconciliation**: `folderDelimiter(path, serverDelimiter)` returns the detected delimiter and whether it matches the server's. On mismatch the user is prompted to rewrite delimiters in-place; `-y/--confirm` auto-accepts.
 3. **Build sync plan** (`buildSyncPlan`): two goroutines run under an `errgroup` - one walks every src mapping calling `FetchMessageMap`, the other walks every dst mapping calling `MailboxExists` + `FetchMessageIDSet`. Trackers advance independently so a slow dst does not stall the src progress bar. After both sides complete a slot, `maybeDiff` fires (guarded by `atomic.Int32` reaching 2 + a `sync.Mutex` for race-detector cleanliness), computes the Message-Id diff, and immediately frees the maps to keep peak memory proportional to one folder at a time. All fetches are envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] + UID`; bodies are not pulled at planning time. The "what would be synced" preview is printed and confirmed before any writes. `--quiet` hides the preview and the prompt, so `runSync` refuses `--quiet` without `-y/--confirm` before it connects to a server.
-4. **Pre-create destination folders** for the active plans (sequential, with per-folder mutex on `Client.folderLocks`). New mailboxes are added back into the cache.
+   - The destination goroutine calls `IsNoSelect` after `MailboxExists`. It does not call `FetchMessageIDSet` for a `\Noselect` destination.
+   - A failed source scan gives a folder failure (`FolderFailure` in `SyncSummary.Failures`). Its error wraps `errSourceScan` ("cannot scan source folder").
+   - A source mapping is a skip (`FolderSkip` in `SyncSummary.Skipped`), not a folder failure, when all these conditions are true:
+     - the scan error wraps `client.ErrSelectRefused`. `FetchMessageMap` adds this marker only when the server refuses the folder with a reply that is not transient and not throttled;
+     - the name is not INBOX, in any letter case;
+     - the mailbox cache does not hold the name;
+     - the mailbox cache holds at least one subfolder of the name (`isHierarchyLevel`).
+   - A skip does not change the exit code.
+   - A `\Noselect` destination is a folder failure when the source scan succeeds and finds at least one message with a Message-Id. When the source scan succeeds and finds no such message, the mapping gives no plan and no folder failure. When the source scan fails, the source rules above apply, and the destination gives no second folder failure.
+   - The error of a `\Noselect` destination failure wraps `errDestinationNoSelect`.
+   - A scan failure of a destination that is not `\Noselect` stops the run before any write.
+   - After the scan, `runSync` does these steps in this order, before the plan preview and the prompt:
+     - if the context ended, it prints nothing and returns the context error;
+     - without `--quiet`, it prints one escaped line for each skip;
+     - it prints the folder-failure list, also with `--quiet`.
+   - A folder failure gives no plan, so the run creates no destination folder for it.
+   - When the plan has no message to copy and a folder failure exists, the run shows no prompt. It prints the error summary line and exits with code 1 (`ErrSilentExit`).
+   - After the copy, when a folder failure exists, the run exits with code 1 (`ErrSilentExit`). Without `--quiet`, it first lists the folder failures again. It always prints the error summary line, with the count of failed folders.
+4. **Pre-create destination folders** for the active plans (sequential, with per-folder mutex on `Client.folderLocks`). New mailboxes are added back into the cache. A name that LIST marks `\Noselect` counts as existing, so the client sends no CREATE for it, also when it is a parent.
 5. **Execute via worker pool**: `newSyncWorkerPool` builds N persistent workers (each owns one src + one dst `Client` for the entire sync). Plans are dispatched through a chan-of-workers semaphore. A single `progress.Writer` covers all plans, with one tracker per plan appended up front. Per-message UI updates are throttled to ~10 Hz. At the end, `logoutAll` logs out all workers at the same time, then the two planning clients, so a silent server costs at most two logout limits.
 
 Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; re-running on a partially completed sync is safe and resumes.
@@ -225,7 +248,7 @@ The guarantee holds for UTF-8 terminals. A terminal that acts on 8-bit C1 bytes 
 
 - the arguments of SELECT, EXAMINE, STATUS, CREATE and APPEND, which go back to a server;
 - plan data, mappings and map keys;
-- error values. `classifyError` and `isAlreadyExistsErr` match on raw server text.
+- error values. `classifyError` and `isAlreadyExistsErr` match on raw server text. The `Err` fields of `MailboxInfo`, `FolderFailure` and `FolderSkip` also hold raw server text, and the print sites escape them.
 
 A tracker line carries our own SGR colour codes. Escape the server parts before you compose the line, never the whole line.
 
@@ -233,8 +256,20 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
 
 - `Client.log` escapes the whole composed message for both sinks. No format of `log` carries colour codes, so every caller of `log` is covered.
 - Two direct sinks escape on their own: the missing-Message-Id warning in `fetch.go` and the per-mailbox tracker line in `mailbox.go`.
-- `internal/app/sync.go` escapes the plan preview, the folders-to-create list, the creation tracker, the "already exists" log, the error text of the "Failed to create folder" log, the waiting and scan trackers, the found-subfolder line and the verbose log of a failed source fetch.
-- `internal/app/show.go` escapes the folder cell of the table.
+- `internal/app/sync.go` escapes these sites:
+  - the plan preview;
+  - the folders-to-create list;
+  - the creation tracker;
+  - the "already exists" log;
+  - the error text of the "Failed to create folder" log (the folder name there stays `%q`);
+  - the waiting trackers and the scan trackers;
+  - the found-subfolder line;
+  - the folder-failure list (`printFolderFailures`), which shows the source folder, the destination folder and the reason. `runSync` prints it after the scan, also with `--quiet`. Without `--quiet`, `runSync` prints it again after the copy;
+  - the "Folder ... skipped" line in `expandMappingsWithSubfolders`, for each source name that the mailbox cache marks `\Noselect` or `\NonExistent`. Only the name is server text. `expandMappingsWithSubfolders` prints the line only with `--verbose` and without `--quiet`;
+  - the skip line for an unlisted parent that refuses to open (`printFolderSkips`). It shows the name, a fixed reason and the error text with the server reply. `runSync` prints it also without `--verbose`, but only without `--quiet`.
+- `internal/app/show.go` escapes these sites:
+  - the folder cell of each table row, also on the "unreadable" and "container" rows;
+  - each line of the unreadable-folder list (`printUnreadableFolders`), which shows the folder name and the reason.
 - `internal/app/worker.go` escapes every tracker line and log, and the verbose Message-Id line. `trackerReason` escapes the inline error reason first, then cuts it to 40 bytes on a rune boundary.
 - `reportError` in `cmd/imapsync-go/main.go` escapes the final `Error:` line, line breaks too. So a multi-line error prints on one line. A raw line break would let a server make a false line after `Error:`.
 - `cmd/imapsync-go/helpers` escapes the GitHub release tag that the root `--help` shows for builds without `-X main.Version`.
@@ -245,10 +280,12 @@ In go-imap v1.2.1, such lines are parse errors and network errors. A parse error
 
 ## Conventions
 
-- Configuration format is detected from the file extension: `.json` / `.yaml` / `.yml` (see `internal/config/config.New`). The CLI accepts either; sample files are `config.example.json` / `config.example.yaml`. The loader rejects a key that `Config` does not define. This applies at all levels, in both formats. The error names the key and the file. The loader also rejects content after the first JSON value or YAML document. An empty or null YAML document after the first document has no settings, so the loader accepts it.
+- Configuration format is detected from the file extension: `.json` / `.yaml` / `.yml` (see `internal/config/config.New`). The CLI accepts either; sample files are `config.example.json` / `config.example.yaml`. The loader rejects a key that `Config` does not define. This applies at all levels, in both formats. JSON matches a key without regard to letter case, as `encoding/json` does, so `SRC` loads as `src`. YAML matches only the exact letter case. The error names the key and the file. The loader also rejects content after the first JSON value or YAML document. An empty or null YAML document after the first document has no settings, so the loader accepts it.
 - `auth` accepts only an empty value, `login` or `cram-md5`, in any letter case. The loaded value keeps the letter case from the file. `config.New` rejects other values with `ErrAuthUnsupported`. The error names the block (`src` or `dst`) and the supported values. It never shows the value from the file, because the value can be a password in the wrong field. `client.New` also refuses an unknown `Options.Auth` before it dials. Its error also does not show the value.
 - Workers are clamped to `[1, 10]` in `config.New`. A value out of range changes to the nearest limit.
-- Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it.
+- Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it. A flag that the user sets, or its environment variable, overrides the config value also when it is 0. For `--bps-down` and `--bps-up`, 0 removes the limit. For `--max-connections`, 0 uses the `--workers` value. `config.New` tests `IsSet`, not a non-zero value.
+- `config.New` rejects a `map` item with an empty or missing `src` or `dst` (`ErrMapSrcRequired`, `ErrMapDstRequired`). The error gives the position of the item, counted from 1. A `map` with no items is valid: `sync` then mirrors every source folder.
+- `ErrSilentExit` makes `reportError` return exit code 1 and print no `Error:` line. A command returns it after it prints its failures on stdout. `sync` uses it for failed messages and failed folders. `show` uses it for folders that it cannot read.
 - `client.New(ctx, addr, user, pass, Options{...})` - keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation.
 - Dependencies are vendored under `vendor/`. The module requires Go 1.27.3 or newer; an older host toolchain is refused unless `GOTOOLCHAIN` is left on `auto` to fetch one.
 

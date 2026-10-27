@@ -145,7 +145,6 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 	return ErrSilentExit
 }
 
-// countUnreadable counts the folders whose statistics could not be read.
 func countUnreadable(mailboxes []*client.MailboxInfo) int {
 	n := 0
 	for _, mbox := range mailboxes {
@@ -156,8 +155,7 @@ func countUnreadable(mailboxes []*client.MailboxInfo) int {
 	return n
 }
 
-// printUnreadableFolders lists the reason for each unreadable folder. Name and
-// reason can carry server text, so both go through termsafe.Escape.
+// Name and reason can carry server text, so both go through termsafe.Escape.
 func printUnreadableFolders(out io.Writer, title string, mailboxes []*client.MailboxInfo) {
 	for _, mbox := range mailboxes {
 		if mbox.Err == nil {

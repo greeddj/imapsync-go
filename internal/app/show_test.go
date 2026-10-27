@@ -34,8 +34,6 @@ func e2eShowOptions(out io.Writer, quiet bool) showOptions {
 	}
 }
 
-// assertRowCells checks that section has a table row for name whose other cells,
-// joined by single spaces, read want.
 func assertRowCells(t *testing.T, section, name, want string) {
 	t.Helper()
 	for line := range strings.SplitSeq(section, "\n") {
@@ -51,27 +49,21 @@ func assertRowCells(t *testing.T, section, name, want string) {
 	t.Errorf("no row for folder %q in\n%s", name, section)
 }
 
-// assertFolderRow checks that section has a table row for name showing count
-// messages and the formatted size.
 func assertFolderRow(t *testing.T, section, name string, count int, size uint64) {
 	t.Helper()
 	assertRowCells(t, section, name, fmt.Sprintf("%d %s", count, utils.FormatSize(size)))
 }
 
-// assertMarkedRow checks a row that shows marker in the Messages cell and no size.
 func assertMarkedRow(t *testing.T, section, name, marker string) {
 	t.Helper()
 	assertRowCells(t, section, name, marker+" -")
 }
 
-// assertTotalsRow checks the footer row of a folder table with no unreadable folder.
 func assertTotalsRow(t *testing.T, section string, folders, messages int, size uint64) {
 	t.Helper()
 	assertTotalsLabel(t, section, fmt.Sprintf("TOTAL FOLDERS %d", folders), messages, size)
 }
 
-// assertTotalsLabel checks the footer row of a folder table: its label, the message
-// sum and the size sum.
 func assertTotalsLabel(t *testing.T, section, label string, messages int, size uint64) {
 	t.Helper()
 	want := fmt.Sprintf("%s %d %s", label, messages, utils.FormatSize(size))

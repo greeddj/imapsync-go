@@ -942,9 +942,7 @@ func Test_New_cramMD5Succeeds(t *testing.T) {
 	}
 }
 
-// Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing asserts that an unknown
-// mechanism is an error with no value in it, not a silent LOGIN. A dial would
-// run the server handler before New returns.
+// A dial would run the server handler before New returns, so the handler shows whether New dialed.
 func Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing(t *testing.T) {
 	t.Parallel()
 
@@ -996,8 +994,6 @@ func Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing(t *testing.T) {
 	}
 }
 
-// Test_New_When_AuthIsLoginInAnyCase_Then_SendsLogin asserts that an empty value
-// and every letter case of "login" select LOGIN.
 func Test_New_When_AuthIsLoginInAnyCase_Then_SendsLogin(t *testing.T) {
 	t.Parallel()
 

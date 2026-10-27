@@ -233,7 +233,6 @@ func checkAuth(side, auth string) error {
 	return fmt.Errorf("%s: %w, use \"login\" or \"cram-md5\"", side, ErrAuthUnsupported)
 }
 
-// validate checks the required fields and the values of auth and map items.
 func (c *Config) validate() error {
 	if c.Src.Server == "" {
 		return ErrSrcServerRequired

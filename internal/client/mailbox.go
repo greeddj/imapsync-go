@@ -231,8 +231,8 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 	return result, nil
 }
 
-// readStats fills the message count and size of mbox. A failed read goes to
-// mbox.Err and leaves both at zero; only an ended ctx is returned as an error.
+// A failed read goes to mbox.Err and leaves Messages and Size at zero; only an
+// ended ctx is returned as an error.
 func (c *Client) readStats(ctx context.Context, mbox *MailboxInfo) error {
 	var status *imap.MailboxStatus
 	err := c.safeCall(func(cli *imapclient.Client) error {

@@ -16,8 +16,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// writeConfigFile writes content to a temp file with the given extension and
-// returns its absolute path.
 func writeConfigFile(t *testing.T, ext, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config"+ext)
@@ -27,9 +25,6 @@ func writeConfigFile(t *testing.T, ext, content string) string {
 	return path
 }
 
-// runNewAt drives config.New through a urfave/cli/v3 Command parsed from
-// extraArgs, with the config flag set to path.
-// Returns whatever Config / error New produced.
 func runNewAt(t *testing.T, path string, extraArgs ...string) (*Config, error) {
 	t.Helper()
 	var (
@@ -56,8 +51,6 @@ func runNewAt(t *testing.T, path string, extraArgs ...string) (*Config, error) {
 	return gotCfg, gotErr
 }
 
-// runNewWithArgs writes content to a temp file with the given extension and
-// runs config.New on it.
 func runNewWithArgs(t *testing.T, ext, content string, extraArgs ...string) (*Config, error) {
 	t.Helper()
 	return runNewAt(t, writeConfigFile(t, ext, content), extraArgs...)
@@ -871,8 +864,7 @@ func Test_restoreNullMapEntries_When_YAMLIsMalformed_Then_ReturnsError(t *testin
 
 const authTestPass = "s3cret-auth-pass"
 
-// authConfig builds a config file of the given format. Each auth value is a raw
-// JSON or YAML scalar, and an empty one leaves the key out.
+// Each auth value is a raw JSON or YAML scalar, and an empty one leaves the key out.
 func authConfig(ext, srcAuth, dstAuth string) string {
 	if ext == ".json" {
 		key := func(raw string) string {

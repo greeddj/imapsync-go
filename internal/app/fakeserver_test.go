@@ -643,8 +643,7 @@ func (s *fakeServer) markNoSelect(names ...string) {
 	}
 }
 
-// hideFromList leaves each folder out of LIST. The folder stays selectable and
-// keeps its messages, as with a mailbox that has the read right but no lookup right.
+// A hidden folder stays selectable and keeps its messages, as with a mailbox that has the read right but no lookup right.
 func (s *fakeServer) hideFromList(names ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -662,8 +661,7 @@ func (s *fakeServer) refuseLogin() {
 	s.store.loginReply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
 }
 
-// refuseLoginAt makes only the n-th LOGIN (1-based, counted over the life of the
-// server) end with a refusal. Every other LOGIN succeeds.
+// n is 1-based and counts LOGINs over the life of the server. All other LOGINs succeed.
 func (s *fakeServer) refuseLoginAt(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -682,8 +680,7 @@ func (s *fakeServer) refuseCreateWith(reply string) {
 	s.store.createReply = reply
 }
 
-// refuseOpenWith makes every EXAMINE and SELECT of folder end with reply, which
-// carries its own status word, as the tagged status line. The folder stays in LIST.
+// reply carries its own status word, as the tagged status line. The folder stays in LIST.
 func (s *fakeServer) refuseOpenWith(folder, reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -693,8 +690,7 @@ func (s *fakeServer) refuseOpenWith(folder, reply string) {
 	s.store.openReply[folder] = reply
 }
 
-// refuseStatusWith makes every STATUS of folder end with reply, which carries its
-// own status word, as the tagged status line. The key is the name on the wire.
+// reply carries its own status word, as the tagged status line. The key is the name on the wire.
 func (s *fakeServer) refuseStatusWith(folder, reply string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -863,8 +859,7 @@ func splitCommand(line string) (tag, verb, arg string) {
 	return tag, strings.ToUpper(verb), arg
 }
 
-// recordCommand counts verb, plus "UID <SUB>" for UID commands. CREATE, EXAMINE,
-// SELECT and STATUS names are recorded on arrival, whether or not the server accepts them.
+// CREATE, EXAMINE, SELECT and STATUS names are recorded on arrival, whether or not the server accepts them.
 func (s *fakeServer) recordCommand(verb, arg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1268,8 +1263,6 @@ func refuseLoginAfterAppendHandler(srv *fakeServer) func(net.Conn) {
 	}
 }
 
-// stallOnSizeFetchHandler serves INBOX with two messages. At the first FETCH, the
-// size read of a show run, it calls onFetch and stops answering.
 func stallOnSizeFetchHandler(srv *fakeServer, onFetch func()) func(net.Conn) {
 	return func(conn net.Conn) {
 		defer func() { _ = conn.Close() }()

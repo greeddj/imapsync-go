@@ -18,17 +18,14 @@ const nonExistentAttr = `\NonExistent`
 // many existence checks we do during sync planning don't each cost a
 // round-trip. New loads it before returning the Client and CreateMailbox
 // adds to it, so readers never see an unloaded cache.
-//
-// noSelect holds the names that LIST marked as unable to hold messages. Each of
-// them also stays in folders, so parent creation never sends CREATE for it.
 type mailboxCache struct {
-	folders   map[string]struct{}
+	folders map[string]struct{}
+	// Each name here also stays in folders, so parent creation never sends CREATE for it.
 	noSelect  map[string]struct{}
 	delimiter string
 }
 
-// noSelectAttr reports whether a LIST attribute list marks a name that cannot
-// hold messages. RFC 3501 makes attributes case-insensitive.
+// RFC 3501 makes attributes case-insensitive.
 func noSelectAttr(attrs []string) bool {
 	return slices.ContainsFunc(attrs, func(attr string) bool {
 		return strings.EqualFold(attr, imap.NoSelectAttr) || strings.EqualFold(attr, nonExistentAttr)
