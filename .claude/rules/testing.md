@@ -115,6 +115,14 @@
   - an unlisted parent that refuses to open, where the plan skips it, prints one line and keeps the exit code (`isHierarchyLevel`);
   - an unlisted INBOX with subfolders that refuses to open, which stays a failure;
   - an unlisted parent whose session drops, which stays a failure;
+  - a destination that CREATE reports as existing but LIST did not show, where the run copies only the missing messages and a second run sends no APPEND, opens no worker connection and sends one LIST (`TestRunSync_When_CreateReportsExistingFolderWithMessages_Then_CopiesOnlyTheDifference`);
+  - the same check for an empty existing destination, which sends no source command (`TestRunSync_When_ExistingDestinationIsEmpty_Then_SourceIsNotScannedAgain`), and for a folder that CREATE made, which gets no scan (`TestRunSync_When_CreateSucceeds_Then_NewFolderIsNotScanned`);
+  - the same check with `--quiet`, where the run copies the missing messages and prints no "already exists and holds" line (`TestRunSync_When_ExistingDestinationHoldsMessagesInQuietMode_Then_PrintsNoInfoLine`);
+  - an existing destination that cannot be scanned, where the folder failure shows also with `--quiet`, the other plans still copy, and the run opens no worker connection when no plan is left (`TestRunSync_When_ExistingDestinationCannotBeScanned_Then_ReportsFolderFailure`);
+  - a source that cannot be scanned again during the check, which gives a folder failure and no APPEND (`TestRunSync_When_SourceRescanFails_Then_ReportsFolderFailure`);
+  - a context that ends during the check, where `runSync` returns `context.Canceled`, sends no APPEND and prints no failure list (`TestRunSync_When_ContextEndsDuringDestinationRecheck_Then_ReturnsCanceledWithoutAppend`);
+  - a context that has ended before `recheckExistingDestinations` starts, where a plan outside the set passes and the first plan in the set sends no command, and the call returns `context.Canceled` with no kept plan and no failure (`Test_recheckExistingDestinations_When_ContextAlreadyEnded_Then_SendsNoCommand`);
+  - `Test_rediffPlan` - the new diff never adds a UID, drops the UIDs that the destination holds or the source lost, scales the size and leaves the input slice unchanged;
   - a context that ends before either scan of `buildSyncPlan` starts, where `buildSyncPlan` returns `context.Canceled` (`Test_buildSyncPlan_When_ContextEndsAfterEntryCheck_Then_NeitherScanStarts`);
   - a context that ends before the hierarchy check of a refused source folder, where `buildSyncPlan` returns `context.Canceled` (`Test_buildSyncPlan_When_ContextEndsBeforeHierarchyCheck_Then_ReturnsContextError`);
   - `runShow` with unreadable folders (marked rows, the reason list and a non-zero exit) and with a `\Noselect` container (a `container` row and exit code 0);

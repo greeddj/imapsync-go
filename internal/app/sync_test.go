@@ -3486,7 +3486,7 @@ func TestRunSync_When_FolderCreationFails_Then_LogShowsEscapes(t *testing.T) {
 			createReply: "NO [ALREADYEXISTS] Mailbox already exists",
 			verbose:     true,
 			wantLog:     "Folder " + hostileShownName + " already exists",
-			// The fake CREATE creates nothing, so the APPEND that follows is refused.
+			// The fake CREATE creates nothing, so the scan of the folder that follows fails.
 			wantErr: func(err error) bool { return errors.Is(err, ErrSilentExit) },
 		},
 	}
@@ -5706,6 +5706,380 @@ func Test_canonicalMappings(t *testing.T) {
 
 			if mappings[0] != tt.want {
 				t.Errorf("mapping = %+v, want %+v", mappings[0], tt.want)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_CreateReportsExistingFolderWithMessages_Then_CopiesOnlyTheDifference(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x", "m3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x", "m2@x")})
+	dst.hideFromList("Work")
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+	runOnce := func() string {
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+		if err := runSync(e2eContext(t), cfg, opts); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+		return out.String()
+	}
+
+	first := runOnce()
+
+	assertIDs(t, "dst Work after the first run", dst.folderMsgIDs("Work"), "m1@x", "m2@x", "m3@x")
+	assertIDs(t, "dst APPENDs after the first run", dst.appended("Work"), "m3@x")
+	assertContainsAll(t, first,
+		"  ℹ️  Destination folder Work already exists and holds 2 of the 3 planned messages from Work, so they are not copied\n",
+		"Syncing messages",
+		"Sync completed successfully",
+	)
+	srcLogins, dstLogins, dstLists := src.callCount("LOGIN"), dst.callCount("LOGIN"), dst.callCount("LIST")
+
+	second := runOnce()
+
+	assertIDs(t, "dst Work after the second run", dst.folderMsgIDs("Work"), "m1@x", "m2@x", "m3@x")
+	assertIDs(t, "dst APPENDs over both runs", dst.appended("Work"), "m3@x")
+	assertContainsAll(t, second, "holds 3 of the 3 planned messages", "All folders already synced!")
+	assertContainsNone(t, second, "Syncing messages", "Sync completed successfully")
+	if n := src.callCount("LOGIN") - srcLogins; n != 1 {
+		t.Errorf("source saw %d LOGIN commands in the second run, want 1: no worker may connect", n)
+	}
+	if n := dst.callCount("LOGIN") - dstLogins; n != 1 {
+		t.Errorf("destination saw %d LOGIN commands in the second run, want 1: no worker may connect", n)
+	}
+	if n := dst.callCount("LIST") - dstLists; n != 1 {
+		t.Errorf("destination saw %d LIST commands in the second run, want 1", n)
+	}
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work", "Work")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_ExistingDestinationIsEmpty_Then_SourceIsNotScannedAgain(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": nil})
+	dst.hideFromList("Work")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Work")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+	assertContainsNone(t, out.String(), "already exists and holds")
+	// The copy reads bodies with UID FETCH, so every plain FETCH is a Message-Id scan.
+	if n := src.callCount("FETCH"); n != 1 {
+		t.Errorf("source saw %d Message-Id scans, want 1: the planning scan only", n)
+	}
+	assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "Work")
+}
+
+func TestRunSync_When_CreateSucceeds_Then_NewFolderIsNotScanned(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Work")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+	if slices.Contains(dst.capturedNames("EXAMINE"), "Work") {
+		t.Error("dst received EXAMINE for Work, want none: CREATE made the folder, so it is empty")
+	}
+	assertContainsNone(t, out.String(), "already exists and holds")
+}
+
+func TestRunSync_When_ExistingDestinationHoldsMessagesInQuietMode_Then_PrintsNoInfoLine(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x", "m3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x", "m2@x")})
+	dst.hideFromList("Work")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.quiet = true, true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Work")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x", "m2@x", "m3@x")
+	assertIDs(t, "dst APPENDs to Work", dst.appended("Work"), "m3@x")
+	assertContainsNone(t, out.String(), "already exists and holds")
+}
+
+func TestRunSync_When_ExistingDestinationCannotBeScanned_Then_ReportsFolderFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		withOther bool
+		quiet     bool
+	}{
+		{name: "another plan still copies", withOther: true},
+		{name: "another plan still copies in quiet mode", withOther: true, quiet: true},
+		{name: "no plan left"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srcFolders := map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x")}
+			mappings := []config.DirectoryMapping{mapping("Work", "Work")}
+			if tt.withOther {
+				srcFolders["Other"] = fakeMsgs("o1@x")
+				mappings = append(mappings, mapping("Other", "Other"))
+			}
+			src := newStoreServer(t, "/", srcFolders)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x")})
+			dst.hideFromList("Work")
+			dst.refuseOpenWith("Work", "NO "+hostileReply)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mappings...), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit", err)
+			}
+			got := out.String()
+			assertContainsAll(t, got,
+				"• Work → Work: destination folder already exists and cannot be scanned: ",
+				hostileReplyShown,
+				"1 folders failed",
+			)
+			assertContainsNone(t, got, "already exists and holds", "\x1b]0;pwned", "\x07", "\u202e")
+			assertIDs(t, "dst APPENDs to Work", dst.appended("Work"))
+			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+			if tt.withOther {
+				assertIDs(t, "dst Other", dst.folderMsgIDs("Other"), "o1@x")
+				wantHeader := 2
+				if tt.quiet {
+					wantHeader = 1
+				} else {
+					assertContainsAll(t, got, "Syncing messages")
+				}
+				if n := strings.Count(got, folderFailuresHeader); n != wantHeader {
+					t.Errorf("output holds the failure header %d times, want %d\noutput: %q", n, wantHeader, got)
+				}
+				return
+			}
+			assertContainsNone(t, got, "Syncing messages", "All folders already synced!")
+			if n := strings.Count(got, folderFailuresHeader); n != 1 {
+				t.Errorf("output holds the failure header %d times, want 1\noutput: %q", n, got)
+			}
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+			if n := dst.callCount("LOGIN"); n != 1 {
+				t.Errorf("dst saw %d LOGIN commands, want 1: no worker may connect", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_SourceRescanFails_Then_ReportsFolderFailure(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x")})
+	dst.hideFromList("Work")
+	// The rescan can reuse the selected session and send STATUS, so both commands fail.
+	dst.onCommand("CREATE", func() {
+		src.refuseOpenWith("Work", "NO [CANNOT] folder gone")
+		src.refuseStatusWith("Work", "NO [CANNOT] folder gone")
+	})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Work")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, out.String(), folderFailuresHeader, "• Work → Work: cannot scan source folder: ", "folder gone", "1 folders failed")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	}
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+}
+
+func TestRunSync_When_ContextEndsDuringDestinationRecheck_Then_ReturnsCanceledWithoutAppend(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x")})
+	dst.hideFromList("Work")
+	// Work is not cached, so the planning scan sends no EXAMINE and this one is the recheck's.
+	dst.onCommand("EXAMINE", cancel)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("Work", "Work")), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	}
+	assertContainsNone(t, out.String(), folderFailuresHeader)
+}
+
+func Test_recheckExistingDestinations_When_ContextAlreadyEnded_Then_SendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x"), "B": fakeMsgs("b1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": fakeMsgs("b1@x")})
+	srcC := newAppClient(t, src, "src")
+	dstC := newAppClient(t, dst, "dst")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	plans := []FolderSyncPlan{
+		{SourceFolder: "A", DestinationFolder: "A", SrcUIDs: []uint32{1}, NewMessages: 1},
+		{SourceFolder: "B", DestinationFolder: "B", SrcUIDs: []uint32{1}, NewMessages: 1},
+	}
+	existing := map[string]struct{}{"B": {}}
+	out := &syncBuffer{}
+
+	kept, failures, err := recheckExistingDestinations(ctx, out, false, srcC, dstC, plans, existing)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if kept != nil || failures != nil {
+		t.Errorf("kept = %v, failures = %v, want both nil", kept, failures)
+	}
+	if out.String() != "" {
+		t.Errorf("output = %q, want empty", out.String())
+	}
+	for name, srv := range map[string]*fakeServer{"source": src, "destination": dst} {
+		for _, verb := range []string{"EXAMINE", "STATUS", "FETCH"} {
+			if n := srv.callCount(verb); n != 0 {
+				t.Errorf("%s saw %d %s commands, want 0", name, n, verb)
+			}
+		}
+	}
+}
+
+func Test_rediffPlan(t *testing.T) {
+	t.Parallel()
+
+	planned := FolderSyncPlan{
+		SourceFolder:      "Src",
+		DestinationFolder: "Dst",
+		SrcUIDs:           []uint32{1, 2, 3},
+		NewMessages:       3,
+		NewSize:           300,
+	}
+	allIDs := map[string]uint32{"a@x": 1, "b@x": 2, "c@x": 3}
+	tests := []struct {
+		srcMap   map[string]uint32
+		dstIDs   map[string]struct{}
+		name     string
+		wantUIDs []uint32
+		plan     FolderSyncPlan
+		wantSize uint64
+	}{
+		{
+			name:     "destination holds some IDs",
+			plan:     planned,
+			srcMap:   allIDs,
+			dstIDs:   map[string]struct{}{"a@x": {}, "c@x": {}},
+			wantUIDs: []uint32{2},
+			wantSize: 100,
+		},
+		{
+			name:     "destination holds all IDs",
+			plan:     planned,
+			srcMap:   allIDs,
+			dstIDs:   map[string]struct{}{"a@x": {}, "b@x": {}, "c@x": {}},
+			wantUIDs: nil,
+			wantSize: 0,
+		},
+		{
+			name:     "empty destination keeps the plan",
+			plan:     planned,
+			srcMap:   allIDs,
+			dstIDs:   map[string]struct{}{},
+			wantUIDs: []uint32{1, 2, 3},
+			wantSize: 300,
+		},
+		{
+			name:     "fresh source UID outside the plan is never added",
+			plan:     FolderSyncPlan{SourceFolder: "Src", DestinationFolder: "Dst", SrcUIDs: []uint32{1, 2}, NewMessages: 2, NewSize: 200},
+			srcMap:   allIDs,
+			dstIDs:   map[string]struct{}{},
+			wantUIDs: []uint32{1, 2},
+			wantSize: 200,
+		},
+		{
+			name:     "planned UID gone from the fresh source is dropped",
+			plan:     planned,
+			srcMap:   map[string]uint32{"a@x": 1, "c@x": 3},
+			dstIDs:   map[string]struct{}{},
+			wantUIDs: []uint32{1, 3},
+			wantSize: 200,
+		},
+		{
+			name:     "size scales with the kept share",
+			plan:     planned,
+			srcMap:   allIDs,
+			dstIDs:   map[string]struct{}{"c@x": {}},
+			wantUIDs: []uint32{1, 2},
+			wantSize: 200,
+		},
+		{
+			name:     "plan without UIDs has no size",
+			plan:     FolderSyncPlan{SourceFolder: "Src", DestinationFolder: "Dst"},
+			srcMap:   allIDs,
+			dstIDs:   map[string]struct{}{},
+			wantUIDs: nil,
+			wantSize: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			before := slices.Clone(tt.plan.SrcUIDs)
+
+			got := rediffPlan(tt.plan, tt.srcMap, tt.dstIDs)
+
+			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) {
+				t.Errorf("SrcUIDs = %v, want %v", got.SrcUIDs, tt.wantUIDs)
+			}
+			if got.NewMessages != len(tt.wantUIDs) {
+				t.Errorf("NewMessages = %d, want %d", got.NewMessages, len(tt.wantUIDs))
+			}
+			if got.NewSize != tt.wantSize {
+				t.Errorf("NewSize = %d, want %d", got.NewSize, tt.wantSize)
+			}
+			if !got.DestinationFolderExists {
+				t.Error("DestinationFolderExists = false, want true")
+			}
+			if got.SourceFolder != tt.plan.SourceFolder || got.DestinationFolder != tt.plan.DestinationFolder {
+				t.Errorf("folders = %q → %q, want %q → %q", got.SourceFolder, got.DestinationFolder, tt.plan.SourceFolder, tt.plan.DestinationFolder)
+			}
+			if !slices.Equal(tt.plan.SrcUIDs, before) {
+				t.Errorf("input SrcUIDs = %v, want %v: the plan slice must not change", tt.plan.SrcUIDs, before)
 			}
 		})
 	}

@@ -88,6 +88,14 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - When the plan has no message to copy and a folder failure exists, the run shows no prompt. It prints the error summary line and exits with code 1 (`ErrSilentExit`).
    - After the copy, when a folder failure exists, the run exits with code 1 (`ErrSilentExit`). Without `--quiet`, it first lists the folder failures again. It always prints the error summary line, with the count of failed folders.
 4. **Pre-create destination folders** for the active plans (sequential, with per-folder mutex on `Client.folderLocks`). New mailboxes are added back into the cache. A name that LIST marks `\Noselect` counts as existing, so the client sends no CREATE for it, also when it is a parent.
+   - `CreateMailbox` gives `created == false` and no error when the CREATE reply says that the folder exists, or when the mailbox cache already holds the name. The planning scan did not find that folder, so its plan has no diff against the folder. `runSync` keeps each such folder in a set.
+   - After the creation loop and before the worker pool, `recheckExistingDestinations` checks each plan whose destination is in this set. It runs in sequence on the two planning clients, sends no LIST and starts no goroutine. All checks end before the first APPEND.
+   - `recheckPlan` reads the destination first with `FetchMessageIDSet`. If the folder holds no Message-Id, the plan does not change and the run sends no source command. If not, it reads the source again with `FetchMessageMap`, and `rediffPlan` keeps the planned UIDs that the new diff still lists.
+   - The check only removes messages. It never adds a UID to a plan and never shows a second prompt.
+   - Without `--quiet`, when a plan loses messages, `runSync` prints one escaped line: `Destination folder ... already exists and holds N of the M planned messages from ..., so they are not copied`. The check removes a plan that has no UID left.
+   - A scan that fails gives a folder failure. Its error wraps `errDestinationRecheck` for the destination or `errSourceScan` for the source. `runSync` adds it to `SyncSummary.Failures` and prints the new failures at once, also with `--quiet`. The run ends with exit code 1 (`ErrSilentExit`).
+   - When the check leaves no plan, the run prints no "Syncing messages" line and opens no worker connection. It ends in the same way as the case with no message to copy.
+   - When the context ends during the check, `runSync` returns the context error. It prints no failure line and sends no APPEND.
 5. **Execute via worker pool**: `newSyncWorkerPool` builds N persistent workers (each owns one src + one dst `Client` for the entire sync). Plans are dispatched through a chan-of-workers semaphore. A single `progress.Writer` covers all plans, with one tracker per plan appended up front. Per-message UI updates are throttled to ~10 Hz. At the end, `logoutAll` logs out all workers at the same time, then the two planning clients, so a silent server costs at most two logout limits.
 
 Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; re-running on a partially completed sync is safe and resumes.
@@ -266,7 +274,8 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
   - the found-subfolder line;
   - the folder-failure list (`printFolderFailures`), which shows the source folder, the destination folder and the reason. `runSync` prints it after the scan, also with `--quiet`. Without `--quiet`, `runSync` prints it again after the copy;
   - the "Folder ... skipped" line in `expandMappingsWithSubfolders`, for each source name that the mailbox cache marks `\Noselect` or `\NonExistent`. Only the name is server text. `expandMappingsWithSubfolders` prints the line only with `--verbose` and without `--quiet`;
-  - the skip line for an unlisted parent that refuses to open (`printFolderSkips`). It shows the name, a fixed reason and the error text with the server reply. `runSync` prints it also without `--verbose`, but only without `--quiet`.
+  - the skip line for an unlisted parent that refuses to open (`printFolderSkips`). It shows the name, a fixed reason and the error text with the server reply. `runSync` prints it also without `--verbose`, but only without `--quiet`;
+  - the "already exists and holds" line of `recheckExistingDestinations`, which shows the destination folder and the source folder. `runSync` prints it only without `--quiet`. The failures of the same check go through `printFolderFailures`.
 - `internal/app/show.go` escapes these sites:
   - the folder cell of each table row, also on the "unreadable" and "container" rows;
   - each line of the unreadable-folder list (`printUnreadableFolders`), which shows the folder name and the reason.

@@ -376,14 +376,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			}
 		}
 	} else {
-		if len(summary.Failures) > 0 {
-			printSyncErrors(out, 0, 0, len(summary.Failures))
-			return ErrSilentExit
-		}
-		if !quiet {
-			_, _ = fmt.Fprintln(out, "✅ All folders already synced!")
-		}
-		return nil
+		return endRunWithoutCopy(out, quiet, len(summary.Failures))
 	}
 
 	// Collect active plans
@@ -403,6 +396,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			foldersToCreate[plan.DestinationFolder] = true
 		}
 	}
+	// Folders that CREATE reported as existing although the planning scan did not list them.
+	existing := make(map[string]struct{})
 
 	if len(foldersToCreate) > 0 {
 		if !quiet {
@@ -444,6 +439,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				if verbose {
 					creationPW.Log("Folder %s already exists", termsafe.Escape(folder))
 				}
+				existing[folder] = struct{}{}
 				createdCount++
 			}
 
@@ -456,6 +452,21 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 
 		if failedCount > 0 {
 			return fmt.Errorf("failed to create %d folders", failedCount)
+		}
+	}
+
+	if len(existing) > 0 {
+		var newFailures []FolderFailure
+		activePlans, newFailures, err = recheckExistingDestinations(ctx, out, quiet, srcClient, dstClient, activePlans, existing)
+		if err != nil {
+			return err
+		}
+		if len(newFailures) > 0 {
+			summary.Failures = append(summary.Failures, newFailures...)
+			printFolderFailures(out, newFailures)
+		}
+		if len(activePlans) == 0 {
+			return endRunWithoutCopy(out, quiet, len(summary.Failures))
 		}
 	}
 
@@ -545,6 +556,96 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 
 	_, _ = fmt.Fprintln(out, "✨ Sync completed successfully. ✨")
 	return nil
+}
+
+// endRunWithoutCopy ends a run that has no message left to copy. The caller printed the failed folders.
+func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
+	if failedFolders > 0 {
+		printSyncErrors(out, 0, 0, failedFolders)
+		return ErrSilentExit
+	}
+	if !quiet {
+		_, _ = fmt.Fprintln(out, "✅ All folders already synced!")
+	}
+	return nil
+}
+
+// The prompt already showed the plans, so a plan only loses messages here and never gains one.
+func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool, srcClient, dstClient *client.Client, plans []FolderSyncPlan, existing map[string]struct{}) ([]FolderSyncPlan, []FolderFailure, error) {
+	kept := make([]FolderSyncPlan, 0, len(plans))
+	var failures []FolderFailure
+	for _, plan := range plans {
+		if _, ok := existing[plan.DestinationFolder]; !ok {
+			kept = append(kept, plan)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		rechecked, err := recheckPlan(ctx, srcClient, dstClient, plan)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, nil, ctxErr
+			}
+			failures = append(failures, FolderFailure{
+				SourceFolder:      plan.SourceFolder,
+				DestinationFolder: plan.DestinationFolder,
+				Err:               err,
+			})
+			continue
+		}
+		if dropped := plan.NewMessages - rechecked.NewMessages; dropped > 0 && !quiet {
+			_, _ = fmt.Fprintf(out, "  ℹ️  Destination folder %s already exists and holds %d of the %d planned messages from %s, so they are not copied\n",
+				termsafe.Escape(plan.DestinationFolder), dropped, plan.NewMessages, termsafe.Escape(plan.SourceFolder))
+		}
+		if len(rechecked.SrcUIDs) > 0 {
+			kept = append(kept, rechecked)
+		}
+	}
+	return kept, failures, nil
+}
+
+// The destination is read first: an empty folder holds nothing the plan could drop, so it needs no source scan.
+func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, error) {
+	dstIDs, err := dstClient.FetchMessageIDSet(ctx, plan.DestinationFolder)
+	if err != nil {
+		return plan, fmt.Errorf("%w: %w", errDestinationRecheck, err)
+	}
+	if len(dstIDs) == 0 {
+		plan.DestinationFolderExists = true
+		return plan, nil
+	}
+	srcMap, _, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
+	if err != nil {
+		return plan, fmt.Errorf("%w: %w", errSourceScan, err)
+	}
+	return rediffPlan(plan, srcMap, dstIDs), nil
+}
+
+// The result intersects the planned UIDs with the fresh diff, so it never gains a UID. It gets a new slice, because plan.SrcUIDs backs summary.Plans.
+func rediffPlan(plan FolderSyncPlan, srcMap map[string]uint32, dstIDs map[string]struct{}) FolderSyncPlan {
+	fresh := make([]uint32, 0, len(srcMap))
+	for id, uid := range srcMap {
+		if _, present := dstIDs[id]; !present {
+			fresh = append(fresh, uid)
+		}
+	}
+	slices.Sort(fresh)
+	kept := make([]uint32, 0, min(len(plan.SrcUIDs), len(fresh)))
+	for _, uid := range plan.SrcUIDs {
+		if _, found := slices.BinarySearch(fresh, uid); found {
+			kept = append(kept, uid)
+		}
+	}
+	var newSize uint64
+	if before := len(plan.SrcUIDs); before > 0 {
+		newSize = uint64(float64(plan.NewSize) * float64(len(kept)) / float64(before))
+	}
+	plan.SrcUIDs = kept
+	plan.NewMessages = len(kept)
+	plan.NewSize = newSize
+	plan.DestinationFolderExists = true
+	return plan
 }
 
 // Folder names and Err can carry server text, so every part goes through termsafe.Escape.

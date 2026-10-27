@@ -29,6 +29,7 @@ type fakeServer struct {
 	store          *mailStore
 	counts         map[string]int
 	names          map[string][]string
+	hooks          map[string][]func()
 	connHandlers   []func(net.Conn)
 	connHandlerIdx int
 	mu             sync.Mutex
@@ -70,6 +71,26 @@ func (s *fakeServer) addConnHandler(fn func(net.Conn)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.connHandlers = append(s.connHandlers, fn)
+}
+
+// onCommand makes a store-backed server run fn whenever a connection sends verb: after the server
+// records the command and before it answers. fn runs outside s.mu.
+func (s *fakeServer) onCommand(verb string, fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hooks == nil {
+		s.hooks = make(map[string][]func())
+	}
+	s.hooks[verb] = append(s.hooks[verb], fn)
+}
+
+func (s *fakeServer) runHooks(verb string) {
+	s.mu.Lock()
+	hooks := slices.Clone(s.hooks[verb])
+	s.mu.Unlock()
+	for _, fn := range hooks {
+		fn()
+	}
 }
 
 func (s *fakeServer) callCount(verb string) int {
@@ -834,6 +855,7 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 		}
 		tag, verb, arg := splitCommand(raw)
 		s.recordCommand(verb, arg)
+		s.runHooks(verb)
 
 		switch verb {
 		case "LOGIN":

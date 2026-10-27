@@ -13,7 +13,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 
 ## Sync flow invariants
 
-1. **Plan, confirm, execute** - never stream-as-you-go. The Message-Id diff must be computed and shown before any write to the destination. `--quiet` hides the plan, so it requires `--confirm`.
+1. **Plan, confirm, execute** - never stream-as-you-go. The Message-Id diff must be computed and shown before any write to the destination. `--quiet` hides the plan, so it requires `--confirm`. After the prompt, the check of a destination that CREATE reported as existing only removes messages from a plan. It never adds a UID and never asks a second question.
 2. **Idempotency = Message-Id diff**, not UID bookkeeping. Do not add a state store.
 3. **`BODY.PEEK[...]` everywhere a body or header is fetched** - `FetchRFC822` sets `\Seen` on the source, which is a write a sync tool must not perform.
 4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. After a `ClassTransient` failure, it reconnects and sends the APPEND again one time, only when go-imap did not start to read the body. After go-imap started to read the body, it sends no second APPEND, because the server can already have the message. The next run's Message-Id diff copies it. Do not move `AppendMessage` into `safeCall`, because `safeCall` retries also after a partial read.
