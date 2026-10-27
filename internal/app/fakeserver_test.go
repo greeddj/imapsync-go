@@ -583,8 +583,8 @@ type mailStore struct {
 }
 
 // newStoreServer starts a fake IMAP server with in-memory mailboxes. Queued
-// connHandlers take precedence. A server with no folders reports no delimiter,
-// so the client assumes "/".
+// connHandlers take precedence. An empty delimiter makes LIST answer NIL. A
+// server with no folders sends no LIST entry, so the client sees no delimiter.
 func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg) *fakeServer {
 	t.Helper()
 	st := &mailStore{
@@ -902,6 +902,10 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 		attrs := ""
 		if noSelect[name] {
 			attrs = `\HasChildren \Noselect`
+		}
+		if delim == "" {
+			rw.line(`* LIST (%s) NIL "%s"`, attrs, name)
+			continue
 		}
 		rw.line(`* LIST (%s) "%s" "%s"`, attrs, delim, name)
 	}

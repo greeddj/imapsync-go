@@ -769,29 +769,42 @@ func Test_buildSyncPlan_canceledContext(t *testing.T) {
 	}
 }
 
-// Test_expandMappingsWithSubfolders_emptyDelimiters covers the else-branches
-// for relativePath and dstPath when srcDelimiter and dstDelimiter are "".
-// listSubfoldersFromCache falls back to the client's cached "/" delimiter, so
-// INBOX/Sub is found. With empty dstDelimiter the destination is the parent
-// mapping's destination (not expanded).
-func Test_expandMappingsWithSubfolders_emptyDelimiters(t *testing.T) {
-	srcSrv := newFakeServer(t)
-	// Include a real subfolder so listSubfoldersFromCache (using "/") finds it.
-	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
-	srcC := newAppClient(t, srcSrv, "src")
+func Test_expandMappingsWithSubfolders_When_DelimiterIsEmpty_Then_FlatSideHasNoHierarchy(t *testing.T) {
+	t.Parallel()
 
-	mappings := []config.DirectoryMapping{{Source: "INBOX", Destination: "TARGET"}}
-	// srcDelimiter="" → else branch: relativePath = TrimPrefix(subfolder, mapping.Source)
-	// dstDelimiter="" → else branch: dstPath = mapping.Destination
-	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings, "", "", false, true)
-	if err != nil {
-		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	tests := []struct {
+		name         string
+		srcDelimiter string
+		dstDelimiter string
+		want         []config.DirectoryMapping
+	}{
+		{
+			name: "flat source gets no subfolders",
+			want: []config.DirectoryMapping{mapping("INBOX", "TARGET")},
+		},
+		{
+			name:         "flat destination keeps the source relative name",
+			srcDelimiter: "/",
+			want:         []config.DirectoryMapping{mapping("INBOX", "TARGET"), mapping("INBOX/Sub", "TARGET/Sub")},
+		},
 	}
-	if len(got) != 2 {
-		t.Fatalf("len=%d, want 2 (INBOX + INBOX/Sub), got %v", len(got), got)
-	}
-	if got[1].Destination != "TARGET" {
-		t.Errorf("INBOX/Sub destination=%q, want TARGET", got[1].Destination)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srcSrv := newFakeServer(t)
+			srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
+			srcC := newAppClient(t, srcSrv, "src")
+
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, []config.DirectoryMapping{mapping("INBOX", "TARGET")}, tt.srcDelimiter, tt.dstDelimiter, false, true)
+
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("mappings = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -3664,6 +3677,7 @@ func Test_isHierarchyLevel(t *testing.T) {
 		query   string
 		hidden  []string
 		want    bool
+		flat    bool
 	}{
 		{name: "unlisted with listed children", folders: map[string][]fakeMsg{"Archive/2024": nil}, query: "Archive", want: true},
 		{
@@ -3675,12 +3689,17 @@ func Test_isHierarchyLevel(t *testing.T) {
 		{name: "unlisted without children", folders: map[string][]fakeMsg{"Archive/2024": nil}, query: "Archiv"},
 		{name: "upper case INBOX unlisted with children", folders: map[string][]fakeMsg{"INBOX/Sub": nil}, query: "INBOX"},
 		{name: "mixed case Inbox unlisted with children", folders: map[string][]fakeMsg{"Inbox/Sub": nil}, query: "Inbox"},
+		{name: "flat server whose names share the prefix", folders: map[string][]fakeMsg{"Archive/2024": nil, "Archiveold": nil}, query: "Archive", flat: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			src := newStoreServer(t, "/", tt.folders)
+			delimiter := "/"
+			if tt.flat {
+				delimiter = ""
+			}
+			src := newStoreServer(t, delimiter, tt.folders)
 			src.hideFromList(tt.hidden...)
 			srcC := newAppClient(t, src, "src")
 
@@ -4465,4 +4484,134 @@ func TestRunSync_When_DestinationParentIsNoSelect_Then_ChildIsCreatedWithoutCrea
 	assertContainsAll(t, out.String(), "Sync completed successfully")
 	assertContainsNone(t, out.String(), "cannot be synced")
 	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_BothServersAreFlat_Then_DottedFolderIsCopiedUnchanged(t *testing.T) {
+	t.Parallel()
+
+	const folder = "Mr. Smith"
+	src := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil, folder: fakeMsgs("a@x", "b@x")})
+	dst := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), "a@x", "b@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), folder)
+	if slices.Contains(src.capturedNames("EXAMINE"), "Mr/ Smith") {
+		t.Errorf("source EXAMINE names = %q, want no rewritten name", src.capturedNames("EXAMINE"))
+	}
+	assertContainsAll(t, out.String(), `Source [src]: ""`, `Destination [dst]: ""`)
+	assertContainsNone(t, out.String(), "server expects", "delimiter mismatch", "Fixed source", "Fixed destination")
+}
+
+func TestRunSync_When_DestinationIsFlat_Then_CreatesNoParentFolder(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work/2023": fakeMsgs("w@x")})
+	dst := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil})
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work/2023", "Work/2023")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work/2023")
+	if dst.hasFolder("Work") {
+		t.Error("destination holds a folder Work that the source does not have")
+	}
+	assertIDs(t, "dst Work/2023", dst.folderMsgIDs("Work/2023"), "w@x")
+}
+
+func TestRunSync_When_SourceIsFlat_Then_MappingGetsNoSubfolders(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "", map[string][]fakeMsg{
+		"Work":      fakeMsgs("w1@x"),
+		"Work/2023": fakeMsgs("w2@x"),
+		"Workshop":  fakeMsgs("s1@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Archive")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst Archive", dst.folderMsgIDs("Archive"), "w1@x")
+	assertIDs(t, "dst folders", newAppClient(t, dst, "dst").MailboxNames(), "Archive", "INBOX")
+	for _, name := range []string{"Work/2023", "Workshop"} {
+		if slices.Contains(src.capturedNames("EXAMINE"), name) {
+			t.Errorf("source EXAMINE names = %q, want no %q: a flat server has no subfolders", src.capturedNames("EXAMINE"), name)
+		}
+	}
+}
+
+func TestRunSync_When_DestinationIsFlat_Then_SubfoldersKeepTheirSourceNames(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		src         map[string][]fakeMsg
+		mappings    []config.DirectoryMapping
+		wantDst     map[string][]string
+		wantCreates []string
+		wantAppends int
+	}{
+		{
+			name: "explicit mapping",
+			src: map[string][]fakeMsg{
+				"Work":         fakeMsgs("w1@x"),
+				"Work/2023":    fakeMsgs("w2@x"),
+				"Work/2023/Q1": fakeMsgs("w3@x"),
+			},
+			mappings:    []config.DirectoryMapping{mapping("Work", "Archive")},
+			wantDst:     map[string][]string{"Archive": {"w1@x"}, "Archive/2023": {"w2@x"}, "Archive/2023/Q1": {"w3@x"}},
+			wantCreates: []string{"Archive", "Archive/2023", "Archive/2023/Q1"},
+			wantAppends: 3,
+		},
+		{
+			name: "mirror mode",
+			src: map[string][]fakeMsg{
+				"INBOX":     nil,
+				"Work":      fakeMsgs("w1@x"),
+				"Work/2023": fakeMsgs("w2@x"),
+			},
+			wantDst:     map[string][]string{"Work": {"w1@x"}, "Work/2023": {"w2@x"}},
+			wantCreates: []string{"Work", "Work/2023"},
+			wantAppends: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil})
+			opts := e2eOptions(&syncBuffer{}, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+			for folder, want := range tt.wantDst {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), want...)
+			}
+			assertIDs(t, "dst CREATE names", slices.Sorted(slices.Values(dst.capturedNames("CREATE"))), tt.wantCreates...)
+			if n := dst.callCount("APPEND"); n != tt.wantAppends {
+				t.Errorf("dst APPEND count = %d, want %d: no message may land twice", n, tt.wantAppends)
+			}
+		})
+	}
 }

@@ -1304,6 +1304,52 @@ func Test_CreateMailbox_When_ParentIsNoSelect_Then_CreatesOnlyTheChild(t *testin
 	}
 }
 
+func Test_CreateMailbox_When_ServerIsFlat_Then_SendsOneCreateWithoutParents(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX", delim: "NIL"}}})
+
+	created, err := c.CreateMailbox(t.Context(), "Work/2023")
+
+	if err != nil {
+		t.Fatalf("CreateMailbox: %v", err)
+	}
+	if !created {
+		t.Error("CreateMailbox returned created=false, want true")
+	}
+	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"Work/2023"}) {
+		t.Errorf("CREATE names = %q, want only Work/2023: a flat server has no parent folder", got)
+	}
+	if c.hasMailbox("Work") {
+		t.Error("hasMailbox(Work) = true, want false")
+	}
+	if !c.hasMailbox("Work/2023") {
+		t.Error("hasMailbox(Work/2023) = false after the create")
+	}
+}
+
+func Test_ListSubfolders_When_ServerIsFlat_Then_ReturnsNoChildren(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "Work", delim: "NIL"},
+		{name: "Workshop", delim: "NIL"},
+		{name: "Work/2023", delim: "NIL"},
+	}})
+
+	got, err := c.ListSubfolders(t.Context(), "Work", "")
+
+	if err != nil {
+		t.Fatalf("ListSubfolders: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListSubfolders = %q, want none: a flat server has no hierarchy", got)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+}
+
 func Test_IsNoSelect_When_CacheListsNoSelectNames_Then_CacheReadsSendNoCommand(t *testing.T) {
 	t.Parallel()
 

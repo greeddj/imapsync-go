@@ -456,10 +456,12 @@ func cramMD5Handler(srv *fakeServer, user, pass string) func(net.Conn) {
 }
 
 // scriptFolder is one mailbox of a mailboxScript; each entry of sizes is the
-// RFC822.SIZE of one message.
+// RFC822.SIZE of one message. delim is the wire token for the hierarchy
+// delimiter, such as NIL or ".", and an empty value means "/".
 type scriptFolder struct {
 	name  string
 	attrs string
+	delim string
 	sizes []uint32
 }
 
@@ -503,7 +505,11 @@ func (m *mailboxScript) handler(srv *fakeServer) func(net.Conn) {
 					if attrs == "" {
 						attrs = `\HasNoChildren`
 					}
-					writeLine(conn, `* LIST (%s) "/" "%s"`, attrs, f.name)
+					delim := f.delim
+					if delim == "" {
+						delim = `"/"`
+					}
+					writeLine(conn, `* LIST (%s) %s "%s"`, attrs, delim, f.name)
 				}
 				writeLine(conn, "%s OK LIST completed", cmd.tag)
 			case "STATUS":

@@ -21,7 +21,8 @@ const nonExistentAttr = `\NonExistent`
 type mailboxCache struct {
 	folders map[string]struct{}
 	// Each name here also stays in folders, so parent creation never sends CREATE for it.
-	noSelect  map[string]struct{}
+	noSelect map[string]struct{}
+	// Empty when no LIST entry names a delimiter: NIL marks a flat namespace (RFC 3501).
 	delimiter string
 }
 
@@ -79,9 +80,6 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if delim == "" {
-		delim = "/"
-	}
 
 	c.mailboxCacheMu.Lock()
 	c.mailboxCache.folders = folders
@@ -111,10 +109,14 @@ func (c *Client) addMailboxToCache(name string) {
 
 // listSubfoldersFromCache returns mailboxes that look like children of parent.
 // "Children" means the cached name starts with parent+delimiter. Unlike a
-// LIST pattern this does not require a server round-trip.
+// LIST pattern this does not require a server round-trip. It returns nil when
+// neither delimiter is set, as on a flat server.
 func (c *Client) listSubfoldersFromCache(parent, delimiter string) []string {
 	if delimiter == "" {
 		delimiter = c.delimiter
+	}
+	if delimiter == "" {
+		return nil
 	}
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()

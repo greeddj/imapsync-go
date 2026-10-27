@@ -864,10 +864,16 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// The listing reads the mailbox cache, so it fails only when ctx ends.
-		subfolders, err := getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
-		if err != nil {
-			return nil, err
+		// A flat source has no subfolders. ListSubfolders would swap an empty
+		// delimiter for the client's own, and the relative path below needs one.
+		var subfolders []string
+		if srcDelimiter != "" {
+			// The listing reads the mailbox cache, so it fails only when ctx ends.
+			var err error
+			subfolders, err = getSubfolders(ctx, srcClient, mapping.Source, srcDelimiter)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if srcClient.IsNoSelect(mapping.Source) {
 			skip(mapping.Source, skipReasonNoSelect)
@@ -885,23 +891,20 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				continue
 			}
 			// Calculate relative path from source root
-			var relativePath string
-			if srcDelimiter != "" {
-				relativePath = strings.TrimPrefix(subfolder, mapping.Source+srcDelimiter)
-			} else {
-				relativePath = strings.TrimPrefix(subfolder, mapping.Source)
-			}
+			relativePath := strings.TrimPrefix(subfolder, mapping.Source+srcDelimiter)
 
 			// Build destination path
 			var dstPath string
-			if dstDelimiter != "" && relativePath != "" {
+			if dstDelimiter != "" {
 				// Convert delimiter if needed
-				if srcDelimiter != "" && srcDelimiter != dstDelimiter {
+				if srcDelimiter != dstDelimiter {
 					relativePath = strings.ReplaceAll(relativePath, srcDelimiter, dstDelimiter)
 				}
 				dstPath = mapping.Destination + dstDelimiter + relativePath
 			} else {
-				dstPath = mapping.Destination
+				// A flat destination has no hierarchy, so the source delimiter is ordinary
+				// name text. Merging into the parent would join distinct folders.
+				dstPath = mapping.Destination + srcDelimiter + relativePath
 			}
 
 			expanded = append(expanded, config.DirectoryMapping{

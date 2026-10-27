@@ -147,7 +147,8 @@ func (c *Client) IsNoSelect(name string) bool {
 
 // ListSubfolders returns subfolders of folder, derived from the cached
 // mailbox list. delimiter is used to compute the prefix; when empty the
-// client's cached server delimiter is substituted.
+// client's cached server delimiter is substituted. It returns nil when both
+// delimiters are empty, as on a flat server.
 func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) ([]string, error) {
 	stop := c.withCancel(ctx)
 	defer stop()

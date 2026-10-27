@@ -288,7 +288,9 @@ func (c *Client) progressTracker() ProgressTracker {
 	return nil
 }
 
-// GetDelimiter returns the cached hierarchy delimiter for this server.
+// GetDelimiter returns the cached hierarchy delimiter for this server. It is
+// empty when no LIST entry names a delimiter, for example on a flat server that
+// reports NIL.
 func (c *Client) GetDelimiter() string { return c.delimiter }
 
 // Logout ends the IMAP session. It closes the socket and returns an error when

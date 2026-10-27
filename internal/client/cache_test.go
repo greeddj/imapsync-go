@@ -86,6 +86,19 @@ func TestListSubfoldersFromCache(t *testing.T) {
 	if len(got2) != 0 {
 		t.Errorf("Inbox subfolders = %v, want []", got2)
 	}
+
+	t.Run("no delimiter means no children", func(t *testing.T) {
+		t.Parallel()
+
+		flat := newTestClient()
+		flat.mailboxCache = mailboxCache{folders: c.mailboxCache.folders}
+
+		for _, parent := range []string{"Archive", "Inbox"} {
+			if got := flat.listSubfoldersFromCache(parent, ""); len(got) != 0 {
+				t.Errorf("%s subfolders = %v, want none: a name that only shares the prefix is not a child", parent, got)
+			}
+		}
+	})
 }
 
 func Test_New_When_ListStalls_Then_ContextCancelReturns(t *testing.T) {
@@ -209,19 +222,51 @@ func Test_loadMailboxCache_When_ContextExpiresDuringList_Then_ReturnsItsError(t 
 	}
 }
 
-func Test_loadMailboxCache_When_ServerListsNoMailboxes_Then_DelimiterDefaultsToSlash(t *testing.T) {
+func Test_loadMailboxCache_When_ListNamesNoDelimiter_Then_DelimiterStaysEmpty(t *testing.T) {
 	t.Parallel()
 
-	_, c := newScriptedClient(t, &mailboxScript{})
+	tests := []struct {
+		name    string
+		want    string
+		folders []scriptFolder
+	}{
+		{
+			name:    "every entry answers NIL",
+			folders: []scriptFolder{{name: "INBOX", delim: "NIL"}, {name: "Work/2023", delim: "NIL"}},
+		},
+		{
+			name:    "NIL first and a dot later",
+			folders: []scriptFolder{{name: "INBOX", delim: "NIL"}, {name: "Work.2023", delim: `"."`}},
+			want:    ".",
+		},
+		{
+			name:    "a dot first and NIL later",
+			folders: []scriptFolder{{name: "Work.2023", delim: `"."`}, {name: "INBOX", delim: "NIL"}},
+			want:    ".",
+		},
+		{
+			name: "no entries",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	if err := c.loadMailboxCache(t.Context()); err != nil {
-		t.Fatalf("loadMailboxCache: %v", err)
-	}
-	if c.mailboxCache.delimiter != "/" {
-		t.Errorf("delimiter = %q, want %q when the server names none", c.mailboxCache.delimiter, "/")
-	}
-	if len(c.mailboxCache.folders) != 0 {
-		t.Errorf("folders = %v, want none", c.mailboxCache.folders)
+			srv, c := newLoadedClient(t, &mailboxScript{folders: tt.folders})
+
+			if c.mailboxCache.delimiter != tt.want {
+				t.Errorf("cache delimiter = %q, want %q", c.mailboxCache.delimiter, tt.want)
+			}
+			if got := c.GetDelimiter(); got != tt.want {
+				t.Errorf("GetDelimiter = %q, want %q", got, tt.want)
+			}
+			if got, want := len(c.mailboxCache.folders), len(tt.folders); got != want {
+				t.Errorf("folders = %v, want %d names", c.mailboxCache.folders, want)
+			}
+			if n := srv.callCount("LIST"); n != 1 {
+				t.Errorf("LIST count = %d, want 1: the delimiter comes from the same LIST", n)
+			}
+		})
 	}
 }
 
