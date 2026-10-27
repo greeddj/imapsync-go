@@ -2908,6 +2908,110 @@ func Test_buildSyncPlan_When_SourceScanIsRefused_Then_OnlyAnUnlistedParentIsSkip
 	}
 }
 
+func waitForTrackerValue(t *testing.T, tr *progress.Tracker, want int64) {
+	t.Helper()
+
+	deadline := time.Now().Add(e2eTimeout)
+	for tr.Value() < want {
+		if time.Now().After(deadline) {
+			t.Errorf("tracker value = %d after %v, want %d", tr.Value(), e2eTimeout, want)
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func Test_buildSyncPlan_When_ContextEndsBeforeHierarchyCheck_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	srcTr, dstTr := makePlanTrackers()
+	srcSrv := newFakeServer(t)
+	srcSrv.addConnHandler(scriptedHandler(srcSrv, []string{"Parent/Child", "Last"}, func(verb string, nth int) (string, bool) {
+		if verb != "EXAMINE" {
+			return "", false
+		}
+		if nth == 1 {
+			// The destination scan returns nil after its last Increment, so the cancel below
+			// can only reach the summary phase.
+			waitForTrackerValue(t, dstTr, 2)
+		} else {
+			cancel()
+		}
+		return "NO Permission denied", true
+	}))
+	dstSrv := newFakeServer(t)
+	srcC := newAppClient(t, srcSrv, "src")
+	dstC := newAppClient(t, dstSrv, "dst")
+	mappings := []config.DirectoryMapping{mapping("Parent", "Parent"), mapping("Last", "Last")}
+
+	summary, err := buildSyncPlan(ctx, srcC, dstC, mappings, srcTr, dstTr, "src", "dst")
+
+	if summary != nil {
+		t.Errorf("summary = %+v, want nil", summary)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if srcTr.Value() != 2 || dstTr.Value() != 2 {
+		t.Errorf("tracker values = %d src, %d dst, want 2 on both: each scan must end before the error", srcTr.Value(), dstTr.Value())
+	}
+	assertIDs(t, "src EXAMINE names", srcSrv.capturedNames("EXAMINE"), "Parent", "Last")
+	if n := dstSrv.callCount("EXAMINE"); n != 0 {
+		t.Errorf("dst saw %d EXAMINE commands, want 0: neither destination exists", n)
+	}
+}
+
+// endsAfterFirstErr passes the first Err check and ends the context right after it.
+// Everything derived from the context is then already done.
+type endsAfterFirstErr struct {
+	context.Context
+	end   context.CancelFunc
+	calls atomic.Int32
+}
+
+func (c *endsAfterFirstErr) Err() error {
+	if c.calls.Add(1) == 1 {
+		c.end()
+		return nil
+	}
+	return c.Context.Err()
+}
+
+func Test_buildSyncPlan_When_ContextEndsAfterEntryCheck_Then_NeitherScanStarts(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil})
+	srcC := newAppClient(t, src, "src")
+	dstC := newAppClient(t, dst, "dst")
+	srcTr, dstTr := makePlanTrackers()
+	base, end := context.WithCancel(t.Context())
+	t.Cleanup(end)
+	ctx := &endsAfterFirstErr{Context: base, end: end}
+
+	summary, err := buildSyncPlan(ctx, srcC, dstC, []config.DirectoryMapping{mapping("A", "A")}, srcTr, dstTr, "src", "dst")
+
+	if summary != nil {
+		t.Errorf("summary = %+v, want nil", summary)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if srcTr.Message != "src" || dstTr.Message != "dst" {
+		t.Errorf("tracker messages = %q src, %q dst, want both untouched: no scan may start", srcTr.Message, dstTr.Message)
+	}
+	if srcTr.Value() != 0 || dstTr.Value() != 0 {
+		t.Errorf("tracker values = %d src, %d dst, want 0 on both", srcTr.Value(), dstTr.Value())
+	}
+	for _, srv := range []*fakeServer{src, dst} {
+		if n := srv.callCount("EXAMINE"); n != 0 {
+			t.Errorf("a server saw %d EXAMINE commands, want 0", n)
+		}
+	}
+}
+
 // The name is short so go-pretty does not snip the tracker line that holds it.
 func hostileFolder(letter string) (wire, name, shown string) {
 	return letter + "&ABs-[2J", letter + "\x1b[2J", letter + `\x1b[2J`
