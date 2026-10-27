@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -587,4 +588,52 @@ func TestRunShow_When_FolderNameCarriesControlCharacters_Then_TableShowsEscapes(
 	}
 	assertFolderRow(t, srcSection, hostileShownName, 1, uint64(len(imapFullBody("a@x"))))
 	assertContainsNone(t, out.String(), hostileName, "\u202e", "\x1b[2J")
+}
+
+func TestRunShow_When_ContextEndsWhileReadingStatistics_Then_ReturnsContextErrorWithoutFailureBlock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		handler func(srv *fakeServer, cancel func()) func(net.Conn)
+		name    string
+	}{
+		{
+			name: "STATUS is pending",
+			handler: func(srv *fakeServer, cancel func()) func(net.Conn) {
+				return scriptedHandler(srv, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+					if verb == "STATUS" {
+						cancel()
+						return "", true
+					}
+					return "", false
+				})
+			},
+		},
+		{
+			name:    "size FETCH is pending",
+			handler: stallOnSizeFetchHandler,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(e2eContext(t))
+			t.Cleanup(cancel)
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("b@x")})
+			src.addConnHandler(tt.handler(src, cancel))
+			out := &syncBuffer{}
+
+			err := runShow(ctx, e2eConfig(src, dst, 1), e2eShowOptions(out, true))
+
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if errors.Is(err, ErrSilentExit) {
+				t.Errorf("error = %v, want no ErrSilentExit for a Ctrl+C", err)
+			}
+			assertContainsNone(t, out.String(), "cannot be read", "unreadable", "UNREADABLE")
+		})
+	}
 }

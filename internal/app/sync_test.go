@@ -3322,6 +3322,7 @@ func TestRunSync_When_DestinationIsNoSelect_Then_ReportsFolderFailureAndContinue
 			assertContainsAll(t, out.String(), tt.wantOut...)
 			assertContainsNone(t, out.String(), tt.wantNone...)
 			assertInOrder(t, out.String(), tt.wantOrder...)
+			assertReadOnly(t, "source", src)
 		})
 	}
 }
@@ -3346,6 +3347,7 @@ func TestRunSync_When_NoSelectDestinationHasNothingToReceive_Then_SyncSucceeds(t
 	if slices.Contains(dst.capturedNames("EXAMINE"), "Projects") {
 		t.Error("destination opened Projects, a folder its LIST marks \\Noselect")
 	}
+	assertReadOnly(t, "source", src)
 }
 
 func TestRunSync_When_NoSelectDestinationNameCarriesControlCharacters_Then_FailureLineShowsEscapes(t *testing.T) {
@@ -3367,6 +3369,7 @@ func TestRunSync_When_NoSelectDestinationNameCarriesControlCharacters_Then_Failu
 	assertContainsAll(t, got, "• "+hostileShownName+" → "+hostileShownName+": 1 messages not copied")
 	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J")
 	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), hostileWireName)
+	assertReadOnly(t, "source", src)
 }
 
 func Test_buildSyncPlan_When_DestinationIsNoSelect_Then_RecordsFailureNotPlan(t *testing.T) {
@@ -3757,6 +3760,7 @@ func TestRunSync_When_MappedSourceIsMissing_Then_OtherFoldersCopyAndRunFails(t *
 			if !tt.quiet {
 				assertInOrder(t, got, folderFailuresHeader, "Messages to be copied to destination", "Syncing messages", folderFailuresHeader, "1 folders failed")
 			}
+			assertReadOnly(t, "source", src)
 		})
 	}
 }
@@ -3788,6 +3792,7 @@ func TestRunSync_When_SourceRefusesExamineWithoutMapping_Then_FolderIsReported(t
 		"Temporary server failure",
 		"1 folders failed",
 	)
+	assertReadOnly(t, "source", src)
 }
 
 func TestRunSync_When_PlanningSourceClientGivesUp_Then_EveryLaterFolderIsReported(t *testing.T) {
@@ -3823,6 +3828,7 @@ func TestRunSync_When_PlanningSourceClientGivesUp_Then_EveryLaterFolderIsReporte
 		"1 messages uploaded, 0 errors occurred, 2 folders failed",
 	)
 	assertContainsNone(t, got, "Sync completed successfully")
+	assertReadOnly(t, "source", src)
 }
 
 func TestRunSync_When_OnlyFailuresAndNothingToCopy_Then_NoPromptAndExitsNonZero(t *testing.T) {
@@ -3844,6 +3850,7 @@ func TestRunSync_When_OnlyFailuresAndNothingToCopy_Then_NoPromptAndExitsNonZero(
 	}
 	assertContainsAll(t, out.String(), folderFailuresHeader, "1 folders failed")
 	assertContainsNone(t, out.String(), "Proceed with synchronization?", "All folders already synced!")
+	assertReadOnly(t, "source", src)
 }
 
 func TestRunSync_When_SourceRefusalCarriesControlCharacters_Then_FailureLineShowsEscapes(t *testing.T) {
@@ -3978,6 +3985,7 @@ func TestRunSync_When_UnlistedParentRefusesOpen_Then_SkipsItAndCopiesChildren(t 
 			assertIDs(t, "dst APPENDs to Archive", dst.appended("Archive"))
 			got := out.String()
 			assertContainsNone(t, got, "cannot be synced")
+			assertReadOnly(t, "source", src)
 			if tt.quiet {
 				assertContainsNone(t, got, "skipped")
 				return
@@ -4045,4 +4053,327 @@ func TestRunSync_When_UnlistedParentRefusalCarriesControlCharacters_Then_SkipLin
 		t.Errorf("source EXAMINE names = %q, want the first to be the exact name %q", names, hostileWireName)
 	}
 	assertIDs(t, "dst child folder", dst.folderMsgIDs(hostileWireName+"/2024"), "e1@x")
+}
+
+// assertNoCommandFor checks that srv never received a command that names a folder
+// its LIST marks \Noselect.
+func assertNoCommandFor(t *testing.T, what string, srv *fakeServer, folder string) {
+	t.Helper()
+	for _, verb := range []string{"EXAMINE", "SELECT", "STATUS", "CREATE"} {
+		if slices.Contains(srv.capturedNames(verb), folder) {
+			t.Errorf("%s received %s for %q, a name its LIST marks \\Noselect", what, verb, folder)
+		}
+	}
+	assertIDs(t, what+" APPENDs to "+folder, srv.appended(folder))
+}
+
+func TestRunSync_When_PromptIsDeclinedWithFailures_Then_ListsFailuresFirstAndWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "n\n")
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "Copy"), mapping("Gone", "Gone")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	got := out.String()
+	assertInOrder(t, got,
+		folderFailuresHeader,
+		"• Gone → Gone: cannot scan source folder:",
+		"• INBOX → Copy will copy 2 messages",
+		"Proceed with synchronization?",
+		"Sync canceled by user",
+	)
+	assertContainsNone(t, got, "Creating destination folders", "Syncing messages", "Sync completed", "All folders already synced!")
+	if n := strings.Count(got, folderFailuresHeader); n != 1 {
+		t.Errorf("output holds the failure header %d times, want 1\noutput: %q", n, got)
+	}
+	for _, verb := range []string{"CREATE", "APPEND"} {
+		if n := dst.callCount(verb); n != 0 {
+			t.Errorf("dst saw %d %s commands after the prompt was declined, want 0", n, verb)
+		}
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_AppendsFailAndFoldersFail_Then_FinalLineCountsBoth(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseAppend()
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"), mapping("Gone1", "Gone1"), mapping("Gone2", "Gone2"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"• Gone1 → Gone1: cannot scan source folder:",
+		"• Gone2 → Gone2: cannot scan source folder:",
+		"0 messages uploaded, 1 errors occurred, 2 folders failed",
+	)
+	assertContainsNone(t, got, "Sync completed successfully", "All folders already synced!")
+	if n := strings.Count(got, folderFailuresHeader); n != 2 {
+		t.Errorf("output holds the failure header %d times, want 2 (before the plan and before the final line)\noutput: %q", n, got)
+	}
+	assertInOrder(t, got, folderFailuresHeader, "Messages to be copied to destination", "Syncing messages", folderFailuresHeader, "2 folders failed")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceExamineIsThrottled_Then_FolderIsReportedWithoutReconnect(t *testing.T) {
+	t.Parallel()
+
+	const (
+		reply = "Account exceeded command or bandwidth limits"
+		wire  = "NO [THROTTLED] " + reply
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x"), "B": fakeMsgs("b1@x")})
+	src.refuseOpenWith("A", wire)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{})
+	cfg := e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst B", dst.folderMsgIDs("B"), "b1@x")
+	if dst.hasFolder("A") {
+		t.Error("dst holds A, want none: its source scan was throttled")
+	}
+	assertContainsAll(t, out.String(),
+		"• A → A: cannot scan source folder: ",
+		reply,
+		"1 messages uploaded, 0 errors occurred, 1 folders failed",
+	)
+	assertContainsNone(t, out.String(), "Sync completed successfully")
+	examinesOfA := 0
+	for _, name := range src.capturedNames("EXAMINE") {
+		if name == "A" {
+			examinesOfA++
+		}
+	}
+	if examinesOfA != 1 {
+		t.Errorf("source saw %d EXAMINE commands for A, want 1: a throttled reply is not retried", examinesOfA)
+	}
+	if n := src.callCount("LOGIN"); n != 2 {
+		t.Errorf("source saw %d LOGIN commands, want 2 (the planning client and one worker): no reconnect", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_RunTwiceWithAFailureThatStays_Then_SecondRunWritesNothingAndFailsAgain(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"), mapping("Gone", "Gone"))
+
+	firstOut := &syncBuffer{}
+	first := e2eOptions(firstOut, "")
+	first.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, first); !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("first runSync error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, firstOut.String(), "2 messages uploaded, 0 errors occurred, 1 folders failed")
+	appends, creates := dst.callCount("APPEND"), dst.callCount("CREATE")
+	if appends != 2 {
+		t.Fatalf("first run did %d APPEND, want 2", appends)
+	}
+
+	secondOut := &syncBuffer{}
+	err := runSync(e2eContext(t), cfg, e2eOptions(secondOut, ""))
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("second runSync error = %v, want ErrSilentExit", err)
+	}
+	got := secondOut.String()
+	assertContainsAll(t, got,
+		folderFailuresHeader,
+		"• Gone → Gone: cannot scan source folder:",
+		"0 messages uploaded, 0 errors occurred, 1 folders failed",
+	)
+	assertContainsNone(t, got, "All folders already synced!", "Sync completed successfully", "Proceed with synchronization?")
+	if n := dst.callCount("APPEND"); n != appends {
+		t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+	}
+	if n := dst.callCount("CREATE"); n != creates {
+		t.Errorf("CREATE count went from %d to %d on the second run", creates, n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_NoSelectSourceNameCarriesControlCharacters_Then_SkipLineShowsEscapesAndChildrenCopy(t *testing.T) {
+	t.Parallel()
+
+	const (
+		wire       = "Zed&ABs-[2J&IC4-x&MWQ-"
+		name       = "Zed\x1b[2J\u202ex\u3164"
+		shown      = `Zed\x1b[2J\u202ex\u3164`
+		childWire  = wire + "/Kid"
+		childShown = shown + "/Kid"
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{childWire: fakeMsgs("k1@x")})
+	src.markNoSelect(wire)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(name, name)), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"Folder "+shown+" skipped - the source server marks it \\Noselect\n",
+		"Found subfolder: "+childShown+" → "+childShown,
+		"Sync completed successfully",
+	)
+	assertContainsNone(t, got, name, "\u202e", "\x1b[2J", "cannot be synced")
+	// The "Created folder" log is a documented %q site, which keeps U+3164, so only the skip line is checked for it.
+	for line := range strings.SplitSeq(got, "\n") {
+		if strings.Contains(line, "skipped") && strings.Contains(line, "\u3164") {
+			t.Errorf("skip line holds the raw rune U+3164: %q", line)
+		}
+	}
+	assertNoCommandFor(t, "source", src, wire)
+	assertIDs(t, "dst APPENDs to the child", dst.appended(childWire), "k1@x")
+	if creates := dst.capturedNames("CREATE"); !slices.Contains(creates, childWire) {
+		t.Errorf("dst CREATE names = %q, want the exact wire name %q among them", creates, childWire)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_MappedSourceIsNoSelectWithoutSubfolders_Then_NothingIsScannedAndSyncSucceeds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		byFlags bool
+	}{
+		{name: "config map"},
+		{name: "source and destination flags", byFlags: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			src.markNoSelect("Container")
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+			if tt.byFlags {
+				opts.srcFolder, opts.dstFolder = "Container", "Archive"
+			} else {
+				cfg.Map = []config.DirectoryMapping{mapping("Container", "Archive")}
+			}
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+			assertContainsAll(t, out.String(),
+				"Folder Container skipped - the source server marks it \\Noselect",
+				"All folders already synced!",
+			)
+			assertContainsNone(t, out.String(), "cannot be synced", "folders failed", "Sync completed successfully")
+			assertNoCommandFor(t, "source", src, "Container")
+			for _, verb := range []string{"CREATE", "APPEND"} {
+				if n := dst.callCount(verb); n != 0 {
+					t.Errorf("dst saw %d %s commands, want 0", n, verb)
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_NoSelectDestinationReceivesDuplicateMessageIds_Then_FailureCountsDistinctIds(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Projects": fakeMsgs("p1@x", "p1@x", "p2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{})
+	dst.markNoSelect("Projects")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Projects", "Projects")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, out.String(), "• Projects → Projects: 2 messages not copied: ")
+	assertContainsNone(t, out.String(), "3 messages not copied")
+	assertNoCommandFor(t, "destination", dst, "Projects")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_FolderFailsAndCreateIsRefused_Then_FailuresPrecedeTheCreateError(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseCreate()
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "Copy"), mapping("Gone", "Gone")), opts)
+
+	if err == nil || !strings.Contains(err.Error(), "failed to create 1 folders") {
+		t.Fatalf("error = %v, want %q", err, "failed to create 1 folders")
+	}
+	if errors.Is(err, ErrSilentExit) {
+		t.Errorf("error = %v, want a create error, not ErrSilentExit", err)
+	}
+	got := out.String()
+	assertInOrder(t, got, folderFailuresHeader, "• Gone → Gone: cannot scan source folder:", "Messages to be copied to destination", "Creating destination folders")
+	assertContainsNone(t, got, "Syncing messages", "Sync completed")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_DestinationParentIsNoSelect_Then_ChildIsCreatedWithoutCreatingTheParent(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"[Gmail]/Sent": fakeMsgs("s1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.markNoSelect("[Gmail]")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("[Gmail]/Sent", "[Gmail]/Sent")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "[Gmail]/Sent")
+	assertIDs(t, "dst APPENDs to [Gmail]/Sent", dst.appended("[Gmail]/Sent"), "s1@x")
+	assertNoCommandFor(t, "destination", dst, "[Gmail]")
+	assertContainsAll(t, out.String(), "Sync completed successfully")
+	assertContainsNone(t, out.String(), "cannot be synced")
+	assertReadOnly(t, "source", src)
 }

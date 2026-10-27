@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -574,7 +575,7 @@ func TestNew_When_ContentFollowsFirstDocument_Then_ReturnsError(t *testing.T) {
 	}
 }
 
-func TestNew_When_TrailingWhitespaceFollowsDocument_Then_Loads(t *testing.T) {
+func TestNew_When_ExtraContentHoldsNoSettings_Then_Loads(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -585,39 +586,14 @@ func TestNew_When_TrailingWhitespaceFollowsDocument_Then_Loads(t *testing.T) {
 		{"JSON trailing whitespace", ".json", validJSONConfig + "\n\n  "},
 		{"YAML document end marker", ".yaml", validYAMLConfig + "...\n"},
 		{"YAML document start marker", ".yaml", "---\n" + validYAMLConfig},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg, err := runNewWithArgs(t, tt.ext, tt.content)
-
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-			if cfg.Src.Server != "src:993" || cfg.RateLimit.MaxConnections != 5 {
-				t.Errorf("Config = %+v, want the file values", cfg)
-			}
-		})
-	}
-}
-
-func TestNew_When_NullOrEmptyDocumentFollowsDocument_Then_Loads(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		ext     string
-		content string
-	}{
-		{"separator only", ".yaml", validYAMLConfig + "---\n"},
-		{"separator without final newline", ".yaml", validYAMLConfig + "---"},
-		{"comment only document", ".yaml", validYAMLConfig + "---\n# comment\n"},
-		{"tilde null document", ".yaml", validYAMLConfig + "---\n~\n"},
-		{"null word document", ".yaml", validYAMLConfig + "---\nnull\n"},
-		{"tagged null document", ".yaml", validYAMLConfig + "--- !<tag:yaml.org,2002:null>\n"},
-		{"two null documents", ".yaml", validYAMLConfig + "---\n~\n---\n"},
-		{"end marker then separator", ".yaml", validYAMLConfig + "...\n---\n"},
+		{"YAML separator only", ".yaml", validYAMLConfig + "---\n"},
+		{"YAML separator without final newline", ".yaml", validYAMLConfig + "---"},
+		{"YAML comment only document", ".yaml", validYAMLConfig + "---\n# comment\n"},
+		{"YAML tilde null document", ".yaml", validYAMLConfig + "---\n~\n"},
+		{"YAML null word document", ".yaml", validYAMLConfig + "---\nnull\n"},
+		{"YAML tagged null document", ".yaml", validYAMLConfig + "--- !<tag:yaml.org,2002:null>\n"},
+		{"YAML two null documents", ".yaml", validYAMLConfig + "---\n~\n---\n"},
+		{"YAML end marker then separator", ".yaml", validYAMLConfig + "...\n---\n"},
 		{"yml separator only", ".yml", validYAMLConfig + "---\n"},
 	}
 	for _, tt := range tests {
@@ -984,6 +960,8 @@ func TestNew_When_AuthIsUnsupported_Then_ReturnsErrorNamingSideNotValue(t *testi
 		{value: "xoauth2"},
 		{value: "plain"},
 		{value: " login"},
+		{value: "login "},
+		{value: " cram-md5"},
 		{value: "cram-md5 "},
 		{value: "abcdefghijklmnop", secret: true},
 		{value: "abcd efgh ijkl mnop", secret: true},
@@ -1107,6 +1085,219 @@ func TestValidate_When_AuthIsUnsupported_Then_ChecksBlocksInOrder(t *testing.T) 
 			}
 			if !strings.HasPrefix(err.Error(), tt.wantPrefix) {
 				t.Errorf("validate() error = %q, want the prefix %q", err, tt.wantPrefix)
+			}
+		})
+	}
+}
+
+func TestNew_When_KeyLetterCaseDiffers_Then_JSONMatchesAndYAMLRejects(t *testing.T) {
+	t.Parallel()
+
+	t.Run("JSON keys match without regard to case", func(t *testing.T) {
+		t.Parallel()
+
+		content := `{
+  "Src": {"Server":"s:993","USER":"u","Pass":"p"},
+  "DST": {"server":"d:993","user":"u","pass":"p"},
+  "MAP": [{"Src":"INBOX","DST":"Archive"}],
+  "Rate_Limit": {"Down_BPS":111,"UP_bps":222,"Max_Connections":3}
+}`
+
+		cfg, err := runNewWithArgs(t, ".json", content)
+
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if cfg.Src.Server != "s:993" || cfg.Src.User != "u" || cfg.Src.Pass != "p" {
+			t.Errorf("Src = %+v, want the file values", cfg.Src)
+		}
+		if want := []DirectoryMapping{{Source: "INBOX", Destination: "Archive"}}; !slices.Equal(cfg.Map, want) {
+			t.Errorf("Map = %+v, want %+v", cfg.Map, want)
+		}
+		if want := (RateLimit{DownBPS: 111, UpBPS: 222, MaxConnections: 3}); cfg.RateLimit != want {
+			t.Errorf("RateLimit = %+v, want %+v", cfg.RateLimit, want)
+		}
+	})
+
+	t.Run("YAML keys must match the case", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name    string
+			key     string
+			content string
+		}{
+			{"top level map", "Map", mapTestYAMLCreds + "Map:\n  - src: INBOX\n    dst: INBOX\n"},
+			{"top level src", "Src", "Src: {server: 's:993', user: u, pass: p}\ndst: {server: 'd:993', user: u, pass: p}\n"},
+			{"map entry dst", "Dst", mapTestYAMLCreds + "map:\n  - src: INBOX\n    Dst: INBOX\n"},
+			{"rate limit key", "Down_BPS", mapTestYAMLCreds + "rate_limit:\n  Down_BPS: 300000\n"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				path := writeConfigFile(t, ".yaml", tt.content)
+
+				cfg, err := runNewAt(t, path)
+
+				if cfg != nil {
+					t.Errorf("Config = %+v, want nil", cfg)
+				}
+				if err == nil {
+					t.Fatal("New returned nil error, want an unknown key error")
+				}
+				if !strings.Contains(err.Error(), path) {
+					t.Errorf("error = %q, want the config path %q", err, path)
+				}
+				if msg := strings.ReplaceAll(err.Error(), path, ""); !strings.Contains(msg, tt.key) {
+					t.Errorf("error = %q, want the key %q", msg, tt.key)
+				}
+			})
+		}
+	})
+}
+
+func TestNew_When_YAMLUsesAnchors_Then_ExpandsDefinedKeysAndRejectsUndefinedOnes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("anchor alias and merge inside defined keys", func(t *testing.T) {
+		t.Parallel()
+
+		content := `src: &creds
+  server: s:993
+  user: alice
+  pass: p
+  auth: cram-md5
+dst:
+  <<: *creds
+  server: d:993
+  user: bob
+map:
+  - &pair {src: INBOX, dst: INBOX}
+  - *pair
+  - {<<: *pair, dst: Archive}
+`
+
+		cfg, err := runNewWithArgs(t, ".yaml", content)
+
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if cfg.Src.User != "alice" || cfg.Src.Server != "s:993" {
+			t.Errorf("Src = %+v, want the anchored values", cfg.Src)
+		}
+		if cfg.Dst.User != "bob" || cfg.Dst.Server != "d:993" {
+			t.Errorf("Dst = %+v, want the overridden user and server", cfg.Dst)
+		}
+		if cfg.Dst.Pass != "p" || cfg.Dst.Auth != "cram-md5" {
+			t.Errorf("Dst = %+v, want pass and auth merged from the anchor", cfg.Dst)
+		}
+		want := []DirectoryMapping{
+			{Source: "INBOX", Destination: "INBOX"},
+			{Source: "INBOX", Destination: "INBOX"},
+			{Source: "INBOX", Destination: "Archive"},
+		}
+		if !slices.Equal(cfg.Map, want) {
+			t.Errorf("Map = %+v, want %+v", cfg.Map, want)
+		}
+	})
+
+	t.Run("anchor under an undefined top level key", func(t *testing.T) {
+		t.Parallel()
+
+		content := `defaults: &d
+  server: s:993
+  user: u
+  pass: p
+src: *d
+dst:
+  <<: *d
+  server: d:993
+`
+		path := writeConfigFile(t, ".yaml", content)
+
+		cfg, err := runNewAt(t, path)
+
+		if cfg != nil {
+			t.Errorf("Config = %+v, want nil", cfg)
+		}
+		if err == nil {
+			t.Fatal("New returned nil error, want an unknown key error")
+		}
+		if !strings.Contains(err.Error(), path) {
+			t.Errorf("error = %q, want the config path %q", err, path)
+		}
+		if msg := strings.ReplaceAll(err.Error(), path, ""); !strings.Contains(msg, "defaults") {
+			t.Errorf("error = %q, want the key %q", msg, "defaults")
+		}
+	})
+}
+
+func TestNew_When_UnknownKeyHoldsASecret_Then_ErrorHasNoSecretValue(t *testing.T) {
+	t.Parallel()
+
+	const secret = "tp-9f3a-secret-value"
+	tests := []struct {
+		name    string
+		ext     string
+		content string
+		key     string
+	}{
+		{
+			name: "JSON password under src", ext: ".json", key: "password",
+			content: `{"src":{"server":"s:993","user":"u","password":"` + secret + `"},` +
+				`"dst":{"server":"d:993","user":"u","pass":"p"}}`,
+		},
+		{
+			name: "JSON password under dst", ext: ".json", key: "password",
+			content: `{"src":{"server":"s:993","user":"u","pass":"p"},` +
+				`"dst":{"server":"d:993","user":"u","pass":"p","password":"` + secret + `"}}`,
+		},
+		{
+			name: "JSON secret under a top level key", ext: ".json", key: "secrets",
+			content: `{"src":{"server":"s:993","user":"u","pass":"p"},` +
+				`"dst":{"server":"d:993","user":"u","pass":"p"},"secrets":{"pw":"` + secret + `"}}`,
+		},
+		{
+			name: "YAML password under src", ext: ".yaml", key: "password",
+			content: "src: {server: 's:993', user: u, password: " + secret + "}\n" +
+				"dst: {server: 'd:993', user: u, pass: p}\n",
+		},
+		{
+			name: "YAML password under dst", ext: ".yaml", key: "password",
+			content: "src: {server: 's:993', user: u, pass: p}\n" +
+				"dst: {server: 'd:993', user: u, pass: p, password: " + secret + "}\n",
+		},
+		{
+			name: "YAML secret under a top level key", ext: ".yaml", key: "secrets",
+			content: "src: {server: 's:993', user: u, pass: p}\n" +
+				"dst: {server: 'd:993', user: u, pass: p}\nsecrets:\n  pw: " + secret + "\n",
+		},
+		{
+			name: "yml password under src", ext: ".yml", key: "password",
+			content: "src:\n  server: s:993\n  user: u\n  password: " + secret + "\n" +
+				"dst: {server: 'd:993', user: u, pass: p}\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := writeConfigFile(t, tt.ext, tt.content)
+
+			cfg, err := runNewAt(t, path)
+
+			if cfg != nil {
+				t.Errorf("Config = %+v, want nil", cfg)
+			}
+			if err == nil {
+				t.Fatal("New returned nil error, want an unknown key error")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("error = %q, want no secret value", err)
+			}
+			if msg := strings.ReplaceAll(err.Error(), path, ""); !strings.Contains(msg, tt.key) {
+				t.Errorf("error = %q, want the key %q", msg, tt.key)
 			}
 		})
 	}

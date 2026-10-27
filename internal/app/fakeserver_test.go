@@ -1267,3 +1267,50 @@ func refuseLoginAfterAppendHandler(srv *fakeServer) func(net.Conn) {
 		}
 	}
 }
+
+// stallOnSizeFetchHandler serves INBOX with two messages. At the first FETCH, the
+// size read of a show run, it calls onFetch and stops answering.
+func stallOnSizeFetchHandler(srv *fakeServer, onFetch func()) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+		rw := replyWriter{conn: conn}
+		rw.line("* OK [CAPABILITY IMAP4rev1] fake ready")
+
+		rd := bufio.NewReader(conn)
+		for {
+			raw, err := rd.ReadString('\n')
+			if err != nil {
+				return
+			}
+			raw = strings.TrimRight(raw, "\r\n")
+			if raw == "" {
+				continue
+			}
+			tag, verb, arg := splitCommand(raw)
+			srv.recordCommand(verb, arg)
+
+			switch verb {
+			case "LIST":
+				rw.line(`* LIST () "/" "INBOX"`)
+				rw.line("%s OK LIST completed", tag)
+			case "STATUS":
+				rw.line(`* STATUS "INBOX" (MESSAGES 2)`)
+				rw.line("%s OK STATUS completed", tag)
+			case "EXAMINE":
+				rw.line("* 2 EXISTS")
+				rw.line("* 0 RECENT")
+				rw.line("%s OK [READ-ONLY] EXAMINE completed", tag)
+			case "FETCH":
+				onFetch()
+				_, _ = rd.ReadByte()
+				return
+			case "LOGOUT":
+				rw.line("* BYE Logging out")
+				rw.line("%s OK LOGOUT completed", tag)
+				return
+			default:
+				rw.line("%s OK %s completed", tag, verb)
+			}
+		}
+	}
+}

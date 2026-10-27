@@ -599,6 +599,18 @@ func Test_ListMailboxes_When_SizingFails_Then_FolderCarriesTheReason(t *testing.
 			}
 
 			assertUnreadable(t, infosByName(t, infos), "INBOX", "read folder size", "examine refused")
+			if m := infosByName(t, infos)["INBOX"]; m != nil {
+				found := false
+				for e := m.Err; e != nil; e = errors.Unwrap(e) {
+					if e.Error() == "examine refused" {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("error = %v, want a link in its chain with the reply %q", m.Err, "examine refused")
+				}
+			}
 			if len(infos) != 1 {
 				t.Errorf("ListMailboxes returned %d folders, want 1", len(infos))
 			}
@@ -1304,5 +1316,95 @@ func Test_CreateMailbox_When_ParentIsNoSelect_Then_CreatesOnlyTheChild(t *testin
 	}
 	if c.IsNoSelect("[Gmail]/New") {
 		t.Error("IsNoSelect([Gmail]/New) = true for a folder this client created")
+	}
+}
+
+// Test_IsNoSelect_When_CacheListsNoSelectNames_Then_CacheReadsSendNoCommand
+// asserts that the cache reads for \Noselect names add no command after the one
+// LIST that New sends.
+func Test_IsNoSelect_When_CacheListsNoSelectNames_Then_CacheReadsSendNoCommand(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "[Gmail]", attrs: `\HasChildren \Noselect`},
+		{name: "Ghost", attrs: `\NonExistent`},
+		{name: "INBOX", sizes: []uint32{10}},
+		{name: "[Gmail]/Sent", sizes: []uint32{10}},
+	}})
+
+	for name, want := range map[string]bool{"[Gmail]": true, "Ghost": true, "INBOX": false, "[Gmail]/Sent": false} {
+		if got := c.IsNoSelect(name); got != want {
+			t.Errorf("IsNoSelect(%q) = %t, want %t", name, got, want)
+		}
+		exists, err := c.MailboxExists(t.Context(), name)
+		if err != nil {
+			t.Fatalf("MailboxExists(%q): %v", name, err)
+		}
+		if !exists {
+			t.Errorf("MailboxExists(%q) = false, want true: a listed name exists", name)
+		}
+	}
+	if got := c.MailboxNames(); !slices.Equal(got, []string{"Ghost", "INBOX", "[Gmail]", "[Gmail]/Sent"}) {
+		t.Errorf("MailboxNames = %q, want every listed name", got)
+	}
+	subfolders, err := c.ListSubfolders(t.Context(), "[Gmail]", "/")
+	if err != nil {
+		t.Fatalf("ListSubfolders: %v", err)
+	}
+	if want := []string{"[Gmail]/Sent"}; !slices.Equal(subfolders, want) {
+		t.Errorf("ListSubfolders = %q, want %q", subfolders, want)
+	}
+
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+	for _, verb := range []string{"EXAMINE", "SELECT", "STATUS", "CREATE", "FETCH"} {
+		if n := srv.callCount(verb); n != 0 {
+			t.Errorf("%s count = %d, want 0", verb, n)
+		}
+	}
+}
+
+// Test_ListMailboxes_When_ReconnectGivesUpWhileSizing_Then_ErrWrapsTheGiveUpError
+// asserts that a folder whose sizing ends in a reconnect that gives up carries
+// an error that wraps the give-up error.
+func Test_ListMailboxes_When_ReconnectGivesUpWhileSizing_Then_ErrWrapsTheGiveUpError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		switch cmd.verb {
+		case "LIST":
+			writeLine(conn, `* LIST (\HasNoChildren) "/" "INBOX"`)
+			writeLine(conn, "%s OK LIST completed", cmd.tag)
+			return true, true
+		case "STATUS":
+			writeLine(conn, `* STATUS "INBOX" (MESSAGES 3)`)
+			writeLine(conn, "%s OK STATUS completed", cmd.tag)
+			return true, true
+		case "EXAMINE":
+			return true, false
+		}
+		return false, true
+	}))
+	for range maxReconnectAttempts {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	c := newClientWithFake(t, srv)
+	c.backoff = 0
+	c.reviveDur = time.Hour
+
+	infos, err := c.ListMailboxes(t.Context())
+	if err != nil {
+		t.Fatalf("ListMailboxes: %v", err)
+	}
+
+	if c.giveUpErr == nil {
+		t.Fatal("the client did not give up")
+	}
+	got := infosByName(t, infos)
+	assertUnreadable(t, got, "INBOX", "read folder size")
+	if m := got["INBOX"]; m != nil && !errors.Is(m.Err, c.giveUpErr) {
+		t.Errorf("error = %v, want it to wrap the give-up error %v", m.Err, c.giveUpErr)
 	}
 }

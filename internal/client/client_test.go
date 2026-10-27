@@ -905,6 +905,7 @@ func Test_New_cramMD5Succeeds(t *testing.T) {
 	}{
 		{name: "lower case mechanism", auth: "cram-md5"},
 		{name: "upper case mechanism", auth: "CRAM-MD5"},
+		{name: "mixed case mechanism", auth: "Cram-Md5"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -925,6 +926,9 @@ func Test_New_cramMD5Succeeds(t *testing.T) {
 				_ = c.Logout()
 			})
 
+			if got := srv.callCount("AUTHENTICATE"); got != 1 {
+				t.Errorf("AUTHENTICATE count = %d, want 1", got)
+			}
 			if got := srv.callCount("CRAM-MD5 VERIFIED"); got != 1 {
 				t.Errorf("verified digests = %d, want 1", got)
 			}
@@ -946,7 +950,7 @@ func Test_New_When_AuthIsUnsupported_Then_RefusesBeforeDialing(t *testing.T) {
 
 	const password = "secret-pass"
 
-	for _, auth := range []string{"cram_md5", "crammd5", "xoauth2", "plain", "abcdefghijklmnop", "abcd efgh ijkl mnop"} {
+	for _, auth := range []string{"cram_md5", "crammd5", "xoauth2", "plain", "abcdefghijklmnop", "abcd efgh ijkl mnop", " login", "login ", " cram-md5", "cram-md5 "} {
 		t.Run(auth, func(t *testing.T) {
 			t.Parallel()
 
