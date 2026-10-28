@@ -27,7 +27,7 @@ type mailboxCache struct {
 	folders map[string]struct{}
 	// Each name here also stays in folders, so parent creation never sends CREATE for it.
 	noSelect map[string]struct{}
-	// Maps the canonical form of a listed name to its listed spelling, only where the two differ. Nil when no listed name differs.
+	// Maps the canonical form of a listed name under the cache delimiter to its listed spelling, only where the two differ. Nil when none differs.
 	inboxSpellings map[string]string
 	// Empty when no LIST entry names a delimiter: NIL marks a flat namespace (RFC 3501).
 	delimiter string
@@ -160,20 +160,17 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 
 	folders := make(map[string]struct{})
 	var noSelect map[string]struct{}
-	var spellings map[string]string
 	var invalid []string
 	delim := ""
 
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		folders = make(map[string]struct{})
 		noSelect = nil
-		spellings = nil
 		invalid = nil
 		delim = ""
 		var err error
 		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {
 			folders[m.Name] = struct{}{}
-			spellings = noteSpelling(spellings, m.Name, m.Delimiter)
 			if noSelectAttr(m.Attributes) {
 				if noSelect == nil {
 					noSelect = make(map[string]struct{})
@@ -197,6 +194,12 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	// Lookups and folder locks fold INBOX with the cache delimiter. It is known only after LIST, because an entry before the first named delimiter can answer NIL.
+	var spellings map[string]string
+	for name := range folders {
+		spellings = noteSpelling(spellings, name, delim)
 	}
 
 	c.mailboxCacheMu.Lock()

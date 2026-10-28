@@ -593,6 +593,7 @@ type mailStore struct {
 	openReply    map[string]string
 	statusReply  map[string]string
 	literal      map[string]bool
+	nilDelim     map[string]bool
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -727,6 +728,18 @@ func (s *fakeServer) listAsLiteral(names ...string) {
 	}
 	for _, name := range names {
 		s.store.literal[name] = true
+	}
+}
+
+// Lists a name with NIL next to names with a delimiter, as a server that breaks the single-delimiter rule of RFC 3501 does.
+func (s *fakeServer) listWithNilDelimiter(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.nilDelim == nil {
+		s.store.nilDelim = make(map[string]bool, len(names))
+	}
+	for _, name := range names {
+		s.store.nilDelim[name] = true
 	}
 }
 
@@ -985,6 +998,7 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 	noSelect := maps.Clone(s.store.noSelect)
 	hidden := maps.Clone(s.store.hidden)
 	literal := maps.Clone(s.store.literal)
+	nilDelim := maps.Clone(s.store.nilDelim)
 	s.mu.Unlock()
 	for _, name := range names {
 		if hidden[name] {
@@ -996,13 +1010,13 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 		}
 		if literal[name] {
 			token := "NIL"
-			if delim != "" {
+			if delim != "" && !nilDelim[name] {
 				token = `"` + delim + `"`
 			}
 			rw.line("* LIST (%s) %s {%d}\r\n%s", attrs, token, len(name), name)
 			continue
 		}
-		if delim == "" {
+		if delim == "" || nilDelim[name] {
 			rw.line(`* LIST (%s) NIL "%s"`, attrs, name)
 			continue
 		}

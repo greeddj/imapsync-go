@@ -5813,6 +5813,70 @@ func TestRunSync_When_DestinationListsInboxChildInAnotherCase_Then_ItIsUsedUnder
 	}
 }
 
+func TestRunSync_When_DestinationListsInboxChildWithNilDelimiter_Then_ItIsUsedUnderItsListedName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "mirror"},
+		{name: "typed INBOX.Sub", mappings: []config.DirectoryMapping{mapping("INBOX.Sub", "INBOX.Sub")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil, "INBOX.Sub": fakeMsgs("s1@x", "s2@x")})
+			dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil, "inbox.Sub": fakeMsgs("s1@x")})
+			dst.foldOnlyBareInbox()
+			dst.listWithNilDelimiter("inbox.Sub")
+			cfg := e2eConfig(src, dst, 1, tt.mappings...)
+
+			first := runSyncConfirmed(t, cfg, "", "")
+			second := runSyncConfirmed(t, cfg, "", "")
+
+			assertContainsNone(t, first, folderFailuresHeader)
+			if n := dst.callCount("CREATE"); n != 0 {
+				t.Errorf("dst CREATE names = %q, want none: inbox.Sub exists", dst.capturedNames("CREATE"))
+			}
+			for _, verb := range []string{"EXAMINE", "SELECT"} {
+				if names := dst.capturedNames(verb); slices.Contains(names, "INBOX.Sub") {
+					t.Errorf("dst %s names = %q, want no INBOX.Sub: the server lists inbox.Sub", verb, names)
+				}
+			}
+			if dst.hasFolder("INBOX.Sub") {
+				t.Error("dst holds INBOX.Sub, want only the listed inbox.Sub")
+			}
+			assertIDs(t, "dst inbox.Sub", dst.folderMsgIDs("inbox.Sub"), "s1@x", "s2@x")
+			assertIDs(t, "dst APPENDs to inbox.Sub", dst.appended("inbox.Sub"), "s2@x")
+			assertContainsAll(t, second, "All folders already synced!")
+		})
+	}
+}
+
+func TestRunSync_When_SourceListsInboxChildWithNilDelimiter_Then_TypedNameScansTheListedFolder(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil, "inbox.Sub": fakeMsgs("s1@x")})
+	src.foldOnlyBareInbox()
+	src.listWithNilDelimiter("inbox.Sub")
+	dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX.Sub", "Archive"))
+
+	out := runSyncConfirmed(t, cfg, "", "")
+
+	examined := src.capturedNames("EXAMINE")
+	if !slices.Contains(examined, "inbox.Sub") {
+		t.Errorf("source EXAMINE names = %q, want the listed inbox.Sub among them", examined)
+	}
+	if slices.Contains(examined, "INBOX.Sub") {
+		t.Errorf("source EXAMINE names = %q, want no INBOX.Sub: the server never listed it", examined)
+	}
+	assertContainsNone(t, out, folderFailuresHeader)
+	assertIDs(t, "dst Archive", dst.folderMsgIDs("Archive"), "s1@x")
+}
+
 func TestRunSync_When_TwoSourcesDifferOnlyInInboxCase_Then_TheyAreOneSource(t *testing.T) {
 	t.Parallel()
 

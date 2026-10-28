@@ -518,6 +518,107 @@ func Test_loadMailboxCache_When_ListGivesTwoSpellingsOfAnInboxChild_Then_CacheKe
 	}
 }
 
+func Test_loadMailboxCache_When_EntryNamesAnotherDelimiter_Then_InboxLevelFollowsTheCacheDelimiter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		folders []scriptFolder
+	}{
+		{
+			name: "NIL entry after a dot entry",
+			folders: []scriptFolder{
+				{name: "Work", delim: `"."`},
+				{name: "inbox.Sub", delim: "NIL", attrs: `\Noselect`},
+			},
+		},
+		{
+			name: "NIL entry before a dot entry",
+			folders: []scriptFolder{
+				{name: "inbox.Sub", delim: "NIL", attrs: `\Noselect`},
+				{name: "Work", delim: `"."`},
+			},
+		},
+		{
+			name: "slash entry on a dot server",
+			folders: []scriptFolder{
+				{name: "Work", delim: `"."`},
+				{name: "inbox.Sub", delim: `"/"`, attrs: `\Noselect`},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, c := newLoadedClient(t, &mailboxScript{folders: tt.folders})
+
+			if c.mailboxCache.delimiter != "." {
+				t.Fatalf("cache delimiter = %q, want a dot", c.mailboxCache.delimiter)
+			}
+			for _, input := range []string{"inbox.Sub", "INBOX.Sub", "Inbox.Sub"} {
+				if exists, err := c.MailboxExists(t.Context(), input); err != nil || !exists {
+					t.Errorf("MailboxExists(%q) = %t, %v, want true", input, exists, err)
+				}
+				if got := c.ResolveName(input); got != "inbox.Sub" {
+					t.Errorf("ResolveName(%q) = %q, want the listed inbox.Sub", input, got)
+				}
+				if !c.IsNoSelect(input) {
+					t.Errorf("IsNoSelect(%q) = false, want true: the server marked inbox.Sub", input)
+				}
+				if c.folderLock(input) != c.folderLock("inbox.Sub") {
+					t.Errorf("folderLock(%q) is not the lock of inbox.Sub: two creates could race", input)
+				}
+			}
+			got, err := c.ListSubfolders(t.Context(), "INBOX", "")
+			if err != nil {
+				t.Fatalf("ListSubfolders: %v", err)
+			}
+			if want := []string{"inbox.Sub"}; !slices.Equal(got, want) {
+				t.Errorf("ListSubfolders(INBOX) = %q, want %q", got, want)
+			}
+			if got, want := c.MailboxNames(), []string{"Work", "inbox.Sub"}; !slices.Equal(got, want) {
+				t.Errorf("MailboxNames = %q, want %q: every name keeps the bytes that LIST gave", got, want)
+			}
+			if n := srv.callCount("LIST"); n != 1 {
+				t.Errorf("LIST count = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func Test_loadMailboxCache_When_SlashChildIsListedOnADotServer_Then_InboxLevelDoesNotFold(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "Work", delim: `"."`},
+		{name: "inbox/Sub", delim: `"/"`},
+	}})
+
+	if got := c.ResolveName("INBOX/Sub"); got != "INBOX/Sub" {
+		t.Errorf("ResolveName(INBOX/Sub) = %q, want INBOX/Sub: the dot server does not fold a slash child", got)
+	}
+	if exists, err := c.MailboxExists(t.Context(), "INBOX/Sub"); err != nil || exists {
+		t.Errorf("MailboxExists(INBOX/Sub) = %t, %v, want false", exists, err)
+	}
+	if exists, err := c.MailboxExists(t.Context(), "inbox/Sub"); err != nil || !exists {
+		t.Errorf("MailboxExists(inbox/Sub) = %t, %v, want true: the listed bytes match", exists, err)
+	}
+	if got := c.ResolveName("inbox/Sub"); got != "inbox/Sub" {
+		t.Errorf("ResolveName(inbox/Sub) = %q, want the listed inbox/Sub", got)
+	}
+	got, err := c.ListSubfolders(t.Context(), "INBOX", "")
+	if err != nil {
+		t.Fatalf("ListSubfolders: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListSubfolders(INBOX) = %q, want none: the slash child is not a child under the dot", got)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+}
+
 func Test_loadMailboxCache_When_ListIsRetried_Then_SpellingsOfTheFailedAttemptAreDropped(t *testing.T) {
 	t.Parallel()
 
