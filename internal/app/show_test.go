@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
@@ -688,6 +689,57 @@ func TestRunShow_When_FolderNameIsNotModifiedUTF7_Then_TableLeavesItOutAndWarns(
 			for _, name := range append(src.capturedNames("STATUS"), dst.capturedNames("STATUS")...) {
 				if name != "INBOX" {
 					t.Errorf("a server got STATUS for %q, want only INBOX", name)
+				}
+			}
+		})
+	}
+}
+
+func TestRunShow_When_FolderNameHoldsLatin1Byte_Then_TableLeavesItOutAndWarnsWithTheEscapedName(t *testing.T) {
+	t.Parallel()
+
+	const (
+		latin1 = "Entw\xfcrfe"
+		shown  = `Entw\xfcrfe`
+	)
+	for _, quiet := range []bool{true, false} {
+		t.Run(fmt.Sprintf("quiet=%v", quiet), func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x"), latin1: fakeMsgs("b@x")})
+			src.listAsLiteral(latin1)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+
+			if err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, quiet)); err != nil {
+				t.Fatalf("runShow: %v", err)
+			}
+
+			raw := out.String()
+			if strings.Contains(raw, "\xfc") || !utf8.ValidString(raw) {
+				t.Errorf("output holds the raw byte or invalid UTF-8: %q", raw)
+			}
+			got := stripANSI(raw)
+			tables, warnings, ok := strings.Cut(got, "⚠️")
+			if !ok {
+				t.Fatalf("output has no warning:\n%s", got)
+			}
+			assertContainsAll(t, "⚠️"+warnings, leftOutLine("src", shown))
+			assertContainsNone(t, tables, "Entw")
+			size := uint64(len(imapFullBody("a@x")))
+			_, srcSection, ok := strings.Cut(tables, "Source")
+			if !ok {
+				t.Fatalf("output has no Source title:\n%s", got)
+			}
+			srcSection, _, ok = strings.Cut(srcSection, "Destination")
+			if !ok {
+				t.Fatalf("output has no Destination title:\n%s", got)
+			}
+			assertFolderRow(t, srcSection, "INBOX", 1, size)
+			assertTotalsRow(t, srcSection, 1, 1, size)
+			for _, name := range src.capturedNames("STATUS") {
+				if name != "INBOX" {
+					t.Errorf("source got STATUS for %q, want only INBOX", name)
 				}
 			}
 		})

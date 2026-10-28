@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/emersion/go-imap"
 )
 
 func newTestClient() *Client {
@@ -709,5 +711,172 @@ func Test_loadMailboxCache_When_Reloaded_Then_InvalidNamesAreReplaced(t *testing
 
 	if got := c.InvalidMailboxNames(); len(got) != 0 {
 		t.Errorf("InvalidMailboxNames after a reload = %q, want none", got)
+	}
+}
+
+func Test_New_When_ListEntryIsMalformed_Then_FailsInsteadOfLeavingItOut(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		{name: "attributes are not a list", entry: `* LIST X "/" "Work"`},
+		{name: "delimiter is a list", entry: `* LIST () (x) "Work"`},
+		{name: "name is a list", entry: `* LIST () "/" (a b)`},
+		{name: "name is NIL", entry: `* LIST () "/" NIL`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+				if cmd.verb != "LIST" {
+					return false, true
+				}
+				writeLine(conn, "%s", tt.entry)
+				writeLine(conn, "%s OK LIST completed", cmd.tag)
+				return true, true
+			}))
+
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "src", DialTimeout: 5 * time.Second})
+
+			if err == nil {
+				c.Cancel()
+				t.Fatal("New returned nil error, want the malformed entry to stop the LIST")
+			}
+			for _, want := range []string{"failed to load mailbox list", "[src] list mailboxes"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			if n := srv.callCount("LIST"); n != 1 {
+				t.Errorf("LIST count = %d, want 1: a parse failure is not transient", n)
+			}
+		})
+	}
+}
+
+func Test_New_When_ListIsInterleavedWithOtherUntaggedResponses_Then_CacheKeepsEveryName(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		writeLine(conn, `* OK [ALERT] maintenance tonight`)
+		writeLine(conn, `* LIST () "/" "INBOX"`)
+		writeLine(conn, `* CAPABILITY IMAP4rev1 UIDPLUS`)
+		writeLine(conn, `* LIST () "/" "Work"`)
+		writeLine(conn, "%s OK LIST completed", cmd.tag)
+		return true, true
+	}))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if got, want := c.MailboxNames(), []string{"INBOX", "Work"}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %q, want %q: a response that is not a LIST entry must not end the listing", got, want)
+	}
+	if got := c.InvalidMailboxNames(); len(got) != 0 {
+		t.Errorf("InvalidMailboxNames = %q, want none", got)
+	}
+	// go-imap stores the capabilities of an untagged CAPABILITY response only when the LIST handler passes it on.
+	if supported, err := c.c.Load().Support("UIDPLUS"); err != nil || !supported {
+		t.Errorf("Support(UIDPLUS) = %t, %v, want true: the response during LIST must reach go-imap", supported, err)
+	}
+	if n := srv.callCount("CAPABILITY"); n != 0 {
+		t.Errorf("CAPABILITY count = %d, want 0: the response during LIST already told the client", n)
+	}
+}
+
+func FuzzCanonicalName(f *testing.F) {
+	seeds := []struct{ name, delimiter string }{
+		{"INBOX", "/"}, {"inbox", "/"}, {"iNbOx", ""}, {"inbox/Work", "/"}, {"inbox.Work", "."},
+		{"inbox/Work", "."}, {"inbox/Work", ""}, {"INBOXES", "/"}, {"inbox/", "/"}, {"", "/"}, {"inbo", "/"},
+		{"INBO\xc3\xa9", "/"}, {"INB\xff", "/"}, {"inbox\xff", "/"}, {"inbox\xc3\xa9/x", "/"}, {"ınbox", "/"},
+		{"inbox//x", "//"}, {"inbox\xe2\x80\xa8x", "\xe2\x80\xa8"},
+	}
+	for _, s := range seeds {
+		f.Add(s.name, s.delimiter)
+	}
+	prefix := len(imap.InboxName)
+	f.Fuzz(func(t *testing.T, name, delimiter string) {
+		got := canonicalName(name, delimiter)
+
+		if again := canonicalName(got, delimiter); again != got {
+			t.Errorf("canonicalName(%q, %q) = %q, but a second pass gives %q", name, delimiter, got, again)
+		}
+		if len(got) != len(name) {
+			t.Fatalf("canonicalName(%q, %q) = %q, want the same length", name, delimiter, got)
+		}
+		if len(name) > prefix && got[prefix:] != name[prefix:] {
+			t.Errorf("canonicalName(%q, %q) = %q, want only the first %d bytes changed", name, delimiter, got, prefix)
+		}
+		if len(name) <= prefix && got != name && got != imap.InboxName {
+			t.Errorf("canonicalName(%q, %q) = %q, want the input or INBOX", name, delimiter, got)
+		}
+		levelFollows := len(name) > prefix && delimiter != "" && strings.HasPrefix(name[prefix:], delimiter)
+		if !levelFollows {
+			if want := imap.CanonicalMailboxName(name); got != want {
+				t.Errorf("canonicalName(%q, %q) = %q, want %q like the go-imap rule", name, delimiter, got, want)
+			}
+			return
+		}
+		if want := imap.InboxName + name[prefix:]; strings.EqualFold(name[:prefix], imap.InboxName) && got != want {
+			t.Errorf("canonicalName(%q, %q) = %q, want %q", name, delimiter, got, want)
+		}
+		if !strings.EqualFold(name[:prefix], imap.InboxName) && got != name {
+			t.Errorf("canonicalName(%q, %q) = %q, want the input: the first level is not INBOX", name, delimiter, got)
+		}
+	})
+}
+
+func Test_loadMailboxCache_When_ListIsRetried_Then_DelimiterOfTheFailedAttemptIsDropped(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		// The connection drops after a name that carries a delimiter, before the tagged reply.
+		writeLine(conn, `* LIST () "." "Work.Sub"`)
+		return true, false
+	}))
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		writeLine(conn, `* LIST () NIL "Flat"`)
+		writeLine(conn, "%s OK LIST completed", cmd.tag)
+		return true, true
+	}))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if n := srv.callCount("LIST"); n != 2 {
+		t.Fatalf("LIST count = %d, want 2 (the dropped attempt and its retry)", n)
+	}
+	if got := c.GetDelimiter(); got != "" {
+		t.Errorf("GetDelimiter = %q, want empty: the retry names no delimiter", got)
+	}
+	if got, want := c.MailboxNames(), []string{"Flat"}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %q, want %q", got, want)
 	}
 }

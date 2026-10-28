@@ -835,3 +835,52 @@ func Test_runFolderSync_When_StreamFailsWithHostileReply_Then_LogAndTrackerShowE
 		t.Errorf("final tracker message = %q, want %q", tr.Message, want)
 	}
 }
+
+func Test_newSyncWorkerPool_When_WorkerListFails_Then_ErrorNamesTheWorkerLabel(t *testing.T) {
+	t.Parallel()
+
+	serves := func(srv *fakeServer) {
+		srv.addConnHandler(scriptedHandler(srv, []string{"INBOX"}, func(string, int) (string, bool) { return "", false }))
+	}
+	refuses := func(srv *fakeServer) {
+		srv.addConnHandler(scriptedHandler(srv, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+			if verb == "LIST" {
+				return "NO [CANNOT] list refused", true
+			}
+			return "", false
+		}))
+	}
+	tests := []struct {
+		name     string
+		want     string
+		srcConns []func(*fakeServer)
+		dstConns []func(*fakeServer)
+	}{
+		{name: "first source worker", srcConns: []func(*fakeServer){refuses}, want: "worker 1 source connect: failed to load mailbox list: [alpha-w1] list mailboxes"},
+		{name: "first destination worker", srcConns: []func(*fakeServer){serves}, dstConns: []func(*fakeServer){refuses}, want: "worker 1 destination connect: failed to load mailbox list: [beta-w1] list mailboxes"},
+		{name: "second source worker", srcConns: []func(*fakeServer){serves, refuses}, dstConns: []func(*fakeServer){serves}, want: "worker 2 source connect: failed to load mailbox list: [alpha-w2] list mailboxes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst := newFakeServer(t), newFakeServer(t)
+			for _, add := range tt.srcConns {
+				add(src)
+			}
+			for _, add := range tt.dstConns {
+				add(dst)
+			}
+			cfg := &config.Config{
+				Src: config.Credentials{Label: "alpha", Server: src.ln.Addr().String(), User: "user", Pass: "pass"},
+				Dst: config.Credentials{Label: "beta", Server: dst.ln.Addr().String(), User: "user", Pass: "pass"},
+			}
+
+			_, err := newSyncWorkerPool(t.Context(), cfg, client.Options{DialTimeout: 5 * time.Second}, client.Options{DialTimeout: 5 * time.Second}, 2)
+
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.want)
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
@@ -6258,6 +6260,795 @@ func TestRunSync_When_SourceListFailsAtConnect_Then_ErrorNamesTheLabel(t *testin
 
 	if err == nil || !strings.Contains(err.Error(), "[src] list mailboxes") {
 		t.Fatalf("error = %v, want it to contain %q", err, "[src] list mailboxes")
+	}
+	if strings.Contains(err.Error(), "[]") {
+		t.Errorf("error = %q, want no empty label", err)
+	}
+}
+
+func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesAreCopied(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		change       func(src *fakeServer)
+		name         string
+		input        string
+		wantDst      []string
+		wantAppended []string
+		wantNext     []string
+		autoConfirm  bool
+	}{
+		{
+			name:         "unattended run with new mail",
+			autoConfirm:  true,
+			change:       func(src *fakeServer) { src.addMessage("Work", "m4@x") },
+			wantDst:      []string{"m1@x", "m2@x", "m3@x"},
+			wantAppended: []string{"m3@x"},
+			wantNext:     []string{"m3@x", "m4@x"},
+		},
+		{
+			name:         "interactive run with new mail",
+			input:        "y\n",
+			change:       func(src *fakeServer) { src.addMessage("Work", "m4@x") },
+			wantDst:      []string{"m1@x", "m2@x", "m3@x"},
+			wantAppended: []string{"m3@x"},
+			wantNext:     []string{"m3@x", "m4@x"},
+		},
+		{
+			name:         "planned message disappears",
+			autoConfirm:  true,
+			change:       func(src *fakeServer) { src.removeMessage("Work", "m3@x") },
+			wantDst:      []string{"m1@x", "m2@x"},
+			wantAppended: nil,
+			wantNext:     nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x", "m3@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x", "m2@x")})
+			dst.hideFromList("Work")
+			var once sync.Once
+			dst.onCommand("CREATE", func() { once.Do(func() { tt.change(src) }) })
+			cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, tt.input)
+			opts.autoConfirm = tt.autoConfirm
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), tt.wantDst...)
+			assertIDs(t, "dst APPENDs to Work", dst.appended("Work"), tt.wantAppended...)
+			assertContainsNone(t, out.String(), folderFailuresHeader)
+			if !tt.autoConfirm {
+				if n := strings.Count(out.String(), "Proceed with synchronization?"); n != 1 {
+					t.Errorf("output asks to proceed %d times, want 1: the recheck must not ask again\noutput: %q", n, out.String())
+				}
+			}
+			if len(tt.wantAppended) == 0 {
+				assertContainsAll(t, out.String(), "All folders already synced!")
+				if n := dst.callCount("LOGIN"); n != 1 {
+					t.Errorf("destination saw %d LOGIN commands, want 1: no worker may connect", n)
+				}
+			}
+
+			next := e2eOptions(&syncBuffer{}, "")
+			next.autoConfirm = true
+			if err := runSync(e2eContext(t), cfg, next); err != nil {
+				t.Fatalf("second runSync: %v", err)
+			}
+			assertIDs(t, "dst APPENDs to Work after the second run", dst.appended("Work"), tt.wantNext...)
+		})
+	}
+}
+
+func TestRunSync_When_ExistingDestinationNamesCarryControlCharacters_Then_InfoLineShowsEscapesAndServersGetExactNames(t *testing.T) {
+	t.Parallel()
+
+	const (
+		srcName  = "S\x1b]0;p\xe2\x80\xae\xe3\x85\xa4"
+		dstName  = "D\x1b]0;p\xe2\x80\xae\xe3\x85\xa4"
+		srcWire  = "S&ABs-]0;p&IC4xZA-"
+		dstWire  = "D&ABs-]0;p&IC4xZA-"
+		srcShown = `S\x1b]0;p\u202e\u3164`
+		dstShown = `D\x1b]0;p\u202e\u3164`
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{srcWire: fakeMsgs("m1@x", "m2@x", "m3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, dstWire: fakeMsgs("m1@x", "m2@x")})
+	dst.hideFromList(dstWire)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(srcName, dstName)), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	got := out.String()
+	assertContainsAll(t, got,
+		"  ℹ️  Destination folder "+dstShown+" already exists and holds 2 of the 3 planned messages from "+srcShown+", so they are not copied\n")
+	assertContainsNone(t, got, "\x1b]0;", "\xe2\x80\xae", "\xe3\x85\xa4")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), dstWire)
+	assertIDs(t, "dst APPENDs", dst.appended(dstWire), "m3@x")
+	if examined := src.capturedNames("EXAMINE"); !slices.Contains(examined, srcWire) {
+		t.Errorf("source EXAMINE names = %q, want the exact wire name %q among them", examined, srcWire)
+	}
+	if examined := dst.capturedNames("EXAMINE"); !slices.Contains(examined, dstWire) {
+		t.Errorf("destination EXAMINE names = %q, want the exact wire name %q among them", examined, dstWire)
+	}
+	for _, name := range append(src.capturedNames("EXAMINE"), dst.capturedNames("EXAMINE")...) {
+		if name != srcWire && name != dstWire {
+			t.Errorf("EXAMINE of %q, want only %q or %q", name, srcWire, dstWire)
+		}
+	}
+}
+
+func TestRunSync_When_TypedSourceNamesInboxChildInAnotherCaseWithWrongDelimiter_Then_RewriteTargetsTheListedFolder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		viaFlags bool
+	}{
+		{name: "config map"},
+		{name: "folder flags", viaFlags: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "INBOX/Work": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("inbox.Work", "X"))
+			srcFlag, dstFlag := "", ""
+			if tt.viaFlags {
+				cfg.Map = nil
+				srcFlag, dstFlag = "inbox.Work", "X"
+			}
+
+			first := runSyncConfirmed(t, cfg, srcFlag, dstFlag)
+
+			assertContainsAll(t, first,
+				"Folder path delimiter mismatch detected",
+				`Source folder "inbox.Work" uses delimiter ".", server expects "/"`,
+				`Fixed source: "inbox.Work" → "inbox/Work"`,
+			)
+			assertIDs(t, "dst X", dst.folderMsgIDs("X"), "m1@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "X")
+			examined := src.capturedNames("EXAMINE")
+			if !slices.Contains(examined, "INBOX/Work") {
+				t.Errorf("source EXAMINE names = %q, want the canonical INBOX/Work among them", examined)
+			}
+			for _, name := range examined {
+				if name != "INBOX/Work" {
+					t.Errorf("source EXAMINE of %q, want only INBOX/Work", name)
+				}
+			}
+			if !tt.viaFlags {
+				if want := []config.DirectoryMapping{mapping("inbox.Work", "X")}; !slices.Equal(cfg.Map, want) {
+					t.Errorf("cfg.Map = %+v, want %+v", cfg.Map, want)
+				}
+			}
+
+			second := runSyncConfirmed(t, cfg, srcFlag, dstFlag)
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("dst APPEND count = %d, want 1: the second run copies nothing", n)
+			}
+		})
+	}
+}
+
+type delimiterCase struct {
+	name      string
+	delimiter string
+}
+
+var delimiterCases = []delimiterCase{
+	{name: "slash", delimiter: "/"},
+	{name: "dot", delimiter: "."},
+	{name: "backslash", delimiter: `\`},
+	{name: "underscore", delimiter: "_"},
+	{name: "flat", delimiter: ""},
+}
+
+func pathsOver(alphabet []string, maxLen int) []string {
+	all := []string{""}
+	level := []string{""}
+	for range maxLen {
+		var next []string
+		for _, prefix := range level {
+			for _, element := range alphabet {
+				next = append(next, prefix+element)
+			}
+		}
+		all = append(all, next...)
+		level = next
+	}
+	return all
+}
+
+func checkConvertedLevels(t *testing.T, path, srcDelimiter, dstDelimiter string) {
+	t.Helper()
+	got, renamed := convertFolderPath(path, srcDelimiter, dstDelimiter)
+	wantLevels := 0
+	if srcDelimiter != "" {
+		wantLevels = strings.Count(path, srcDelimiter)
+	}
+	if n := strings.Count(got, dstDelimiter); n != wantLevels {
+		t.Errorf("convertFolderPath(%q, %q, %q) = %q with %d levels, want %d", path, srcDelimiter, dstDelimiter, got, n, wantLevels)
+	}
+	if want := strings.Contains(path, dstDelimiter); renamed != want {
+		t.Errorf("convertFolderPath(%q, %q, %q) renamed = %t, want %t", path, srcDelimiter, dstDelimiter, renamed, want)
+	}
+}
+
+func Test_convertFolderPath_When_AnyDelimiterPair_Then_LevelsMatchTheSource(t *testing.T) {
+	t.Parallel()
+
+	paths := pathsOver([]string{"a", "/", ".", `\`, "_", "-"}, 4)
+	for _, src := range delimiterCases {
+		for _, dst := range delimiterCases {
+			if dst.delimiter == "" || src.delimiter == dst.delimiter {
+				continue
+			}
+			t.Run(src.name+" to "+dst.name, func(t *testing.T) {
+				t.Parallel()
+				for _, path := range paths {
+					checkConvertedLevels(t, path, src.delimiter, dst.delimiter)
+				}
+			})
+		}
+	}
+}
+
+func FuzzConvertFolderPath(f *testing.F) {
+	for _, seed := range []string{"", "a/b.c", `a\b.c_d`, "Mr. Smith", "\xff.\xfe/"} {
+		for srcIndex, src := range delimiterCases {
+			for dstIndex, dst := range delimiterCases {
+				if dst.delimiter != "" && src.delimiter != dst.delimiter {
+					f.Add(seed, uint8(srcIndex), uint8(dstIndex))
+				}
+			}
+		}
+	}
+	f.Fuzz(func(t *testing.T, path string, srcIndex, dstIndex uint8) {
+		srcDelimiter := delimiterCases[int(srcIndex)%len(delimiterCases)].delimiter
+		dstDelimiter := delimiterCases[int(dstIndex)%len(delimiterCases)].delimiter
+		if dstDelimiter == "" || srcDelimiter == dstDelimiter {
+			t.Skip("the conversion applies only to two different delimiters")
+		}
+		checkConvertedLevels(t, path, srcDelimiter, dstDelimiter)
+	})
+}
+
+func Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfolderAgreesWithMirrorMappings(t *testing.T) {
+	t.Parallel()
+
+	segments := []string{"A", "a.b", "a_b", "a/b", "x-y"}
+	sources := []delimiterCase{
+		{name: "source slash", delimiter: "/"},
+		{name: "source dot", delimiter: "."},
+		{name: "source underscore", delimiter: "_"},
+	}
+	for _, source := range sources {
+		srcDelimiter := source.delimiter
+		t.Run(source.name, func(t *testing.T) {
+			t.Parallel()
+
+			var usable []string
+			for _, segment := range segments {
+				if !strings.Contains(segment, srcDelimiter) {
+					usable = append(usable, segment)
+				}
+			}
+			folders := make(map[string][]fakeMsg)
+			for _, root := range usable {
+				folders[root] = nil
+				for _, child := range usable {
+					folders[root+srcDelimiter+child] = nil
+					for _, grandchild := range usable[:min(len(usable), 3)] {
+						folders[root+srcDelimiter+child+srcDelimiter+grandchild] = nil
+					}
+				}
+			}
+			srcC := newAppClient(t, newStoreServer(t, srcDelimiter, folders), "src")
+			names := srcC.MailboxNames()
+
+			for _, destination := range delimiterCases {
+				dstDelimiter := destination.delimiter
+				all, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, mirrorMappings(names, srcDelimiter, dstDelimiter), srcDelimiter, dstDelimiter, false, true)
+				if err != nil {
+					t.Fatalf("expandMappingsWithSubfolders(all names, dst %q): %v", dstDelimiter, err)
+				}
+				if len(all) != len(names) {
+					t.Errorf("mirror with dst %q plans %d folders, want one for each of the %d listed names", dstDelimiter, len(all), len(names))
+				}
+				for _, got := range all {
+					if want := mirrorMappings([]string{got.Source}, srcDelimiter, dstDelimiter)[0]; got != want {
+						t.Errorf("mirror with dst %q keeps %+v for %q, but mirroring it alone gives %+v", dstDelimiter, got, got.Source, want)
+					}
+				}
+				for _, name := range names {
+					roots := mirrorMappings([]string{name}, srcDelimiter, dstDelimiter)
+					expanded, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, roots, srcDelimiter, dstDelimiter, false, true)
+					if err != nil {
+						t.Fatalf("expandMappingsWithSubfolders(%q, dst %q): %v", name, dstDelimiter, err)
+					}
+					for _, got := range expanded {
+						if want := mirrorMappings([]string{got.Source}, srcDelimiter, dstDelimiter)[0]; got != want {
+							t.Errorf("expanding %q with dst %q gives %+v, but mirroring %q gives %+v", name, dstDelimiter, got, got.Source, want)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_FlatSourceHoldsNameWithSlash_Then_UnlistedParentIsAFailureNotASkip(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "Archive/2024": fakeMsgs("a1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Archive", "Archive"), mapping("INBOX", "INBOX")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, out.String(), folderFailuresHeader, "• Archive → Archive: cannot scan source folder", "1 folders failed")
+	assertContainsNone(t, out.String(), "skipped")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	if dst.hasFolder("Archive") || dst.hasFolder("Archive/2024") {
+		t.Error("destination holds Archive or Archive/2024, want neither: a flat server has no hierarchy")
+	}
+	for _, name := range src.capturedNames("EXAMINE") {
+		if name == "Archive/2024" {
+			t.Errorf("source EXAMINE of %q, want it never scanned as a subfolder", name)
+		}
+	}
+}
+
+func TestRunSync_When_BothServersAreFlat_Then_TypedNamesWithDelimiterTextAreCopiedUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantFolders map[string][]string
+		name        string
+		srcFlag     string
+		dstFlag     string
+		mappings    []config.DirectoryMapping
+	}{
+		{
+			name:        "config map with both folders",
+			mappings:    []config.DirectoryMapping{mapping("Mr. Smith", "Mr. Smith"), mapping("Work/2023", "Work/2023")},
+			wantFolders: map[string][]string{"Mr. Smith": {"a@x"}, "Work/2023": {"b@x", "c@x"}},
+		},
+		{
+			name:        "folder flags with a dot and a space",
+			srcFlag:     "Mr. Smith",
+			dstFlag:     "Mr. Smith",
+			wantFolders: map[string][]string{"Mr. Smith": {"a@x"}},
+		},
+		{
+			name:        "folder flags with a slash",
+			srcFlag:     "Work/2023",
+			dstFlag:     "Work/2023",
+			wantFolders: map[string][]string{"Work/2023": {"b@x", "c@x"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "", map[string][]fakeMsg{
+				"INBOX":     nil,
+				"Mr. Smith": fakeMsgs("a@x"),
+				"Work/2023": fakeMsgs("b@x", "c@x"),
+			})
+			dst := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, tt.mappings...)
+			out := &syncBuffer{}
+			// The only answer is for the "Proceed" prompt: a delimiter prompt would take it.
+			opts := e2eOptions(out, "y\n")
+			opts.srcFolder, opts.dstFolder = tt.srcFlag, tt.dstFlag
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertContainsNone(t, out.String(), "server expects", "delimiter mismatch", "Fix folder delimiters", "Fixed source", "Fixed destination")
+			wantCreates := slices.Sorted(maps.Keys(tt.wantFolders))
+			assertIDs(t, "dst CREATE names", slices.Sorted(slices.Values(dst.capturedNames("CREATE"))), wantCreates...)
+			for folder, ids := range tt.wantFolders {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), ids...)
+			}
+			for _, name := range src.capturedNames("EXAMINE") {
+				if !slices.Contains(wantCreates, name) {
+					t.Errorf("source EXAMINE of %q, want only %q", name, wantCreates)
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_DestinationListsNothing_Then_NestedTypedNameIsCreatedWithoutParent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		src      map[string][]fakeMsg
+		mappings []config.DirectoryMapping
+	}{
+		{
+			name:     "typed mapping",
+			src:      map[string][]fakeMsg{"Work/2023": fakeMsgs("w@x")},
+			mappings: []config.DirectoryMapping{mapping("Work/2023", "Work/2023")},
+		},
+		{
+			name: "mirror",
+			src:  map[string][]fakeMsg{"INBOX": nil, "Work/2023": fakeMsgs("w@x")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, "/", nil)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertContainsAll(t, out.String(), `Destination [dst]: ""`, "Sync completed successfully")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work/2023")
+			assertIDs(t, "dst Work/2023", dst.folderMsgIDs("Work/2023"), "w@x")
+			if dst.hasFolder("Work") {
+				t.Error("destination holds a parent folder Work: a server that lists no folder gives no hierarchy")
+			}
+		})
+	}
+}
+
+func TestRunSync_When_ListHoldsNameWithLatin1Byte_Then_RunSucceedsAndShowsTheEscapedName(t *testing.T) {
+	t.Parallel()
+
+	const (
+		latin1 = "Entw\xfcrfe"
+		shown  = `Entw\xfcrfe`
+	)
+	tests := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "mirror"},
+		{name: "typed mapping for another folder", mappings: []config.DirectoryMapping{mapping("INBOX", "INBOX")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), latin1: fakeMsgs("m2@x")})
+			src.listAsLiteral(latin1)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			assertContainsAll(t, got, leftOutLine("src", shown))
+			if strings.Contains(got, "\xfc") || !utf8.ValidString(got) {
+				t.Errorf("output holds the raw byte or invalid UTF-8: %q", got)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+			for _, verb := range []string{"EXAMINE", "STATUS"} {
+				for _, name := range src.capturedNames(verb) {
+					if name != "INBOX" {
+						t.Errorf("source got %s for %q, want only INBOX", verb, name)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_MirrorListsNamesThatAreNotModifiedUTF7_Then_NoCommandCarriesTheirBytes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		srcBad   string
+		dstBad   string
+		srcShown string
+		dstShown string
+		literal  bool
+	}{
+		{name: "bare ampersand", srcBad: "Q&A", dstBad: "R&D", srcShown: "Q&A", dstShown: "R&D"},
+		{name: "raw UTF-8", srcBad: "Входящие", dstBad: "Отправленные", srcShown: "Входящие", dstShown: "Отправленные"},
+		{
+			name:   "Latin-1 byte as a literal",
+			srcBad: "Entw\xfcrfe", dstBad: "Entw\xfcrfe2", srcShown: `Entw\xfcrfe`, dstShown: `Entw\xfcrfe2`,
+			literal: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX":   fakeMsgs("m1@x"),
+				"Work":    fakeMsgs("w1@x"),
+				tt.srcBad: fakeMsgs("b1@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, tt.dstBad: fakeMsgs("d1@x")})
+			if tt.literal {
+				src.listAsLiteral(tt.srcBad)
+				dst.listAsLiteral(tt.dstBad)
+			}
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "w1@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work")
+			allowed := []string{"INBOX", "Work"}
+			for side, srv := range map[string]*fakeServer{"source": src, "destination": dst} {
+				for _, verb := range []string{"EXAMINE", "STATUS", "SELECT", "CREATE"} {
+					for _, name := range srv.capturedNames(verb) {
+						if !slices.Contains(allowed, name) {
+							t.Errorf("%s got %s for %q, want only %q", side, verb, name, allowed)
+						}
+					}
+				}
+			}
+			assertContainsAll(t, out.String(), leftOutLine("src", tt.srcShown), leftOutLine("dst", tt.dstShown))
+		})
+	}
+}
+
+func Test_delimiterRewrite_When_ContextEndsBetweenLookups_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	srv := newStoreServer(t, "/", map[string][]fakeMsg{"Archive/2024": nil})
+	c := newAppClient(t, srv, "srv")
+	base, end := context.WithCancel(t.Context())
+	ctx := &endsAfterFirstErr{Context: base, end: end}
+
+	rewritten, used, err := delimiterRewrite(ctx, c, "Archive.2024")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if rewritten != "" || used != "" {
+		t.Errorf("delimiterRewrite = (%q, %q), want no rewrite", rewritten, used)
+	}
+}
+
+func Test_delimiterRewrite_When_TypedNameAndItsRewriteAreBothListed_Then_KeepsTheTypedName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		noSelect bool
+	}{
+		{name: "selectable typed name"},
+		{name: "typed name listed as noselect", noSelect: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newStoreServer(t, "/", map[string][]fakeMsg{"Work/Sub": nil})
+			if tt.noSelect {
+				srv.markNoSelect("Work.Sub")
+			} else {
+				srv.addFolder("Work.Sub")
+			}
+			c := newAppClient(t, srv, "srv")
+
+			rewritten, used, err := delimiterRewrite(e2eContext(t), c, "Work.Sub")
+
+			if err != nil {
+				t.Fatalf("delimiterRewrite: %v", err)
+			}
+			if rewritten != "" || used != "" {
+				t.Errorf("delimiterRewrite = (%q, %q), want no rewrite: the typed name is listed, so a delimiter character in it is name text", rewritten, used)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_TypedNameAndItsRewriteAreBothListed_Then_OnlyTheTypedFolderIsCopied(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":       nil,
+		"example.com": fakeMsgs("dot@x"),
+		"example/com": fakeMsgs("slash@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("example.com", "Target"))
+
+	// The only answer is for the "Proceed" prompt: a delimiter prompt would take it.
+	out := &syncBuffer{}
+	if err := runSync(e2eContext(t), cfg, e2eOptions(out, "y\n")); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertContainsNone(t, out.String(), "Fix folder delimiters", "delimiter mismatch")
+	assertIDs(t, "dst Target", dst.folderMsgIDs("Target"), "dot@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Target")
+	assertIDs(t, "src EXAMINE names", src.capturedNames("EXAMINE"), "example.com", "example.com")
+}
+
+func Test_collectDelimiterFixes_When_ContextEndsDuringLookup_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		srcDelimiter string
+	}{
+		{name: "source lookup", srcDelimiter: "/"},
+		{name: "destination lookup after a flat source", srcDelimiter: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srcC := newAppClient(t, newStoreServer(t, tt.srcDelimiter, map[string][]fakeMsg{"INBOX": nil}), "src")
+			dstC := newAppClient(t, newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil}), "dst")
+			base, end := context.WithCancel(t.Context())
+			ctx := &endsAfterFirstErr{Context: base, end: end}
+
+			fixes, err := collectDelimiterFixes(ctx, srcC, dstC, []config.DirectoryMapping{mapping("Archive.2024", "Archive.2024")})
+
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want context.Canceled", err)
+			}
+			if fixes != nil {
+				t.Errorf("fixes = %+v, want nil", fixes)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_RenameClashNamesCarryControlCharacters_Then_FailureLinesShowEscapesAndNothingIsSent(t *testing.T) {
+	t.Parallel()
+
+	const (
+		dottedWire = "v&ABs-[2J.1"
+		plainWire  = "v&ABs-[2J_1"
+		dottedName = "v\x1b[2J.1"
+		plainName  = "v\x1b[2J_1"
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, dottedWire: fakeMsgs("a@x"), plainWire: fakeMsgs("b@x")})
+	dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	// Quiet mode silences the progress writer, so the whole output can be checked for raw control characters.
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		`• v\x1b[2J.1 → v\x1b[2J_1: same destination folder as source folder v\x1b[2J_1`+"\n",
+		`• v\x1b[2J_1 → v\x1b[2J_1: same destination folder as source folder v\x1b[2J.1`+"\n",
+	)
+	assertContainsNone(t, got, "\x1b", dottedName, plainName)
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "INBOX")
+	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d CREATE or APPEND commands, want 0", n)
+	}
+}
+
+func TestRunSync_When_DestinationInboxIsMissingFromList_Then_OnlyTheDifferenceIsCopied(t *testing.T) {
+	t.Parallel()
+
+	for _, typed := range []string{"INBOX", "inbox"} {
+		t.Run(typed, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x", "m3@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+			dst.hideFromList("INBOX")
+			cfg := e2eConfig(src, dst, 1, mapping(typed, typed))
+
+			first := runSyncConfirmed(t, cfg, "", "")
+			second := runSyncConfirmed(t, cfg, "", "")
+
+			assertContainsAll(t, first, "holds 2 of the 3 planned messages")
+			assertContainsAll(t, second, "All folders already synced!")
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x", "m3@x")
+			assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), "m3@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "INBOX", "INBOX")
+		})
+	}
+}
+
+func TestRunSync_When_OnlyOneDestinationIsMissingFromList_Then_OnlyThatFolderIsChecked(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"Listed": fakeMsgs("a1@x", "a2@x", "a3@x"),
+		"Hidden": fakeMsgs("b1@x", "b2@x", "b3@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Listed": fakeMsgs("a1@x"), "Hidden": fakeMsgs("b1@x")})
+	dst.hideFromList("Hidden")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Listed", "Listed"), mapping("Hidden", "Hidden")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+	assertIDs(t, "dst APPENDs to Listed", dst.appended("Listed"), "a2@x", "a3@x")
+	assertIDs(t, "dst APPENDs to Hidden", dst.appended("Hidden"), "b2@x", "b3@x")
+	assertContainsAll(t, out.String(), "Destination folder Hidden already exists and holds 1 of the 3 planned messages from Hidden")
+	assertContainsNone(t, out.String(), "from Listed")
+	examined := dst.capturedNames("EXAMINE")
+	for _, folder := range []string{"Listed", "Hidden"} {
+		n := 0
+		for _, name := range examined {
+			if name == folder {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("destination got %d EXAMINE commands for %s, want 1: only the hidden folder needs a second look (%q)", n, folder, examined)
+		}
+	}
+	// The copy reads bodies with UID FETCH, so every plain FETCH is a Message-Id scan.
+	if n := src.callCount("FETCH"); n != 3 {
+		t.Errorf("source saw %d Message-Id scans, want 3: two planning scans and one rescan of Hidden", n)
+	}
+}
+
+func TestRunSync_When_DestinationListFailsAtConnect_Then_ErrorNamesTheLabel(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst := newFakeServer(t)
+	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb == "LIST" {
+			return "NO [CANNOT] list refused", true
+		}
+		return "", false
+	}))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if err == nil || !strings.Contains(err.Error(), "[dst] list mailboxes") {
+		t.Fatalf("error = %v, want it to contain %q", err, "[dst] list mailboxes")
 	}
 	if strings.Contains(err.Error(), "[]") {
 		t.Errorf("error = %q, want no empty label", err)

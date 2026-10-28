@@ -592,6 +592,7 @@ type mailStore struct {
 	hidden       map[string]bool
 	openReply    map[string]string
 	statusReply  map[string]string
+	literal      map[string]bool
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -700,6 +701,32 @@ func (s *fakeServer) hideFromList(names ...string) {
 	for _, name := range names {
 		s.store.hidden[name] = true
 	}
+}
+
+// LIST sends each named folder as a literal, which keeps every byte of a name that is not valid UTF-8.
+func (s *fakeServer) listAsLiteral(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.literal == nil {
+		s.store.literal = make(map[string]bool, len(names))
+	}
+	for _, name := range names {
+		s.store.literal[name] = true
+	}
+}
+
+// addMessage appends a message to a folder that exists, as mail that arrives while a sync runs.
+func (s *fakeServer) addMessage(folder, msgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.addStored(folder, storedMsg{msgID: msgID, body: imapFullBody(msgID)})
+}
+
+// removeMessage deletes a message and leaves the UIDs of the others as they are.
+func (s *fakeServer) removeMessage(folder, msgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.folders[folder] = slices.DeleteFunc(s.store.folders[folder], func(m storedMsg) bool { return m.msgID == msgID })
 }
 
 func (s *fakeServer) refuseLogin() {
@@ -942,6 +969,7 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 	names := slices.Sorted(maps.Keys(s.store.folders))
 	noSelect := maps.Clone(s.store.noSelect)
 	hidden := maps.Clone(s.store.hidden)
+	literal := maps.Clone(s.store.literal)
 	s.mu.Unlock()
 	for _, name := range names {
 		if hidden[name] {
@@ -950,6 +978,14 @@ func (s *fakeServer) storeList(rw replyWriter, tag string) {
 		attrs := ""
 		if noSelect[name] {
 			attrs = `\HasChildren \Noselect`
+		}
+		if literal[name] {
+			token := "NIL"
+			if delim != "" {
+				token = `"` + delim + `"`
+			}
+			rw.line("* LIST (%s) %s {%d}\r\n%s", attrs, token, len(name), name)
+			continue
 		}
 		if delim == "" {
 			rw.line(`* LIST (%s) NIL "%s"`, attrs, name)

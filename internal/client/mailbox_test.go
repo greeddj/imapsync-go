@@ -1709,3 +1709,24 @@ func Test_ListMailboxes_When_SessionEndedByBye_Then_ReconnectsAndLists(t *testin
 		})
 	}
 }
+
+func Test_CacheReads_When_ContextAlreadyEnded_Then_ReturnContextError(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}, {name: "INBOX/Work"}}})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	exists, existsErr := c.MailboxExists(ctx, "INBOX")
+	children, listErr := c.ListSubfolders(ctx, "INBOX", "")
+
+	if !errors.Is(existsErr, context.Canceled) || exists {
+		t.Errorf("MailboxExists = %t, %v, want false and context.Canceled", exists, existsErr)
+	}
+	if !errors.Is(listErr, context.Canceled) || children != nil {
+		t.Errorf("ListSubfolders = %q, %v, want nil and context.Canceled", children, listErr)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1: the cache serves both reads", n)
+	}
+}
