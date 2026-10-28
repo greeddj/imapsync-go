@@ -585,7 +585,7 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		rechecked, err := recheckPlan(ctx, srcClient, dstClient, plan)
+		rechecked, drops, err := recheckPlan(ctx, srcClient, dstClient, plan)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, nil, ctxErr
@@ -597,9 +597,13 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 			})
 			continue
 		}
-		if dropped := plan.NewMessages - rechecked.NewMessages; dropped > 0 && !quiet {
+		if drops.held > 0 && !quiet {
 			_, _ = fmt.Fprintf(out, "  ℹ️  Destination folder %s already exists and holds %d of the %d planned messages from %s, so they are not copied\n",
-				termsafe.Escape(plan.DestinationFolder), dropped, plan.NewMessages, termsafe.Escape(plan.SourceFolder))
+				termsafe.Escape(plan.DestinationFolder), drops.held, plan.NewMessages, termsafe.Escape(plan.SourceFolder))
+		}
+		if drops.gone > 0 && !quiet {
+			_, _ = fmt.Fprintf(out, "  ℹ️  Source folder %s no longer holds %d of the %d planned messages for %s, so they are not copied\n",
+				termsafe.Escape(plan.SourceFolder), drops.gone, plan.NewMessages, termsafe.Escape(plan.DestinationFolder))
 		}
 		if len(rechecked.SrcUIDs) > 0 {
 			kept = append(kept, rechecked)
@@ -609,35 +613,52 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 }
 
 // The destination is read first: an empty folder holds nothing the plan could drop, so it needs no source scan.
-func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, error) {
+func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, recheckDrops, error) {
 	dstIDs, err := dstClient.FetchMessageIDSet(ctx, plan.DestinationFolder)
 	if err != nil {
-		return plan, fmt.Errorf("%w: %w", errDestinationRecheck, err)
+		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errDestinationRecheck, err)
 	}
 	if len(dstIDs) == 0 {
 		plan.DestinationFolderExists = true
-		return plan, nil
+		return plan, recheckDrops{}, nil
 	}
 	srcMap, _, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
 	if err != nil {
-		return plan, fmt.Errorf("%w: %w", errSourceScan, err)
+		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errSourceScan, err)
 	}
-	return rediffPlan(plan, srcMap, dstIDs), nil
+	rechecked, drops := rediffPlan(plan, srcMap, dstIDs)
+	return rechecked, drops, nil
+}
+
+// held counts planned messages that the source still lists and the destination holds. gone counts those that the source no longer lists.
+type recheckDrops struct {
+	held, gone int
 }
 
 // The result intersects the planned UIDs with the fresh diff, so it never gains a UID. It gets a new slice, because plan.SrcUIDs backs summary.Plans.
-func rediffPlan(plan FolderSyncPlan, srcMap map[string]uint32, dstIDs map[string]struct{}) FolderSyncPlan {
+func rediffPlan(plan FolderSyncPlan, srcMap map[string]uint32, dstIDs map[string]struct{}) (FolderSyncPlan, recheckDrops) {
 	fresh := make([]uint32, 0, len(srcMap))
+	onDst := make([]uint32, 0, min(len(srcMap), len(dstIDs)))
 	for id, uid := range srcMap {
-		if _, present := dstIDs[id]; !present {
+		if _, present := dstIDs[id]; present {
+			onDst = append(onDst, uid)
+		} else {
 			fresh = append(fresh, uid)
 		}
 	}
 	slices.Sort(fresh)
+	slices.Sort(onDst)
+	var drops recheckDrops
 	kept := make([]uint32, 0, min(len(plan.SrcUIDs), len(fresh)))
 	for _, uid := range plan.SrcUIDs {
-		if _, found := slices.BinarySearch(fresh, uid); found {
+		if _, ok := slices.BinarySearch(fresh, uid); ok {
 			kept = append(kept, uid)
+			continue
+		}
+		if _, ok := slices.BinarySearch(onDst, uid); ok {
+			drops.held++
+		} else {
+			drops.gone++
 		}
 	}
 	var newSize uint64
@@ -648,7 +669,7 @@ func rediffPlan(plan FolderSyncPlan, srcMap map[string]uint32, dstIDs map[string
 	plan.NewMessages = len(kept)
 	plan.NewSize = newSize
 	plan.DestinationFolderExists = true
-	return plan
+	return plan, drops
 }
 
 // Folder names and Err can carry server text, so every part goes through termsafe.Escape.

@@ -5981,6 +5981,145 @@ func Test_recheckExistingDestinations_When_ContextAlreadyEnded_Then_SendsNoComma
 	}
 }
 
+func Test_recheckExistingDestinations_When_PlannedMessagesAreDropped_Then_EachCauseHasItsOwnLine(t *testing.T) {
+	t.Parallel()
+
+	type folderNames struct {
+		src, dst, srcWire, dstWire, srcShown, dstShown string
+	}
+	plain := folderNames{src: "Work", dst: "Work", srcWire: "Work", dstWire: "Work", srcShown: "Work", dstShown: "Work"}
+	hostile := folderNames{
+		src:      "S\x1b]0;p\xe2\x80\xae\xe3\x85\xa4",
+		dst:      "D\x1b]0;p\xe2\x80\xae\xe3\x85\xa4",
+		srcWire:  "S&ABs-]0;p&IC4xZA-",
+		dstWire:  "D&ABs-]0;p&IC4xZA-",
+		srcShown: `S\x1b]0;p\u202e\u3164`,
+		dstShown: `D\x1b]0;p\u202e\u3164`,
+	}
+	heldLine := func(n folderNames, count int) string {
+		return fmt.Sprintf("  ℹ️  Destination folder %s already exists and holds %d of the 3 planned messages from %s, so they are not copied\n",
+			n.dstShown, count, n.srcShown)
+	}
+	goneLine := func(n folderNames, count int) string {
+		return fmt.Sprintf("  ℹ️  Source folder %s no longer holds %d of the 3 planned messages for %s, so they are not copied\n",
+			n.srcShown, count, n.dstShown)
+	}
+	tests := []struct {
+		wantOut  func(n folderNames) string
+		names    folderNames
+		name     string
+		srcIDs   []string
+		dstIDs   []string
+		wantKept []uint32
+		quiet    bool
+	}{
+		{
+			name:     "destination holds some",
+			names:    plain,
+			srcIDs:   []string{"m1@x", "m2@x", "m3@x"},
+			dstIDs:   []string{"m1@x", "m2@x"},
+			wantKept: []uint32{3},
+			wantOut:  func(n folderNames) string { return heldLine(n, 2) },
+		},
+		{
+			name:     "source lost one",
+			names:    plain,
+			srcIDs:   []string{"m1@x", "m2@x"},
+			dstIDs:   []string{"other@x"},
+			wantKept: []uint32{1, 2},
+			wantOut:  func(n folderNames) string { return goneLine(n, 1) },
+		},
+		{
+			name:     "both causes",
+			names:    plain,
+			srcIDs:   []string{"m1@x", "m2@x"},
+			dstIDs:   []string{"m1@x"},
+			wantKept: []uint32{2},
+			wantOut:  func(n folderNames) string { return heldLine(n, 1) + goneLine(n, 1) },
+		},
+		{
+			name:     "nothing left",
+			names:    plain,
+			srcIDs:   []string{"m1@x"},
+			dstIDs:   []string{"m1@x"},
+			wantKept: nil,
+			wantOut:  func(n folderNames) string { return heldLine(n, 1) + goneLine(n, 2) },
+		},
+		{
+			name:     "both causes in quiet mode",
+			names:    plain,
+			quiet:    true,
+			srcIDs:   []string{"m1@x", "m2@x"},
+			dstIDs:   []string{"m1@x"},
+			wantKept: []uint32{2},
+			wantOut:  func(folderNames) string { return "" },
+		},
+		{
+			name:     "nothing dropped",
+			names:    plain,
+			srcIDs:   []string{"m1@x", "m2@x", "m3@x"},
+			dstIDs:   []string{"other@x"},
+			wantKept: []uint32{1, 2, 3},
+			wantOut:  func(folderNames) string { return "" },
+		},
+		{
+			name:     "names with control characters",
+			names:    hostile,
+			srcIDs:   []string{"m1@x", "m2@x"},
+			dstIDs:   []string{"m1@x"},
+			wantKept: []uint32{2},
+			wantOut:  func(n folderNames) string { return heldLine(n, 1) + goneLine(n, 1) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{tt.names.srcWire: fakeMsgs(tt.srcIDs...)})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{tt.names.dstWire: fakeMsgs(tt.dstIDs...)})
+			srcC := newAppClient(t, src, "src")
+			dstC := newAppClient(t, dst, "dst")
+			plans := []FolderSyncPlan{{
+				SourceFolder:      tt.names.src,
+				DestinationFolder: tt.names.dst,
+				SrcUIDs:           []uint32{1, 2, 3},
+				NewMessages:       3,
+				NewSize:           300,
+			}}
+			existing := map[string]struct{}{tt.names.dst: {}}
+			out := &syncBuffer{}
+
+			kept, failures, err := recheckExistingDestinations(t.Context(), out, tt.quiet, srcC, dstC, plans, existing)
+
+			if err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			if failures != nil {
+				t.Errorf("failures = %v, want nil", failures)
+			}
+			if want := tt.wantOut(tt.names); out.String() != want {
+				t.Errorf("output = %q, want %q", out.String(), want)
+			}
+			assertContainsNone(t, out.String(), "\x1b]0;", "\xe2\x80\xae", "\xe3\x85\xa4", "holds 0 of")
+			if tt.wantKept == nil {
+				if len(kept) != 0 {
+					t.Fatalf("kept = %v, want no plan", kept)
+				}
+				return
+			}
+			if len(kept) != 1 {
+				t.Fatalf("kept = %v, want one plan", kept)
+			}
+			if !slices.Equal(kept[0].SrcUIDs, tt.wantKept) || kept[0].NewMessages != len(tt.wantKept) {
+				t.Errorf("kept SrcUIDs = %v, NewMessages = %d, want %v and %d", kept[0].SrcUIDs, kept[0].NewMessages, tt.wantKept, len(tt.wantKept))
+			}
+			if kept[0].SourceFolder != tt.names.src || kept[0].DestinationFolder != tt.names.dst {
+				t.Errorf("kept folders = %q → %q, want the exact plan names %q → %q", kept[0].SourceFolder, kept[0].DestinationFolder, tt.names.src, tt.names.dst)
+			}
+		})
+	}
+}
+
 func Test_rediffPlan(t *testing.T) {
 	t.Parallel()
 
@@ -5999,6 +6138,8 @@ func Test_rediffPlan(t *testing.T) {
 		wantUIDs []uint32
 		plan     FolderSyncPlan
 		wantSize uint64
+		wantHeld int
+		wantGone int
 	}{
 		{
 			name:     "destination holds some IDs",
@@ -6007,6 +6148,7 @@ func Test_rediffPlan(t *testing.T) {
 			dstIDs:   map[string]struct{}{"a@x": {}, "c@x": {}},
 			wantUIDs: []uint32{2},
 			wantSize: 100,
+			wantHeld: 2,
 		},
 		{
 			name:     "destination holds all IDs",
@@ -6015,6 +6157,7 @@ func Test_rediffPlan(t *testing.T) {
 			dstIDs:   map[string]struct{}{"a@x": {}, "b@x": {}, "c@x": {}},
 			wantUIDs: nil,
 			wantSize: 0,
+			wantHeld: 3,
 		},
 		{
 			name:     "empty destination keeps the plan",
@@ -6039,6 +6182,17 @@ func Test_rediffPlan(t *testing.T) {
 			dstIDs:   map[string]struct{}{},
 			wantUIDs: []uint32{1, 3},
 			wantSize: 200,
+			wantGone: 1,
+		},
+		{
+			name:     "destination holds one planned ID and the source lost another",
+			plan:     planned,
+			srcMap:   map[string]uint32{"a@x": 1, "c@x": 3},
+			dstIDs:   map[string]struct{}{"a@x": {}},
+			wantUIDs: []uint32{3},
+			wantSize: 100,
+			wantHeld: 1,
+			wantGone: 1,
 		},
 		{
 			name:     "size scales with the kept share",
@@ -6047,6 +6201,7 @@ func Test_rediffPlan(t *testing.T) {
 			dstIDs:   map[string]struct{}{"c@x": {}},
 			wantUIDs: []uint32{1, 2},
 			wantSize: 200,
+			wantHeld: 1,
 		},
 		{
 			name:     "plan without UIDs has no size",
@@ -6063,7 +6218,7 @@ func Test_rediffPlan(t *testing.T) {
 
 			before := slices.Clone(tt.plan.SrcUIDs)
 
-			got := rediffPlan(tt.plan, tt.srcMap, tt.dstIDs)
+			got, drops := rediffPlan(tt.plan, tt.srcMap, tt.dstIDs)
 
 			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) {
 				t.Errorf("SrcUIDs = %v, want %v", got.SrcUIDs, tt.wantUIDs)
@@ -6073,6 +6228,12 @@ func Test_rediffPlan(t *testing.T) {
 			}
 			if got.NewSize != tt.wantSize {
 				t.Errorf("NewSize = %d, want %d", got.NewSize, tt.wantSize)
+			}
+			if drops.held != tt.wantHeld || drops.gone != tt.wantGone {
+				t.Errorf("drops = held %d, gone %d, want held %d, gone %d", drops.held, drops.gone, tt.wantHeld, tt.wantGone)
+			}
+			if total := drops.held + drops.gone + len(got.SrcUIDs); total != len(tt.plan.SrcUIDs) {
+				t.Errorf("held %d + gone %d + kept %d = %d, want %d planned UIDs", drops.held, drops.gone, len(got.SrcUIDs), total, len(tt.plan.SrcUIDs))
 			}
 			if !got.DestinationFolderExists {
 				t.Error("DestinationFolderExists = false, want true")
@@ -6269,6 +6430,10 @@ func TestRunSync_When_SourceListFailsAtConnect_Then_ErrorNamesTheLabel(t *testin
 func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesAreCopied(t *testing.T) {
 	t.Parallel()
 
+	const (
+		heldLine = "  ℹ️  Destination folder Work already exists and holds 2 of the 3 planned messages from Work, so they are not copied\n"
+		goneLine = "  ℹ️  Source folder Work no longer holds 1 of the 3 planned messages for Work, so they are not copied\n"
+	)
 	tests := []struct {
 		change       func(src *fakeServer)
 		name         string
@@ -6276,6 +6441,8 @@ func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesA
 		wantDst      []string
 		wantAppended []string
 		wantNext     []string
+		wantLines    []string
+		noLines      []string
 		autoConfirm  bool
 	}{
 		{
@@ -6285,6 +6452,8 @@ func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesA
 			wantDst:      []string{"m1@x", "m2@x", "m3@x"},
 			wantAppended: []string{"m3@x"},
 			wantNext:     []string{"m3@x", "m4@x"},
+			wantLines:    []string{heldLine},
+			noLines:      []string{"no longer holds"},
 		},
 		{
 			name:         "interactive run with new mail",
@@ -6293,6 +6462,8 @@ func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesA
 			wantDst:      []string{"m1@x", "m2@x", "m3@x"},
 			wantAppended: []string{"m3@x"},
 			wantNext:     []string{"m3@x", "m4@x"},
+			wantLines:    []string{heldLine},
+			noLines:      []string{"no longer holds"},
 		},
 		{
 			name:         "planned message disappears",
@@ -6301,6 +6472,8 @@ func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesA
 			wantDst:      []string{"m1@x", "m2@x"},
 			wantAppended: nil,
 			wantNext:     nil,
+			wantLines:    []string{heldLine, goneLine},
+			noLines:      []string{"holds 3 of the 3"},
 		},
 	}
 	for _, tt := range tests {
@@ -6324,6 +6497,8 @@ func TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesA
 			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), tt.wantDst...)
 			assertIDs(t, "dst APPENDs to Work", dst.appended("Work"), tt.wantAppended...)
 			assertContainsNone(t, out.String(), folderFailuresHeader)
+			assertContainsAll(t, out.String(), tt.wantLines...)
+			assertContainsNone(t, out.String(), tt.noLines...)
 			if !tt.autoConfirm {
 				if n := strings.Count(out.String(), "Proceed with synchronization?"); n != 1 {
 					t.Errorf("output asks to proceed %d times, want 1: the recheck must not ask again\noutput: %q", n, out.String())
