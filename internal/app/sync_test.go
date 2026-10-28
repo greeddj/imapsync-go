@@ -6034,6 +6034,72 @@ func TestRunSync_When_CreateSucceeds_Then_NewFolderIsNotScanned(t *testing.T) {
 	assertContainsNone(t, out.String(), "already exists and holds")
 }
 
+func TestRunSync_When_DestinationListsInvalidNameAndCreateAnswersOKForFolderWithMessages_Then_CopiesOnlyTheDifference(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x", "m3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":    nil,
+		"Входящие": nil,
+		"Work":     fakeMsgs("m1@x", "m2@x"),
+	})
+	dst.hideFromList("Work")
+	dst.refuseCreateWith("OK CREATE completed")
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+	runOnce := func() string {
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+		if err := runSync(e2eContext(t), cfg, opts); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+		return out.String()
+	}
+
+	first := runOnce()
+
+	assertIDs(t, "dst Work after the first run", dst.folderMsgIDs("Work"), "m1@x", "m2@x", "m3@x")
+	assertIDs(t, "dst APPENDs after the first run", dst.appended("Work"), "m3@x")
+	assertContainsAll(t, first,
+		leftOutLine("dst", "Входящие"),
+		"  ℹ️  Destination folder Work already exists and holds 2 of the 3 planned messages from Work, so they are not copied\n",
+		"Syncing messages",
+		"Sync completed successfully",
+	)
+
+	second := runOnce()
+
+	assertIDs(t, "dst Work after the second run", dst.folderMsgIDs("Work"), "m1@x", "m2@x", "m3@x")
+	assertIDs(t, "dst APPENDs over both runs", dst.appended("Work"), "m3@x")
+	assertContainsAll(t, second, "holds 3 of the 3 planned messages", "All folders already synced!")
+	assertContainsNone(t, second, "Syncing messages")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work", "Work")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_DestinationListsInvalidNameAndCreateMakesFolder_Then_RecheckReadsOnlyTheDestination(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Входящие": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Work")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x")
+	assertContainsAll(t, out.String(), leftOutLine("dst", "Входящие"))
+	assertContainsNone(t, out.String(), "already exists and holds")
+	// The copy reads bodies with UID FETCH, so every plain FETCH is a Message-Id scan.
+	if n := src.callCount("FETCH"); n != 1 {
+		t.Errorf("source saw %d Message-Id scans, want 1: the planning scan only", n)
+	}
+	assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "Work")
+}
+
 func TestRunSync_When_ExistingDestinationHoldsMessagesInQuietMode_Then_PrintsNoInfoLine(t *testing.T) {
 	t.Parallel()
 

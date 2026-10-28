@@ -400,7 +400,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			foldersToCreate[plan.DestinationFolder] = true
 		}
 	}
-	// Folders that CREATE reported as existing although the planning scan did not list them.
+	// Folders whose plan may have no diff against the real folder: CREATE said it exists, or the destination LIST left out names, so an OK proves nothing.
 	existing := make(map[string]struct{})
 
 	if len(foldersToCreate) > 0 {
@@ -416,6 +416,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 
 		createdCount := 0
 		failedCount := 0
+		dstListIncomplete := len(dstClient.InvalidMailboxNames()) > 0
 
 		// Sorted, so a parent path is created before its children and the log
 		// order is stable.
@@ -437,6 +438,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			case created:
 				if verbose {
 					creationPW.Log("Created folder %q", folder)
+				}
+				if dstListIncomplete {
+					existing[folder] = struct{}{}
 				}
 				createdCount++
 			default:
