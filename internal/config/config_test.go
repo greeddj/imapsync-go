@@ -782,6 +782,106 @@ func TestNew_When_MapEntryHasNoFolderName_Then_ReturnsErrorNamingEntryAndKey(t *
 	}
 }
 
+// contentWithMap builds a config with one map item for each pair, in the format of ext. An empty name leaves the key empty.
+func contentWithMap(ext string, pairs ...DirectoryMapping) string {
+	if ext == ".json" {
+		items := make([]string, len(pairs))
+		for i, p := range pairs {
+			items[i] = fmt.Sprintf(`{"src":%q,"dst":%q}`, p.Source, p.Destination)
+		}
+		return jsonWithMap(`"map":[` + strings.Join(items, ",") + `]`)
+	}
+	var b strings.Builder
+	b.WriteString(mapTestYAMLCreds + "map:\n")
+	for _, p := range pairs {
+		fmt.Fprintf(&b, "  - src: %q\n    dst: %q\n", p.Source, p.Destination)
+	}
+	return b.String()
+}
+
+func TestNew_When_MapRepeatsSourceWithAnotherDestination_Then_ReturnsErrorNamingBothEntries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantErr  error
+		name     string
+		wantText string
+		pairs    []DirectoryMapping
+	}{
+		{
+			name: "two items", wantErr: ErrMapSrcConflict, wantText: "map entries 1 and 2: ",
+			pairs: []DirectoryMapping{{"A", "X"}, {"A", "Y"}},
+		},
+		{
+			name: "another source between the items", wantErr: ErrMapSrcConflict, wantText: "map entries 1 and 3: ",
+			pairs: []DirectoryMapping{{"A", "X"}, {"B", "Z"}, {"A", "Y"}},
+		},
+		{
+			name: "equal item before the conflict", wantErr: ErrMapSrcConflict, wantText: "map entries 1 and 3: ",
+			pairs: []DirectoryMapping{{"A", "X"}, {"A", "X"}, {"A", "Y"}},
+		},
+		{
+			name: "letter case of the destination counts", wantErr: ErrMapSrcConflict, wantText: "map entries 1 and 2: ",
+			pairs: []DirectoryMapping{{"A", "X"}, {"A", "x"}},
+		},
+		{
+			name: "a missing destination comes first", wantErr: ErrMapDstRequired, wantText: "map entry 2: ",
+			pairs: []DirectoryMapping{{"A", "X"}, {"A", ""}, {"A", "Y"}},
+		},
+	}
+	for _, tt := range tests {
+		for _, ext := range []string{".json", ".yaml"} {
+			t.Run(tt.name+" "+ext, func(t *testing.T) {
+				t.Parallel()
+
+				cfg, err := runNewWithArgs(t, ext, contentWithMap(ext, tt.pairs...))
+
+				if cfg != nil {
+					t.Errorf("Config = %+v, want nil", cfg)
+				}
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantText) {
+					t.Errorf("error = %q, want the text %q", err, tt.wantText)
+				}
+				if !errors.Is(tt.wantErr, ErrMapSrcConflict) && errors.Is(err, ErrMapSrcConflict) {
+					t.Errorf("error = %v, also matches %v", err, ErrMapSrcConflict)
+				}
+			})
+		}
+	}
+}
+
+func TestNew_When_MapItemsRepeatOrShareADestination_Then_Loads(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		pairs []DirectoryMapping
+	}{
+		{name: "equal items", pairs: []DirectoryMapping{{"A", "X"}, {"A", "X"}}},
+		{name: "two sources with one destination", pairs: []DirectoryMapping{{"A", "X"}, {"B", "X"}}},
+		{name: "sources that differ in letter case", pairs: []DirectoryMapping{{"inbox", "X"}, {"INBOX", "Y"}}},
+	}
+	for _, tt := range tests {
+		for _, ext := range []string{".json", ".yaml"} {
+			t.Run(tt.name+" "+ext, func(t *testing.T) {
+				t.Parallel()
+
+				cfg, err := runNewWithArgs(t, ext, contentWithMap(ext, tt.pairs...))
+
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				if !slices.Equal(cfg.Map, tt.pairs) {
+					t.Errorf("Map = %+v, want %+v", cfg.Map, tt.pairs)
+				}
+			})
+		}
+	}
+}
+
 func TestNew_When_MapFolderNameHasSpaces_Then_LoadsItUnchanged(t *testing.T) {
 	t.Parallel()
 
@@ -1167,7 +1267,7 @@ dst:
 map:
   - &pair {src: INBOX, dst: INBOX}
   - *pair
-  - {<<: *pair, dst: Archive}
+  - {<<: *pair, src: Sent}
 `
 
 		cfg, err := runNewWithArgs(t, ".yaml", content)
@@ -1187,7 +1287,7 @@ map:
 		want := []DirectoryMapping{
 			{Source: "INBOX", Destination: "INBOX"},
 			{Source: "INBOX", Destination: "INBOX"},
-			{Source: "INBOX", Destination: "Archive"},
+			{Source: "Sent", Destination: "INBOX"},
 		}
 		if !slices.Equal(cfg.Map, want) {
 			t.Errorf("Map = %+v, want %+v", cfg.Map, want)

@@ -23,3 +23,6 @@ var errDestinationRecheck = errors.New("cannot scan destination folder after CRE
 
 // errDestinationClash fails each mapping of a rename clash alone: the rest of the sync still runs, and the run ends non-zero.
 var errDestinationClash = errors.New("same destination folder as source folder")
+
+// errSourceConflict stops the run before the plan, because the order of the map items must not choose the destination.
+var errSourceConflict = errors.New("different destination folders for source folder")

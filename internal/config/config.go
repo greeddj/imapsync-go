@@ -26,6 +26,7 @@ var (
 	ErrDstPassRequired   = errors.New("destination password is required")
 	ErrMapSrcRequired    = errors.New(`"src" folder name is required`)
 	ErrMapDstRequired    = errors.New(`"dst" folder name is required`)
+	ErrMapSrcConflict    = errors.New(`one "src" folder has two different "dst" folders`)
 	ErrAuthUnsupported   = errors.New("unsupported auth mechanism")
 )
 
@@ -258,12 +259,22 @@ func (c *Config) validate() error {
 	if err := checkAuth("dst", c.Dst.Auth); err != nil {
 		return err
 	}
+	// Raw bytes only: the sync resolves the letter case of INBOX against the server.
+	first := make(map[string]int, len(c.Map))
 	for i := range c.Map {
 		if c.Map[i].Source == "" {
 			return fmt.Errorf("map entry %d: %w", i+1, ErrMapSrcRequired)
 		}
 		if c.Map[i].Destination == "" {
 			return fmt.Errorf("map entry %d: %w", i+1, ErrMapDstRequired)
+		}
+		j, seen := first[c.Map[i].Source]
+		if !seen {
+			first[c.Map[i].Source] = i
+			continue
+		}
+		if c.Map[i].Destination != c.Map[j].Destination {
+			return fmt.Errorf("map entries %d and %d: %w", j+1, i+1, ErrMapSrcConflict)
 		}
 	}
 	return nil

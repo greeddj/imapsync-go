@@ -255,8 +255,11 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err := offerDelimiterFixes(ctx, out, in, srcClient, dstClient, mappings, autoConfirm); err != nil {
 			return err
 		}
-		// Typed names resolve to the listed spelling, so dedup, the clash check and the subfolder cut compare the server's bytes.
+		// Typed names resolve to the listed spelling, so the conflict check, the clash check and the subfolder cut compare the server's bytes.
 		resolveMappings(mappings, srcClient, dstClient)
+		if err := checkSourceConflicts(mappings); err != nil {
+			return err
+		}
 		roots = typedMappings(mappings)
 	} else {
 		// The names come from the planning client's mailbox cache, so no extra session opens.
@@ -267,14 +270,13 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if !quiet && verbose {
 		_, _ = fmt.Fprintln(out, "Checking for subfolders...")
 	}
-	expanded, err := expandMappingsWithSubfolders(ctx, out, srcClient, roots, srcDelimiter, dstDelimiter, verbose, quiet)
+	expanded, err := expandMappingsWithSubfolders(ctx, out, srcClient, dstClient, roots, srcDelimiter, dstDelimiter, verbose, quiet)
 	if err != nil {
 		return fmt.Errorf("failed to expand mappings: %w", err)
 	}
 	if len(expanded) > len(roots) && !quiet && verbose {
 		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expanded)-len(roots), len(expanded))
 	}
-	resolveDestinations(expanded, dstClient)
 	planned, clashes := splitDestinationClashes(expanded)
 	printFolderRenames(out, planned, dstDelimiter)
 	mappings = directoryMappings(planned)
@@ -907,6 +909,12 @@ type folderMapping struct {
 	renamed bool
 }
 
+// expansionEntry records which mapping produced a folder: root is the Source of that mapping, and equals the entry Source for the mapping itself.
+type expansionEntry struct {
+	root string
+	folderMapping
+}
+
 func resolveMappings(mappings []config.DirectoryMapping, srcClient, dstClient *client.Client) {
 	for i := range mappings {
 		mappings[i].Source = srcClient.ResolveName(mappings[i].Source)
@@ -914,11 +922,20 @@ func resolveMappings(mappings []config.DirectoryMapping, srcClient, dstClient *c
 	}
 }
 
-// A derived destination can spell an INBOX level in another letter case than the one the server lists, and the wire needs the listed bytes.
-func resolveDestinations(mappings []folderMapping, dstClient *client.Client) {
-	for i := range mappings {
-		mappings[i].Destination = dstClient.ResolveName(mappings[i].Destination)
+// checkSourceConflicts runs after the resolution, so two spellings of one source count as one source.
+func checkSourceConflicts(mappings []config.DirectoryMapping) error {
+	first := make(map[string]int, len(mappings))
+	for i, m := range mappings {
+		j, seen := first[m.Source]
+		if !seen {
+			first[m.Source] = i
+			continue
+		}
+		if m.Destination != mappings[j].Destination {
+			return fmt.Errorf("map entries %d and %d: %w %s", j+1, i+1, errSourceConflict, m.Source)
+		}
 	}
+	return nil
 }
 
 func typedMappings(in []config.DirectoryMapping) []folderMapping {
@@ -1141,9 +1158,9 @@ func offerDelimiterFixes(ctx context.Context, out io.Writer, in *bufio.Reader, s
 	return nil
 }
 
-// expandMappingsWithSubfolders expands each mapping to include all subfolders
-func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient *client.Client, roots []folderMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]folderMapping, error) {
-	expanded := make([]folderMapping, 0, len(roots))
+// expandMappingsWithSubfolders expands each mapping to include all subfolders. The most specific mapping decides where a folder goes, so the order of the map items does not change the plan.
+func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient, dstClient *client.Client, roots []folderMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]folderMapping, error) {
+	entries := make([]expansionEntry, 0, len(roots))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1176,7 +1193,9 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		if srcClient.IsNoSelect(root.Source) {
 			skip(root.Source, skipReasonNoSelect)
 		} else {
-			expanded = append(expanded, root)
+			own := root
+			own.Destination = dstClient.ResolveName(root.Destination)
+			entries = append(entries, expansionEntry{root: root.Source, folderMapping: own})
 		}
 
 		// Add mapping for each subfolder
@@ -1203,30 +1222,53 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				dstPath = root.Destination + srcDelimiter + relativePath
 			}
 
-			expanded = append(expanded, folderMapping{
-				DirectoryMapping: config.DirectoryMapping{Source: subfolder, Destination: dstPath},
-				renamed:          renamed,
+			// A derived destination can spell an INBOX level in another letter case than the one the server lists, and the wire needs the listed bytes.
+			entries = append(entries, expansionEntry{
+				root: root.Source,
+				folderMapping: folderMapping{
+					DirectoryMapping: config.DirectoryMapping{Source: subfolder, Destination: dstClient.ResolveName(dstPath)},
+					renamed:          renamed,
+				},
 			})
-
-			if verbose && !quiet {
-				_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", termsafe.Escape(subfolder), termsafe.Escape(dstPath))
-			}
 		}
 	}
 
-	// A parent mapping's subfolder expansion can collide with an explicit
-	// mapping for that same subfolder; without dedup the plan ends up with
-	// duplicate entries that scan and copy the folder twice.
-	deduped, dropped := dedupeMappings(expanded)
+	winners := mostSpecific(entries)
+	expanded := make([]folderMapping, 0, len(entries))
+	for i, e := range entries {
+		if winners[i] == i {
+			expanded = append(expanded, e.folderMapping)
+		}
+	}
 	if verbose && !quiet {
-		for _, name := range slices.Sorted(maps.Keys(skipped)) {
-			_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), skipped[name])
-		}
-		for _, m := range dropped {
-			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", m.Source)
+		printExpansion(out, entries, winners, skipped)
+	}
+	return expanded, nil
+}
+
+// A found line shows only a destination that the plan uses, so verbose never names one that lost.
+func printExpansion(out io.Writer, entries []expansionEntry, winners []int, skipped map[string]string) {
+	for i, e := range entries {
+		if e.root != e.Source && e.Destination == entries[winners[i]].Destination {
+			_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", termsafe.Escape(e.Source), termsafe.Escape(e.Destination))
 		}
 	}
-	return deduped, nil
+	for _, name := range slices.Sorted(maps.Keys(skipped)) {
+		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), skipped[name])
+	}
+	for i, e := range entries {
+		if winners[i] == i {
+			continue
+		}
+		kept := entries[winners[i]]
+		if e.Destination == kept.Destination {
+			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", e.Source)
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s\n",
+			termsafe.Escape(e.Source), termsafe.Escape(kept.Destination), termsafe.Escape(e.Destination),
+			termsafe.Escape(kept.root), termsafe.Escape(e.root))
+	}
 }
 
 // computeEffectiveWorkers caps the worker count by both the configured cap
@@ -1247,21 +1289,28 @@ func computeEffectiveWorkers(workers, maxConn, planCount int) int {
 	return eff
 }
 
-// dedupeMappings keeps the first occurrence of each Source. The second return
-// value lists every dropped entry so callers can surface them under verbose
-// without coupling the dedup to a logger.
-func dedupeMappings(in []folderMapping) (out, dropped []folderMapping) {
-	out = make([]folderMapping, 0, len(in))
-	seen := make(map[string]struct{}, len(in))
-	for _, m := range in {
-		if _, ok := seen[m.Source]; ok {
-			dropped = append(dropped, m)
-			continue
+// mostSpecific returns, for each entry, the index of the entry that its Source keeps.
+func mostSpecific(entries []expansionEntry) []int {
+	best := make(map[string]int, len(entries))
+	for i, e := range entries {
+		if j, seen := best[e.Source]; seen {
+			prior := entries[j].root
+			// Every root that produced a name is an ancestor of it, and the INBOX fold keeps the length, so the longer root is the nearer ancestor.
+			if len(e.root) < len(prior) {
+				continue
+			}
+			// Equal lengths mean two listed spellings of one INBOX level. Byte order, as in the mailbox cache, keeps the choice independent of the map order.
+			if len(e.root) == len(prior) && e.root >= prior {
+				continue
+			}
 		}
-		seen[m.Source] = struct{}{}
-		out = append(out, m)
+		best[e.Source] = i
 	}
-	return out, dropped
+	winners := make([]int, len(entries))
+	for i, e := range entries {
+		winners[i] = best[e.Source]
+	}
+	return winners
 }
 
 // isHierarchyLevel reports whether LIST leaves name out but lists its subfolders. It reads

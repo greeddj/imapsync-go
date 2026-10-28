@@ -259,70 +259,6 @@ func TestComputeEffectiveWorkers(t *testing.T) {
 	}
 }
 
-func TestDedupeMappings_keepsFirstOccurrence(t *testing.T) {
-	t.Parallel()
-
-	in := rootMappings(mapping("A", "X"), mapping("A", "Y"), mapping("B", "Z"))
-	out, dropped := dedupeMappings(in)
-
-	wantOut := rootMappings(mapping("A", "X"), mapping("B", "Z"))
-	if !slices.Equal(out, wantOut) {
-		t.Errorf("out=%+v, want %+v", out, wantOut)
-	}
-	wantDropped := rootMappings(mapping("A", "Y"))
-	if !slices.Equal(dropped, wantDropped) {
-		t.Errorf("dropped=%+v, want %+v", dropped, wantDropped)
-	}
-}
-
-func TestDedupeMappings_emptyInput(t *testing.T) {
-	t.Parallel()
-
-	out, dropped := dedupeMappings(nil)
-	if len(out) != 0 {
-		t.Errorf("out=%+v, want empty", out)
-	}
-	if dropped != nil {
-		t.Errorf("dropped=%+v, want nil", dropped)
-	}
-}
-
-func TestDedupeMappings_noDuplicates_passthrough(t *testing.T) {
-	t.Parallel()
-
-	in := rootMappings(mapping("A", "X"), mapping("B", "Y"), mapping("C", "Z"))
-	out, dropped := dedupeMappings(in)
-
-	if !slices.Equal(out, in) {
-		t.Errorf("out=%+v, want %+v", out, in)
-	}
-	if dropped != nil {
-		t.Errorf("dropped=%+v, want nil", dropped)
-	}
-}
-
-// TestDedupeMappings_parentExpandsBeforeExplicitChild mirrors the real bug:
-// a parent mapping's subfolder expansion produces an entry that an explicit
-// later mapping would re-add. The first occurrence (the expansion) wins.
-func TestDedupeMappings_parentExpandsBeforeExplicitChild(t *testing.T) {
-	t.Parallel()
-
-	in := rootMappings(
-		mapping("jira", "jira"),
-		mapping("jira/DEVOPS", "jira/DEVOPS"),
-		mapping("jira/INTERNAL", "jira/INTERNAL"),
-		mapping("jira/DEVOPS", "DEVOPS"),
-		mapping("jira/INTERNAL", "INTERNAL"),
-	)
-	out, dropped := dedupeMappings(in)
-	if len(out) != 3 {
-		t.Errorf("len(out)=%d, want 3, got %+v", len(out), out)
-	}
-	if len(dropped) != 2 {
-		t.Errorf("len(dropped)=%d, want 2, got %+v", len(dropped), dropped)
-	}
-}
-
 func makePlanTrackers() (srcTr, dstTr *progress.Tracker) {
 	return progress.NewTracker("src", 10), progress.NewTracker("dst", 10)
 }
@@ -536,8 +472,8 @@ func Test_buildSyncPlan_When_SourceScanFails_Then_RecordsFailureAndKeepsOtherPla
 }
 
 // Test_expandMappingsWithSubfolders_addsChildrenAndDedups asserts that
-// subfolders in the mailbox cache are appended and that a later explicit
-// mapping for the same source is deduplicated in favour of the expansion.
+// subfolders in the mailbox cache are appended and that an explicit mapping
+// for the same source replaces the one that the parent expansion derives.
 func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 	srcSrv := newFakeServer(t)
 
@@ -548,7 +484,8 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 	delimiter := srcC.GetDelimiter() // "/"
 
 	mappings1 := rootMappings(mapping("jira", "jira"))
-	got1, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings1, delimiter, delimiter, false, true)
+	dstC := newDestinationClient(t, delimiter)
+	got1, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, dstC, mappings1, delimiter, delimiter, false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders run1: %v", err)
 	}
@@ -565,15 +502,15 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 	}
 
 	mappings2 := rootMappings(mapping("jira", "jira"), mapping("jira/DEVOPS", "DEVOPS"))
-	got2, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings2, delimiter, delimiter, false, true)
+	got2, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, dstC, mappings2, delimiter, delimiter, false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders run2: %v", err)
 	}
 	if len(got2) != 3 {
 		t.Fatalf("run2 len=%d, want 3, got %v", len(got2), got2)
 	}
-	// The first occurrence of jira/DEVOPS is from the parent expansion, whose
-	// destination is jira/DEVOPS (not the explicit DEVOPS).
+	// The explicit mapping names jira/DEVOPS itself, so its destination
+	// DEVOPS wins over the derived jira/DEVOPS.
 	var devopsMapping folderMapping
 	for _, m := range got2 {
 		if m.Source == "jira/DEVOPS" {
@@ -581,8 +518,8 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 			break
 		}
 	}
-	if devopsMapping.Destination != "jira/DEVOPS" {
-		t.Errorf("jira/DEVOPS destination=%q, want jira/DEVOPS (first occurrence wins)", devopsMapping.Destination)
+	if devopsMapping.Destination != "DEVOPS" {
+		t.Errorf("jira/DEVOPS destination=%q, want DEVOPS (the explicit mapping wins)", devopsMapping.Destination)
 	}
 }
 
@@ -785,11 +722,12 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	delimiter := srcC.GetDelimiter()
 
-	// Explicit INBOX/Sub mapping will be deduped (expansion wins). The verbose +
-	// !quiet path writes the found-subfolder and dropped-mapping lines.
+	// The explicit INBOX/Sub mapping and the derived one agree on the destination, so
+	// one of them is dropped. The verbose + !quiet path writes the found-subfolder and dropped-mapping lines.
 	mappings := rootMappings(mapping("INBOX", "INBOX"), mapping("INBOX/Sub", "INBOX/Sub"))
 	var out strings.Builder
-	got, err := expandMappingsWithSubfolders(context.Background(), &out, srcC, mappings, delimiter, delimiter, true, false)
+	dstC := newDestinationClient(t, delimiter)
+	got, err := expandMappingsWithSubfolders(context.Background(), &out, srcC, dstC, mappings, delimiter, delimiter, true, false)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
@@ -813,7 +751,8 @@ func Test_expandMappingsWithSubfolders_canceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := expandMappingsWithSubfolders(ctx, io.Discard, srcC, rootMappings(mapping("INBOX", "INBOX")), "/", "/", false, true)
+	dstC := newDestinationClient(t, "/")
+	_, err := expandMappingsWithSubfolders(ctx, io.Discard, srcC, dstC, rootMappings(mapping("INBOX", "INBOX")), "/", "/", false, true)
 	if err == nil {
 		t.Fatal("expected error from canceled context, got nil")
 	}
@@ -866,7 +805,8 @@ func Test_expandMappingsWithSubfolders_When_DelimiterIsEmpty_Then_FlatSideHasNoH
 			srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
 			srcC := newAppClient(t, srcSrv, "src")
 
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, rootMappings(mapping("INBOX", "TARGET")), tt.srcDelimiter, tt.dstDelimiter, false, true)
+			dstC := newDestinationClient(t, tt.dstDelimiter)
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(mapping("INBOX", "TARGET")), tt.srcDelimiter, tt.dstDelimiter, false, true)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -887,7 +827,8 @@ func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 
 	mappings := rootMappings(mapping("jira", "jira"))
-	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings, "/", ".", false, true)
+	dstC := newDestinationClient(t, ".")
+	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, dstC, mappings, "/", ".", false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
@@ -997,7 +938,8 @@ func Test_expandMappingsWithSubfolders_When_SegmentHoldsDestinationDelimiter_The
 	srcC := newAppClient(t, src, "src")
 	var out strings.Builder
 
-	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, rootMappings(mapping("Projects", "Old.Projects")), "/", ".", true, false)
+	dstC := newDestinationClient(t, ".")
+	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("Projects", "Old.Projects")), "/", ".", true, false)
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -1021,7 +963,8 @@ func Test_expandMappingsWithSubfolders_When_RootIsRenamed_Then_SubfoldersAreRena
 	srcC := newAppClient(t, src, "src")
 	roots := []folderMapping{{DirectoryMapping: mapping("acme.com", "acme_com"), renamed: true}}
 
-	got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, roots, "/", ".", false, true)
+	dstC := newDestinationClient(t, ".")
+	got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, roots, "/", ".", false, true)
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -1046,7 +989,8 @@ func Test_expandMappingsWithSubfolders_When_ListOrderVaries_Then_SubfoldersFollo
 	src := newStoreServer(t, "/", folders)
 	srcC := newAppClient(t, src, "src")
 
-	got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, rootMappings(mapping("r", "r")), "/", "/", false, true)
+	dstC := newDestinationClient(t, "/")
+	got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(mapping("r", "r")), "/", "/", false, true)
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -1536,6 +1480,12 @@ func mapping(src, dst string) config.DirectoryMapping {
 
 func rootMappings(in ...config.DirectoryMapping) []folderMapping {
 	return typedMappings(in)
+}
+
+// newDestinationClient dials a destination that lists only INBOX, so ResolveName changes no name except the letter case of an INBOX level.
+func newDestinationClient(t *testing.T, delimiter string) *client.Client {
+	t.Helper()
+	return newAppClient(t, newStoreServer(t, delimiter, map[string][]fakeMsg{"INBOX": nil}), "dst")
 }
 
 func fakeMsgs(ids ...string) []fakeMsg {
@@ -4046,7 +3996,8 @@ func Test_expandMappingsWithSubfolders_When_SourceIsNoSelect_Then_SkipsItAndKeep
 			mappings := rootMappings(mapping("a", "A"), mapping("Missing", "Missing"))
 			var out strings.Builder
 
-			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, mappings, "/", "/", tt.verbose, false)
+			dstC := newDestinationClient(t, "/")
+			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, mappings, "/", "/", tt.verbose, false)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -4095,7 +4046,8 @@ func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedParent_Then_KeepsItW
 			srcC := newAppClient(t, src, "src")
 			var out strings.Builder
 
-			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, rootMappings(mapping("Archive", "Old")), "/", "/", tt.verbose, false)
+			dstC := newDestinationClient(t, "/")
+			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("Archive", "Old")), "/", "/", tt.verbose, false)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -4197,7 +4149,8 @@ func Test_expandMappingsWithSubfolders_When_InboxIsUnlistedButHasSubfolders_Then
 
 			typed := []config.DirectoryMapping{mapping(tt.inbox, tt.inbox)}
 			resolveMappings(typed, srcC, srcC)
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, typedMappings(typed), "/", "/", false, false)
+			dstC := newDestinationClient(t, "/")
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, typedMappings(typed), "/", "/", false, false)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -4239,7 +4192,8 @@ func Test_expandMappingsWithSubfolders_When_ListedChildSpellsInboxInAnotherCase_
 			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Inbox/Sub": nil, "Inbox/Sub/Deep": nil})
 			srcC := newAppClient(t, src, "src")
 
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, rootMappings(tt.root), "/", tt.dstDelimiter, false, false)
+			dstC := newDestinationClient(t, tt.dstDelimiter)
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(tt.root), "/", tt.dstDelimiter, false, false)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -4263,7 +4217,8 @@ func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedWithoutSubfolders_Th
 	srcC := newAppClient(t, src, "src")
 	var out strings.Builder
 
-	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, rootMappings(mapping("Sentt", "Sent")), "/", "/", true, false)
+	dstC := newDestinationClient(t, "/")
+	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("Sentt", "Sent")), "/", "/", true, false)
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -5877,15 +5832,12 @@ func TestRunSync_When_TwoSourcesDifferOnlyInInboxCase_Then_TheyAreOneSource(t *t
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
-	cfg := e2eConfig(src, dst, 1, mapping("inbox", "A"), mapping("INBOX", "B"))
+	cfg := e2eConfig(src, dst, 1, mapping("inbox", "A"), mapping("INBOX", "A"))
 
 	runSyncConfirmed(t, cfg, "", "")
 
 	assertIDs(t, "dst A", dst.folderMsgIDs("A"), "m1@x")
 	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A")
-	if dst.hasFolder("B") {
-		t.Error("dst holds folder B: both mappings name the same source, so only the first applies")
-	}
 }
 
 func TestRunSync_When_DestinationNameDiffersInCaseFromAnotherFolder_Then_ItStaysASeparateFolder(t *testing.T) {
@@ -7028,7 +6980,8 @@ func Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfol
 
 			for _, destination := range delimiterCases {
 				dstDelimiter := destination.delimiter
-				all, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, mirrorMappings(names, srcDelimiter, dstDelimiter), srcDelimiter, dstDelimiter, false, true)
+				dstC := newDestinationClient(t, dstDelimiter)
+				all, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, dstC, mirrorMappings(names, srcDelimiter, dstDelimiter), srcDelimiter, dstDelimiter, false, true)
 				if err != nil {
 					t.Fatalf("expandMappingsWithSubfolders(all names, dst %q): %v", dstDelimiter, err)
 				}
@@ -7042,7 +6995,7 @@ func Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfol
 				}
 				for _, name := range names {
 					roots := mirrorMappings([]string{name}, srcDelimiter, dstDelimiter)
-					expanded, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, roots, srcDelimiter, dstDelimiter, false, true)
+					expanded, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, dstC, roots, srcDelimiter, dstDelimiter, false, true)
 					if err != nil {
 						t.Fatalf("expandMappingsWithSubfolders(%q, dst %q): %v", name, dstDelimiter, err)
 					}
@@ -7518,5 +7471,381 @@ func TestRunSync_When_DestinationListFailsAtConnect_Then_ErrorNamesTheLabel(t *t
 	}
 	if strings.Contains(err.Error(), "[]") {
 		t.Errorf("error = %q, want no empty label", err)
+	}
+}
+
+func TestRunSync_When_ParentAndChildFoldersAreBothMapped_Then_ChildMappingWinsInEitherOrder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "parent first", mappings: []config.DirectoryMapping{mapping("INBOX", "Old"), mapping("INBOX/Work", "Work")}},
+		{name: "child first", mappings: []config.DirectoryMapping{mapping("INBOX/Work", "Work"), mapping("INBOX", "Old")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX": fakeMsgs("m1@x"), "INBOX/Work": fakeMsgs("w1@x"), "INBOX/Work/A": fakeMsgs("a1@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 2, tt.mappings...)
+
+			runSyncConfirmed(t, cfg, "", "")
+			appends := dst.callCount("APPEND")
+			second := runSyncConfirmed(t, cfg, "", "")
+
+			assertIDs(t, "dst Old", dst.folderMsgIDs("Old"), "m1@x")
+			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "w1@x")
+			assertIDs(t, "dst Work/A", dst.folderMsgIDs("Work/A"), "a1@x")
+			if dst.hasFolder("Old/Work") || dst.hasFolder("Old/Work/A") {
+				t.Errorf("destination holds Old/Work or Old/Work/A: the mapping of INBOX/Work must decide where its folders go")
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Old", "Work", "Work/A")
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != appends {
+				t.Errorf("second run sent %d more APPEND commands, want 0", n-appends)
+			}
+		})
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_ExplicitMappingsNest_Then_MostSpecificWinsInEveryOrder(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "A/B": nil, "A/B/C": nil, "A/B/C/D": nil, "A/B/E": nil, "A/F": nil})
+	srcC := newAppClient(t, src, "src")
+	dstC := newDestinationClient(t, "/")
+	explicit := []config.DirectoryMapping{mapping("A", "X"), mapping("A/B", "Y"), mapping("A/B/C", "Z")}
+	want := []string{"A->X", "A/B->Y", "A/B/C->Z", "A/B/C/D->Z/D", "A/B/E->Y/E", "A/F->X/F"}
+	slices.Sort(want)
+
+	for _, order := range [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}} {
+		t.Run(fmt.Sprint(order), func(t *testing.T) {
+			roots := rootMappings(explicit[order[0]], explicit[order[1]], explicit[order[2]])
+
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, roots, "/", "/", false, true)
+
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			pairs := make([]string, len(got))
+			for i, m := range got {
+				pairs[i] = m.Source + "->" + m.Destination
+			}
+			slices.Sort(pairs)
+			if !slices.Equal(pairs, want) {
+				t.Errorf("expanded = %v, want %v", pairs, want)
+			}
+		})
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_VerboseNamesBothDestinations(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "INBOX/Work": nil, "INBOX/Work/A": nil})
+	srcC := newAppClient(t, src, "src")
+	dstC := newDestinationClient(t, "/")
+	orders := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "parent first", mappings: []config.DirectoryMapping{mapping("INBOX", "Old"), mapping("INBOX/Work", "Work")}},
+		{name: "child first", mappings: []config.DirectoryMapping{mapping("INBOX/Work", "Work"), mapping("INBOX", "Old")}},
+	}
+	var outputs []string
+
+	for _, tt := range orders {
+		var out strings.Builder
+		got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(tt.mappings...), "/", "/", true, false)
+		if err != nil {
+			t.Fatalf("%s: expandMappingsWithSubfolders: %v", tt.name, err)
+		}
+		if len(got) != 3 {
+			t.Errorf("%s: expanded = %v, want three folders", tt.name, got)
+		}
+		assertContainsAll(t, out.String(),
+			"  ℹ️  Folder INBOX/Work goes to Work, not to Old/Work: the mapping of INBOX/Work wins over the mapping of INBOX\n",
+			"  ℹ️  Folder INBOX/Work/A goes to Work/A, not to Old/Work/A: the mapping of INBOX/Work wins over the mapping of INBOX\n",
+			"  📁 Found subfolder: INBOX/Work/A → Work/A\n",
+		)
+		if n := strings.Count(out.String(), "Found subfolder"); n != 1 {
+			t.Errorf("%s: output holds %d found lines, want 1\noutput: %q", tt.name, n, out.String())
+		}
+		assertContainsNone(t, out.String(), "already covered", "→ Old/Work", "→ Old/Work/A")
+		outputs = append(outputs, out.String())
+
+		var quiet strings.Builder
+		if _, err := expandMappingsWithSubfolders(t.Context(), &quiet, srcC, dstC, rootMappings(tt.mappings...), "/", "/", false, false); err != nil {
+			t.Fatalf("%s: expandMappingsWithSubfolders without verbose: %v", tt.name, err)
+		}
+		if quiet.Len() != 0 {
+			t.Errorf("%s: output without --verbose = %q, want none", tt.name, quiet.String())
+		}
+	}
+
+	if outputs[0] != outputs[1] {
+		t.Errorf("the order of the map items changes the output\nparent first: %q\nchild first:  %q", outputs[0], outputs[1])
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_OverrideNamesCarryControlCharacters_Then_LineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"P": nil, "P/K": nil, "P/K/" + hostileWireName: nil})
+	srcC := newAppClient(t, src, "src")
+	dstC := newDestinationClient(t, "/")
+	roots := rootMappings(mapping("P", "Old"), mapping("P/K", "New"))
+	var out strings.Builder
+
+	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, roots, "/", "/", true, false)
+
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	}
+	assertContainsAll(t, out.String(),
+		"  ℹ️  Folder P/K/"+hostileShownName+" goes to New/"+hostileShownName+", not to Old/K/"+hostileShownName+": the mapping of P/K wins over the mapping of P\n")
+	assertContainsNone(t, out.String(), hostileName, "\u202e", "\x1b[2J")
+	want := folderMapping{DirectoryMapping: mapping("P/K/"+hostileName, "New/"+hostileName)}
+	if !slices.Contains(got, want) {
+		t.Errorf("expanded = %+v, want it to keep the raw entry %+v", got, want)
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_ExplicitChildIsNoSelectOrUnlisted_Then_ItsChildrenFollowIt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		folders  map[string][]fakeMsg
+		noSelect []string
+		explicit []config.DirectoryMapping
+		want     []string
+	}{
+		{
+			name:     "child is a container",
+			folders:  map[string][]fakeMsg{"INBOX": nil, "INBOX/Work": nil, "INBOX/Work/A": nil},
+			noSelect: []string{"INBOX/Work"},
+			explicit: []config.DirectoryMapping{mapping("INBOX", "Old"), mapping("INBOX/Work", "Work")},
+			want:     []string{"INBOX->Old", "INBOX/Work/A->Work/A"},
+		},
+		{
+			name:     "child is not listed",
+			folders:  map[string][]fakeMsg{"Archive/2024/Q1": nil},
+			explicit: []config.DirectoryMapping{mapping("Archive", "Old"), mapping("Archive/2024", "Y")},
+			want:     []string{"Archive->Old", "Archive/2024->Y", "Archive/2024/Q1->Y/Q1"},
+		},
+	}
+	for _, tt := range tests {
+		for _, reversed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s reversed=%t", tt.name, reversed), func(t *testing.T) {
+				t.Parallel()
+
+				src := newStoreServer(t, "/", tt.folders)
+				src.markNoSelect(tt.noSelect...)
+				srcC := newAppClient(t, src, "src")
+				dstC := newDestinationClient(t, "/")
+				explicit := slices.Clone(tt.explicit)
+				if reversed {
+					slices.Reverse(explicit)
+				}
+
+				got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(explicit...), "/", "/", false, true)
+
+				if err != nil {
+					t.Fatalf("expandMappingsWithSubfolders: %v", err)
+				}
+				pairs := make([]string, len(got))
+				for i, m := range got {
+					pairs[i] = m.Source + "->" + m.Destination
+				}
+				slices.Sort(pairs)
+				if !slices.Equal(pairs, tt.want) {
+					t.Errorf("expanded = %v, want %v", pairs, tt.want)
+				}
+			})
+		}
+	}
+}
+
+func Test_expandMappingsWithSubfolders_When_ExplicitDestinationEqualsRenamedDerivedName_Then_ExplicitEntryIsKept(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Projects": nil, "Projects/v1.2": nil})
+	srcC := newAppClient(t, src, "src")
+	dstC := newDestinationClient(t, ".")
+	explicit := []config.DirectoryMapping{mapping("Projects", "Old.Projects"), mapping("Projects/v1.2", "Old.Projects.v1_2")}
+
+	for _, reversed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reversed=%t", reversed), func(t *testing.T) {
+			roots := slices.Clone(explicit)
+			if reversed {
+				slices.Reverse(roots)
+			}
+
+			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(roots...), "/", ".", false, true)
+
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			if len(got) != 2 {
+				t.Fatalf("expanded = %+v, want two entries", got)
+			}
+			for _, m := range got {
+				if m.renamed {
+					t.Errorf("entry %+v is marked renamed, want only the typed destination and no rename", m)
+				}
+			}
+			for _, want := range explicit {
+				if !slices.ContainsFunc(got, func(m folderMapping) bool { return m.DirectoryMapping == want }) {
+					t.Errorf("expanded = %+v, want it to hold %+v", got, want)
+				}
+			}
+		})
+	}
+}
+
+func Test_mostSpecific(t *testing.T) {
+	t.Parallel()
+
+	entry := func(root, source string) expansionEntry {
+		return expansionEntry{root: root, folderMapping: folderMapping{DirectoryMapping: mapping(source, "D/"+root)}}
+	}
+	tests := []struct {
+		name    string
+		entries []expansionEntry
+		want    []int
+	}{
+		{name: "empty input", entries: nil, want: []int{}},
+		{name: "distinct sources pass through", entries: []expansionEntry{entry("A", "A"), entry("A", "A/B"), entry("A/B", "A/B/C")}, want: []int{0, 1, 2}},
+		{name: "longer root wins when it comes last", entries: []expansionEntry{entry("A", "A/B/C"), entry("A/B", "A/B/C")}, want: []int{1, 1}},
+		{name: "longer root wins when it comes first", entries: []expansionEntry{entry("A/B", "A/B/C"), entry("A", "A/B/C")}, want: []int{0, 0}},
+		{
+			name:    "longer root wins in the middle",
+			entries: []expansionEntry{entry("A", "A/B/C/D"), entry("A/B/C", "A/B/C/D"), entry("A/B", "A/B/C/D")},
+			want:    []int{1, 1, 1},
+		},
+		{name: "equal roots keep the first entry", entries: []expansionEntry{entry("A", "A/B"), entry("A", "A/B"), entry("A", "A/B")}, want: []int{0, 0, 0}},
+		{
+			name:    "equal length picks the smaller root, upper case first",
+			entries: []expansionEntry{entry("INBOX/Work", "INBOX/Work/A"), entry("Inbox/Work", "INBOX/Work/A")},
+			want:    []int{0, 0},
+		},
+		{
+			name:    "equal length picks the smaller root, upper case last",
+			entries: []expansionEntry{entry("Inbox/Work", "INBOX/Work/A"), entry("INBOX/Work", "INBOX/Work/A")},
+			want:    []int{1, 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := mostSpecific(tt.entries); !slices.Equal(got, tt.want) {
+				t.Errorf("mostSpecific = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_checkSourceConflicts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		wantText string
+		in       []config.DirectoryMapping
+	}{
+		{name: "no items"},
+		{name: "distinct sources", in: []config.DirectoryMapping{mapping("A", "X"), mapping("B", "X")}},
+		{name: "equal items", in: []config.DirectoryMapping{mapping("A", "X"), mapping("A", "X")}},
+		{
+			name: "two destinations", in: []config.DirectoryMapping{mapping("A", "X"), mapping("A", "Y")},
+			wantText: "map entries 1 and 2: different destination folders for source folder A",
+		},
+		{
+			name: "the first item is the reference", in: []config.DirectoryMapping{mapping("A", "X"), mapping("B", "X"), mapping("A", "X"), mapping("A", "Y")},
+			wantText: "map entries 1 and 4: ",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := checkSourceConflicts(tt.in)
+
+			if tt.wantText == "" {
+				if err != nil {
+					t.Errorf("checkSourceConflicts = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, errSourceConflict) {
+				t.Fatalf("checkSourceConflicts = %v, want errSourceConflict", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("error = %q, want the text %q", err, tt.wantText)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_TwoMappingsNameOneSourceWithDifferentDestinations_Then_RunStopsBeforeThePlan(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		srcFolders map[string][]fakeMsg
+		delimiter  string
+		wantSuffix string
+		mappings   []config.DirectoryMapping
+	}{
+		{
+			name:       "two spellings of INBOX",
+			srcFolders: map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")},
+			delimiter:  "/",
+			mappings:   []config.DirectoryMapping{mapping("inbox", "A"), mapping("INBOX", "B")},
+			wantSuffix: "source folder INBOX",
+		},
+		{
+			name:       "delimiter rewrite makes one source",
+			srcFolders: map[string][]fakeMsg{"INBOX": nil, "A/B": fakeMsgs("b1@x")},
+			delimiter:  "/",
+			mappings:   []config.DirectoryMapping{mapping("A.B", "X"), mapping("A/B", "Y")},
+			wantSuffix: "source folder A/B",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, tt.delimiter, tt.srcFolders)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, errSourceConflict) {
+				t.Fatalf("error = %v, want errSourceConflict", err)
+			}
+			if !strings.Contains(err.Error(), "map entries 1 and 2: ") || !strings.HasSuffix(err.Error(), tt.wantSuffix) {
+				t.Errorf("error = %q, want the entry numbers and the source name", err)
+			}
+			if n := src.callCount("EXAMINE"); n != 0 {
+				t.Errorf("source saw %d EXAMINE commands (%q), want 0", n, src.capturedNames("EXAMINE"))
+			}
+			for _, verb := range []string{"CREATE", "APPEND"} {
+				if n := dst.callCount(verb); n != 0 {
+					t.Errorf("destination saw %d %s commands, want 0", n, verb)
+				}
+			}
+			assertContainsNone(t, out.String(), "Messages to be copied")
+		})
 	}
 }
