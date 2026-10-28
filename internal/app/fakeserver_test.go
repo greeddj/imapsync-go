@@ -73,8 +73,7 @@ func (s *fakeServer) addConnHandler(fn func(net.Conn)) {
 	s.connHandlers = append(s.connHandlers, fn)
 }
 
-// onCommand makes a store-backed server run fn whenever a connection sends verb: after the server
-// records the command and before it answers. fn runs outside s.mu.
+// onCommand makes a store-backed server run fn whenever a connection sends verb: after the server records the command and before it answers. fn runs outside s.mu.
 func (s *fakeServer) onCommand(verb string, fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -605,9 +604,7 @@ type mailStore struct {
 	bareInbox    bool
 }
 
-// newStoreServer starts a fake IMAP server with in-memory mailboxes. Queued
-// connHandlers take precedence. An empty delimiter makes LIST answer NIL. A
-// server with no folders sends no LIST entry, so the client sees no delimiter.
+// newStoreServer starts a fake IMAP server with in-memory mailboxes; queued connHandlers take precedence. An empty delimiter makes LIST answer NIL, and no folders means no LIST entry.
 func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg) *fakeServer {
 	t.Helper()
 	st := &mailStore{
@@ -629,7 +626,7 @@ func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg
 	return listenFakeServer(t, st)
 }
 
-// RFC 3501 makes INBOX case-insensitive, also as the first level of a name. The caller holds the server mu.
+// RFC 3501 makes INBOX case-insensitive; this server applies the same rule to the first level of a name. The caller holds the server mu.
 func (st *mailStore) resolve(name string) string {
 	if _, ok := st.folders[name]; ok {
 		return name
@@ -699,8 +696,7 @@ func (s *fakeServer) markNoSelect(names ...string) {
 	}
 }
 
-// foldOnlyBareInbox makes the server match every name except the bare INBOX byte for byte,
-// as a server does that treats the letter case of an INBOX child as significant.
+// foldOnlyBareInbox makes the server match every name except the bare INBOX byte for byte, as a server does that treats the letter case of an INBOX child as significant.
 func (s *fakeServer) foldOnlyBareInbox() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -887,7 +887,6 @@ func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 
 	mappings := rootMappings(mapping("jira", "jira"))
-	// srcDelimiter="/", dstDelimiter="." → the relative path takes the destination delimiter.
 	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, mappings, "/", ".", false, true)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -895,15 +894,12 @@ func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len=%d, want 2, got %v", len(got), got)
 	}
-	// The subfolder jira/DEVOPS has relative path "DEVOPS", which holds no delimiter,
-	// so the dst is "jira.DEVOPS".
 	if got[1].Destination != "jira.DEVOPS" {
 		t.Errorf("jira/DEVOPS destination=%q, want jira.DEVOPS", got[1].Destination)
 	}
 }
 
-// Test_splitDestinationClashes checks that a destination shared with a renamed
-// mapping fails every member of the group, and that a group without a rename stays.
+// Test_splitDestinationClashes checks that a destination shared with a renamed mapping fails every member of the group, and that a group without a rename stays.
 func Test_splitDestinationClashes(t *testing.T) {
 	t.Parallel()
 
@@ -5555,8 +5551,7 @@ func TestRunSync_When_TypedDestinationHoldsDestinationDelimiter_Then_NameIsNotRe
 	assertContainsNone(t, out.String(), "is renamed to")
 }
 
-// runSyncConfirmed runs one sync with -y and returns what it printed. A non-empty
-// srcFolder and dstFolder replace the configured mappings, as the folder flags do.
+// runSyncConfirmed runs one sync with -y and returns what it printed. A non-empty srcFolder and dstFolder replace the configured mappings, as the folder flags do.
 func runSyncConfirmed(t *testing.T, cfg *config.Config, srcFolder, dstFolder string) string {
 	t.Helper()
 
@@ -6547,8 +6542,7 @@ func Test_rediffPlan(t *testing.T) {
 
 const notModifiedUTF7Reason = "the server sent a name that is not valid modified UTF-7"
 
-// leftOutLine is the warning runSync and runShow print for a LIST name that is not
-// valid modified UTF-7. shown is the name as the terminal shows it.
+// leftOutLine is the warning runSync and runShow print for a LIST name that is not valid modified UTF-7. shown is the name as the terminal shows it.
 func leftOutLine(label, shown string) string {
 	return "⚠️  [" + label + "] Folder " + shown + " is left out: " + notModifiedUTF7Reason + "\n"
 }

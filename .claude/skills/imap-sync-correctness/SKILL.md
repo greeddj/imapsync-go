@@ -31,8 +31,8 @@ This is a sync tool. The single most important property is "running it again doe
 
 `internal/app/sync.go` is structured as:
 
-1. expand mappings,
-2. reconcile delimiters,
+1. reconcile delimiters and convert folder names,
+2. expand mappings,
 3. build the full Message-Id diff,
 4. **print the plan and confirm**,
 5. pre-create destination folders,

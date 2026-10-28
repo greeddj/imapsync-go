@@ -24,9 +24,7 @@ type MailboxInfo struct {
 	NoSelect bool
 }
 
-// MailboxExists reports whether the mailbox cache holds name, so planning
-// costs one LIST. A leading INBOX level matches in any letter case. A
-// \Noselect name counts as existing.
+// MailboxExists reports whether the mailbox cache holds name, so planning costs one LIST. A \Noselect name counts as existing, and a leading INBOX level matches in any letter case.
 func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -122,9 +120,7 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 	return nil
 }
 
-// MailboxNames returns every cached mailbox name byte for byte as the server
-// listed it, sorted, \Noselect names included. IsNoSelect tells whether a name
-// can hold messages. It costs no round-trip.
+// MailboxNames returns every cached name as LIST gave it, sorted, \Noselect names included, at no round-trip. A bare INBOX is upper case, as go-imap folds it.
 func (c *Client) MailboxNames() []string {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
@@ -143,8 +139,7 @@ func (c *Client) InvalidMailboxNames() []string {
 	return slices.Clone(c.mailboxCache.invalid)
 }
 
-// IsNoSelect reports whether the listed name that name resolves to is marked
-// \Noselect or \NonExistent. An exact listed spelling wins over a fold of the INBOX level.
+// IsNoSelect reports whether the listed name that name resolves to is marked \Noselect or \NonExistent. An exact listed spelling wins over a fold of the INBOX level.
 func (c *Client) IsNoSelect(name string) bool {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
@@ -156,9 +151,7 @@ func (c *Client) IsNoSelect(name string) bool {
 	return noSelect
 }
 
-// ListSubfolders returns the cached listed names under folder; an empty
-// delimiter means the server's. Only a leading INBOX level can differ in
-// letter case from folder, so cut by length.
+// ListSubfolders returns listed names under folder; an empty delimiter means the server's. A leading INBOX level can differ in letter case, so callers cut the relative path by length.
 func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) ([]string, error) {
 	stop := c.withCancel(ctx)
 	defer stop()

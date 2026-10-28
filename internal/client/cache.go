@@ -23,7 +23,7 @@ const nonExistentAttr = `\NonExistent`
 // round-trip. New loads it before returning the Client and CreateMailbox
 // adds to it, so readers never see an unloaded cache.
 type mailboxCache struct {
-	// Each key is the name byte for byte as LIST gave it.
+	// Each key is the decoded name as LIST gave it, except that go-imap folds a bare INBOX to upper case.
 	folders map[string]struct{}
 	// Each name here also stays in folders, so parent creation never sends CREATE for it.
 	noSelect map[string]struct{}
@@ -41,7 +41,7 @@ func (m *mailboxCache) setInvalid(names []string) {
 	m.invalid = slices.Compact(names)
 }
 
-// RFC 3501 makes INBOX case-insensitive, and a leading INBOX level follows the same rule, so cache keys and lookups agree.
+// RFC 3501 makes INBOX case-insensitive; this code applies the same rule to a leading INBOX level, so cache keys and lookups agree.
 func canonicalName(name, delimiter string) string {
 	n := len(imap.InboxName)
 	if len(name) < n || !strings.EqualFold(name[:n], imap.InboxName) {
@@ -233,8 +233,7 @@ func (c *Client) addMailboxToCache(name string) {
 	c.mailboxCache.inboxSpellings = noteSpelling(c.mailboxCache.inboxSpellings, name, c.mailboxCache.delimiter)
 }
 
-// listSubfoldersFromCache returns the listed names that are children of parent. It
-// costs no round-trip and returns nil when neither delimiter is set, as on a flat server.
+// listSubfoldersFromCache returns the listed children of parent. It returns nil when neither delimiter is set, as on a flat server.
 func (c *Client) listSubfoldersFromCache(parent, delimiter string) []string {
 	if delimiter == "" {
 		delimiter = c.delimiter

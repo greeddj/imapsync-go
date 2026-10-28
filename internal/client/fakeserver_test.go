@@ -455,9 +455,7 @@ func cramMD5Handler(srv *fakeServer, user, pass string) func(net.Conn) {
 	}
 }
 
-// scriptFolder is one mailbox of a mailboxScript; each entry of sizes is the
-// RFC822.SIZE of one message. delim is the wire token for the hierarchy
-// delimiter, such as NIL or ".", and an empty value means "/".
+// scriptFolder is one mailbox of a mailboxScript; sizes holds the RFC822.SIZE of each message. delim is the wire token of the delimiter, such as NIL or "."; empty means "/".
 type scriptFolder struct {
 	name  string
 	attrs string

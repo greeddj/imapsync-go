@@ -119,8 +119,11 @@ map:
 
 > **Note:** The `map` section is optional. If omitted, `imapsync-go`
 > automatically connects to the source server, lists all mailboxes, and
-> builds a 1:1 mapping of every source folder to the same-named destination
-> folder. You can also use `--src-folder` / `--dest-folder` to sync a single
+> builds a 1:1 mapping of every source folder to the destination folder with
+> the same name. If the two servers use different hierarchy delimiters, the
+> command converts the name. Refer to
+> [Folder names and hierarchy delimiters](#folder-names-and-hierarchy-delimiters).
+> You can also use `--src-folder` / `--dest-folder` to sync a single
 > folder without a config file `map` section.
 
 The command checks the configuration file when it loads the file.
@@ -212,12 +215,63 @@ sync -w 4
 - `-w, --workers` - Number of parallel workers (default: 4, max: 10) (env: `IMAPSYNC_WORKERS`)
 - `-y, --confirm, --yes` - Auto-confirm without prompt. The `-q` option needs this option. (env: `IMAPSYNC_CONFIRM`)
 - `-V, --verbose` - Enable verbose output (env: `IMAPSYNC_VERBOSE`)
-- `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the list `Folders that cannot be synced` still show. The final line also shows when the sync copies messages or has a failed folder. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
+- `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice, the notice of a renamed folder, the notice of a left-out folder and the list `Folders that cannot be synced` still show. The final line also shows when the sync copies messages or has a failed folder. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
 - `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
 - `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`). The limit is shared by all workers. Below about 110 bytes/sec for each worker, an upload can wait so long that the 5-minute idle limit closes the connection, so `sync` prints a warning before the plan.
 - `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
 
 The same `bps-down`, `bps-up`, and `max-connections` values can be set in config under a `rate_limit` block (`down_bps`, `up_bps`, `max_connections`). CLI flags take precedence when both are set. This is also true when the value is 0. For example, `--bps-down 0` or `IMAPSYNC_BPS_DOWN=0` removes the `down_bps` limit of the config file.
+
+## Folder names and hierarchy delimiters
+
+An IMAP server uses a hierarchy delimiter to split a folder name into levels. For example, `Archive/2023` has two levels when the delimiter is `/`. Some servers use `.`. A flat server has no delimiter.
+
+### Names that you type
+
+You can type a folder name in `map`, or with `-s` and `-d`. The command changes a delimiter in a typed name only when all these conditions are true:
+
+- The server of that side does not list the name.
+- The name holds `/`, `.` or `\`, and this character is not the delimiter of the server.
+- The server lists the name when the delimiter of the server replaces this character.
+
+The command shows each change in the notice `Folder path delimiter mismatch detected` and asks one question. With `-y`, the command does not ask. If you answer no, the command keeps the names as you typed them.
+
+The command never changes a name that the server lists. For example, a folder `example.com` on a `/` server keeps its name.
+
+If the server does not list a typed source name, and the server lists no changed name, the command keeps the typed name. The command sends this name to the server. If the server refuses it, the folder appears in the list `Folders that cannot be synced`.
+
+If the server does not list a typed destination name, and the server lists no changed name, the command keeps the typed name. It creates the folder with this name. For example, if a `.` server lists neither `Archive/2024` nor `Archive.2024`, the command sends CREATE for `Archive/2024`.
+
+### Names that the command converts
+
+If `map` has no items and you do not use `-s` and `-d`, the command builds the destination name from the source name. It does the same for each subfolder of a mapped folder. It replaces the delimiter of the source server with the delimiter of the destination server.
+
+If a level of the source name holds the delimiter of the destination server as text, the command replaces this character with `_`. It uses `-` when the delimiter of the destination server is `_`. For example, `Clients/acme.com` on a `/` server becomes `Clients.acme_com` on a `.` server.
+
+- The command prints one warning line for each renamed folder before the plan. The line shows also without `--verbose` and with `-q`.
+- If a renamed folder gets the same destination name as another folder, the command copies none of these folders. Each of these folders appears in the list `Folders that cannot be synced`.
+
+The command never converts a destination name that you type.
+
+### Flat servers
+
+If the server answers NIL for the delimiter of each folder, or lists no folder, the command treats the server as flat. A flat server has no levels.
+
+- The command creates no parent folder on a flat destination.
+- A flat source has no subfolders. Each mapped folder gives one folder.
+- On a flat destination, a subfolder keeps the delimiter of the source as part of its name.
+
+### INBOX
+
+The letter case of a leading `INBOX` level is not important. `inbox`, `Inbox` and `INBOX` select the same folder. On a `/` server, `inbox/Work` and `INBOX/Work` select the same subfolder when the server lists only one of these spellings. If the server lists two spellings, for example `INBOX/Work` and `Inbox/Work`, each spelling is a different folder. The command sends the spelling that the server lists.
+
+### Names that are not valid modified UTF-7
+
+A server sends folder names in modified UTF-7. Some names are not valid. For example, a name can be raw UTF-8, or it can hold an `&` that has no encoding. The command leaves such a folder out and copies the other folders.
+
+- The command prints one line for each left-out folder: `[label] Folder NAME is left out: the server sent a name that is not valid modified UTF-7`.
+- The line shows also with `-q`. The `show` command prints it too.
+- The exit code does not change.
 
 ## Folders that `sync` cannot copy or `show` cannot read
 
@@ -237,6 +291,7 @@ If `sync` cannot scan a source folder, it does not stop. It copies the other fol
 - After the copy, the final line shows the number of failed folders, and the command ends with exit code 1.
 - If no folder has new messages and a folder failed, the command asks no question. It prints the list and ends with exit code 1.
 - If you answer no to the question before the copy, the command copies no messages and ends with exit code 0. This is also true when a folder failed.
+- A destination folder that the command reads again after CREATE can fail in the same way. This happens when the command cannot scan this folder or its source folder again. The command prints the list at once. Refer to [Idempotency caveats](#idempotency-caveats).
 
 Some servers list the subfolders of a folder, but not the folder. If such a folder refuses to open, `sync` skips it and copies the subfolders. The command prints one line for the folder, and the `-q` option hides this line. The exit code does not change. `sync` never skips INBOX in this way.
 
@@ -312,6 +367,13 @@ safe, but it has two known limitations:
   see the original IDs as still "missing" on the destination and re-upload
   them. If you suspect this, do the sync in a single pass and avoid re-running
   it against the same destination.
+
+When CREATE answers that the destination folder already exists, the folder was not in the list of the destination server. The plan has no diff against this folder, so the command reads the folder again after your answer.
+
+- The command removes from the plan each message whose `Message-Id` the folder holds. It never adds a message.
+- Without `-q`, the command prints the line `Destination folder ... already exists and holds N of the M planned messages from ..., so they are not copied`.
+- Without `-q`, if a planned message left the source, the command prints the line `Source folder ... no longer holds N of the M planned messages for ..., so they are not copied`.
+- The command also makes this check for a folder that it creates, if the destination server sent a name that is not valid modified UTF-7.
 
 ## Known issues
 

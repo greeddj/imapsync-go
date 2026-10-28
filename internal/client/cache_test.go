@@ -760,8 +760,7 @@ func Test_ResolveName(t *testing.T) {
 	}
 }
 
-// Not parallel: AllocsPerRun counts allocations of the whole process. MailboxExists is
-// left out because withCancel allocates; hasMailbox is the lookup it runs.
+// Not parallel: AllocsPerRun counts allocations of the whole process. MailboxExists is left out because withCancel allocates; hasMailbox is the lookup it runs.
 func Test_ResolveName_When_NameNeedsNoFolding_Then_LookupsAllocateNothing(t *testing.T) {
 	c := newTestClient()
 	c.mailboxCache = mailboxCache{
@@ -795,8 +794,7 @@ func Test_ResolveName_When_NameNeedsNoFolding_Then_LookupsAllocateNothing(t *tes
 	}
 }
 
-// Test_New_When_ListHoldsNamesThatAreNotModifiedUTF7_Then_CacheLeavesThemOut sends
-// each bad name before a good one, so a later good name proves the LIST went on.
+// Test_New_When_ListHoldsNamesThatAreNotModifiedUTF7_Then_CacheLeavesThemOut sends each bad name before a good one, so a later good name proves the LIST went on.
 func Test_New_When_ListHoldsNamesThatAreNotModifiedUTF7_Then_CacheLeavesThemOut(t *testing.T) {
 	t.Parallel()
 
@@ -1181,8 +1179,7 @@ func Test_loadMailboxCache_When_ListIsRetried_Then_DelimiterOfTheFailedAttemptIs
 	}
 }
 
-// gatedWriteConn forwards a write that carries LIST, then waits for gate and fails
-// that write with a connection reset, so the server answers a command whose write failed.
+// gatedWriteConn forwards a write that carries LIST, then waits for gate and fails that write with a connection reset, so the server answers a command whose write failed.
 type gatedWriteConn struct {
 	net.Conn
 	gate <-chan struct{}

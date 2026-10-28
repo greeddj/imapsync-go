@@ -259,8 +259,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		resolveMappings(mappings, srcClient, dstClient)
 		roots = typedMappings(mappings)
 	} else {
-		// No mapping from flags or config: mirror every source folder. The names
-		// come from the planning client's mailbox cache, so no extra session opens.
+		// The names come from the planning client's mailbox cache, so no extra session opens.
 		roots = mirrorMappings(srcClient.MailboxNames(), srcDelimiter, dstDelimiter)
 	}
 
@@ -566,7 +565,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	return nil
 }
 
-// endRunWithoutCopy ends a run that has no message left to copy. The caller printed the failed folders.
+// The caller has already printed the failed folders.
 func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
 	if failedFolders > 0 {
 		printSyncErrors(out, 0, 0, failedFolders)
@@ -894,7 +893,6 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	return true
 }
 
-// delimiterFix is one rewrite that delimiterRewrite offered for a typed name.
 type delimiterFix struct {
 	typed     string
 	rewritten string
@@ -1088,7 +1086,7 @@ func collectDelimiterFixes(ctx context.Context, srcClient, dstClient *client.Cli
 	return fixes, nil
 }
 
-// offerDelimiterFixes asks one question for all rewrites, so piped input needs one answer however many mappings change. It prints nothing when it offers no rewrite.
+// offerDelimiterFixes asks one question for all rewrites, so piped input needs one answer however many mappings change.
 func offerDelimiterFixes(ctx context.Context, out io.Writer, in *bufio.Reader, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, autoConfirm bool) error {
 	fixes, err := collectDelimiterFixes(ctx, srcClient, dstClient, mappings)
 	if err != nil {
@@ -1163,8 +1161,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// A flat source has no subfolders. ListSubfolders would swap an empty
-		// delimiter for the client's own, and the relative path below needs one.
+		// A flat source has no subfolders: ListSubfolders would swap an empty delimiter for the client's own.
 		var subfolders []string
 		if srcDelimiter != "" {
 			// The listing reads the mailbox cache, so it fails only when ctx ends.
@@ -1202,8 +1199,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				dstPath = root.Destination + dstDelimiter + converted
 				renamed = renamed || relRenamed
 			} else {
-				// A flat destination has no hierarchy, so the source delimiter is ordinary
-				// name text. Merging into the parent would join distinct folders.
+				// A flat destination has no hierarchy: the source delimiter is name text, and merging into the parent would join distinct folders.
 				dstPath = root.Destination + srcDelimiter + relativePath
 			}
 

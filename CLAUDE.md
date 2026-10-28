@@ -31,14 +31,14 @@ Single-binary IMAP-to-IMAP sync tool. Six things to internalize before making ch
 ```
 cmd/imapsync-go/main.go         - urfave/cli/v3 wiring, version flags, signal-to-context
 cmd/imapsync-go/commands/       - thin subcommand definitions (sync, show); they only declare flags and call into internal/app
-internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, builds the plan, confirms, dispatches to worker pool
-internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table, then a list of the folders it cannot read (ErrSilentExit)
+internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, fixes typed delimiters, converts folder names, builds the plan, confirms, dispatches to worker pool
+internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table, the LIST names that are not valid modified UTF-7, then a list of the folders it cannot read (ErrSilentExit)
 internal/app/worker.go          - syncWorker pool + runFolderSync helper consumed by sync.go
 internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect with the give-up and revive gate, Select that trusts the go-imap session state
 internal/client/watchdog.go     - idleConn: inactivity watchdog for commands in flight
 internal/client/fetch.go        - single-pass FetchMessageMap (Message-Id+UID), StreamMessagesByUIDs (batched UID FETCH, a retry fetches only the UIDs not yet delivered)
-internal/client/mailbox.go      - MailboxExists / IsNoSelect / ListSubfolders / CreateMailbox via the cache, ListMailboxes (a folder that cannot be read carries its reason in MailboxInfo.Err)
-internal/client/cache.go        - per-Client mailboxCache (one LIST "" "*"), a created mailbox is added to it, the names that LIST marks \Noselect or \NonExistent are kept
+internal/client/mailbox.go      - MailboxExists / IsNoSelect / ListSubfolders / CreateMailbox via the cache, InvalidMailboxNames, ListMailboxes (a folder that cannot be read carries its reason in MailboxInfo.Err)
+internal/client/cache.go        - per-Client mailboxCache (one LIST "" "*" through listAll, which leaves out names that are not valid modified UTF-7), a created mailbox is added to it, the names that LIST marks \Noselect or \NonExistent are kept, ResolveName folds a leading INBOX level, the delimiter stays empty for a flat server
 internal/client/append.go       - AppendMessage streaming the literal directly from the fetched body, one retry only before go-imap reads the body
 internal/client/errors.go       - classifyError: Transient / Permanent / Throttled, text matched on leaf errors only; canRevive; isAlreadyExistsErr; ErrSelectRefused marks a server refusal of SELECT or EXAMINE
 internal/client/provider.go     - DetectProvider, used by sync.go to print quota warnings
@@ -61,13 +61,37 @@ internal/utils/                 - `AskConfirm(ctx, in *bufio.Reader, out io.Writ
 
 The sync flow is **plan, confirm, execute** - not stream-as-you-go:
 
-1. **Expand mappings**: each configured mapping is expanded with subfolders. `expandMappingsWithSubfolders` calls `client.ListSubfolders`, which serves the answer from the per-Client mailbox cache (one `LIST "" "*"` populates it on first connect).
+1. **Delimiter reconciliation and name conversion**: First, `runSync` prints one escaped warning line for each LIST name that is not valid modified UTF-7 (`printInvalidNames`). The mailbox cache leaves these names out. The source lines come first, and each side is in name order. These lines show also with `--quiet`. They do not change the exit code.
+   - A typed mapping comes from the config `map` or from `--src-folder` and `--dest-folder`. `runSync` copies the config `map` before it changes a name, because the changes are in place and the config belongs to the caller.
+   - Only a typed mapping goes through `offerDelimiterFixes`. A mirror run asks no delimiter question.
+   - `delimiterRewrite` offers a rewrite of a typed name only when all these conditions are true:
+     - the server of that side has a delimiter;
+     - the mailbox cache does not list the typed name;
+     - the name holds `/`, `.` or `\`, and this character is not the delimiter of the server;
+     - the cache lists the name when the server delimiter replaces this character. The function tries the three characters in this order and takes the first listed name.
+   - A name that the cache lists never changes, because a delimiter character can be part of a name. A typed name that the cache does not list, and that has no listed rewrite, stays as typed and gives no question.
+   - `offerDelimiterFixes` shows all rewrites in one notice and asks one question. `-y/--confirm` accepts without a question. If the user declines, the names stay as typed.
+   - `resolveMappings` replaces each typed name with the name that the mailbox cache lists (`Client.ResolveName`). So the dedup, the clash check and the subfolder cut compare the bytes of the server.
+   - A mirror run builds its mappings with `mirrorMappings`. It gives each listed source name to `convertFolderPath` and asks no question.
+   - `convertFolderPath(path, srcDelimiter, dstDelimiter)` gives the destination name. These rules apply in this order:
+     - If the destination has no delimiter, or the two delimiters are the same, the path does not change.
+     - If the path holds no text of the destination delimiter, each source delimiter becomes the destination delimiter.
+     - If not, the destination delimiter inside a level is name text. The function replaces it with `_` (with `-` when the destination delimiter is `_`) and joins the levels with the destination delimiter. The result is a renamed name (`folderMapping.renamed`).
+   - A typed destination is never converted. The relative path of each subfolder gets the conversion. A subfolder is renamed when this conversion renamed it or when its root is renamed.
+2. **Expand mappings**: each configured mapping is expanded with subfolders. `expandMappingsWithSubfolders` calls `client.ListSubfolders`, which serves the answer from the per-Client mailbox cache (one `LIST "" "*"` populates it on first connect).
    - The expansion skips each source name that `Client.IsNoSelect` reports. This applies to the mapped name and to each subfolder.
    - `IsNoSelect` reads the mailbox cache. The cache marks a name when the same `LIST "" "*"` gives it the `\Noselect` or `\NonExistent` attribute. The attribute can have any letter case.
    - The expansion keeps the subfolders of a skipped name.
    - With `--verbose` and without `--quiet`, the expansion prints one escaped "Folder ... skipped" line for each skipped name, in name order.
-   - A mapped source name that LIST leaves out stays in the expansion, also when LIST shows its subfolders. Step 3 scans it.
-2. **Delimiter reconciliation**: `folderDelimiter(path, serverDelimiter)` returns the detected delimiter and whether it matches the server's. On mismatch the user is prompted to rewrite delimiters in-place; `-y/--confirm` auto-accepts.
+   - A mapped source name that LIST does not show stays in the expansion, also when LIST shows its subfolders. Step 3 scans it.
+   - A flat source has an empty delimiter. The expansion lists no subfolder for it, so each mapping gives one folder.
+   - The expansion sorts the subfolders of each mapping in byte order, because the cache lists names in map order. So the plans and the failure lines are the same on each run.
+   - The relative path of a subfolder is the part of its listed name after the mapped name and one delimiter. The code cuts this part by length, because the listed name can spell a leading INBOX level in another letter case.
+   - If the destination has a delimiter, `convertFolderPath` (step 1) converts the relative path. The destination name of the subfolder is then the destination root, the destination delimiter and the converted path. A flat destination has no hierarchy, so the name is the destination root, the source delimiter and the relative path.
+   - After the expansion, `resolveDestinations` replaces the INBOX level of each derived destination with the listed spelling.
+   - `splitDestinationClashes` groups the expanded mappings by destination. When a group holds two or more mappings and at least one is renamed, every mapping of the group fails. Its `FolderFailure` wraps `errDestinationClash` and names one other source folder of the group. A group with no renamed mapping stays unchanged.
+   - `runSync` puts the clash failures before the failures of the scan in `SyncSummary.Failures`. A clash gives no plan, so the run creates no destination folder for it.
+   - `printFolderRenames` prints one escaped warning line for each renamed mapping that remains, before the scan. The line shows the two names and the destination delimiter. It shows also without `--verbose` and with `--quiet`.
 3. **Build sync plan** (`buildSyncPlan`): two goroutines run under an `errgroup` - one walks every src mapping calling `FetchMessageMap`, the other walks every dst mapping calling `MailboxExists` + `FetchMessageIDSet`. Trackers advance independently so a slow dst does not stall the src progress bar. After both sides complete a slot, `maybeDiff` fires (guarded by `atomic.Int32` reaching 2 + a `sync.Mutex` for race-detector cleanliness), computes the Message-Id diff, and immediately frees the maps to keep peak memory proportional to one folder at a time. All fetches are envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] + UID`; bodies are not pulled at planning time. The "what would be synced" preview is printed and confirmed before any writes. `--quiet` hides the preview and the prompt, so `runSync` refuses `--quiet` without `-y/--confirm` before it connects to a server.
    - The destination goroutine calls `IsNoSelect` after `MailboxExists`. It does not call `FetchMessageIDSet` for a `\Noselect` destination.
    - A failed source scan gives a folder failure (`FolderFailure` in `SyncSummary.Failures`). Its error wraps `errSourceScan` ("cannot scan source folder").
@@ -89,6 +113,7 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - After the copy, when a folder failure exists, the run exits with code 1 (`ErrSilentExit`). Without `--quiet`, it first lists the folder failures again. It always prints the error summary line, with the count of failed folders.
 4. **Pre-create destination folders** for the active plans (sequential, with per-folder mutex on `Client.folderLocks`). New mailboxes are added back into the cache. A name that LIST marks `\Noselect` counts as existing, so the client sends no CREATE for it, also when it is a parent.
    - `CreateMailbox` gives `created == false` and no error when the CREATE reply says that the folder exists, or when the mailbox cache already holds the name. The planning scan did not find that folder, so its plan has no diff against the folder. `runSync` keeps each such folder in a set.
+   - If the destination LIST has names that are not valid modified UTF-7 (`InvalidMailboxNames`), the set also holds each folder that CREATE made. An OK reply does not prove that the folder is new.
    - After the creation loop and before the worker pool, `recheckExistingDestinations` checks each plan whose destination is in this set. It runs in sequence on the two planning clients, sends no LIST and starts no goroutine. All checks end before the first APPEND.
    - `recheckPlan` reads the destination first with `FetchMessageIDSet`. If the folder holds no Message-Id, the plan does not change and the run sends no source command. If not, it reads the source again with `FetchMessageMap`, and `rediffPlan` keeps the planned UIDs that the new diff still lists. `rediffPlan` also counts each dropped UID in a `recheckDrops` value, by cause.
    - The check only removes messages. It never adds a UID to a plan and never shows a second prompt.
@@ -103,6 +128,19 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
 5. **Execute via worker pool**: `newSyncWorkerPool` builds N persistent workers (each owns one src + one dst `Client` for the entire sync). Plans are dispatched through a chan-of-workers semaphore. A single `progress.Writer` covers all plans, with one tracker per plan appended up front. Per-message UI updates are throttled to ~10 Hz. At the end, `logoutAll` logs out all workers at the same time, then the two planning clients, so a silent server costs at most two logout limits.
 
 Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; re-running on a partially completed sync is safe and resumes.
+
+**Folder names in the mailbox cache** (`internal/client/cache.go`):
+
+- A flat server has no hierarchy delimiter. When no LIST entry names a delimiter, `GetDelimiter` returns an empty string. This happens when the entries answer NIL and when LIST has no entry. The code does not use `/` in its place. The cache delimiter is the first delimiter that a LIST entry names. An entry with NIL does not change it.
+- With an empty delimiter, `listSubfoldersFromCache` returns no child. `CreateMailbox` sends one CREATE for the whole name and creates no parent. Only a bare `INBOX` folds.
+- The cache keeps each name as LIST gave it, after the decoding of modified UTF-7. go-imap folds a bare INBOX to upper case.
+- RFC 3501 makes INBOX case-insensitive. `canonicalName(name, delimiter)` applies the same rule to a leading INBOX level and folds it to upper case. The level is the bare name, or the name followed by the cache delimiter. A name `Inbox/Sub` folds when the cache delimiter is `/`. It does not fold when the cache delimiter is `.`.
+- `inboxSpellings` maps a folded name to its listed spelling, only where the two differ. If one folded name has several listed spellings, the smallest in byte order wins. So the answer does not depend on the LIST order.
+- `resolve` finds the listed name in this order: the exact name, the folded name, the indexed spelling. A miss returns the folded name. `MailboxExists`, `IsNoSelect` and `CreateMailbox` use it. `ListSubfolders` and `folderLock` use the folded name. `MailboxNames` returns the listed spellings.
+- `runSync` resolves typed names and derived destination names with `ResolveName`, so EXAMINE, STATUS, CREATE and APPEND carry the listed spelling. A name that the cache does not list gets the folded INBOX level and no other change.
+- go-imap v1 aborts the whole LIST when one entry has a name that is not valid modified UTF-7. `listAll` runs LIST with its own handler (`listHandler`). The handler leaves out such a name and records the raw name. Any other parse error still fails the LIST. The callback runs on the go-imap reader goroutine, so it must not block or call the client.
+- `InvalidMailboxNames` returns the sorted raw names of the latest LIST, each name once. No mapping, plan or command holds them. The raw names are for printing and for the check in step 4.
+- `loadMailboxCache` and `ListMailboxes` publish the result of a LIST only after the attempt succeeds. After a failed command write, go-imap can call the callback after `Execute` returns. So a retry keeps no name, no delimiter and no left-out name of a failed attempt.
 
 ### 3. Connection resilience (`internal/client/client.go`, `internal/client/watchdog.go`)
 
@@ -260,6 +298,7 @@ The guarantee holds for UTF-8 terminals. A terminal that acts on 8-bit C1 bytes 
 
 - the arguments of SELECT, EXAMINE, STATUS, CREATE and APPEND, which go back to a server;
 - plan data, mappings and map keys;
+- the names that `MailboxNames` and `InvalidMailboxNames` return. The print sites escape them;
 - error values. `classifyError` and `isAlreadyExistsErr` match on raw server text. The `Err` fields of `MailboxInfo`, `FolderFailure` and `FolderSkip` also hold raw server text, and the print sites escape them.
 
 A tracker line carries our own SGR colour codes. Escape the server parts before you compose the line, never the whole line.
@@ -279,10 +318,14 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
   - the folder-failure list (`printFolderFailures`), which shows the source folder, the destination folder and the reason. `runSync` prints it after the scan, also with `--quiet`. Without `--quiet`, `runSync` prints it again after the copy;
   - the "Folder ... skipped" line in `expandMappingsWithSubfolders`, for each source name that the mailbox cache marks `\Noselect` or `\NonExistent`. Only the name is server text. `expandMappingsWithSubfolders` prints the line only with `--verbose` and without `--quiet`;
   - the skip line for an unlisted parent that refuses to open (`printFolderSkips`). It shows the name, a fixed reason and the error text with the server reply. `runSync` prints it also without `--verbose`, but only without `--quiet`;
-  - the "already exists and holds" line and the "no longer holds" line of `recheckExistingDestinations`. Each line shows the destination folder and the source folder. `runSync` prints each line only without `--quiet`. The failures of the same check go through `printFolderFailures`.
+  - the "already exists and holds" line and the "no longer holds" line of `recheckExistingDestinations`. Each line shows the destination folder and the source folder. `runSync` prints each line only without `--quiet`. The failures of the same check go through `printFolderFailures`;
+  - the "is left out" line of `printInvalidNames`, which shows the raw name from LIST. `runSync` prints it also with `--quiet`;
+  - the "is renamed to" line of `printFolderRenames`, which shows the source name, the destination name and the destination delimiter. `runSync` prints it also without `--verbose` and with `--quiet`;
+  - the clash failures of `splitDestinationClashes`. They go through `printFolderFailures`, and the reason names another source folder.
 - `internal/app/show.go` escapes these sites:
   - the folder cell of each table row, also on the "unreadable" and "container" rows;
-  - each line of the unreadable-folder list (`printUnreadableFolders`), which shows the folder name and the reason.
+  - each line of the unreadable-folder list (`printUnreadableFolders`), which shows the folder name and the reason;
+  - the "is left out" line of `printInvalidNames`. `runShow` prints it after the two tables, also with `--quiet`.
 - `internal/app/worker.go` escapes every tracker line and log, and the verbose Message-Id line. `trackerReason` escapes the inline error reason first, then cuts it to 40 bytes on a rune boundary.
 - `reportError` in `cmd/imapsync-go/main.go` escapes the final `Error:` line, line breaks too. So a multi-line error prints on one line. A raw line break would let a server make a false line after `Error:`.
 - `cmd/imapsync-go/helpers` escapes the GitHub release tag that the root `--help` shows for builds without `-X main.Version`.
@@ -299,7 +342,7 @@ In go-imap v1.2.1, such lines are parse errors and network errors. A parse error
 - Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it. A flag that the user sets, or its environment variable, overrides the config value also when it is 0. For `--bps-down` and `--bps-up`, 0 removes the limit. For `--max-connections`, 0 uses the `--workers` value. `config.New` tests `IsSet`, not a non-zero value.
 - `config.New` rejects a `map` item with an empty or missing `src` or `dst` (`ErrMapSrcRequired`, `ErrMapDstRequired`). The error gives the position of the item, counted from 1. A `map` with no items is valid: `sync` then mirrors every source folder.
 - `ErrSilentExit` makes `reportError` return exit code 1 and print no `Error:` line. A command returns it after it prints its failures on stdout. `sync` uses it for failed messages and failed folders. `show` uses it for folders that it cannot read.
-- `client.New(ctx, addr, user, pass, Options{...})` - keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation.
+- `client.New(ctx, addr, user, pass, Options{...})` - keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation. Set `Options.Label`. It prefixes the log lines and the errors of LIST, EXAMINE, FETCH, CREATE and APPEND, so a LIST that fails inside `New` names the side.
 - Dependencies are vendored under `vendor/`. The module requires Go 1.27.3 or newer; an older host toolchain is refused unless `GOTOOLCHAIN` is left on `auto` to fetch one.
 
 ## Multi-agent workflow

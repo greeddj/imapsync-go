@@ -84,7 +84,7 @@ type Options struct {
 	ReadLimiter  *rate.Limiter
 	WriteLimiter *rate.Limiter
 	Auth         string // "", "login" or "cram-md5" in any letter case; New refuses other values
-	Label        string // prefixes log lines and errors, so a failure inside New names the side
+	Label        string // prefixes log lines and the errors of LIST, EXAMINE, FETCH, CREATE and APPEND, so a failed LIST in New names the side
 	DialTimeout  time.Duration
 	UseTLS       bool
 	Verbose      bool
@@ -289,9 +289,7 @@ func (c *Client) progressTracker() ProgressTracker {
 	return nil
 }
 
-// GetDelimiter returns the cached hierarchy delimiter for this server. It is
-// empty when no LIST entry names a delimiter, for example on a flat server that
-// reports NIL.
+// GetDelimiter returns the cached hierarchy delimiter. It is empty when no LIST entry names one, as on a flat server.
 func (c *Client) GetDelimiter() string { return c.delimiter }
 
 // Logout ends the IMAP session. It closes the socket and returns an error when

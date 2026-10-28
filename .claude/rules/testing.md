@@ -34,6 +34,31 @@
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
 
+  The hierarchy delimiter has these tests:
+  - `Test_loadMailboxCache_When_ListNamesNoDelimiter_Then_DelimiterStaysEmpty` - NIL entries leave the cache delimiter empty, and the first delimiter that an entry names sets it;
+  - `Test_CreateMailbox_When_ServerIsFlat_Then_SendsOneCreateWithoutParents` and `Test_ListSubfolders_When_ServerIsFlat_Then_ReturnsNoChildren` - a flat server gets one CREATE for the whole name, and no name is a child;
+  - `Test_loadMailboxCache_When_ListIsRetried_Then_DelimiterOfTheFailedAttemptIsDropped` - a retried LIST keeps no delimiter of the failed attempt.
+
+  The INBOX letter case has these tests:
+  - `Test_canonicalName`, `FuzzCanonicalName` and `Test_canonicalName_When_NameNeedsNoChange_Then_AllocatesNothing` - the fold of a leading INBOX level follows the cache delimiter; a name that needs no fold costs no allocation;
+  - `Test_ResolveName` and `Test_ResolveName_When_NameNeedsNoFolding_Then_LookupsAllocateNothing` - the listed spelling, and a lookup that needs no fold costs no allocation;
+  - `Test_loadMailboxCache_When_ListGivesMixedCaseInboxChild_Then_CacheKeepsListedName` and `Test_loadMailboxCache_When_ListGivesTwoSpellingsOfAnInboxChild_Then_CacheKeepsAllNames` - the cache keeps each listed spelling;
+  - `Test_loadMailboxCache_When_EntryNamesAnotherDelimiter_Then_InboxLevelFollowsTheCacheDelimiter` and `Test_loadMailboxCache_When_SlashChildIsListedOnADotServer_Then_InboxLevelDoesNotFold` - the fold uses the cache delimiter only;
+  - `TestAddMailboxToCache_When_TwoSpellingsShareOneCanonicalForm_Then_SmallerWinsInAnyOrder` and `Test_loadMailboxCache_When_ListIsRetried_Then_SpellingsOfTheFailedAttemptAreDropped` - the indexed spelling does not depend on the order, and a retry drops the spellings of a failed attempt;
+  - `Test_MailboxExists_When_NameIsInboxInAnyCase_Then_CacheFindsIt`, `Test_MailboxExists_When_ServerIsFlat_Then_OnlyTheBareInboxNameFolds`, `Test_ListSubfolders_When_ParentIsInboxInAnyCase_Then_ReturnsInboxChildren`, `Test_IsNoSelect_When_NameDiffersOnlyInInboxCase_Then_ReportsIt` and `Test_CreateMailbox_When_NameIsInboxInAnotherCase_Then_SendsNoCreateForInbox` - each cache read and `CreateMailbox` follow the fold;
+  - `Test_folderLock_When_NamesDifferOnlyInInboxCase_Then_ShareOneMutex` - two spellings of one name share one lock;
+  - `Test_FetchMessageMap_When_ListGivesInboxChildInAnotherCase_Then_ExaminesTheListedName` - the EXAMINE carries the listed spelling;
+  - `Test_CacheReads_When_ContextAlreadyEnded_Then_ReturnContextError` - the cache reads return the context error and send no new LIST.
+
+  The names that are not valid modified UTF-7 have these tests:
+  - `Test_New_When_ListHoldsNamesThatAreNotModifiedUTF7_Then_CacheLeavesThemOut` and `Test_loadMailboxCache_When_ListSendsInvalidNameAsLiteral_Then_LeavesItOutAndKeepsTheNextEntry` - the cache leaves out each such name, a literal too, and keeps the next entry;
+  - `Test_New_When_ListIsInterleavedWithOtherUntaggedResponses_Then_CacheKeepsEveryName` - other untagged responses do not drop a name;
+  - `Test_New_When_ListEntryLacksAName_Then_FailsAsBefore` and `Test_New_When_ListEntryIsMalformed_Then_FailsInsteadOfLeavingItOut` - any other parse error still fails the LIST, and the error names the label;
+  - `Test_InvalidMailboxNames_When_ListNamesOneInvalidNameTwice_Then_ReportsItOnceAndReturnsACopy` - each name shows once, and the caller gets a copy;
+  - `Test_loadMailboxCache_When_Reloaded_Then_InvalidNamesAreReplaced`, `Test_ListMailboxes_When_ListHoldsInvalidName_Then_ResultLeavesItOutAndRecordsIt` and `Test_ListMailboxes_When_ListChangesAfterConnect_Then_InvalidNamesFollowTheLatestList` - the latest LIST sets the left-out names, for the cache and for `ListMailboxes`;
+  - `Test_loadMailboxCache_When_ListIsRetried_Then_NamesAndInvalidNamesOfTheFailedAttemptAreDropped`, `Test_ListMailboxes_When_ListIsRetried_Then_ResultAndInvalidNamesOfTheFailedAttemptAreDropped` and `Test_listAll_When_CommandWriteFails_Then_ReturnsWhileCallbackStillRuns` - a failed attempt leaves no state, also when go-imap calls the callback after `Execute` returns;
+  - `Test_ListMailboxes_When_SessionEndedByBye_Then_ReconnectsAndLists` - after a BYE, `ListMailboxes` reconnects and lists.
+
   The error class has these tests:
   - `TestClassifyError` and `TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides` - the text of a wrapper (a folder name or a label) never changes the class, and a leaf reply keeps its class under each wrapper;
   - `TestCanRevive` - only a transient or throttled give-up can revive;
@@ -111,12 +136,14 @@
   - a `\Noselect` source folder, where only the subfolders copy;
   - a `\Noselect` destination, where a source message with a Message-Id gives a folder failure and an empty source folder gives none;
   - a mirror run where both servers list the Gmail container `[Gmail]`;
-  - a readable source folder that LIST leaves out, where the folder and its subfolders copy;
+  - a readable source folder that LIST does not show, where the folder and its subfolders copy;
   - an unlisted parent that refuses to open, where the plan skips it, prints one line and keeps the exit code (`isHierarchyLevel`);
   - an unlisted INBOX with subfolders that refuses to open, which stays a failure;
   - an unlisted parent whose session drops, which stays a failure;
   - a destination that CREATE reports as existing but LIST did not show, where the run copies only the missing messages and a second run sends no APPEND, opens no worker connection and sends one LIST (`TestRunSync_When_CreateReportsExistingFolderWithMessages_Then_CopiesOnlyTheDifference`);
   - the same check for an empty existing destination, which sends no source command (`TestRunSync_When_ExistingDestinationIsEmpty_Then_SourceIsNotScannedAgain`), and for a folder that CREATE made, which gets no scan (`TestRunSync_When_CreateSucceeds_Then_NewFolderIsNotScanned`);
+  - a destination LIST that has names that are not valid modified UTF-7, where a folder that CREATE made is also checked. The check copies only the missing messages when the folder holds some (`TestRunSync_When_DestinationListsInvalidNameAndCreateAnswersOKForFolderWithMessages_Then_CopiesOnlyTheDifference`). The check reads only the destination when the folder is empty (`TestRunSync_When_DestinationListsInvalidNameAndCreateMakesFolder_Then_RecheckReadsOnlyTheDestination`);
+  - a destination folder that LIST does not show, where the run copies only the missing messages and checks only that folder (`TestRunSync_When_DestinationInboxIsMissingFromList_Then_OnlyTheDifferenceIsCopied` and `TestRunSync_When_OnlyOneDestinationIsMissingFromList_Then_OnlyThatFolderIsChecked`);
   - the same check with `--quiet`, where the run copies the missing messages and prints no "already exists and holds" line (`TestRunSync_When_ExistingDestinationHoldsMessagesInQuietMode_Then_PrintsNoInfoLine`);
   - an existing destination that cannot be scanned, where the folder failure shows also with `--quiet`, the other plans still copy, and the run opens no worker connection when no plan is left (`TestRunSync_When_ExistingDestinationCannotBeScanned_Then_ReportsFolderFailure`);
   - a source that cannot be scanned again during the check, which gives a folder failure and no APPEND (`TestRunSync_When_SourceRescanFails_Then_ReportsFolderFailure`);
@@ -130,9 +157,61 @@
   - `runShow` with unreadable folders (marked rows, the reason list and a non-zero exit) and with a `\Noselect` container (a `container` row and exit code 0);
   - the `ActionSync` and `ActionShow` adapters, which run through a urfave/cli root (the TLS-only dial and the config load errors);
   - a config with an unknown key, an unsupported `auth` value or a `map` item with no folder name, which both adapters refuse before they connect.
+
+  The delimiter fix has these tests:
+  - `Test_delimiterRewrite` and `Test_delimiterRewrite_When_TypedNameAndItsRewriteAreBothListed_Then_KeepsTheTypedName` - a rewrite is offered only for an unlisted name with a listed result; a listed name never changes;
+  - `Test_delimiterRewrite_When_ContextEnded_Then_ReturnsContextError`, `Test_delimiterRewrite_When_ContextEndsBetweenLookups_Then_ReturnsContextError` and `Test_collectDelimiterFixes_When_ContextEndsDuringLookup_Then_ReturnsContextError` - a context that ends returns its error;
+  - `TestRunSync_When_TypedNameIsListed_Then_NoDelimiterPrompt` - a listed name gives no question;
+  - `TestRunSync_When_TypedNameAndItsRewriteAreMissing_Then_NameIsKeptWithoutPrompt` - an unlisted name with no listed rewrite stays as typed, on the source side and on the destination side, with no question;
+  - `TestRunSync_When_TypedNameAndItsRewriteAreBothListed_Then_OnlyTheTypedFolderIsCopied` - the typed folder is copied and its rewrite is not;
+  - `TestRunSync_When_DestinationListsTheRewrittenPath_Then_PathIsRewrittenAfterConfirmation` - the rewrite happens after the answer, or with `-y`;
+  - `TestRunSync_When_DelimiterIsRewritten_Then_ConfigMapKeepsTheTypedNames` - the config `map` of the caller does not change;
+  - `TestRunSync_When_MirroredNameHoldsDelimiterText_Then_FolderIsCopiedUnchanged` - a mirror run asks no question and keeps a name that holds delimiter text;
+  - `TestRunSync_When_TypedSourceNamesInboxChildInAnotherCaseWithWrongDelimiter_Then_RewriteTargetsTheListedFolder` - the rewrite finds a listed INBOX child in another letter case.
+
+  The name conversion and the rename notice have these tests:
+  - `Test_convertFolderPath`, `Test_convertFolderPath_When_AnyDelimiterPair_Then_LevelsMatchTheSource` and `FuzzConvertFolderPath` - the rules of `convertFolderPath`, and the levels of the result for any pair of delimiters;
+  - `Test_expandMappingsWithSubfolders_When_SegmentHoldsDestinationDelimiter_Then_ItBecomesUnderscore` and `Test_expandMappingsWithSubfolders_When_RootIsRenamed_Then_SubfoldersAreRenamed` - the rename of a level, and a root that passes the rename to its subfolders;
+  - `Test_expandMappingsWithSubfolders_When_ListOrderVaries_Then_SubfoldersFollowByteOrder` - the order of the subfolders does not depend on the LIST order;
+  - `Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfolderAgreesWithMirrorMappings` - an expanded subfolder and its mirror mapping give the same destination;
+  - `Test_expandMappingsWithSubfolders_When_ListedChildSpellsInboxInAnotherCase_Then_RelativePathIsCutByLength` - the relative path of an INBOX child in another letter case;
+  - `TestRunSync_When_SourceSegmentHoldsDestinationDelimiter_Then_FolderIsRenamedNotNested`, `TestRunSync_When_MirrorCrossesDelimiters_Then_DestinationUsesItsDelimiterWithoutPrompt` and `TestRunSync_When_TypedDestinationHoldsDestinationDelimiter_Then_NameIsNotRenamed` - the end-to-end results, and a typed destination that stays as typed;
+  - `TestRunSync_When_FolderIsRenamed_Then_WarningShowsWithoutVerboseAndBeforePrompt` - the rename notice shows before the prompt, also without `--verbose` and with `--quiet`;
+  - `TestRunSync_When_RenamedNameCarriesControlCharacters_Then_WarningShowsEscapesAndServerGetsExactName` - the notice escapes the names, and the servers get the exact names.
+
+  The clash of destination names has these tests:
+  - `Test_splitDestinationClashes` - a group with a renamed mapping fails every member, and a group with no renamed mapping stays;
+  - `TestRunSync_When_RenameMakesTwoSourcesShareADestination_Then_BothFailAndNothingMerges` - both folders fail, the run opens neither folder on the source, and it creates no destination folder for them;
+  - `TestRunSync_When_RenameClashAppearsAfterAnEarlierRun_Then_ExistingFolderGetsNoForeignMail` - a folder that an earlier run filled gets no mail from a renamed source;
+  - `TestRunSync_When_RenameClashNamesCarryControlCharacters_Then_FailureLinesShowEscapesAndNothingIsSent` - the failure lines escape the names.
+
+  The INBOX letter case in `sync` has these tests:
+  - `Test_resolveMappings` - each typed name gets the listed spelling;
+  - `TestRunSync_When_DestinationNamesInboxInAnotherCase_Then_NothingIsCopiedTwice` and `TestRunSync_When_SourceNamesInboxInAnotherCase_Then_SubfoldersAreCopied` - a typed `inbox` selects the INBOX and its subfolders;
+  - `TestRunSync_When_SourceListsInboxChildInMixedCase_Then_ChildIsCopiedOnce` and `TestRunSync_When_SourceListsTwoSpellingsOfAnInboxChild_Then_BothAreScannedAndCopied` - each listed spelling is one folder;
+  - `TestRunSync_When_SourceListsInboxChildInAnotherCaseAndMatchesItExactly_Then_WireKeepsTheListedName`, `TestRunSync_When_DestinationListsInboxChildInAnotherCase_Then_ItIsUsedUnderItsListedName`, `TestRunSync_When_DestinationListsInboxChildWithNilDelimiter_Then_ItIsUsedUnderItsListedName` and `TestRunSync_When_SourceListsInboxChildWithNilDelimiter_Then_TypedNameScansTheListedFolder` - the commands carry the listed spelling;
+  - `TestRunSync_When_TwoSourcesDifferOnlyInInboxCase_Then_TheyAreOneSource` - two typed spellings of one source are one source;
+  - `TestRunSync_When_DestinationNameDiffersInCaseFromAnotherFolder_Then_ItStaysASeparateFolder` - a name that is not INBOX keeps its letter case.
+
+  The flat servers have these tests:
+  - `TestRunSync_When_BothServersAreFlat_Then_DottedFolderIsCopiedUnchanged` and `TestRunSync_When_BothServersAreFlat_Then_TypedNamesWithDelimiterTextAreCopiedUnchanged` - a name with delimiter text stays;
+  - `TestRunSync_When_DestinationIsFlat_Then_CreatesNoParentFolder` and `TestRunSync_When_DestinationListsNothing_Then_NestedTypedNameIsCreatedWithoutParent` - a flat destination, or one that lists nothing, gets no parent folder;
+  - `TestRunSync_When_SourceIsFlat_Then_MappingGetsNoSubfolders` and `TestRunSync_When_FlatSourceHoldsNameWithSlash_Then_UnlistedParentIsAFailureNotASkip` - a flat source has no subfolders, so an unlisted name that refuses to open is a folder failure, not a skip;
+  - `TestRunSync_When_DestinationIsFlat_Then_SubfoldersKeepTheirSourceNames` - a subfolder keeps the delimiter of the source.
+
+  The names that are not valid modified UTF-7 have these tests:
+  - `TestRunSync_When_UnmappedFolderNameIsNotModifiedUTF7_Then_RestSyncsAndWarns` and `TestRunSync_When_MirrorSourceListsInvalidName_Then_OtherFoldersCopyAndWarningShowsWithQuiet` - the run copies the other folders and prints the warning, also with `--quiet`;
+  - `TestRunSync_When_DestinationListsInvalidName_Then_SyncRunsAndWarnsWithDstLabel` and `TestRunSync_When_BothSidesListInvalidNames_Then_SourceWarningsComeFirstInNameOrder` - the label and the order of the warnings;
+  - `TestRunSync_When_MappingNamesInvalidFolder_Then_FolderFailsAndRestCopies` - a mapping that names such a folder gives a folder failure;
+  - `TestRunSync_When_MirrorListsNamesThatAreNotModifiedUTF7_Then_NoCommandCarriesTheirBytes` - no command carries the raw bytes of a left-out name;
+  - `TestRunSync_When_ListHoldsNameWithLatin1Byte_Then_RunSucceedsAndShowsTheEscapedName` - a name with an invalid UTF-8 byte shows as escape text;
+  - `TestRunShow_When_FolderNameIsNotModifiedUTF7_Then_TableLeavesItOutAndWarns` and `TestRunShow_When_FolderNameHoldsLatin1Byte_Then_TableLeavesItOutAndWarnsWithTheEscapedName` - `show` leaves the folder out of the table and sends no STATUS for it; it prints the warning after the tables, with and without `--quiet`.
+
+  The label of an error has these tests:
+  - `TestRunSync_When_SourceListFailsAtConnect_Then_ErrorNamesTheLabel`, `TestRunSync_When_DestinationListFailsAtConnect_Then_ErrorNamesTheLabel` and `Test_newSyncWorkerPool_When_WorkerListFails_Then_ErrorNamesTheWorkerLabel` - a LIST that fails inside `client.New` names the side or the worker.
 - **`internal/progress`** - interface compliance against the contract `internal/client` expects.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
-- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read.
+- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read. They also include the left-out lines, the rename notice and the "already exists and holds" lines (`TestRunSync_When_ExistingDestinationNamesCarryControlCharacters_Then_InfoLineShowsEscapesAndServersGetExactNames`).
 - **`cmd/imapsync-go`** - `TestReportError` covers the exit code and the escaped `Error:` line. `TestFetchTag` covers `helpers.fetchTag` against an `httptest` server.
 
 ## What we deliberately don't test
@@ -146,7 +225,6 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 ### Deliberate exclusions in `internal/client`
 
 - **`client.New`** - the `Test_New_*` tests cover CRAM-MD5, dial failure, LIST refusal, cancel during LOGIN and shared limiters. Only `internal/app` tests cover two branches: the `tls.Dialer` path and the default dial timeout. The `tls.Dialer` test uses a plaintext server, so a handshake error is expected. The standard library handles a successful TLS handshake, so no test covers it.
-- **`Client.SetPrefix`, `Client.GetDelimiter`** - trivial one-liners; observable in all fake-server tests that set a delimiter.
 - **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
 - **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
