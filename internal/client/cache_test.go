@@ -878,37 +878,62 @@ func Test_loadMailboxCache_When_ListSendsInvalidNameAsLiteral_Then_LeavesItOutAn
 	}
 }
 
-func Test_loadMailboxCache_When_ListIsRetried_Then_InvalidNamesOfTheFailedAttemptAreDropped(t *testing.T) {
+func Test_loadMailboxCache_When_ListIsRetried_Then_NamesAndInvalidNamesOfTheFailedAttemptAreDropped(t *testing.T) {
 	t.Parallel()
 
-	srv := newFakeServer(t)
-	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
-		if cmd.verb != "LIST" {
-			return false, true
-		}
-		// The connection drops after one bad name, before the tagged reply.
-		writeLine(conn, `* LIST () "/" "Q&A"`)
-		return true, false
-	}))
-	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	tests := []struct {
+		fail func(conn net.Conn, tag string) (keep bool)
+		name string
+	}{
+		{
+			name: "the connection drops before the tagged reply",
+			fail: func(net.Conn, string) bool { return false },
+		},
+		{
+			name: "the server refuses with a transient reply",
+			fail: func(conn net.Conn, tag string) bool {
+				writeLine(conn, "%s NO Not logged in", tag)
+				return true
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() {
-		c.Cancel()
-		_ = c.Logout()
-	})
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+				if cmd.verb != "LIST" {
+					return false, true
+				}
+				writeLine(conn, `* LIST () "/" "Stale"`)
+				writeLine(conn, `* LIST () "/" "Q&A"`)
+				return true, tt.fail(conn, cmd.tag)
+			}))
+			srv.addConnHandler(interceptHandler(srv, serveNormally))
 
-	if n := srv.callCount("LIST"); n != 2 {
-		t.Fatalf("LIST count = %d, want 2 (the dropped attempt and its retry)", n)
-	}
-	if got := c.InvalidMailboxNames(); len(got) != 0 {
-		t.Errorf("InvalidMailboxNames = %q, want none: the retry lists only INBOX", got)
-	}
-	if !c.hasMailbox("INBOX") {
-		t.Error("hasMailbox(INBOX) = false after the retry")
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if n := srv.callCount("LIST"); n != 2 {
+				t.Fatalf("LIST count = %d, want 2 (the failed attempt and its retry)", n)
+			}
+			if got := c.InvalidMailboxNames(); len(got) != 0 {
+				t.Errorf("InvalidMailboxNames = %q, want none: the retry lists only INBOX", got)
+			}
+			if got := c.MailboxNames(); !slices.Equal(got, []string{"INBOX"}) {
+				t.Errorf("MailboxNames = %q, want [INBOX]: the retry lists only INBOX", got)
+			}
+			if !c.hasMailbox("INBOX") {
+				t.Error("hasMailbox(INBOX) = false after the retry")
+			}
+		})
 	}
 }
 

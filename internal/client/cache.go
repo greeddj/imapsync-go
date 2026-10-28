@@ -158,7 +158,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 		return err
 	}
 
-	folders := make(map[string]struct{})
+	var folders map[string]struct{}
 	var noSelect map[string]struct{}
 	var invalid []string
 	delim := ""
@@ -166,7 +166,6 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		folders = make(map[string]struct{})
 		noSelect = nil
-		invalid = nil
 		delim = ""
 		var err error
 		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {

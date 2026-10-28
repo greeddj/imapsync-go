@@ -718,6 +718,67 @@ func Test_ListMailboxes_When_ReconnectGivesUpMidList_Then_EveryRemainingFolderCa
 	}
 }
 
+func Test_ListMailboxes_When_ListIsRetried_Then_ResultAndInvalidNamesOfTheFailedAttemptAreDropped(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		fail func(conn net.Conn, tag string) (keep bool)
+		name string
+	}{
+		{
+			name: "the connection drops before the tagged reply",
+			fail: func(net.Conn, string) bool { return false },
+		},
+		{
+			name: "the server refuses with a transient reply",
+			fail: func(conn net.Conn, tag string) bool {
+				writeLine(conn, "%s NO Not logged in", tag)
+				return true
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+				if cmd.verb != "LIST" {
+					return false, true
+				}
+				writeLine(conn, `* LIST () "/" "Stale"`)
+				writeLine(conn, `* LIST () "/" "Q&A"`)
+				return true, tt.fail(conn, cmd.tag)
+			}))
+			srv.addConnHandler(interceptHandler(srv, serveNormally))
+			c := newClientWithFake(t, srv)
+
+			infos, err := c.ListMailboxes(t.Context())
+			if err != nil {
+				t.Fatalf("ListMailboxes: %v", err)
+			}
+
+			names := make([]string, 0, len(infos))
+			for _, m := range infos {
+				names = append(names, m.Name)
+			}
+			slices.Sort(names)
+			if !slices.Equal(names, []string{"INBOX"}) {
+				t.Errorf("ListMailboxes names = %q, want [INBOX]: the retry lists only INBOX", names)
+			}
+			if got := c.InvalidMailboxNames(); len(got) != 0 {
+				t.Errorf("InvalidMailboxNames = %q, want none: the retry lists only INBOX", got)
+			}
+			if n := srv.callCount("LIST"); n != 2 {
+				t.Errorf("LIST count = %d, want 2 (the failed attempt and its retry)", n)
+			}
+			if n := srv.callCount("LOGIN"); n != 2 {
+				t.Errorf("LOGIN count = %d, want 2 (the first session and the reconnect)", n)
+			}
+		})
+	}
+}
+
 // Test_ListMailboxes_reportsProgress asserts that the tracker learns the folder
 // total once and advances once per folder, including a folder that was skipped.
 func Test_ListMailboxes_reportsProgress(t *testing.T) {
