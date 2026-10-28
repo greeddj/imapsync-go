@@ -496,18 +496,12 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
 	c.verbose = true
 
-	result, totalSize, err := c.FetchMessageMap(context.Background(), "INBOX")
+	result, err := c.FetchMessageMap(context.Background(), "INBOX")
 	if err != nil {
 		t.Fatalf("FetchMessageMap: %v", err)
 	}
-	if len(result) != 1 {
-		t.Errorf("returned map has %d entries, want 1", len(result))
-	}
-	if _, ok := result["ok@host"]; !ok {
-		t.Errorf("expected key ok@host in map, got %v", result)
-	}
-	if totalSize == 0 {
-		t.Error("totalSize = 0, want > 0 - RFC822.SIZE not aggregated from fake server response")
+	if want := map[string][]MessageRef{"ok@host": {{UID: 1, Size: 1024}}}; !equalMessageMaps(result, want) {
+		t.Errorf("map = %v, want %v", result, want)
 	}
 
 	var foundLog bool
@@ -522,30 +516,131 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 	}
 }
 
-// Test_FetchMessageIDSet_returnsIDsWithoutUIDs asserts that FetchMessageIDSet
-// wraps FetchMessageMap correctly: it returns the same Message-Id keys but
-// drops the UID values, and the returned set contains exactly those IDs.
-func Test_FetchMessageIDSet_returnsIDsWithoutUIDs(t *testing.T) {
+// scanRow is one scripted Message-Id scan response. An empty msgID sends a header section with no Message-Id.
+type scanRow struct {
+	msgID string
+	uid   uint32
+	size  uint32
+}
+
+// scanIntercept answers EXAMINE with one EXISTS per row and each FETCH with the rows in the given order.
+func scanIntercept(rows []scanRow) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (bool, bool) {
+		switch cmd.verb {
+		case "SELECT", "EXAMINE":
+			writeLine(conn, "* %d EXISTS", len(rows))
+			writeLine(conn, "* 0 RECENT")
+			writeLine(conn, "%s OK [READ-ONLY] %s completed", cmd.tag, cmd.verb)
+		case "FETCH":
+			for i, r := range rows {
+				hdr := "\r\n"
+				if r.msgID != "" {
+					hdr = "Message-Id: <" + r.msgID + ">\r\n\r\n"
+				}
+				writeLine(conn, "* %d FETCH (UID %d RFC822.SIZE %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)",
+					i+1, r.uid, r.size, len(hdr), hdr)
+			}
+			writeLine(conn, "%s OK FETCH completed", cmd.tag)
+		default:
+			return false, true
+		}
+		return true, true
+	}
+}
+
+func equalMessageMaps(a, b map[string][]MessageRef) bool {
+	return maps.EqualFunc(a, b, slices.Equal[[]MessageRef])
+}
+
+func Test_FetchMessageMap_When_MessagesShareMessageId_Then_KeepsEveryUIDInAscendingOrder(t *testing.T) {
 	t.Parallel()
 
 	srv := newFakeServer(t)
-	srv.addConnHandler(fetchTwoMessagesHandler(srv))
-
+	srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+		{msgID: "dup@x", uid: 9, size: 10},
+		{msgID: "dup@x", uid: 4, size: 20},
+		{msgID: "one@x", uid: 6, size: 30},
+		{msgID: "dup@x", uid: 7, size: 40},
+		{uid: 8, size: 50},
+	})))
 	c := newClientWithFake(t, srv)
-	c.mailboxCache = mailboxCache{
-		folders:   map[string]struct{}{"INBOX": {}},
-		delimiter: "/",
-	}
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
 
-	result, err := c.FetchMessageIDSet(context.Background(), "INBOX")
+	got, err := c.FetchMessageMap(t.Context(), "INBOX")
+
 	if err != nil {
-		t.Fatalf("FetchMessageIDSet: %v", err)
+		t.Fatalf("FetchMessageMap: %v", err)
 	}
-	if len(result) != 1 {
-		t.Errorf("FetchMessageIDSet returned %d entries, want 1", len(result))
+	want := map[string][]MessageRef{
+		"dup@x": {{UID: 4, Size: 20}, {UID: 7, Size: 40}, {UID: 9, Size: 10}},
+		"one@x": {{UID: 6, Size: 30}},
 	}
-	if _, ok := result["ok@host"]; !ok {
-		t.Errorf("expected key ok@host in set, got %v", result)
+	if !equalMessageMaps(got, want) {
+		t.Errorf("map = %v, want %v", got, want)
+	}
+	var warnings int
+	for _, msg := range logged {
+		if strings.Contains(msg, "1 message(s) without Message-Id") {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Errorf("got %d warnings about a missing Message-Id, want 1; log: %v", warnings, logged)
+	}
+}
+
+func Test_FetchMessageMap_When_ServerRepeatsAResponse_Then_KeepsTheUIDOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		want map[string][]MessageRef
+		name string
+		rows []scanRow
+	}{
+		{
+			name: "the repeated response is alone for its id",
+			rows: []scanRow{{msgID: "a@x", uid: 5, size: 10}, {msgID: "a@x", uid: 5, size: 10}},
+			want: map[string][]MessageRef{"a@x": {{UID: 5, Size: 10}}},
+		},
+		{
+			name: "the repeated responses sit inside a group of repeated ids",
+			rows: []scanRow{
+				{msgID: "dup@x", uid: 9, size: 10},
+				{msgID: "dup@x", uid: 4, size: 20},
+				{msgID: "dup@x", uid: 9, size: 10},
+				{msgID: "dup@x", uid: 6, size: 30},
+				{msgID: "dup@x", uid: 4, size: 20},
+			},
+			want: map[string][]MessageRef{"dup@x": {{UID: 4, Size: 20}, {UID: 6, Size: 30}, {UID: 9, Size: 10}}},
+		},
+		{
+			name: "a repeated response does not disturb an id that has one message",
+			rows: []scanRow{
+				{msgID: "a@x", uid: 1, size: 10},
+				{msgID: "b@x", uid: 2, size: 20},
+				{msgID: "b@x", uid: 2, size: 20},
+			},
+			want: map[string][]MessageRef{"a@x": {{UID: 1, Size: 10}}, "b@x": {{UID: 2, Size: 20}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, scanIntercept(tt.rows)))
+			c := newClientWithFake(t, srv)
+
+			got, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+			if err != nil {
+				t.Fatalf("FetchMessageMap: %v", err)
+			}
+			if !equalMessageMaps(got, tt.want) {
+				t.Errorf("map = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -653,7 +748,7 @@ func Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStay
 	// Not parallel: TotalAlloc counts every goroutine, so a parallel test would add its own allocations.
 	const (
 		hugeMessageCount uint32 = 1 << 22
-		// The capped hint costs about 3.3 MiB. An uncapped hint for hugeMessageCount costs about 213 MiB.
+		// The capped hint costs about 6.1 MiB. An uncapped hint for hugeMessageCount costs about 384 MiB.
 		maxScanAlloc uint64 = 16 << 20
 	)
 	wantSeqSet := fmt.Sprintf("1:%d", hugeMessageCount)
@@ -688,7 +783,7 @@ func Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStay
 			c := newClientWithFake(t, srv)
 
 			if tt.warmUp {
-				if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+				if _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
 					t.Fatalf("FetchMessageMap while selecting the folder: %v", err)
 				}
 				if got := <-sets; got != "1:2" {
@@ -698,17 +793,14 @@ func Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStay
 
 			var before, after runtime.MemStats
 			runtime.ReadMemStats(&before)
-			ids, size, err := c.FetchMessageMap(t.Context(), "INBOX")
+			ids, err := c.FetchMessageMap(t.Context(), "INBOX")
 			runtime.ReadMemStats(&after)
 			if err != nil {
 				t.Fatalf("FetchMessageMap: %v", err)
 			}
 
-			if want := map[string]uint32{"ok@host": 1}; !maps.Equal(ids, want) {
+			if want := map[string][]MessageRef{"ok@host": {{UID: 1, Size: 1024}}}; !equalMessageMaps(ids, want) {
 				t.Errorf("ids = %v, want %v", ids, want)
-			}
-			if size != 1536 {
-				t.Errorf("size = %d, want 1536", size)
 			}
 			delta := after.TotalAlloc - before.TotalAlloc
 			t.Logf("FetchMessageMap allocated %.1f MiB", float64(delta)/(1<<20))
@@ -1086,10 +1178,10 @@ func Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAga
 	}))
 	c := newWatchedClient(t, srv, 0)
 
-	if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+	if _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
 		t.Fatalf("FetchMessageMap INBOX: %v", err)
 	}
-	if _, _, err := c.FetchMessageMap(t.Context(), "Missing"); err == nil {
+	if _, err := c.FetchMessageMap(t.Context(), "Missing"); err == nil {
 		t.Fatal("FetchMessageMap Missing returned nil, want the refusal")
 	}
 
@@ -1429,7 +1521,7 @@ func Test_FetchMessageMap_When_RefusalEchoesTransientPhraseOfFolderName_Then_Rec
 	}
 	c := newClientWithFake(t, srv)
 
-	_, _, err := c.FetchMessageMap(t.Context(), folder)
+	_, err := c.FetchMessageMap(t.Context(), folder)
 
 	if err == nil {
 		t.Fatal("FetchMessageMap returned nil, want the refusal")
@@ -1504,7 +1596,7 @@ func Test_FetchMessageMap_When_ExamineIsRefused_Then_OnlyServerRefusalsAreMarked
 			srv.addConnHandler(interceptHandler(srv, refuseExamine))
 			c := newClientWithFake(t, srv)
 
-			_, _, err := c.FetchMessageMap(t.Context(), tt.folder)
+			_, err := c.FetchMessageMap(t.Context(), tt.folder)
 
 			if err == nil {
 				t.Fatal("FetchMessageMap returned nil, want the refusal")
@@ -1539,7 +1631,7 @@ func Test_FetchMessageMap_When_ExamineDropsAndReconnectIsRefused_Then_ErrorIsNot
 	srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Invalid credentials"))
 	c := newClientWithFake(t, srv)
 
-	_, _, err := c.FetchMessageMap(t.Context(), "Archive")
+	_, err := c.FetchMessageMap(t.Context(), "Archive")
 
 	if err == nil {
 		t.Fatal("FetchMessageMap returned nil, want the reconnect failure")
@@ -1598,7 +1690,7 @@ func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_Re
 				}
 			}
 
-			if _, _, err := c.FetchMessageMap(t.Context(), tt.folder); err != nil {
+			if _, err := c.FetchMessageMap(t.Context(), tt.folder); err != nil {
 				t.Fatalf("FetchMessageMap: %v, want success after the reconnect", err)
 			}
 
@@ -1658,7 +1750,7 @@ func Test_FetchMessageMap_When_FolderNameCarriesControlCharacters_Then_WarningSh
 	var logged []string
 	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
 
-	if _, _, err := c.FetchMessageMap(t.Context(), hostileName); err != nil {
+	if _, err := c.FetchMessageMap(t.Context(), hostileName); err != nil {
 		t.Fatalf("FetchMessageMap: %v", err)
 	}
 
@@ -1689,7 +1781,7 @@ func Test_FetchMessageMap_When_ListGivesInboxChildInAnotherCase_Then_ExaminesThe
 		t.Fatalf("ListSubfolders: %v", err)
 	}
 	for _, name := range subfolders {
-		if _, _, err := c.FetchMessageMap(t.Context(), name); err != nil {
+		if _, err := c.FetchMessageMap(t.Context(), name); err != nil {
 			t.Errorf("FetchMessageMap(%q): %v", name, err)
 		}
 	}

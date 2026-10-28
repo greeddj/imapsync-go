@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -55,10 +56,9 @@ func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Wri
 // FolderSyncPlan describes how a single source folder should be copied to its
 // destination.
 //
-// SrcUIDs holds the source UIDs (sorted) for messages present on src but
-// missing on dst; bodies are deliberately not fetched at planning time so a
-// confirm prompt can show counts without materializing potentially many GB
-// of mail in memory.
+// SrcUIDs holds the sorted source UIDs that the destination count does not
+// cover. Planning fetches no bodies, so the prompt can show counts without
+// holding mail in memory.
 type FolderSyncPlan struct {
 	SourceFolder            string
 	DestinationFolder       string
@@ -83,12 +83,10 @@ type FolderSkip struct {
 }
 
 // SyncSummary aggregates the per-folder plans along with total message counts
-// and an estimated total byte volume.
+// and the total byte volume.
 //
-// TotalNewSize is approximate: it scales the source folder's full RFC822.SIZE
-// total by the new-to-total message ratio (NewMessages / SourceMessages). The
-// exact size would require an extra UID FETCH per new UID, which is not worth
-// the round-trips for what is only a preview number.
+// TotalNewSize is the sum of RFC822.SIZE of the planned messages, read by the
+// planning FETCH.
 type SyncSummary struct {
 	Plans        []FolderSyncPlan
 	Failures     []FolderFailure
@@ -620,45 +618,47 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 
 // The destination is read first: an empty folder holds nothing the plan could drop, so it needs no source scan.
 func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, recheckDrops, error) {
-	dstIDs, err := dstClient.FetchMessageIDSet(ctx, plan.DestinationFolder)
+	dstMap, err := dstClient.FetchMessageMap(ctx, plan.DestinationFolder)
 	if err != nil {
 		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errDestinationRecheck, err)
 	}
-	if len(dstIDs) == 0 {
+	if len(dstMap) == 0 {
 		plan.DestinationFolderExists = true
 		return plan, recheckDrops{}, nil
 	}
-	srcMap, _, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
+	srcMap, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
 	if err != nil {
 		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errSourceScan, err)
 	}
-	rechecked, drops := rediffPlan(plan, srcMap, dstIDs)
+	rechecked, drops := rediffPlan(plan, srcMap, dstMap)
 	return rechecked, drops, nil
 }
 
-// held counts planned messages that the source still lists and the destination holds. gone counts those that the source no longer lists.
+// held counts planned messages that the source still lists and the destination count covers. gone counts those that the source no longer lists.
 type recheckDrops struct {
 	held, gone int
 }
 
 // The result intersects the planned UIDs with the fresh diff, so it never gains a UID. It gets a new slice, because plan.SrcUIDs backs summary.Plans.
-func rediffPlan(plan FolderSyncPlan, srcMap map[string]uint32, dstIDs map[string]struct{}) (FolderSyncPlan, recheckDrops) {
-	fresh := make([]uint32, 0, len(srcMap))
-	onDst := make([]uint32, 0, min(len(srcMap), len(dstIDs)))
-	for id, uid := range srcMap {
-		if _, present := dstIDs[id]; present {
-			onDst = append(onDst, uid)
-		} else {
-			fresh = append(fresh, uid)
+func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageRef) (FolderSyncPlan, recheckDrops) {
+	fresh := make([]client.MessageRef, 0, len(srcMap))
+	onDst := make([]uint32, 0, min(len(srcMap), len(dstMap)))
+	for id, refs := range srcMap {
+		covered, missing := splitByDestinationCount(refs, len(dstMap[id]))
+		fresh = append(fresh, missing...)
+		for _, ref := range covered {
+			onDst = append(onDst, ref.UID)
 		}
 	}
-	slices.Sort(fresh)
+	slices.SortFunc(fresh, func(a, b client.MessageRef) int { return cmp.Compare(a.UID, b.UID) })
 	slices.Sort(onDst)
 	var drops recheckDrops
+	var newSize uint64
 	kept := make([]uint32, 0, min(len(plan.SrcUIDs), len(fresh)))
 	for _, uid := range plan.SrcUIDs {
-		if _, ok := slices.BinarySearch(fresh, uid); ok {
+		if i, ok := slices.BinarySearchFunc(fresh, uid, compareRefToUID); ok {
 			kept = append(kept, uid)
+			newSize += uint64(fresh[i].Size)
 			continue
 		}
 		if _, ok := slices.BinarySearch(onDst, uid); ok {
@@ -667,15 +667,27 @@ func rediffPlan(plan FolderSyncPlan, srcMap map[string]uint32, dstIDs map[string
 			drops.gone++
 		}
 	}
-	var newSize uint64
-	if before := len(plan.SrcUIDs); before > 0 {
-		newSize = uint64(float64(plan.NewSize) * float64(len(kept)) / float64(before))
-	}
 	plan.SrcUIDs = kept
 	plan.NewMessages = len(kept)
 	plan.NewSize = newSize
 	plan.DestinationFolderExists = true
 	return plan, drops
+}
+
+func compareRefToUID(ref client.MessageRef, uid uint32) int { return cmp.Compare(ref.UID, uid) }
+
+// The first have messages in UID order count as already on the destination, so each run and the recheck pick the same messages.
+func splitByDestinationCount(refs []client.MessageRef, have int) (covered, missing []client.MessageRef) {
+	n := min(have, len(refs))
+	return refs[:n], refs[n:]
+}
+
+func countRefs(byID map[string][]client.MessageRef) int {
+	var n int
+	for _, refs := range byID {
+		n += len(refs)
+	}
+	return n
 }
 
 // Folder names and Err can carry server text, so every part goes through termsafe.Escape.
@@ -704,19 +716,18 @@ func printSyncErrors(out io.Writer, synced, errs, failedFolders int) {
 // done is incremented by each side; when it reaches 2, maybeDiff fires.
 // Pointer fields precede non-pointer fields to minimise the GC scan range.
 //
-// srcFolderSize and srcFolderCount are recorded before srcMap is freed so the
-// proportional size estimate in maybeDiff can run after the diff.
+// srcMessages counts the source messages that have a Message-Id. It is set
+// before srcMap is freed, so the \Noselect failure can use it after the diff.
 type folderScan struct {
-	srcMap         map[string]uint32
-	dstIDs         map[string]struct{}
-	srcErr         error
-	dstErr         error
-	srcFolderSize  uint64
-	srcFolderCount int
-	dstExists      bool
-	dstNoSelect    bool
-	mu             sync.Mutex
-	done           atomic.Int32
+	srcMap      map[string][]client.MessageRef
+	dstMap      map[string][]client.MessageRef
+	srcErr      error
+	dstErr      error
+	srcMessages int
+	dstExists   bool
+	dstNoSelect bool
+	mu          sync.Mutex
+	done        atomic.Int32
 }
 
 func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, srcLabel, dstLabel string) (*SyncSummary, error) {
@@ -744,13 +755,12 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				return err
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
-			mp, size, err := srcClient.FetchMessageMap(gCtx, m.Source)
+			mp, err := srcClient.FetchMessageMap(gCtx, m.Source)
 			if err != nil {
 				scans[idx].srcErr = err
 			} else {
 				scans[idx].srcMap = mp
-				scans[idx].srcFolderSize = size
-				scans[idx].srcFolderCount = len(mp)
+				scans[idx].srcMessages = countRefs(mp)
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
 			srcTracker.Increment(1)
@@ -770,7 +780,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			case err != nil:
 				scans[idx].dstErr = err
 			case !exists:
-				// dstExists stays false, dstIDs stays nil - benign; folder will be created.
+				// dstExists stays false, dstMap stays nil - benign; folder will be created.
 			case dstClient.IsNoSelect(m.Destination):
 				// A \Noselect folder is listed but refuses EXAMINE, so scanning it would
 				// abort the whole plan.
@@ -778,11 +788,11 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				scans[idx].dstNoSelect = true
 			default:
 				scans[idx].dstExists = true
-				ids, err := dstClient.FetchMessageIDSet(gCtx, m.Destination)
+				mp, err := dstClient.FetchMessageMap(gCtx, m.Destination)
 				if err != nil {
 					scans[idx].dstErr = err
 				} else {
-					scans[idx].dstIDs = ids
+					scans[idx].dstMap = mp
 				}
 			}
 			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, termsafe.Escape(m.Destination), idx+1, n))
@@ -825,11 +835,11 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			continue
 		}
 		if scans[idx].dstNoSelect {
-			if scans[idx].srcFolderCount > 0 {
+			if scans[idx].srcMessages > 0 {
 				summary.Failures = append(summary.Failures, FolderFailure{
 					SourceFolder:      mappings[idx].Source,
 					DestinationFolder: mappings[idx].Destination,
-					Err:               fmt.Errorf("%d messages not copied: %w", scans[idx].srcFolderCount, errDestinationNoSelect),
+					Err:               fmt.Errorf("%d messages not copied: %w", scans[idx].srcMessages, errDestinationNoSelect),
 				})
 			}
 			continue
@@ -846,42 +856,39 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 
 // maybeDiff fires the Message-Id diff exactly once, when both the src and dst
 // sides have completed for slot idx. Returns false if only one side is done.
-// Frees srcMap and dstIDs immediately after the diff to keep peak memory
+// Frees srcMap and dstMap immediately after the diff to keep peak memory
 // proportional to one folder at a time, not len(mappings).
 //
-// NewSize is estimated as srcFolderSize × newCount / srcFolderCount - the
-// exact size would require an extra UID FETCH RFC822.SIZE for each new UID
-// before the user has even confirmed, which is too eager. The proportion is
-// good enough for the preview header.
+// NewSize sums the RFC822.SIZE values that the planning FETCH already returned,
+// so the preview needs no extra round-trip.
 func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64) bool {
 	if s.done.Add(1) != 2 {
 		return false
 	}
 	// done==2 guarantees we are the only goroutine here, but mu is still
-	// required: the race detector sees srcMap/dstIDs written by the other
+	// required: the race detector sees srcMap/dstMap written by the other
 	// goroutine and read here without synchronisation unless we take the lock.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.srcErr != nil || s.dstErr != nil || s.dstNoSelect {
-		s.srcMap, s.dstIDs = nil, nil
+		s.srcMap, s.dstMap = nil, nil
 		return true
 	}
-	newUIDs := make([]uint32, 0, len(s.srcMap))
-	for id, uid := range s.srcMap {
-		if _, present := s.dstIDs[id]; !present {
-			newUIDs = append(newUIDs, uid)
+	newUIDs := make([]uint32, 0, s.srcMessages)
+	var newSize uint64
+	for id, refs := range s.srcMap {
+		_, missing := splitByDestinationCount(refs, len(s.dstMap[id]))
+		for _, ref := range missing {
+			newUIDs = append(newUIDs, ref.UID)
+			newSize += uint64(ref.Size)
 		}
 	}
-	s.srcMap, s.dstIDs = nil, nil
+	s.srcMap, s.dstMap = nil, nil
 	if len(newUIDs) == 0 {
 		return true
 	}
 	// Sort for stable preview ordering and compactable UID FETCH ranges.
 	slices.Sort(newUIDs)
-	var newSize uint64
-	if s.srcFolderCount > 0 {
-		newSize = uint64(float64(s.srcFolderSize) * float64(len(newUIDs)) / float64(s.srcFolderCount))
-	}
 	plans[idx] = FolderSyncPlan{
 		SourceFolder:            mappings[idx].Source,
 		DestinationFolder:       mappings[idx].Destination,

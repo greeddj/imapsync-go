@@ -862,6 +862,18 @@ func (s *fakeServer) folderMsgIDs(folder string) []string {
 	return ids
 }
 
+// folderBodies returns the message bodies stored in folder in UID order, or nil
+// when the folder does not exist.
+func (s *fakeServer) folderBodies(folder string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var bodies []string
+	for _, m := range s.store.folders[folder] {
+		bodies = append(bodies, m.body)
+	}
+	return bodies
+}
+
 func (s *fakeServer) hasFolder(folder string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

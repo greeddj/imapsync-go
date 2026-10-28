@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -47,38 +48,39 @@ func (m Message) MessageID() string {
 	return m.m.Envelope.MessageId
 }
 
-// FetchMessageMap returns Message-Id → UID for every message in folder, plus
-// the sum of RFC822.SIZE across all messages.
+// MessageRef is one scanned message: its UID and its RFC822.SIZE.
+type MessageRef struct {
+	UID  uint32
+	Size uint32
+}
+
+// FetchMessageMap returns Message-Id -> messages for every message in folder.
 //
-// One pass over the folder yields all three pieces. Messages without a usable
-// Message-Id are counted and reported once via the progress writer - without
-// that header the diff has no key to match on, so they cannot be tracked
-// across servers and will be silently skipped. The folder-wide size total is
-// used by callers (sync preview) to estimate transfer volume; messages without
-// a Message-Id still contribute to the total because they exist on the wire.
+// Each value lists the messages with that Message-Id in ascending UID order,
+// each UID once. Messages without a Message-Id have no diff key: they are left
+// out and reported once.
 //
-// The returned map is suitable both as the source side of a Message-Id diff
-// and (with UIDs ignored) as the destination side; callers that only need
-// the keys can use FetchMessageIDSet for a slightly thinner allocation.
-func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string]uint32, uint64, error) {
+// The map serves both sides of a Message-Id diff: the source reads the UIDs
+// and sizes, and the destination reads the length of each value.
+func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
 
 	if err := ctx.Err(); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
 	var (
-		ids          map[string]uint32
-		totalSize    uint64
+		ids          map[string][]MessageRef
 		missingCount int
+		repeated     bool
 	)
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		ids = nil
-		totalSize = 0
 		missingCount = 0
+		repeated = false
 		mbox, err := c.selectIfNeeded(cli, folder)
 		if err != nil {
 			// Only a server answer marks a refusal: a broken session or a throttle
@@ -103,18 +105,18 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		}
 		c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, total)
 		if total == 0 {
-			ids = make(map[string]uint32)
+			ids = make(map[string][]MessageRef)
 			return nil
 		}
 		c.log("[%s] Fetching %d message IDs from %s...", c.prefix, total, folder)
 
-		ids = make(map[string]uint32, min(total, maxMessageMapHint))
+		ids = make(map[string][]MessageRef, min(total, maxMessageMapHint))
 		seqset := new(imap.SeqSet)
 		seqset.AddRange(1, total)
 		messages := make(chan *imap.Message, messageChanBuffer)
 		done := make(chan error, 1)
-		// RFC822.SIZE is part of the same FETCH so the size total comes
-		// free with the diff scan - no extra round-trip per folder.
+		// RFC822.SIZE is part of the same FETCH so the sizes come free with
+		// the diff scan - no extra round-trip per folder.
 		items := []imap.FetchItem{messageIDHeaderSection.FetchItem(), imap.FetchUid, imap.FetchRFC822Size}
 		go func() { done <- cli.Fetch(seqset, items, messages) }()
 
@@ -122,16 +124,22 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 			if ctx.Err() != nil {
 				continue
 			}
-			totalSize += uint64(msg.Size)
 			id := readMessageIDHeader(msg)
 			if id == "" {
 				missingCount++
 				continue
 			}
-			ids[id] = msg.Uid
+			refs, seen := ids[id]
+			if seen {
+				repeated = true
+			}
+			ids[id] = append(refs, MessageRef{UID: msg.Uid, Size: msg.Size})
 		}
 		if err := <-done; err != nil {
 			return fmt.Errorf("[%s] fetch IDs: %w", c.prefix, err)
+		}
+		if repeated {
+			sortAndCompactRefs(ids)
 		}
 		return nil
 	})
@@ -144,29 +152,25 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, 0, ctx.Err()
+			return nil, ctx.Err()
 		}
-		return nil, 0, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, 0, err
-	}
-	return ids, totalSize, nil
-}
-
-// FetchMessageIDSet returns the set of Message-Ids in folder, dropping the
-// UIDs. Convenience wrapper around FetchMessageMap for the destination side
-// of a sync where UIDs are irrelevant.
-func (c *Client) FetchMessageIDSet(ctx context.Context, folder string) (map[string]struct{}, error) {
-	m, _, err := c.FetchMessageMap(ctx, folder)
-	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]struct{}, len(m))
-	for id := range m {
-		out[id] = struct{}{}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return out, nil
+	return ids, nil
+}
+
+// Sorting once after the FETCH keeps a hostile response order from costing quadratic time. Compacting stops a repeated response from counting one message twice.
+func sortAndCompactRefs(ids map[string][]MessageRef) {
+	for id, refs := range ids {
+		if len(refs) < 2 {
+			continue
+		}
+		slices.SortFunc(refs, func(a, b MessageRef) int { return cmp.Compare(a.UID, b.UID) })
+		ids[id] = slices.CompactFunc(refs, func(a, b MessageRef) bool { return a.UID == b.UID })
+	}
 }
 
 // readMessageIDHeader extracts a normalized Message-Id from a fetched message.
