@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"maps"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1176,5 +1178,100 @@ func Test_loadMailboxCache_When_ListIsRetried_Then_DelimiterOfTheFailedAttemptIs
 	}
 	if got, want := c.MailboxNames(), []string{"Flat"}; !slices.Equal(got, want) {
 		t.Errorf("MailboxNames = %q, want %q", got, want)
+	}
+}
+
+// gatedWriteConn forwards a write that carries LIST, then waits for gate and fails
+// that write with a connection reset, so the server answers a command whose write failed.
+type gatedWriteConn struct {
+	net.Conn
+	gate <-chan struct{}
+}
+
+func (c *gatedWriteConn) Write(p []byte) (int, error) {
+	if !bytes.Contains(p, []byte("LIST")) {
+		return c.Conn.Write(p)
+	}
+	if _, err := c.Conn.Write(p); err != nil {
+		return 0, err
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-c.gate:
+	case <-timer.C:
+	}
+	return 0, &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}
+}
+
+func Test_listAll_When_CommandWriteFails_Then_ReturnsWhileCallbackStillRuns(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		// No tagged reply: the entry reaches the client while its command write fails.
+		writeLine(conn, `* LIST () "/" "Late"`)
+		return true, true
+	}))
+
+	entered := make(chan struct{})
+	c := newDisconnectedClient(t, srv)
+	dial := c.dialFn
+	c.dialFn = func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &gatedWriteConn{Conn: conn, gate: entered}, nil
+	}
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("connectAndLogin: %v", err)
+	}
+	cli := c.c.Load()
+
+	// Registered after the client, so it runs first and never leaves the reader blocked under the handler lock.
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	var name string
+	exited := make(chan struct{})
+	enteredOnce := sync.OnceFunc(func() { close(entered) })
+	exitedOnce := sync.OnceFunc(func() { close(exited) })
+	each := func(m *imap.MailboxInfo) {
+		name = m.Name
+		enteredOnce()
+		<-release
+		exitedOnce()
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := listAll(cli, each)
+		errc <- err
+	}()
+
+	err := awaitError(t, errc, "listAll while its callback blocks (go-imap now waits for the handler, so audit the listAll comment and the docs again)")
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Errorf("listAll error = %v, want the connection reset of the failed write", err)
+	}
+	select {
+	case <-entered:
+	default:
+		t.Error("the callback had not started when listAll returned")
+	}
+	select {
+	case <-exited:
+		t.Error("the callback had ended when listAll returned")
+	default:
+	}
+
+	releaseOnce()
+	awaitSignal(t, exited, "the callback that runs after listAll returned")
+	if name != "Late" {
+		t.Errorf("callback name = %q, want %q", name, "Late")
 	}
 }

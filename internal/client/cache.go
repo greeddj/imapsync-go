@@ -136,6 +136,7 @@ func (h *listHandler) Handle(resp imap.Resp) error {
 	return nil
 }
 
+// After a failed command write, go-imap can call each one more time after Execute returns, so each must write only attempt-local state.
 func listAll(cli *imapclient.Client, each func(*imap.MailboxInfo)) (invalid []string, err error) {
 	if state := cli.State(); state != imap.AuthenticatedState && state != imap.SelectedState {
 		return nil, imapclient.ErrNotLoggedIn
@@ -158,31 +159,33 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 		return err
 	}
 
-	var folders map[string]struct{}
-	var noSelect map[string]struct{}
-	var invalid []string
-	delim := ""
+	var (
+		folders  map[string]struct{}
+		noSelect map[string]struct{}
+		invalid  []string
+		delim    string
+	)
 
 	err := c.safeCall(func(cli *imapclient.Client) error {
-		folders = make(map[string]struct{})
-		noSelect = nil
-		delim = ""
-		var err error
-		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {
-			folders[m.Name] = struct{}{}
+		listed := make(map[string]struct{})
+		var listedNoSelect map[string]struct{}
+		listedDelim := ""
+		inv, err := listAll(cli, func(m *imap.MailboxInfo) {
+			listed[m.Name] = struct{}{}
 			if noSelectAttr(m.Attributes) {
-				if noSelect == nil {
-					noSelect = make(map[string]struct{})
+				if listedNoSelect == nil {
+					listedNoSelect = make(map[string]struct{})
 				}
-				noSelect[m.Name] = struct{}{}
+				listedNoSelect[m.Name] = struct{}{}
 			}
-			if delim == "" && m.Delimiter != "" {
-				delim = m.Delimiter
+			if listedDelim == "" && m.Delimiter != "" {
+				listedDelim = m.Delimiter
 			}
 		})
 		if err != nil {
 			return fmt.Errorf("[%s] list mailboxes: %w", c.prefix, err)
 		}
+		folders, noSelect, delim, invalid = listed, listedNoSelect, listedDelim, inv
 		return nil
 	})
 	if err != nil {

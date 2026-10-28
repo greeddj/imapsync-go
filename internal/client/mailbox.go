@@ -187,14 +187,14 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 		invalid []string
 	)
 	err := c.safeCall(func(cli *imapclient.Client) error {
-		result = nil
-		var err error
-		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {
-			result = append(result, &MailboxInfo{Name: m.Name, NoSelect: noSelectAttr(m.Attributes)})
+		var listed []*MailboxInfo
+		inv, err := listAll(cli, func(m *imap.MailboxInfo) {
+			listed = append(listed, &MailboxInfo{Name: m.Name, NoSelect: noSelectAttr(m.Attributes)})
 		})
 		if err != nil {
 			return fmt.Errorf("[%s] list mailboxes: %w", c.prefix, err)
 		}
+		result, invalid = listed, inv
 		return nil
 	})
 	if err != nil {
