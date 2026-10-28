@@ -6084,3 +6084,182 @@ func Test_rediffPlan(t *testing.T) {
 		})
 	}
 }
+
+const notModifiedUTF7Reason = "the server sent a name that is not valid modified UTF-7"
+
+// leftOutLine is the warning runSync and runShow print for a LIST name that is not
+// valid modified UTF-7. shown is the name as the terminal shows it.
+func leftOutLine(label, shown string) string {
+	return "⚠️  [" + label + "] Folder " + shown + " is left out: " + notModifiedUTF7Reason + "\n"
+}
+
+func TestRunSync_When_UnmappedFolderNameIsNotModifiedUTF7_Then_RestSyncsAndWarns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		folder string
+		shown  string
+	}{
+		{name: "raw UTF-8 name", folder: "Входящие", shown: "Входящие"},
+		{name: "bare ampersand", folder: "Q&A", shown: "Q&A"},
+		{name: "control and bidi characters", folder: "\x1b[2J\u202eevil", shown: "\\x1b[2J\\u202eevil"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX":   fakeMsgs("m1@x"),
+				tt.folder: fakeMsgs("m2@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+			if err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+			got := out.String()
+			assertContainsAll(t, got, leftOutLine("src", tt.shown))
+			if n := strings.Count(got, "is left out"); n != 1 {
+				t.Errorf("output holds %d left-out lines, want 1:\n%s", n, got)
+			}
+			assertContainsNone(t, got, "\x1b[2J", "\u202e", "[dst] Folder")
+			for _, verb := range []string{"EXAMINE", "STATUS"} {
+				for _, name := range src.capturedNames(verb) {
+					if name != "INBOX" {
+						t.Errorf("source got %s for %q, want only INBOX", verb, name)
+					}
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_MirrorSourceListsInvalidName_Then_OtherFoldersCopyAndWarningShowsWithQuiet(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Work":  fakeMsgs("w1@x"),
+		"Q&A":   fakeMsgs("q1@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "w1@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Work")
+	assertContainsAll(t, out.String(), leftOutLine("src", "Q&A"))
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_MappingNamesInvalidFolder_Then_FolderFailsAndRestCopies(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Q&A":   fakeMsgs("q1@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Q&A", "Q&A"), mapping("INBOX", "INBOX")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	got := out.String()
+	assertContainsAll(t, got,
+		leftOutLine("src", "Q&A"),
+		folderFailuresHeader,
+		"• Q&A → Q&A: cannot scan source folder:",
+		"1 folders failed",
+	)
+	if dst.hasFolder("Q&A") || len(dst.capturedNames("CREATE")) != 0 {
+		t.Errorf("dst holds Q&A=%v CREATE names=%q, want none", dst.hasFolder("Q&A"), dst.capturedNames("CREATE"))
+	}
+	assertIDs(t, "dst APPENDs to Q&A", dst.appended("Q&A"))
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_DestinationListsInvalidName_Then_SyncRunsAndWarnsWithDstLabel(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Входящие": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	got := out.String()
+	assertContainsAll(t, got, leftOutLine("dst", "Входящие"))
+	assertContainsNone(t, got, "[src] Folder")
+}
+
+func TestRunSync_When_BothSidesListInvalidNames_Then_SourceWarningsComeFirstInNameOrder(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "Q&A": nil, "AT&T": nil})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Входящие": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertInOrder(t, out.String(),
+		leftOutLine("src", "AT&T"),
+		leftOutLine("src", "Q&A"),
+		leftOutLine("dst", "Входящие"),
+		"Messages to be copied to destination",
+	)
+}
+
+func TestRunSync_When_SourceListFailsAtConnect_Then_ErrorNamesTheLabel(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeServer(t)
+	src.addConnHandler(scriptedHandler(src, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+		if verb == "LIST" {
+			return "NO [CANNOT] list refused", true
+		}
+		return "", false
+	}))
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if err == nil || !strings.Contains(err.Error(), "[src] list mailboxes") {
+		t.Fatalf("error = %v, want it to contain %q", err, "[src] list mailboxes")
+	}
+	if strings.Contains(err.Error(), "[]") {
+		t.Errorf("error = %q, want no empty label", err)
+	}
+}

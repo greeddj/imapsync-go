@@ -72,20 +72,20 @@ func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts
 			pool.close()
 			return nil, err
 		}
+		srcOpts.Label = fmt.Sprintf("%s-w%d", cfg.Src.Label, i+1)
 		s, err := client.New(ctx, cfg.Src.Server, cfg.Src.User, cfg.Src.Pass, srcOpts)
 		if err != nil {
 			pool.close()
 			return nil, fmt.Errorf("worker %d source connect: %w", i+1, err)
 		}
-		s.SetPrefix(fmt.Sprintf("%s-w%d", cfg.Src.Label, i+1))
 
+		dstOpts.Label = fmt.Sprintf("%s-w%d", cfg.Dst.Label, i+1)
 		d, err := client.New(ctx, cfg.Dst.Server, cfg.Dst.User, cfg.Dst.Pass, dstOpts)
 		if err != nil {
 			pool.all = append(pool.all, &syncWorker{src: s})
 			pool.close()
 			return nil, fmt.Errorf("worker %d destination connect: %w", i+1, err)
 		}
-		d.SetPrefix(fmt.Sprintf("%s-w%d", cfg.Dst.Label, i+1))
 
 		pool.all = append(pool.all, &syncWorker{src: s, dst: d})
 	}

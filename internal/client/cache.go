@@ -2,12 +2,16 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/commands"
+	"github.com/emersion/go-imap/responses"
+	"github.com/emersion/go-imap/utf7"
 )
 
 // nonExistentAttr is the RFC 5258 attribute for a name that cannot be selected.
@@ -24,6 +28,14 @@ type mailboxCache struct {
 	noSelect map[string]struct{}
 	// Empty when no LIST entry names a delimiter: NIL marks a flat namespace (RFC 3501).
 	delimiter string
+	// Raw names of the latest LIST that are not valid modified UTF-7, sorted. They are not in folders.
+	invalid []string
+}
+
+// The caller holds mailboxCacheMu. A server can list a name twice, and it gets one warning.
+func (m *mailboxCache) setInvalid(names []string) {
+	slices.Sort(names)
+	m.invalid = slices.Compact(names)
 }
 
 // RFC 3501 makes INBOX case-insensitive, and a leading INBOX level follows the same rule, so cache keys and lookups agree.
@@ -56,6 +68,49 @@ func noSelectAttr(attrs []string) bool {
 	})
 }
 
+// go-imap v1 aborts LIST on one name that is not modified UTF-7. each runs on the reader goroutine under the handler lock: do not block or call the client.
+type listHandler struct {
+	each    func(*imap.MailboxInfo)
+	invalid []string
+}
+
+func (h *listHandler) Handle(resp imap.Resp) error {
+	name, fields, ok := imap.ParseNamedResp(resp)
+	if !ok || name != "LIST" {
+		return responses.ErrUnhandled
+	}
+	if len(fields) < 3 {
+		return (&imap.MailboxInfo{}).Parse(fields)
+	}
+
+	raw, err := imap.ParseString(fields[2])
+	if err != nil {
+		return err
+	}
+	info := &imap.MailboxInfo{}
+	if err := info.Parse([]any{fields[0], fields[1], raw}); err != nil {
+		if errors.Is(err, utf7.ErrInvalidUTF7) {
+			h.invalid = append(h.invalid, raw)
+			return nil
+		}
+		return err
+	}
+	h.each(info)
+	return nil
+}
+
+func listAll(cli *imapclient.Client, each func(*imap.MailboxInfo)) (invalid []string, err error) {
+	if state := cli.State(); state != imap.AuthenticatedState && state != imap.SelectedState {
+		return nil, imapclient.ErrNotLoggedIn
+	}
+	h := &listHandler{each: each}
+	status, err := cli.Execute(&commands.List{Reference: "", Mailbox: "*"}, h)
+	if err != nil {
+		return nil, err
+	}
+	return h.invalid, status.Err()
+}
+
 // loadMailboxCache fills the mailbox cache and the hierarchy delimiter from one
 // LIST "" "*".
 func (c *Client) loadMailboxCache(ctx context.Context) error {
@@ -68,16 +123,16 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 
 	folders := make(map[string]struct{})
 	var noSelect map[string]struct{}
+	var invalid []string
 	delim := ""
 
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		folders = make(map[string]struct{})
 		noSelect = nil
+		invalid = nil
 		delim = ""
-		mboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-		done := make(chan error, 1)
-		go func() { done <- cli.List("", "*", mboxes) }()
-		for m := range mboxes {
+		var err error
+		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {
 			key := canonicalName(m.Name, m.Delimiter)
 			folders[key] = struct{}{}
 			if noSelectAttr(m.Attributes) {
@@ -89,8 +144,8 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 			if delim == "" && m.Delimiter != "" {
 				delim = m.Delimiter
 			}
-		}
-		if err := <-done; err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("[%s] list mailboxes: %w", c.prefix, err)
 		}
 		return nil
@@ -109,6 +164,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	c.mailboxCache.folders = folders
 	c.mailboxCache.noSelect = noSelect
 	c.mailboxCache.delimiter = delim
+	c.mailboxCache.setInvalid(invalid)
 	c.mailboxCacheMu.Unlock()
 	return nil
 }

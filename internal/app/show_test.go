@@ -486,12 +486,15 @@ func TestRunShow_When_ListingMailboxesFails_Then_NamesTheFailingAccount(t *testi
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		want    string
-		failSrc bool
+		name          string
+		want          string
+		failSrc       bool
+		failAtConnect bool
 	}{
 		{name: "source listing fails", failSrc: true, want: "[alpha] list mailboxes"},
 		{name: "destination listing fails", want: "[beta] list mailboxes"},
+		{name: "source listing fails at connect", failSrc: true, failAtConnect: true, want: "[alpha] list mailboxes"},
+		{name: "destination listing fails at connect", failAtConnect: true, want: "[beta] list mailboxes"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -503,7 +506,16 @@ func TestRunShow_When_ListingMailboxesFails_Then_NamesTheFailingAccount(t *testi
 			if tt.failSrc {
 				failing = src
 			}
-			failing.addConnHandler(listFailsAfterConnectHandler(failing, "INBOX"))
+			if tt.failAtConnect {
+				failing.addConnHandler(scriptedHandler(failing, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+					if verb == "LIST" {
+						return "NO [CANNOT] list refused", true
+					}
+					return "", false
+				}))
+			} else {
+				failing.addConnHandler(listFailsAfterConnectHandler(failing, "INBOX"))
+			}
 			cfg := e2eConfig(src, dst, 1)
 			cfg.Src.Label, cfg.Dst.Label = "alpha", "beta"
 
@@ -626,6 +638,58 @@ func TestRunShow_When_ContextEndsWhileReadingStatistics_Then_ReturnsContextError
 				t.Errorf("error = %v, want no ErrSilentExit for a Ctrl+C", err)
 			}
 			assertContainsNone(t, out.String(), "cannot be read", "unreadable", "UNREADABLE")
+		})
+	}
+}
+
+func TestRunShow_When_FolderNameIsNotModifiedUTF7_Then_TableLeavesItOutAndWarns(t *testing.T) {
+	t.Parallel()
+
+	const (
+		hostile      = "\x1b[2J\u202eevil"
+		hostileShown = "\\x1b[2J\\u202eevil"
+	)
+	for _, quiet := range []bool{true, false} {
+		t.Run(fmt.Sprintf("quiet=%v", quiet), func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x"), hostile: fakeMsgs("b@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Q&A": nil})
+			out := &syncBuffer{}
+
+			if err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, quiet)); err != nil {
+				t.Fatalf("runShow: %v", err)
+			}
+
+			got := stripANSI(out.String())
+			tables, warnings, ok := strings.Cut(got, "⚠️")
+			if !ok {
+				t.Fatalf("output has no warning:\n%s", got)
+			}
+			_, tables, ok = strings.Cut(tables, "Source")
+			if !ok {
+				t.Fatalf("output has no Source title:\n%s", got)
+			}
+			srcSection, dstSection, ok := strings.Cut(tables, "Destination")
+			if !ok {
+				t.Fatalf("output has no Destination title:\n%s", got)
+			}
+			size := uint64(len(imapFullBody("a@x")))
+			assertFolderRow(t, srcSection, "INBOX", 1, size)
+			assertTotalsRow(t, srcSection, 1, 1, size)
+			assertFolderRow(t, dstSection, "INBOX", 0, 0)
+			assertTotalsRow(t, dstSection, 1, 0, 0)
+			assertContainsNone(t, tables, "Q&A", "evil", "cannot be read")
+			assertInOrder(t, "⚠️"+warnings,
+				leftOutLine("src", hostileShown),
+				leftOutLine("dst", "Q&A"),
+			)
+			assertContainsNone(t, out.String(), "\x1b[2J", "\u202e")
+			for _, name := range append(src.capturedNames("STATUS"), dst.capturedNames("STATUS")...) {
+				if name != "INBOX" {
+					t.Errorf("a server got STATUS for %q, want only INBOX", name)
+				}
+			}
 		})
 	}
 }

@@ -136,6 +136,13 @@ func (c *Client) MailboxNames() []string {
 	return names
 }
 
+// InvalidMailboxNames returns the sorted raw names that the latest LIST left out because they are not valid modified UTF-7.
+func (c *Client) InvalidMailboxNames() []string {
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	return slices.Clone(c.mailboxCache.invalid)
+}
+
 // IsNoSelect reports whether the mailbox cache lists name as \Noselect or
 // \NonExistent.
 func (c *Client) IsNoSelect(name string) bool {
@@ -172,19 +179,18 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 
 	c.log("[%s] Getting mailbox list...", c.prefix)
 
-	var result []*MailboxInfo
+	var (
+		result  []*MailboxInfo
+		invalid []string
+	)
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		result = nil
-		mailboxes := make(chan *imap.MailboxInfo, mailboxChanBuffer)
-		done := make(chan error, 1)
-		go func() { done <- cli.List("", "*", mailboxes) }()
-
-		for m := range mailboxes {
-			if ctx.Err() == nil {
-				result = append(result, &MailboxInfo{Name: m.Name, NoSelect: noSelectAttr(m.Attributes)})
-			}
-		}
-		if err := <-done; err != nil {
+		invalid = nil
+		var err error
+		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {
+			result = append(result, &MailboxInfo{Name: m.Name, NoSelect: noSelectAttr(m.Attributes)})
+		})
+		if err != nil {
 			return fmt.Errorf("[%s] list mailboxes: %w", c.prefix, err)
 		}
 		return nil
@@ -198,6 +204,10 @@ func (c *Client) ListMailboxes(ctx context.Context) ([]*MailboxInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+
+	c.mailboxCacheMu.Lock()
+	c.mailboxCache.setInvalid(invalid)
+	c.mailboxCacheMu.Unlock()
 
 	c.log("[%s] Getting mailbox statistics...", c.prefix)
 

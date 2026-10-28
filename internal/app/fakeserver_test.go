@@ -260,12 +260,11 @@ func newAppClient(t *testing.T, srv *fakeServer, label string) *client.Client {
 		context.Background(),
 		srv.ln.Addr().String(),
 		"user", "pass",
-		client.Options{UseTLS: false},
+		client.Options{UseTLS: false, Label: label},
 	)
 	if err != nil {
 		t.Fatalf("newAppClient(%s): %v", label, err)
 	}
-	c.SetPrefix(label)
 	t.Cleanup(func() { _ = c.Logout() })
 	return c
 }

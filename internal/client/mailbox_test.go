@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1577,5 +1579,133 @@ func Test_MailboxExists_When_ServerIsFlat_Then_OnlyTheBareInboxNameFolds(t *test
 		if got != want {
 			t.Errorf("MailboxExists(%q) = %t, want %t", name, got, want)
 		}
+	}
+}
+
+func Test_ListMailboxes_When_ListHoldsInvalidName_Then_ResultLeavesItOutAndRecordsIt(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newScriptedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "Q&A", sizes: []uint32{5}},
+		{name: "INBOX", sizes: []uint32{100, 250}},
+		{name: "Entw\xfcrfe", sizes: []uint32{7}},
+		{name: "Work"},
+	}})
+
+	infos, err := c.ListMailboxes(t.Context())
+	if err != nil {
+		t.Fatalf("ListMailboxes: %v", err)
+	}
+
+	got := make(map[string]MailboxInfo, len(infos))
+	for _, m := range infos {
+		got[m.Name] = *m
+	}
+	want := map[string]MailboxInfo{
+		"INBOX": {Name: "INBOX", Messages: 2, Size: 350},
+		"Work":  {Name: "Work"},
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("ListMailboxes = %+v, want %+v", got, want)
+	}
+	for _, verb := range []string{"STATUS", "EXAMINE"} {
+		for _, name := range srv.capturedNames(verb) {
+			if name != "INBOX" && name != "Work" {
+				t.Errorf("%s was sent for %q, a name the client left out", verb, name)
+			}
+		}
+	}
+	if got, want := c.InvalidMailboxNames(), []string{"Entw\ufffdrfe", "Q&A"}; !slices.Equal(got, want) {
+		t.Errorf("InvalidMailboxNames = %q, want %q", got, want)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+}
+
+func Test_ListMailboxes_When_ListChangesAfterConnect_Then_InvalidNamesFollowTheLatestList(t *testing.T) {
+	t.Parallel()
+
+	var lists atomic.Int32
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		bad := "A&B"
+		if lists.Add(1) > 1 {
+			bad = "Q&A"
+		}
+		writeLine(conn, `* LIST () "/" "INBOX"`)
+		writeLine(conn, `* LIST () "/" "%s"`, bad)
+		writeLine(conn, "%s OK LIST completed", cmd.tag)
+		return true, true
+	}))
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+	if got := c.InvalidMailboxNames(); !slices.Equal(got, []string{"A&B"}) {
+		t.Fatalf("InvalidMailboxNames after New = %q, want [A&B]", got)
+	}
+
+	if _, err := c.ListMailboxes(t.Context()); err != nil {
+		t.Fatalf("ListMailboxes: %v", err)
+	}
+
+	if got := c.InvalidMailboxNames(); !slices.Equal(got, []string{"Q&A"}) {
+		t.Errorf("InvalidMailboxNames after ListMailboxes = %q, want [Q&A]", got)
+	}
+}
+
+func Test_ListMailboxes_When_SessionEndedByBye_Then_ReconnectsAndLists(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		farewell string
+	}{
+		{name: "the server sent a BYE", farewell: "* BYE server shutting down"},
+		{name: "the server hung up without a BYE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			release := make(chan struct{})
+			releaseOnce := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(releaseOnce)
+			srv := newFakeServer(t)
+			srv.addConnHandler(byeAfterLoginHandler(srv, release, tt.farewell))
+			srv.addConnHandler(interceptHandler(srv, serveNormally))
+			c := newClientWithFake(t, srv)
+			loggedOut := c.c.Load().LoggedOut()
+			releaseOnce()
+			awaitSignal(t, loggedOut, "the client to notice the server ending the session")
+
+			var infos []*MailboxInfo
+			err := awaitCall(t, "ListMailboxes", func() error {
+				var err error
+				infos, err = c.ListMailboxes(t.Context())
+				return err
+			})
+
+			if err != nil {
+				t.Fatalf("ListMailboxes: %v, want the listing on a new session", err)
+			}
+			if len(infos) != 1 || infos[0].Name != "INBOX" {
+				t.Errorf("ListMailboxes = %+v, want only INBOX", infos)
+			}
+			if got := srv.callCount("LOGIN"); got != 2 {
+				t.Errorf("LOGIN count = %d, want 2", got)
+			}
+			if got := srv.callCount("LIST"); got != 1 {
+				t.Errorf("LIST count = %d, want 1: the ended session sent none", got)
+			}
+		})
 	}
 }

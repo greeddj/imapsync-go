@@ -167,10 +167,12 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	dstWriteLim := ratelimit.NewLimiter(cfg.RateLimit.UpBPS)
 	srcOpts := opts.clientOpts
 	srcOpts.Auth = cfg.Src.Auth
+	srcOpts.Label = cfg.Src.Label
 	srcOpts.Verbose = verbose
 	srcOpts.ReadLimiter = srcReadLim
 	dstOpts := opts.clientOpts
 	dstOpts.Auth = cfg.Dst.Auth
+	dstOpts.Label = cfg.Dst.Label
 	dstOpts.Verbose = verbose
 	dstOpts.WriteLimiter = dstWriteLim
 
@@ -215,7 +217,6 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err != nil {
 			return fmt.Errorf("source connection failed: %w", err)
 		}
-		c.SetPrefix(cfg.Src.Label)
 		srcClient = c
 		return nil
 	})
@@ -224,7 +225,6 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err != nil {
 			return fmt.Errorf("destination connection failed: %w", err)
 		}
-		c.SetPrefix(cfg.Dst.Label)
 		dstClient = c
 		return nil
 	})
@@ -236,6 +236,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	printInvalidNames(out, cfg.Src.Label, srcClient.InvalidMailboxNames())
+	printInvalidNames(out, cfg.Dst.Label, dstClient.InvalidMailboxNames())
 
 	typed := len(mappings) > 0
 	srcDelimiter := srcClient.GetDelimiter()
@@ -976,6 +979,14 @@ func splitDestinationClashes(in []folderMapping) (kept []folderMapping, clashes 
 		})
 	}
 	return kept, clashes
+}
+
+// Each name is raw server text, so it goes through termsafe.Escape.
+func printInvalidNames(out io.Writer, label string, names []string) {
+	for _, name := range names {
+		_, _ = fmt.Fprintf(out, "⚠️  [%s] Folder %s is left out: the server sent a name that is not valid modified UTF-7\n",
+			label, termsafe.Escape(name))
+	}
 }
 
 // The names and the delimiter come from the servers, so every part goes through termsafe.Escape.

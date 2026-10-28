@@ -1071,13 +1071,16 @@ func Test_New_whenMailboxListRefused(t *testing.T) {
 	srv := newFakeServer(t)
 	srv.addConnHandler((&mailboxScript{listRefused: true}).handler(srv))
 
-	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "src", DialTimeout: 5 * time.Second})
 	if err == nil {
 		c.Cancel()
 		t.Fatal("New returned nil error, want the mailbox list failure")
 	}
 	if !strings.Contains(err.Error(), "failed to load mailbox list") {
 		t.Errorf("error = %q, want it to mention the mailbox list load", err)
+	}
+	if !strings.Contains(err.Error(), "[src] list mailboxes") {
+		t.Errorf("error = %q, want it to name the side that failed", err)
 	}
 	if got := srv.callCount("LOGOUT"); got != 1 {
 		t.Errorf("LOGOUT count = %d, want 1 (half-built client is closed)", got)
@@ -2591,7 +2594,7 @@ func Test_safeCall_When_WatchdogTrips_Then_LogsWhyItReconnects(t *testing.T) {
 	srv.addConnHandler(interceptHandler(srv, examine.intercept))
 	srv.addConnHandler(interceptHandler(srv, serveNormally))
 	c := newWatchedClient(t, srv, tripLimit)
-	c.SetPrefix("src")
+	c.prefix = "src"
 	var (
 		mu    sync.Mutex
 		lines []string
@@ -3294,6 +3297,19 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 					if delivered[uid] != 1 {
 						t.Errorf("UID %d reached onMessage %d times, want 1", uid, delivered[uid])
 					}
+				}
+				return err
+			},
+		},
+		{
+			name:         "ListMailboxes",
+			handler:      listMailboxesHandler,
+			wantCommands: map[string]int{"LIST": 1},
+			run: func(t *testing.T, c *Client) error {
+				t.Helper()
+				infos, err := c.ListMailboxes(t.Context())
+				if err == nil && len(infos) != 2 {
+					t.Errorf("ListMailboxes returned %d folders, want 2", len(infos))
 				}
 				return err
 			},

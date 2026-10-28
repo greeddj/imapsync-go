@@ -78,18 +78,19 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 	type accountResult struct {
 		cli       *client.Client
 		mailboxes []*client.MailboxInfo
+		invalid   []string
 	}
 	loadAccount := func(ctx context.Context, label string, creds config.Credentials, tr *progress.Tracker) (accountResult, error) {
 		tr.UpdateMessage(fmt.Sprintf("[%s] Connecting...", label))
 		clientOpts := opts.clientOpts
 		clientOpts.Auth = creds.Auth
+		clientOpts.Label = label
 		clientOpts.Verbose = verbose
 		cli, err := client.New(ctx, creds.Server, creds.User, creds.Pass, clientOpts)
 		if err != nil {
 			tr.MarkAsErrored()
 			return accountResult{}, fmt.Errorf("[%s] connect: %w", label, err)
 		}
-		cli.SetPrefix(label)
 		cli.SetProgressWriter(pw)
 		cli.SetProgressTracker(tr)
 
@@ -100,7 +101,7 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 			return accountResult{cli: cli}, fmt.Errorf("[%s] list mailboxes: %w", label, err)
 		}
 		tr.MarkAsDone()
-		return accountResult{cli: cli, mailboxes: mailboxes}, nil
+		return accountResult{cli: cli, mailboxes: mailboxes, invalid: cli.InvalidMailboxNames()}, nil
 	}
 
 	// Run both sides in parallel; errgroup propagates the first error and
@@ -135,6 +136,12 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 	printAccountInfo(out, "Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
 	_, _ = fmt.Fprintln(out)
 	printAccountInfo(out, "Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
+
+	if len(srcRes.invalid)+len(dstRes.invalid) > 0 {
+		_, _ = fmt.Fprintln(out)
+		printInvalidNames(out, cfg.Src.Label, srcRes.invalid)
+		printInvalidNames(out, cfg.Dst.Label, dstRes.invalid)
+	}
 
 	if countUnreadable(srcRes.mailboxes)+countUnreadable(dstRes.mailboxes) == 0 {
 		return nil

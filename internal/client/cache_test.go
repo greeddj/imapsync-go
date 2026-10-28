@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -513,5 +515,199 @@ func Test_CanonicalName_When_ServerUsesDot_Then_OnlyDotLevelsFold(t *testing.T) 
 		if got := c.CanonicalName(tt.input); got != tt.want {
 			t.Errorf("CanonicalName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+// Test_New_When_ListHoldsNamesThatAreNotModifiedUTF7_Then_CacheLeavesThemOut sends
+// each bad name before a good one, so a later good name proves the LIST went on.
+func Test_New_When_ListHoldsNamesThatAreNotModifiedUTF7_Then_CacheLeavesThemOut(t *testing.T) {
+	t.Parallel()
+
+	const (
+		shifted = "&BBIERQQ+BDQETwRJBDgENQ-"
+		decoded = "Входящие"
+	)
+	srv := newFakeServer(t)
+	srv.addConnHandler((&mailboxScript{folders: []scriptFolder{
+		{name: "Q&A"},
+		{name: "INBOX"},
+		{name: "Входящие"},
+		{name: "AT&T"},
+		{name: "R&D-x"},
+		{name: "Entw\xfcrfe"},
+		{name: "\x1b[2J\u202eevil"},
+		{name: shifted},
+		{name: "Work"},
+		{name: "Work/Q&A"},
+	}}).handler(srv))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "src", DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if got := srv.callCount("LIST"); got != 1 {
+		t.Errorf("LIST count = %d, want 1", got)
+	}
+	if got := srv.callCount("LOGOUT"); got != 0 {
+		t.Errorf("LOGOUT count = %d, want 0: New must not drop a connection over a bad name", got)
+	}
+	if got, want := c.MailboxNames(), []string{"INBOX", "Work", decoded}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %q, want %q", got, want)
+	}
+	want := []string{"Q&A", "Входящие", "AT&T", "R&D-x", "Entw\ufffdrfe", "\x1b[2J\u202eevil", "Work/Q&A"}
+	slices.Sort(want)
+	if got := c.InvalidMailboxNames(); !slices.Equal(got, want) {
+		t.Errorf("InvalidMailboxNames = %q, want %q", got, want)
+	}
+	if exists, err := c.MailboxExists(t.Context(), "Q&A"); err != nil || exists {
+		t.Errorf("MailboxExists(Q&A) = %t, %v, want false", exists, err)
+	}
+	if got, err := c.ListSubfolders(t.Context(), "Work", ""); err != nil || len(got) != 0 {
+		t.Errorf("ListSubfolders(Work) = %q, %v, want none: Work/Q&A is left out", got, err)
+	}
+	if got := c.GetDelimiter(); got != "/" {
+		t.Errorf("GetDelimiter = %q, want /", got)
+	}
+}
+
+func Test_loadMailboxCache_When_ListSendsInvalidNameAsLiteral_Then_LeavesItOutAndKeepsTheNextEntry(t *testing.T) {
+	t.Parallel()
+
+	const literal = "Entw\xfcrfe"
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		writeLine(conn, "* LIST () \"/\" {%d}\r\n%s", len(literal), literal)
+		writeLine(conn, `* LIST () "/" "INBOX"`)
+		writeLine(conn, "%s OK LIST completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("loadMailboxCache: %v", err)
+	}
+
+	if got := c.InvalidMailboxNames(); !slices.Equal(got, []string{literal}) {
+		t.Errorf("InvalidMailboxNames = %q, want [%q] byte for byte", got, literal)
+	}
+	if got := c.MailboxNames(); !slices.Equal(got, []string{"INBOX"}) {
+		t.Errorf("MailboxNames = %q, want [INBOX]", got)
+	}
+}
+
+func Test_loadMailboxCache_When_ListIsRetried_Then_InvalidNamesOfTheFailedAttemptAreDropped(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		// The connection drops after one bad name, before the tagged reply.
+		writeLine(conn, `* LIST () "/" "Q&A"`)
+		return true, false
+	}))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if n := srv.callCount("LIST"); n != 2 {
+		t.Fatalf("LIST count = %d, want 2 (the dropped attempt and its retry)", n)
+	}
+	if got := c.InvalidMailboxNames(); len(got) != 0 {
+		t.Errorf("InvalidMailboxNames = %q, want none: the retry lists only INBOX", got)
+	}
+	if !c.hasMailbox("INBOX") {
+		t.Error("hasMailbox(INBOX) = false after the retry")
+	}
+}
+
+func Test_New_When_ListEntryLacksAName_Then_FailsAsBefore(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		writeLine(conn, `* LIST () "/"`)
+		writeLine(conn, "%s OK LIST completed", cmd.tag)
+		return true, true
+	}))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "src", DialTimeout: 5 * time.Second})
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the malformed entry to stop the LIST")
+	}
+	for _, want := range []string{"failed to load mailbox list", "[src] list mailboxes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+func Test_InvalidMailboxNames_When_ListNamesOneInvalidNameTwice_Then_ReportsItOnceAndReturnsACopy(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "INBOX"}, {name: "Q&A"}, {name: "AT&T"}, {name: "Q&A"},
+	}})
+
+	got := c.InvalidMailboxNames()
+	if want := []string{"AT&T", "Q&A"}; !slices.Equal(got, want) {
+		t.Fatalf("InvalidMailboxNames = %q, want %q", got, want)
+	}
+	got[0] = "changed"
+	if again := c.InvalidMailboxNames(); again[0] != "AT&T" {
+		t.Errorf("InvalidMailboxNames after a caller edit = %q, want the cache untouched", again)
+	}
+}
+
+func Test_loadMailboxCache_When_Reloaded_Then_InvalidNamesAreReplaced(t *testing.T) {
+	t.Parallel()
+
+	var lists atomic.Int32
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		writeLine(conn, `* LIST () "/" "INBOX"`)
+		if lists.Add(1) == 1 {
+			writeLine(conn, `* LIST () "/" "Q&A"`)
+		}
+		writeLine(conn, "%s OK LIST completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("first loadMailboxCache: %v", err)
+	}
+	if got := c.InvalidMailboxNames(); !slices.Equal(got, []string{"Q&A"}) {
+		t.Fatalf("InvalidMailboxNames = %q, want [Q&A]", got)
+	}
+
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("second loadMailboxCache: %v", err)
+	}
+
+	if got := c.InvalidMailboxNames(); len(got) != 0 {
+		t.Errorf("InvalidMailboxNames after a reload = %q, want none", got)
 	}
 }

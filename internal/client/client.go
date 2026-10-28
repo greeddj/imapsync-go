@@ -26,8 +26,6 @@ import (
 )
 
 const (
-	// mailboxChanBuffer is the buffer size for mailbox listing channels.
-	mailboxChanBuffer = 10
 	// messageChanBuffer is the buffer size for message fetching channels.
 	messageChanBuffer = 10
 	// initialBackoff is the initial delay before reconnect attempts.
@@ -86,6 +84,7 @@ type Options struct {
 	ReadLimiter  *rate.Limiter
 	WriteLimiter *rate.Limiter
 	Auth         string // "", "login" or "cram-md5" in any letter case; New refuses other values
+	Label        string // prefixes log lines and errors, so a failure inside New names the side
 	DialTimeout  time.Duration
 	UseTLS       bool
 	Verbose      bool
@@ -180,6 +179,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 
 	c := &Client{
 		serverAddr:   addr,
+		prefix:       opts.Label,
 		useTLS:       opts.UseTLS,
 		auth:         opts.Auth,
 		tlsConfig:    opts.TLSConfig,
@@ -250,9 +250,6 @@ func (c *Client) selectIfNeeded(cli *imapclient.Client, folder string) (*imap.Ma
 	}
 	return cli.Select(folder, true)
 }
-
-// SetPrefix configures the log prefix used in progress messages.
-func (c *Client) SetPrefix(p string) { c.prefix = p }
 
 // SetProgressWriter sets the progress writer for logging. Safe to call from
 // any goroutine, including while another goroutine is using the writer.

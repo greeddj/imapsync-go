@@ -1591,7 +1591,7 @@ func Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_Re
 			srv.addConnHandler(interceptHandler(srv, byeOn(verbIs(tt.dropVerb))))
 			srv.addConnHandler(interceptHandler(srv, serveNormally))
 			c := newClientWithFake(t, srv)
-			c.SetPrefix(tt.prefix)
+			c.prefix = tt.prefix
 			if tt.selected {
 				if _, err := c.selectIfNeeded(c.c.Load(), tt.folder); err != nil {
 					t.Fatalf("selectIfNeeded: %v", err)
