@@ -327,11 +327,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if !quiet {
 			_, _ = fmt.Fprintf(out, "📤 Messages to be copied to destination:\n")
 			foldersToCreate := make([]string, 0, len(summary.Plans))
+			// Plans that share a destination list it once.
+			listed := make(map[string]struct{}, len(summary.Plans))
 			for _, plan := range summary.Plans {
 				// Preview only the folders we will actually create - the
 				// real creation loop below filters the same way, so showing
 				// already-existing folders here just misleads the user.
-				if !plan.DestinationFolderExists {
+				if _, dup := listed[plan.DestinationFolder]; !plan.DestinationFolderExists && !dup {
+					listed[plan.DestinationFolder] = struct{}{}
 					foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
 				}
 				if plan.NewMessages > 0 {
@@ -730,6 +733,43 @@ type folderScan struct {
 	done        atomic.Int32
 }
 
+// sharedDestinations counts copies that earlier plans schedule for a destination of two or more mappings. Slot k is diffed before slot k+1, because both scans walk in index order.
+type sharedDestinations struct {
+	// last maps a shared destination to its last mapping index. It is read-only, so reads need no lock.
+	last map[string]int
+	// copies keeps an entry only until the last mapping of its destination is diffed.
+	copies map[string]map[string]int
+	// mu guards copies and keeps the race detector independent of the plan order.
+	mu sync.Mutex
+}
+
+// newSharedDestinations returns nil when no destination has two mappings, so a plain run costs nothing.
+func newSharedDestinations(mappings []config.DirectoryMapping) *sharedDestinations {
+	seen := make(map[string]struct{}, len(mappings))
+	var last map[string]int
+	for i, m := range mappings {
+		if _, repeated := seen[m.Destination]; repeated {
+			if last == nil {
+				last = make(map[string]int)
+			}
+			last[m.Destination] = i
+		}
+		seen[m.Destination] = struct{}{}
+	}
+	if last == nil {
+		return nil
+	}
+	return &sharedDestinations{last: last, copies: make(map[string]map[string]int, len(last))}
+}
+
+func (d *sharedDestinations) lastIndex(destination string) (int, bool) {
+	if d == nil {
+		return 0, false
+	}
+	i, ok := d.last[destination]
+	return i, ok
+}
+
 func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, srcLabel, dstLabel string) (*SyncSummary, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -741,6 +781,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 
 	scans := make([]folderScan, n)
 	plans := make([]FolderSyncPlan, n)
+	shared := newSharedDestinations(mappings)
 	var totalNew atomic.Int64
 	var totalNewSize atomic.Uint64
 
@@ -764,7 +805,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
 			srcTracker.Increment(1)
-			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize, shared)
 		}
 		return nil
 	})
@@ -797,7 +838,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			}
 			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, termsafe.Escape(m.Destination), idx+1, n))
 			dstTracker.Increment(1)
-			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize, shared)
 			if scans[idx].dstErr != nil {
 				return fmt.Errorf("scan destination folder %q: %w", m.Destination, scans[idx].dstErr)
 			}
@@ -858,10 +899,11 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 // sides have completed for slot idx. Returns false if only one side is done.
 // Frees srcMap and dstMap immediately after the diff to keep peak memory
 // proportional to one folder at a time, not len(mappings).
+// A shared destination keeps one count per Message-Id until its last mapping is diffed.
 //
 // NewSize sums the RFC822.SIZE values that the planning FETCH already returned,
 // so the preview needs no extra round-trip.
-func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64) bool {
+func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64, shared *sharedDestinations) bool {
 	if s.done.Add(1) != 2 {
 		return false
 	}
@@ -870,6 +912,21 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	// goroutine and read here without synchronisation unless we take the lock.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	destination := mappings[idx].Destination
+	var scheduled map[string]int
+	reserve := false
+	if last, ok := shared.lastIndex(destination); ok {
+		shared.mu.Lock()
+		defer shared.mu.Unlock()
+		scheduled = shared.copies[destination]
+		reserve = idx != last
+		if !reserve {
+			// Deferred, so a failed last slot releases the counts too. It runs before the unlock.
+			defer delete(shared.copies, destination)
+		}
+	}
+
 	if s.srcErr != nil || s.dstErr != nil || s.dstNoSelect {
 		s.srcMap, s.dstMap = nil, nil
 		return true
@@ -877,7 +934,14 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	newUIDs := make([]uint32, 0, s.srcMessages)
 	var newSize uint64
 	for id, refs := range s.srcMap {
-		_, missing := splitByDestinationCount(refs, len(s.dstMap[id]))
+		_, missing := splitByDestinationCount(refs, len(s.dstMap[id])+scheduled[id])
+		if reserve && len(missing) > 0 {
+			if scheduled == nil {
+				scheduled = make(map[string]int)
+				shared.copies[destination] = scheduled
+			}
+			scheduled[id] += len(missing)
+		}
 		for _, ref := range missing {
 			newUIDs = append(newUIDs, ref.UID)
 			newSize += uint64(ref.Size)
@@ -891,7 +955,7 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	slices.Sort(newUIDs)
 	plans[idx] = FolderSyncPlan{
 		SourceFolder:            mappings[idx].Source,
-		DestinationFolder:       mappings[idx].Destination,
+		DestinationFolder:       destination,
 		DestinationFolderExists: s.dstExists,
 		NewMessages:             len(newUIDs),
 		NewSize:                 newSize,
