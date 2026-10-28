@@ -84,7 +84,7 @@ type Options struct {
 	ReadLimiter  *rate.Limiter
 	WriteLimiter *rate.Limiter
 	Auth         string // "", "login" or "cram-md5" in any letter case; New refuses other values
-	Label        string // prefixes log lines and the errors of LIST, EXAMINE, FETCH, CREATE and APPEND, so a failed LIST in New names the side
+	Label        string // prefixes log lines, LIST, CREATE and APPEND errors, the sync scan and copy errors, and a reconnect give-up; dial, LOGIN and show statistics errors carry none
 	DialTimeout  time.Duration
 	UseTLS       bool
 	Verbose      bool
