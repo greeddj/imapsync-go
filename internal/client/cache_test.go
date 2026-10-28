@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"slices"
 	"strings"
@@ -57,6 +58,26 @@ func TestAddMailboxToCache(t *testing.T) {
 	c.addMailboxToCache("B")
 	if _, ok := c.mailboxCache.folders["B"]; !ok {
 		t.Error("addMailboxToCache after load did not insert")
+	}
+}
+
+func TestAddMailboxToCache_When_TwoSpellingsShareOneCanonicalForm_Then_SmallerWinsInAnyOrder(t *testing.T) {
+	t.Parallel()
+
+	for _, order := range [][]string{{"inbox/New", "Inbox/New"}, {"Inbox/New", "inbox/New"}} {
+		c := newTestClient()
+		c.mailboxCache = mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"}
+
+		for _, name := range order {
+			c.addMailboxToCache(name)
+		}
+
+		if got := c.ResolveName("INBOX/New"); got != "Inbox/New" {
+			t.Errorf("after adding %q, ResolveName(INBOX/New) = %q, want Inbox/New", order, got)
+		}
+		if got, want := c.mailboxCache.folders, map[string]struct{}{"INBOX": {}, "inbox/New": {}, "Inbox/New": {}}; !maps.Equal(got, want) {
+			t.Errorf("after adding %q, folders = %v, want %v", order, got, want)
+		}
 	}
 }
 
@@ -427,7 +448,7 @@ func Test_loadMailboxCache_When_ListIsRetried_Then_NamesOfTheFailedAttemptAreDro
 	}
 }
 
-func Test_loadMailboxCache_When_ListGivesMixedCaseInboxChild_Then_CacheHoldsCanonicalName(t *testing.T) {
+func Test_loadMailboxCache_When_ListGivesMixedCaseInboxChild_Then_CacheKeepsListedName(t *testing.T) {
 	t.Parallel()
 
 	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
@@ -436,18 +457,98 @@ func Test_loadMailboxCache_When_ListGivesMixedCaseInboxChild_Then_CacheHoldsCano
 		{name: "Inbox Archive"},
 	}})
 
-	if got, want := c.MailboxNames(), []string{"INBOX", "INBOX/Work", "Inbox Archive"}; !slices.Equal(got, want) {
-		t.Errorf("MailboxNames = %q, want %q: only the INBOX level changes", got, want)
+	if got, want := c.MailboxNames(), []string{"INBOX", "Inbox Archive", "Inbox/Work"}; !slices.Equal(got, want) {
+		t.Errorf("MailboxNames = %q, want %q: every name keeps the bytes that LIST gave", got, want)
+	}
+	for _, parent := range []string{"INBOX", "inbox"} {
+		got, err := c.ListSubfolders(t.Context(), parent, "")
+		if err != nil {
+			t.Fatalf("ListSubfolders(%q): %v", parent, err)
+		}
+		if want := []string{"Inbox/Work"}; !slices.Equal(got, want) {
+			t.Errorf("ListSubfolders(%q) = %q, want %q", parent, got, want)
+		}
+	}
+	if exists, err := c.MailboxExists(t.Context(), "INBOX/Work"); err != nil || !exists {
+		t.Errorf("MailboxExists(INBOX/Work) = %t, %v, want true", exists, err)
+	}
+	if got := c.ResolveName("INBOX/Work"); got != "Inbox/Work" {
+		t.Errorf("ResolveName(INBOX/Work) = %q, want the listed Inbox/Work", got)
+	}
+	if n := srv.callCount("LIST"); n != 1 {
+		t.Errorf("LIST count = %d, want 1", n)
+	}
+}
+
+func Test_loadMailboxCache_When_ListGivesTwoSpellingsOfAnInboxChild_Then_CacheKeepsAllNames(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{
+		{name: "INBOX"},
+		{name: "INBOX/Sub"},
+		{name: "Inbox/Sub", attrs: `\Noselect`},
+		{name: "Inbox/Sub/Deep"},
+	}})
+
+	all := []string{"INBOX", "INBOX/Sub", "Inbox/Sub", "Inbox/Sub/Deep"}
+	if got := c.MailboxNames(); !slices.Equal(got, all) {
+		t.Errorf("MailboxNames = %q, want %q: two spellings are two folders", got, all)
 	}
 	got, err := c.ListSubfolders(t.Context(), "INBOX", "")
 	if err != nil {
 		t.Fatalf("ListSubfolders: %v", err)
 	}
-	if want := []string{"INBOX/Work"}; !slices.Equal(got, want) {
+	slices.Sort(got)
+	if want := []string{"INBOX/Sub", "Inbox/Sub", "Inbox/Sub/Deep"}; !slices.Equal(got, want) {
 		t.Errorf("ListSubfolders(INBOX) = %q, want %q", got, want)
 	}
-	if n := srv.callCount("LIST"); n != 1 {
-		t.Errorf("LIST count = %d, want 1", n)
+	if !c.IsNoSelect("Inbox/Sub") {
+		t.Error("IsNoSelect(Inbox/Sub) = false, want true: the server marked that spelling")
+	}
+	if c.IsNoSelect("INBOX/Sub") {
+		t.Error("IsNoSelect(INBOX/Sub) = true, want false: the mark belongs to the other spelling")
+	}
+	for _, name := range all {
+		if got := c.ResolveName(name); got != name {
+			t.Errorf("ResolveName(%q) = %q, want the listed spelling unchanged", name, got)
+		}
+	}
+	if got := c.ResolveName("inbox/Sub"); got != "INBOX/Sub" {
+		t.Errorf("ResolveName(inbox/Sub) = %q, want INBOX/Sub: the canonical spelling wins", got)
+	}
+}
+
+func Test_loadMailboxCache_When_ListIsRetried_Then_SpellingsOfTheFailedAttemptAreDropped(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LIST" {
+			return false, true
+		}
+		// The connection drops after one name in another letter case, before the tagged reply.
+		writeLine(conn, `* LIST () "/" "Inbox/Stale"`)
+		return true, false
+	}))
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+
+	if n := srv.callCount("LIST"); n != 2 {
+		t.Fatalf("LIST count = %d, want 2 (the dropped attempt and its retry)", n)
+	}
+	if c.hasMailbox("INBOX/Stale") {
+		t.Error("the cache finds INBOX/Stale through the spelling of the attempt that failed")
+	}
+	if got := c.ResolveName("INBOX/Stale"); got != "INBOX/Stale" {
+		t.Errorf("ResolveName(INBOX/Stale) = %q, want the canonical form: the retry did not list it", got)
 	}
 }
 
@@ -503,19 +604,90 @@ func Test_canonicalName_When_NameNeedsNoChange_Then_AllocatesNothing(t *testing.
 	}
 }
 
-func Test_CanonicalName_When_ServerUsesDot_Then_OnlyDotLevelsFold(t *testing.T) {
+func Test_ResolveName(t *testing.T) {
 	t.Parallel()
 
-	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX", delim: `"."`}}})
-
-	tests := []struct{ input, want string }{
-		{input: "inbox.Work", want: "INBOX.Work"},
+	type resolution struct{ input, want string }
+	slashNames := []string{"INBOX", "Inbox/Work", "inbox/Work", "INBOX/Both", "Inbox/Both", "Sent"}
+	slashWant := []resolution{
+		{input: "Inbox/Work", want: "Inbox/Work"},
 		{input: "inbox/Work", want: "inbox/Work"},
-		{input: "Inbox", want: "INBOX"},
+		{input: "INBOX/Work", want: "Inbox/Work"},
+		{input: "iNbOx/Work", want: "Inbox/Work"},
+		{input: "inbox/Both", want: "INBOX/Both"},
+		{input: "inbox/New", want: "INBOX/New"},
+		{input: "sent", want: "sent"},
+		{input: "inbox", want: "INBOX"},
+	}
+	reversedNames := slices.Clone(slashNames)
+	slices.Reverse(reversedNames)
+	tests := []struct {
+		name   string
+		delim  string
+		listed []string
+		want   []resolution
+	}{
+		{
+			name: "dot server folds only dot levels", delim: `"."`, listed: []string{"INBOX"},
+			want: []resolution{
+				{input: "inbox.Work", want: "INBOX.Work"},
+				{input: "inbox/Work", want: "inbox/Work"},
+				{input: "Inbox", want: "INBOX"},
+			},
+		},
+		{name: "slash server with two spellings", listed: slashNames, want: slashWant},
+		{name: "slash server listing the spellings in reverse order", listed: reversedNames, want: slashWant},
 	}
 	for _, tt := range tests {
-		if got := c.CanonicalName(tt.input); got != tt.want {
-			t.Errorf("CanonicalName(%q) = %q, want %q", tt.input, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			folders := make([]scriptFolder, len(tt.listed))
+			for i, name := range tt.listed {
+				folders[i] = scriptFolder{name: name, delim: tt.delim}
+			}
+			_, c := newLoadedClient(t, &mailboxScript{folders: folders})
+
+			for _, r := range tt.want {
+				if got := c.ResolveName(r.input); got != r.want {
+					t.Errorf("ResolveName(%q) = %q, want %q", r.input, got, r.want)
+				}
+			}
+		})
+	}
+}
+
+// Not parallel: AllocsPerRun counts allocations of the whole process. MailboxExists is
+// left out because withCancel allocates; hasMailbox is the lookup it runs.
+func Test_ResolveName_When_NameNeedsNoFolding_Then_LookupsAllocateNothing(t *testing.T) {
+	c := newTestClient()
+	c.mailboxCache = mailboxCache{
+		folders:        map[string]struct{}{"INBOX": {}, "Inbox/Work": {}, "Archive/2024": {}},
+		noSelect:       map[string]struct{}{"Archive/2024": {}},
+		inboxSpellings: map[string]string{"INBOX/Work": "Inbox/Work"},
+		delimiter:      "/",
+	}
+
+	for _, name := range []string{"INBOX", "Inbox/Work", "Archive/2024", "Missing/Name", "Archive"} {
+		var resolved string
+		var found, noSelect bool
+		allocs := testing.AllocsPerRun(100, func() {
+			resolved = c.ResolveName(name)
+			found = c.hasMailbox(name)
+			noSelect = c.IsNoSelect(name)
+		})
+
+		if allocs != 0 {
+			t.Errorf("lookups of %q allocate %v times, want 0", name, allocs)
+		}
+		if resolved != name {
+			t.Errorf("ResolveName(%q) = %q, want the input", name, resolved)
+		}
+		if wantFound := name != "Missing/Name" && name != "Archive"; found != wantFound {
+			t.Errorf("hasMailbox(%q) = %t, want %t", name, found, wantFound)
+		}
+		if wantNoSelect := name == "Archive/2024"; noSelect != wantNoSelect {
+			t.Errorf("IsNoSelect(%q) = %t, want %t", name, noSelect, wantNoSelect)
 		}
 	}
 }

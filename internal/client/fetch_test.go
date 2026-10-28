@@ -1675,3 +1675,26 @@ func Test_FetchMessageMap_When_FolderNameCarriesControlCharacters_Then_WarningSh
 		t.Errorf("warning = %q, want it to hold %q", warning, hostileShownName)
 	}
 }
+
+func Test_FetchMessageMap_When_ListGivesInboxChildInAnotherCase_Then_ExaminesTheListedName(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newLoadedClient(t, &mailboxScript{
+		folders:        []scriptFolder{{name: "INBOX"}, {name: "Inbox/Work"}},
+		examineRefused: map[string]bool{"INBOX/Work": true},
+	})
+
+	subfolders, err := c.ListSubfolders(t.Context(), "INBOX", "")
+	if err != nil {
+		t.Fatalf("ListSubfolders: %v", err)
+	}
+	for _, name := range subfolders {
+		if _, _, err := c.FetchMessageMap(t.Context(), name); err != nil {
+			t.Errorf("FetchMessageMap(%q): %v", name, err)
+		}
+	}
+
+	if got := srv.capturedNames("EXAMINE"); !slices.Equal(got, []string{"Inbox/Work"}) {
+		t.Errorf("EXAMINE names = %q, want only the listed Inbox/Work: the server refuses INBOX/Work", got)
+	}
+}

@@ -23,9 +23,12 @@ const nonExistentAttr = `\NonExistent`
 // round-trip. New loads it before returning the Client and CreateMailbox
 // adds to it, so readers never see an unloaded cache.
 type mailboxCache struct {
+	// Each key is the name byte for byte as LIST gave it.
 	folders map[string]struct{}
 	// Each name here also stays in folders, so parent creation never sends CREATE for it.
 	noSelect map[string]struct{}
+	// Maps the canonical form of a listed name to its listed spelling, only where the two differ. Nil when no listed name differs.
+	inboxSpellings map[string]string
 	// Empty when no LIST entry names a delimiter: NIL marks a flat namespace (RFC 3501).
 	delimiter string
 	// Raw names of the latest LIST that are not valid modified UTF-7, sorted. They are not in folders.
@@ -54,11 +57,45 @@ func canonicalName(name, delimiter string) string {
 	return imap.InboxName + rest
 }
 
-// CanonicalName returns name as the mailbox cache holds it: INBOX in upper case, including a leading INBOX level.
-func (c *Client) CanonicalName(name string) string {
+// A canonical form with several listed spellings keeps the smallest in byte order, so the answer does not depend on LIST order.
+func noteSpelling(spellings map[string]string, listed, delimiter string) map[string]string {
+	key := canonicalName(listed, delimiter)
+	if key == listed {
+		return spellings
+	}
+	if prior, ok := spellings[key]; ok && prior <= listed {
+		return spellings
+	}
+	if spellings == nil {
+		spellings = make(map[string]string)
+	}
+	spellings[key] = listed
+	return spellings
+}
+
+// An exact listed name wins, then the listed canonical form, then the indexed spelling. A miss returns the canonical form. The caller holds mailboxCacheMu.
+func (m *mailboxCache) resolve(name string) (listed string, ok bool) {
+	if _, found := m.folders[name]; found {
+		return name, true
+	}
+	key := canonicalName(name, m.delimiter)
+	if key != name {
+		if _, found := m.folders[key]; found {
+			return key, true
+		}
+	}
+	if spelling, found := m.inboxSpellings[key]; found {
+		return spelling, true
+	}
+	return key, false
+}
+
+// ResolveName returns the listed spelling of name, or its canonical form when no listed name matches.
+func (c *Client) ResolveName(name string) string {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	return canonicalName(name, c.mailboxCache.delimiter)
+	listed, _ := c.mailboxCache.resolve(name)
+	return listed
 }
 
 // RFC 3501 makes attributes case-insensitive.
@@ -123,23 +160,25 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 
 	folders := make(map[string]struct{})
 	var noSelect map[string]struct{}
+	var spellings map[string]string
 	var invalid []string
 	delim := ""
 
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		folders = make(map[string]struct{})
 		noSelect = nil
+		spellings = nil
 		invalid = nil
 		delim = ""
 		var err error
 		invalid, err = listAll(cli, func(m *imap.MailboxInfo) {
-			key := canonicalName(m.Name, m.Delimiter)
-			folders[key] = struct{}{}
+			folders[m.Name] = struct{}{}
+			spellings = noteSpelling(spellings, m.Name, m.Delimiter)
 			if noSelectAttr(m.Attributes) {
 				if noSelect == nil {
 					noSelect = make(map[string]struct{})
 				}
-				noSelect[key] = struct{}{}
+				noSelect[m.Name] = struct{}{}
 			}
 			if delim == "" && m.Delimiter != "" {
 				delim = m.Delimiter
@@ -163,6 +202,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	c.mailboxCacheMu.Lock()
 	c.mailboxCache.folders = folders
 	c.mailboxCache.noSelect = noSelect
+	c.mailboxCache.inboxSpellings = spellings
 	c.mailboxCache.delimiter = delim
 	c.mailboxCache.setInvalid(invalid)
 	c.mailboxCacheMu.Unlock()
@@ -173,7 +213,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 func (c *Client) hasMailbox(name string) bool {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	_, ok := c.mailboxCache.folders[canonicalName(name, c.mailboxCache.delimiter)]
+	_, ok := c.mailboxCache.resolve(name)
 	return ok
 }
 
@@ -184,13 +224,12 @@ func (c *Client) addMailboxToCache(name string) {
 	if c.mailboxCache.folders == nil {
 		c.mailboxCache.folders = make(map[string]struct{})
 	}
-	c.mailboxCache.folders[canonicalName(name, c.mailboxCache.delimiter)] = struct{}{}
+	c.mailboxCache.folders[name] = struct{}{}
+	c.mailboxCache.inboxSpellings = noteSpelling(c.mailboxCache.inboxSpellings, name, c.mailboxCache.delimiter)
 }
 
-// listSubfoldersFromCache returns mailboxes that look like children of parent.
-// "Children" means the cached name starts with parent+delimiter. Unlike a
-// LIST pattern this does not require a server round-trip. It returns nil when
-// neither delimiter is set, as on a flat server.
+// listSubfoldersFromCache returns the listed names that are children of parent. It
+// costs no round-trip and returns nil when neither delimiter is set, as on a flat server.
 func (c *Client) listSubfoldersFromCache(parent, delimiter string) []string {
 	if delimiter == "" {
 		delimiter = c.delimiter
@@ -200,14 +239,11 @@ func (c *Client) listSubfoldersFromCache(parent, delimiter string) []string {
 	}
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	canonicalParent := canonicalName(parent, delimiter)
-	prefix := canonicalParent + delimiter
+	prefix := canonicalName(parent, delimiter) + delimiter
 	out := make([]string, 0)
 	for name := range c.mailboxCache.folders {
-		if name == canonicalParent {
-			continue
-		}
-		if len(name) > len(prefix) && name[:len(prefix)] == prefix {
+		canonical := canonicalName(name, delimiter)
+		if len(canonical) > len(prefix) && canonical[:len(prefix)] == prefix {
 			out = append(out, name)
 		}
 	}

@@ -255,8 +255,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err := offerDelimiterFixes(ctx, out, in, srcClient, dstClient, mappings, autoConfirm); err != nil {
 			return err
 		}
-		// The caches hold INBOX in canonical form, and dedup, the clash check and the subfolder prefix compare bytes.
-		canonicalMappings(mappings, srcClient, dstClient)
+		// Typed names resolve to the listed spelling, so dedup, the clash check and the subfolder cut compare the server's bytes.
+		resolveMappings(mappings, srcClient, dstClient)
 		roots = typedMappings(mappings)
 	} else {
 		// No mapping from flags or config: mirror every source folder. The names
@@ -275,6 +275,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if len(expanded) > len(roots) && !quiet && verbose {
 		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expanded)-len(roots), len(expanded))
 	}
+	resolveDestinations(expanded, dstClient)
 	planned, clashes := splitDestinationClashes(expanded)
 	printFolderRenames(out, planned, dstDelimiter)
 	mappings = directoryMappings(planned)
@@ -904,10 +905,17 @@ type folderMapping struct {
 	renamed bool
 }
 
-func canonicalMappings(mappings []config.DirectoryMapping, srcClient, dstClient *client.Client) {
+func resolveMappings(mappings []config.DirectoryMapping, srcClient, dstClient *client.Client) {
 	for i := range mappings {
-		mappings[i].Source = srcClient.CanonicalName(mappings[i].Source)
-		mappings[i].Destination = dstClient.CanonicalName(mappings[i].Destination)
+		mappings[i].Source = srcClient.ResolveName(mappings[i].Source)
+		mappings[i].Destination = dstClient.ResolveName(mappings[i].Destination)
+	}
+}
+
+// A derived destination can spell an INBOX level in another letter case than the one the server lists, and the wire needs the listed bytes.
+func resolveDestinations(mappings []folderMapping, dstClient *client.Client) {
+	for i := range mappings {
+		mappings[i].Destination = dstClient.ResolveName(mappings[i].Destination)
 	}
 }
 
@@ -1179,8 +1187,8 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient 
 				skip(subfolder, skipReasonNoSelect)
 				continue
 			}
-			// Roots and cached subfolders are both canonical, so the prefix matches byte for byte.
-			relativePath := strings.TrimPrefix(subfolder, root.Source+srcDelimiter)
+			// A listed child can spell an INBOX level in another letter case than root.Source, but the length is the same.
+			relativePath := subfolder[len(root.Source)+len(srcDelimiter):]
 
 			// Build destination path
 			var dstPath string

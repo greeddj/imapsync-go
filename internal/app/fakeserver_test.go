@@ -601,6 +601,7 @@ type mailStore struct {
 	appends      []appendRecord
 	loginRefusal int
 	seenMutating int
+	bareInbox    bool
 }
 
 // newStoreServer starts a fake IMAP server with in-memory mailboxes. Queued
@@ -630,6 +631,12 @@ func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg
 // RFC 3501 makes INBOX case-insensitive, also as the first level of a name. The caller holds the server mu.
 func (st *mailStore) resolve(name string) string {
 	if _, ok := st.folders[name]; ok {
+		return name
+	}
+	if st.bareInbox {
+		if strings.EqualFold(name, "INBOX") {
+			return "INBOX"
+		}
 		return name
 	}
 	rest, isInbox := inboxRest(name, st.delimiter)
@@ -689,6 +696,14 @@ func (s *fakeServer) markNoSelect(names ...string) {
 		}
 		s.store.noSelect[name] = true
 	}
+}
+
+// foldOnlyBareInbox makes the server match every name except the bare INBOX byte for byte,
+// as a server does that treats the letter case of an INBOX child as significant.
+func (s *fakeServer) foldOnlyBareInbox() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.bareInbox = true
 }
 
 // A hidden folder stays selectable and keeps its messages, as with a mailbox that has the read right but no lookup right.

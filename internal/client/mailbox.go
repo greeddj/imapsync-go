@@ -24,9 +24,9 @@ type MailboxInfo struct {
 	NoSelect bool
 }
 
-// MailboxExists reports whether the per-Client mailbox cache lists name, so
-// planning costs one LIST. A \Noselect name counts as existing; IsNoSelect
-// tells whether it can hold messages.
+// MailboxExists reports whether the mailbox cache holds name, so planning
+// costs one LIST. A leading INBOX level matches in any letter case. A
+// \Noselect name counts as existing.
 func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -122,9 +122,9 @@ func (c *Client) createParentFolders(ctx context.Context, name, delimiter string
 	return nil
 }
 
-// MailboxNames returns every cached mailbox name with INBOX in upper case,
-// sorted, \Noselect names included. IsNoSelect tells whether a name can hold
-// messages. It costs no round-trip.
+// MailboxNames returns every cached mailbox name byte for byte as the server
+// listed it, sorted, \Noselect names included. IsNoSelect tells whether a name
+// can hold messages. It costs no round-trip.
 func (c *Client) MailboxNames() []string {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
@@ -143,19 +143,22 @@ func (c *Client) InvalidMailboxNames() []string {
 	return slices.Clone(c.mailboxCache.invalid)
 }
 
-// IsNoSelect reports whether the mailbox cache lists name as \Noselect or
-// \NonExistent.
+// IsNoSelect reports whether the listed name that name resolves to is marked
+// \Noselect or \NonExistent. An exact listed spelling wins over a fold of the INBOX level.
 func (c *Client) IsNoSelect(name string) bool {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	_, ok := c.mailboxCache.noSelect[canonicalName(name, c.mailboxCache.delimiter)]
-	return ok
+	listed, ok := c.mailboxCache.resolve(name)
+	if !ok {
+		return false
+	}
+	_, noSelect := c.mailboxCache.noSelect[listed]
+	return noSelect
 }
 
-// ListSubfolders returns subfolders of folder, derived from the cached
-// mailbox list. delimiter is used to compute the prefix; when empty the
-// client's cached server delimiter is substituted. It returns nil when both
-// delimiters are empty, as on a flat server.
+// ListSubfolders returns the cached listed names under folder; an empty
+// delimiter means the server's. Only a leading INBOX level can differ in
+// letter case from folder, so cut by length.
 func (c *Client) ListSubfolders(ctx context.Context, folder, delimiter string) ([]string, error) {
 	stop := c.withCancel(ctx)
 	defer stop()

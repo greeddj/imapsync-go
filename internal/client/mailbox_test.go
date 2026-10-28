@@ -1555,6 +1555,12 @@ func Test_CreateMailbox_When_NameIsInboxInAnotherCase_Then_SendsNoCreateForInbox
 	if !exists {
 		t.Error("MailboxExists(INBOX/New) = false after the create")
 	}
+	if got := c.MailboxNames(); !slices.Contains(got, "inbox/New") {
+		t.Errorf("MailboxNames = %q, want inbox/New among them byte for byte", got)
+	}
+	if got := c.ResolveName("INBOX/New"); got != "inbox/New" {
+		t.Errorf("ResolveName(INBOX/New) = %q, want the created inbox/New", got)
+	}
 	if n := srv.callCount("LIST"); n != 1 {
 		t.Errorf("LIST count = %d, want 1", n)
 	}
