@@ -6151,7 +6151,7 @@ func TestRunSync_When_ExistingDestinationCannotBeScanned_Then_ReportsFolderFailu
 			}
 			got := out.String()
 			assertContainsAll(t, got,
-				"• Work → Work: destination folder already exists and cannot be scanned: ",
+				"• Work → Work: cannot scan destination folder after CREATE: ",
 				hostileReplyShown,
 				"1 folders failed",
 			)
