@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -130,13 +131,36 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		tr.UpdateMessage(fmt.Sprintf("%s (%s %s)", base, errPart, trackerReason(lastErrMsg)))
 	}
 
+	refreshTracker := func() {
+		if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
+			lastUpdate = now
+			updateTrackerMsg()
+		}
+	}
+	reportCanceled := func() {
+		tr.UpdateMessage(fmt.Sprintf("%d/%d Canceled %s → %s",
+			planIdx+1, planCount, srcShown, dstShown))
+		tr.MarkAsErrored()
+	}
+
+	// pending holds the planned UIDs whose source body was refused and that a standby copy can still replace.
+	var pending map[uint32]struct{}
+
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDValidity, p.SrcUIDs, func(msg client.Message) error {
 		if err := w.dst.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			errors++
-			lastErrMsg = err.Error()
+			if refusedBody(err) && len(p.standbysOf(msg.UID())) > 0 {
+				if pending == nil {
+					pending = make(map[uint32]struct{})
+				}
+				pending[msg.UID()] = struct{}{}
+			} else {
+				delete(pending, msg.UID())
+				errors++
+				lastErrMsg = err.Error()
+			}
 			// Without --verbose we never persist per-message failures to
 			// the log writer: at high error rates that floods the screen
 			// with hundreds of lines and scrolls the progress bars out.
@@ -145,18 +169,14 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			if verbose {
 				pw.Log("Failed to append message to %s: %s", dstShown, termsafe.Escape(err.Error()))
 			}
-			if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
-				lastUpdate = now
-				updateTrackerMsg()
-			}
+			refreshTracker()
 			return nil
 		}
+		// A response without a body can come before the full one for the same UID.
+		delete(pending, msg.UID())
 		synced++
 		tr.Increment(1)
-		if now := time.Now(); now.Sub(lastUpdate) > 100*time.Millisecond {
-			lastUpdate = now
-			updateTrackerMsg()
-		}
+		refreshTracker()
 		if verbose {
 			pw.Log("Synced %d/%d to %s, processed msg id %s",
 				synced, p.NewMessages, dstShown, termsafe.Escape(msg.MessageID()))
@@ -170,15 +190,65 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		return nil
 	})
 	if ctx.Err() != nil {
-		tr.UpdateMessage(fmt.Sprintf("%d/%d Canceled %s → %s",
-			planIdx+1, planCount, srcShown, dstShown))
-		tr.MarkAsErrored()
+		reportCanceled()
 		return synced, errors
 	}
 	if streamErr != nil {
 		pw.Log("Stream error for folder %s: %s", srcShown, termsafe.Escape(streamErr.Error()))
 		errors++
 	}
+
+	// The main FETCH has ended, so the source session can run the next command.
+	for source, standby := range p.standbySources {
+		uids, owner := standbyRequest(&p, pending, uint32(source))
+		if len(uids) == 0 || ctx.Err() != nil {
+			continue
+		}
+		standbyShown := termsafe.Escape(standby.folder)
+		err := w.src.StreamMessagesByUIDs(ctx, standby.folder, standby.uidValidity, uids, func(msg client.Message) error {
+			planned := owner[msg.UID()]
+			if _, waiting := pending[planned]; !waiting {
+				return nil
+			}
+			err := w.dst.AppendMessage(ctx, p.DestinationFolder, msg)
+			switch {
+			case err == nil:
+				delete(pending, planned)
+				synced++
+				tr.Increment(1)
+				refreshTracker()
+				if verbose {
+					pw.Log("Copied message %s to %s from %s: the copy in %s has no usable body",
+						termsafe.Escape(msg.MessageID()), dstShown, standbyShown, srcShown)
+				}
+				return ctx.Err()
+			case ctx.Err() != nil:
+				return ctx.Err()
+			case refusedBody(err):
+				// The planned UID stays pending, so a later source can still replace it.
+			default:
+				delete(pending, planned)
+				errors++
+				lastErrMsg = err.Error()
+				if verbose {
+					pw.Log("Failed to append message to %s: %s", dstShown, termsafe.Escape(err.Error()))
+				}
+				refreshTracker()
+			}
+			return nil
+		})
+		if ctx.Err() != nil {
+			break
+		}
+		if err != nil {
+			pw.Log("Stream error for folder %s: %s", standbyShown, termsafe.Escape(err.Error()))
+		}
+	}
+	if ctx.Err() != nil {
+		reportCanceled()
+		return synced, errors
+	}
+	errors += len(pending)
 
 	if errors > 0 {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s",
@@ -190,6 +260,29 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		tr.MarkAsDone()
 	}
 	return synced, errors
+}
+
+// refusedBody reports whether AppendMessage refused the message before it sent a command, because the source gave no usable body.
+func refusedBody(err error) bool {
+	return errors.Is(err, client.ErrEmptyBody) || errors.Is(err, client.ErrMissingBody)
+}
+
+// standbyRequest lists the standby UIDs in one source folder that can replace a pending copy, and maps each to its planned UID.
+func standbyRequest(p *FolderSyncPlan, pending map[uint32]struct{}, source uint32) (uids []uint32, owner map[uint32]uint32) {
+	if len(pending) == 0 {
+		return nil, nil
+	}
+	uids = make([]uint32, 0, len(pending))
+	owner = make(map[uint32]uint32, len(pending))
+	for planned := range pending {
+		for _, c := range p.standbysOf(planned) {
+			if c.source == source {
+				uids = append(uids, c.uid)
+				owner[c.uid] = planned
+			}
+		}
+	}
+	return uids, owner
 }
 
 // A long server message would wrap the tracker line and break the rendered bar.

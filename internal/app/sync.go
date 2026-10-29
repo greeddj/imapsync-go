@@ -63,14 +63,46 @@ func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Wri
 // SrcUIDValidity is the UIDVALIDITY that SrcUIDs belong to, or 0 when the
 // server sent none. The copy uses the UIDs only while the folder reports this
 // value.
+//
+// standbys lists copies with the same Message-Id in later mappings of a shared
+// destination, for planned UIDs. It is sorted by planned UID, then by source.
 type FolderSyncPlan struct {
 	SourceFolder            string
 	DestinationFolder       string
 	SrcUIDs                 []uint32
+	standbySources          []standbySource
+	standbys                []standbyCopy
 	NewMessages             int
 	NewSize                 uint64
 	SrcUIDValidity          uint32
 	DestinationFolderExists bool
+}
+
+// standbySource is a source folder that holds standby copies, with the UIDVALIDITY of its scan.
+type standbySource struct {
+	folder      string
+	uidValidity uint32
+}
+
+// standbyCopy says that uid in standbySources[source] has the Message-Id of the planned UID.
+type standbyCopy struct {
+	planned uint32
+	uid     uint32
+	source  uint32
+}
+
+func compareStandbyToPlanned(c standbyCopy, planned uint32) int {
+	return cmp.Compare(c.planned, planned)
+}
+
+// standbysOf returns the standbys of one planned UID, in source order. It allocates nothing.
+func (p *FolderSyncPlan) standbysOf(planned uint32) []standbyCopy {
+	i, _ := slices.BinarySearchFunc(p.standbys, planned, compareStandbyToPlanned)
+	end := i
+	for end < len(p.standbys) && p.standbys[end].planned == planned {
+		end++
+	}
+	return p.standbys[i:end]
 }
 
 // FolderFailure names a mapping that the plan cannot copy, and why.
@@ -743,13 +775,27 @@ type folderScan struct {
 	done           atomic.Int32
 }
 
-// sharedDestinations counts copies that earlier plans schedule for a destination of two or more mappings. Slot k is diffed before slot k+1, because both scans walk in index order.
+// reservation is a copy that a plan schedules for a shared destination: the UID in the source of mapping slot.
+type reservation struct {
+	uid  uint32
+	slot int32
+}
+
+// standbySet holds the standbys of one plan. Its sources are in mapping order.
+type standbySet struct {
+	sources []standbySource
+	copies  []standbyCopy
+}
+
+// sharedDestinations tracks the destinations of two or more mappings. Slot k is diffed before slot k+1, because both scans walk in index order.
 type sharedDestinations struct {
 	// last maps a shared destination to its last mapping index. It is read-only, so reads need no lock.
 	last map[string]int
-	// copies keeps an entry only until the last mapping of its destination is diffed.
-	copies map[string]map[string]int
-	// mu guards copies and keeps the race detector independent of the plan order.
+	// reserved keeps an entry only until the last mapping of its destination is diffed.
+	reserved map[string]map[string][]reservation
+	// standbys is indexed by the slot of the reserving plan. It outlives reserved, because buildSyncPlan reads it after the scans.
+	standbys []standbySet
+	// mu guards reserved and standbys and keeps the race detector independent of the plan order.
 	mu sync.Mutex
 }
 
@@ -769,7 +815,11 @@ func newSharedDestinations(mappings []config.DirectoryMapping) *sharedDestinatio
 	if last == nil {
 		return nil
 	}
-	return &sharedDestinations{last: last, copies: make(map[string]map[string]int, len(last))}
+	return &sharedDestinations{
+		last:     last,
+		reserved: make(map[string]map[string][]reservation, len(last)),
+		standbys: make([]standbySet, len(mappings)),
+	}
 }
 
 func (d *sharedDestinations) lastIndex(destination string) (int, bool) {
@@ -778,6 +828,35 @@ func (d *sharedDestinations) lastIndex(destination string) (int, bool) {
 	}
 	i, ok := d.last[destination]
 	return i, ok
+}
+
+// addStandby records that uid in src has the Message-Id of the reserved copy. The caller holds d.mu.
+func (d *sharedDestinations) addStandby(r reservation, src standbySource, uid uint32) {
+	set := &d.standbys[r.slot]
+	// Slots are diffed in order, so the source is usually the last one.
+	i := len(set.sources) - 1
+	for i >= 0 && set.sources[i] != src {
+		i--
+	}
+	if i < 0 {
+		set.sources = append(set.sources, src)
+		i = len(set.sources) - 1
+	}
+	set.copies = append(set.copies, standbyCopy{planned: r.uid, uid: uid, source: uint32(i)})
+}
+
+// standbysFor returns the standbys of the plan of slot. Call it only after the scans end.
+func (d *sharedDestinations) standbysFor(slot int) ([]standbySource, []standbyCopy) {
+	if d == nil {
+		return nil, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	set := &d.standbys[slot]
+	slices.SortFunc(set.copies, func(a, b standbyCopy) int {
+		return cmp.Or(cmp.Compare(a.planned, b.planned), cmp.Compare(a.source, b.source))
+	})
+	return set.sources, set.copies
 }
 
 func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, mappings []config.DirectoryMapping, srcTracker, dstTracker *progress.Tracker, srcLabel, dstLabel string) (*SyncSummary, error) {
@@ -899,7 +978,9 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 		if plans[idx].SourceFolder == "" {
 			continue
 		}
-		summary.Plans = append(summary.Plans, plans[idx])
+		plan := plans[idx]
+		plan.standbySources, plan.standbys = shared.standbysFor(idx)
+		summary.Plans = append(summary.Plans, plan)
 	}
 	summary.TotalNew = int(totalNew.Load())
 	summary.TotalNewSize = totalNewSize.Load()
@@ -910,7 +991,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 // sides have completed for slot idx. Returns false if only one side is done.
 // Frees srcMap and dstMap immediately after the diff to keep peak memory
 // proportional to one folder at a time, not len(mappings).
-// A shared destination keeps one count per Message-Id until its last mapping is diffed.
+// A shared destination keeps the earlier plans' reservations per Message-Id until its last mapping is diffed.
 //
 // NewSize sums the RFC822.SIZE values that the planning FETCH already returned,
 // so the preview needs no extra round-trip.
@@ -925,16 +1006,16 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	defer s.mu.Unlock()
 
 	destination := mappings[idx].Destination
-	var scheduled map[string]int
+	var reserved map[string][]reservation
 	reserve := false
 	if last, ok := shared.lastIndex(destination); ok {
 		shared.mu.Lock()
 		defer shared.mu.Unlock()
-		scheduled = shared.copies[destination]
+		reserved = shared.reserved[destination]
 		reserve = idx != last
 		if !reserve {
-			// Deferred, so a failed last slot releases the counts too. It runs before the unlock.
-			defer delete(shared.copies, destination)
+			// Deferred, so a failed last slot releases the reservations too. It runs before the unlock.
+			defer delete(shared.reserved, destination)
 		}
 	}
 
@@ -942,16 +1023,28 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 		s.srcMap, s.dstMap = nil, nil
 		return true
 	}
+	standby := standbySource{folder: mappings[idx].Source, uidValidity: s.srcUIDValidity}
 	newUIDs := make([]uint32, 0, s.srcMessages)
 	var newSize uint64
 	for id, refs := range s.srcMap {
-		_, missing := splitByDestinationCount(refs, len(s.dstMap[id])+scheduled[id])
-		if reserve && len(missing) > 0 {
-			if scheduled == nil {
-				scheduled = make(map[string]int)
-				shared.copies[destination] = scheduled
+		held := reserved[id]
+		covered := min(len(refs), len(s.dstMap[id]))
+		taken := min(len(refs), len(s.dstMap[id])+len(held))
+		// The refs between the destination copies and the missing ones stand by for the reserved copies.
+		for j, ref := range refs[covered:taken] {
+			if mappings[held[j].slot].Source != standby.folder {
+				shared.addStandby(held[j], standby, ref.UID)
 			}
-			scheduled[id] += len(missing)
+		}
+		missing := refs[taken:]
+		if reserve && len(missing) > 0 {
+			if reserved == nil {
+				reserved = make(map[string][]reservation)
+				shared.reserved[destination] = reserved
+			}
+			for _, ref := range missing {
+				reserved[id] = append(reserved[id], reservation{uid: ref.UID, slot: int32(idx)})
+			}
 		}
 		for _, ref := range missing {
 			newUIDs = append(newUIDs, ref.UID)

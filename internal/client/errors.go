@@ -48,6 +48,12 @@ func (c ErrClass) String() string {
 // SELECT or EXAMINE with NO or BAD on a working session.
 var ErrSelectRefused = errors.New("cannot select folder")
 
+// ErrEmptyBody marks a message whose source body is empty. AppendMessage returns it before it sends any command.
+var ErrEmptyBody = errors.New("source returned an empty body")
+
+// ErrMissingBody marks a message that has no body section. AppendMessage returns it before it sends any command.
+var ErrMissingBody = errors.New("message has no body")
+
 // ErrUIDValidityChanged marks a source folder whose UIDVALIDITY differs from the one its planned UIDs belong to.
 var ErrUIDValidityChanged = errors.New("source folder changed after the sync plan, run sync again")
 

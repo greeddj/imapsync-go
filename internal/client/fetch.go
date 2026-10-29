@@ -48,6 +48,14 @@ func (m Message) MessageID() string {
 	return m.m.Envelope.MessageId
 }
 
+// UID returns the UID that the server sent with the message, or 0 for the zero Message.
+func (m Message) UID() uint32 {
+	if m.m == nil {
+		return 0
+	}
+	return m.m.Uid
+}
+
 // MessageRef is one scanned message: its UID and its RFC822.SIZE.
 type MessageRef struct {
 	UID  uint32

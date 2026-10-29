@@ -1242,6 +1242,15 @@ func Test_maybeDiff_When_MessagesShareMessageId_Then_PlansByCount(t *testing.T) 
 	}
 }
 
+// reservedCounts maps each Message-Id to the number of copies that earlier plans reserved for it.
+func reservedCounts(byID map[string][]reservation) map[string]int {
+	counts := make(map[string]int, len(byID))
+	for id, list := range byID {
+		counts[id] = len(list)
+	}
+	return counts
+}
+
 func Test_maybeDiff_When_PlansShareADestination_Then_LaterPlansCopyOnlyTheExcess(t *testing.T) {
 	t.Parallel()
 
@@ -1402,9 +1411,9 @@ func Test_maybeDiff_When_PlansShareADestination_Then_LaterPlansCopyOnlyTheExcess
 				if shared == nil {
 					continue
 				}
-				held, has := shared.copies[sl.dest]
-				if has != (len(sl.wantHeld) > 0) || !maps.Equal(held, sl.wantHeld) {
-					t.Errorf("slot %d: copies[%s] = %v (present %t), want %v", i, sl.dest, held, has, sl.wantHeld)
+				byID, has := shared.reserved[sl.dest]
+				if held := reservedCounts(byID); has != (len(sl.wantHeld) > 0) || !maps.Equal(held, sl.wantHeld) {
+					t.Errorf("slot %d: reserved[%s] counts = %v (present %t), want %v", i, sl.dest, held, has, sl.wantHeld)
 				}
 			}
 
@@ -1414,8 +1423,8 @@ func Test_maybeDiff_When_PlansShareADestination_Then_LaterPlansCopyOnlyTheExcess
 			if got := totalNewSize.Load(); got != wantTotalSize {
 				t.Errorf("totalNewSize = %d, want %d", got, wantTotalSize)
 			}
-			if shared != nil && len(shared.copies) != 0 {
-				t.Errorf("copies = %v after the last slot, want none", shared.copies)
+			if shared != nil && len(shared.reserved) != 0 {
+				t.Errorf("reserved = %v after the last slot, want none", shared.reserved)
 			}
 		})
 	}
@@ -9222,7 +9231,7 @@ func Test_maybeDiff_When_ThreeMappingsShareADestinationAmongOthers_Then_CountsAc
 	var totalNewSize atomic.Uint64
 
 	for i := range mappings {
-		s := &folderScan{srcMap: srcMaps[i], srcMessages: countRefs(srcMaps[i]), dstExists: true}
+		s := &folderScan{srcMap: srcMaps[i], srcMessages: countRefs(srcMaps[i]), srcUIDValidity: uint32(10 + i), dstExists: true}
 		maybeDiff(s, i, mappings, plans, &totalNew, &totalNewSize, shared)
 		if !maybeDiff(s, i, mappings, plans, &totalNew, &totalNewSize, shared) {
 			t.Fatalf("slot %d: maybeDiff returned false on the second call, want true", i)
@@ -9231,19 +9240,32 @@ func Test_maybeDiff_When_ThreeMappingsShareADestinationAmongOthers_Then_CountsAc
 		if !slices.Equal(plans[i].SrcUIDs, wantUIDs[i]) {
 			t.Errorf("slot %d: SrcUIDs = %v, want %v", i, plans[i].SrcUIDs, wantUIDs[i])
 		}
-		if held := shared.copies["X"]; !maps.Equal(held, wantHeld[i]) {
-			t.Errorf("slot %d: copies[X] = %v, want %v", i, held, wantHeld[i])
+		if held := reservedCounts(shared.reserved["X"]); !maps.Equal(held, wantHeld[i]) {
+			t.Errorf("slot %d: reserved[X] counts = %v, want %v", i, held, wantHeld[i])
 		}
-		if _, ok := shared.copies["Y"]; ok {
-			t.Errorf("slot %d: copies[Y] is set, want a destination with one mapping to stay out", i)
+		if _, ok := shared.reserved["Y"]; ok {
+			t.Errorf("slot %d: reserved[Y] is set, want a destination with one mapping to stay out", i)
 		}
 	}
 
-	if len(shared.copies) != 0 {
-		t.Errorf("copies = %v after the last slot, want none", shared.copies)
+	if len(shared.reserved) != 0 {
+		t.Errorf("reserved = %v after the last slot, want none", shared.reserved)
 	}
 	if got := totalNew.Load(); got != 6 {
 		t.Errorf("totalNew = %d, want 6", got)
+	}
+	// C and D hold standbys for the m1 of A, and D holds one for the m3 of C. Y has one mapping, and D is the last one.
+	wantStandbys := [][]standbyView{
+		{{planned: 1, folder: "C", uidValidity: 12, uid: 1}, {planned: 1, folder: "D", uidValidity: 13, uid: 1}},
+		nil,
+		{{planned: 2, folder: "D", uidValidity: 13, uid: 2}},
+		nil,
+	}
+	for i, want := range wantStandbys {
+		sources, copies := shared.standbysFor(i)
+		if got := resolveStandbys(t, sources, copies); !slices.Equal(got, want) {
+			t.Errorf("slot %d: standbys = %+v, want %+v", i, got, want)
+		}
 	}
 }
 
@@ -9278,11 +9300,15 @@ func Test_buildSyncPlan_When_SharedDestinationScansFinishInAnyOrder_Then_PlansAr
 	type planView struct {
 		src, dst string
 		uids     []uint32
+		standbys []standbyView
 	}
 	want := []planView{
-		{src: "A", dst: "X", uids: []uint32{1, 2}},
+		{src: "A", dst: "X", uids: []uint32{1, 2}, standbys: []standbyView{
+			{planned: 1, folder: "C", uidValidity: 13, uid: 1},
+			{planned: 1, folder: "D", uidValidity: 14, uid: 1},
+		}},
 		{src: "B", dst: "Y", uids: []uint32{1, 2}},
-		{src: "C", dst: "X", uids: []uint32{2}},
+		{src: "C", dst: "X", uids: []uint32{2}, standbys: []standbyView{{planned: 2, folder: "D", uidValidity: 14, uid: 2}}},
 		{src: "D", dst: "X", uids: []uint32{3}},
 	}
 	for _, tt := range tests {
@@ -9293,6 +9319,9 @@ func Test_buildSyncPlan_When_SharedDestinationScansFinishInAnyOrder_Then_PlansAr
 				"A": fakeMsgs("m1@x", "m2@x"), "B": fakeMsgs("m1@x", "m9@x"),
 				"C": fakeMsgs("m1@x", "m3@x"), "D": fakeMsgs("m1@x", "m3@x", "m4@x"),
 			})
+			for i, folder := range []string{"A", "B", "C", "D"} {
+				src.setUIDValidity(folder, uint32(11+i))
+			}
 			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
 			lagOnNth := func(srv *fakeServer, nth int, verbs ...string) {
 				if nth == 0 {
@@ -9325,10 +9354,10 @@ func Test_buildSyncPlan_When_SharedDestinationScansFinishInAnyOrder_Then_PlansAr
 			}
 			got := make([]planView, len(summary.Plans))
 			for i, p := range summary.Plans {
-				got[i] = planView{src: p.SourceFolder, dst: p.DestinationFolder, uids: p.SrcUIDs}
+				got[i] = planView{src: p.SourceFolder, dst: p.DestinationFolder, uids: p.SrcUIDs, standbys: resolveStandbys(t, p.standbySources, p.standbys)}
 			}
 			if !slices.EqualFunc(got, want, func(a, b planView) bool {
-				return a.src == b.src && a.dst == b.dst && slices.Equal(a.uids, b.uids)
+				return a.src == b.src && a.dst == b.dst && slices.Equal(a.uids, b.uids) && slices.Equal(a.standbys, b.standbys)
 			}) {
 				t.Errorf("plans = %+v, want %+v", got, want)
 			}
@@ -9664,4 +9693,509 @@ func TestRunSync_When_SharedDestinationNameCarriesControlCharacters_Then_Preview
 	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\rx")
 	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), hostileWireName)
 	assertIDs(t, "dst folder", slices.Sorted(slices.Values(dst.folderMsgIDs(hostileWireName))), "m1@x", "m2@x", "m3@x")
+}
+
+func TestRunSync_When_TheFirstSharedMappingHasAnEmptyBody_Then_TheLaterMappingsCopyArrivesInTheSameRun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		workers   int
+		dstHasXIn bool
+	}{
+		{name: "one worker and a missing destination", workers: 1},
+		{name: "two workers and a missing destination", workers: 2},
+		{name: "one worker and an existing destination", workers: 1, dstHasXIn: true},
+		{name: "two workers and an existing destination", workers: 2, dstHasXIn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bodyOfB := subjectBody("m1@x", "from B")
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": fakeMsgs("m1@x", "m2@x"),
+				"B": {{msgID: "m1@x", body: bodyOfB}, {msgID: "m3@x"}},
+			})
+			src.answerBodyIn("A", "m1@x", "NIL")
+			dstFolders := map[string][]fakeMsg{"INBOX": nil}
+			if tt.dstHasXIn {
+				dstFolders["X"] = nil
+			}
+			dst := newStoreServer(t, "/", dstFolders)
+			cfg := e2eConfig(src, dst, tt.workers, mapping("A", "X"), mapping("B", "X"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if err != nil {
+				t.Fatalf("first runSync error = %v, want nil\noutput: %s", err, out.String())
+			}
+			assertContainsAll(t, out.String(),
+				"• A → X will copy 2 messages",
+				"• B → X will copy 1 messages",
+				"Total new messages to sync: 3",
+				"Sync completed successfully",
+			)
+			assertContainsNone(t, out.String(), "errors occurred", "empty body")
+			assertIDs(t, "dst X", slices.Sorted(slices.Values(dst.folderMsgIDs("X"))), "m1@x", "m2@x", "m3@x")
+			if !slices.Contains(dst.folderBodies("X"), bodyOfB) {
+				t.Errorf("dst X bodies = %q, want the copy of m1 from B %q", dst.folderBodies("X"), bodyOfB)
+			}
+			if n := dst.callCount("APPEND"); n != 3 {
+				t.Errorf("destination saw %d APPEND commands, want 3", n)
+			}
+
+			assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != 3 {
+				t.Errorf("destination saw %d APPEND commands after the second run, want 3", n)
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+// diffBothSides plays the two scan goroutines: the first call counts one side done, the second one runs the diff.
+func diffBothSides(t *testing.T, s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64, shared *sharedDestinations) {
+	t.Helper()
+
+	maybeDiff(s, idx, mappings, plans, totalNew, totalNewSize, shared)
+	if !maybeDiff(s, idx, mappings, plans, totalNew, totalNewSize, shared) {
+		t.Fatalf("slot %d: maybeDiff returned false on the second call, want true", idx)
+	}
+}
+
+// standbyView is a standby with its source folder resolved, so tests compare plans without the source indexes.
+type standbyView struct {
+	folder      string
+	planned     uint32
+	uidValidity uint32
+	uid         uint32
+}
+
+// resolveStandbys fails the test when a source folder appears twice or an index points outside the sources.
+func resolveStandbys(t *testing.T, sources []standbySource, copies []standbyCopy) []standbyView {
+	t.Helper()
+
+	seen := make(map[string]bool, len(sources))
+	for _, src := range sources {
+		if seen[src.folder] {
+			t.Errorf("standby sources %+v hold %q twice, want each folder once", sources, src.folder)
+		}
+		seen[src.folder] = true
+	}
+	var views []standbyView
+	for _, c := range copies {
+		if int(c.source) >= len(sources) {
+			t.Fatalf("standby %+v points at source %d, but there are %d sources", c, c.source, len(sources))
+		}
+		src := sources[c.source]
+		views = append(views, standbyView{folder: src.folder, planned: c.planned, uidValidity: src.uidValidity, uid: c.uid})
+	}
+	return views
+}
+
+func Test_maybeDiff_When_SharedDestinationHasStandbyCopies_Then_EachPlannedCopyGetsThemInMapOrder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		sources      []string
+		refs         [][]uint32
+		wantUIDs     [][]uint32
+		wantStandbys [][]standbyView
+		have         int
+	}{
+		{
+			name:     "none of the copies is on the destination",
+			sources:  []string{"A", "B", "C"},
+			refs:     [][]uint32{{1}, {11, 12}, {21, 22, 23}},
+			wantUIDs: [][]uint32{{1}, {12}, {23}},
+			wantStandbys: [][]standbyView{
+				{{planned: 1, folder: "B", uidValidity: 101, uid: 11}, {planned: 1, folder: "C", uidValidity: 102, uid: 21}},
+				{{planned: 12, folder: "C", uidValidity: 102, uid: 22}},
+				nil,
+			},
+		},
+		{
+			name:     "one copy is on the destination",
+			have:     1,
+			sources:  []string{"A", "B", "C"},
+			refs:     [][]uint32{{1}, {11, 12}, {21, 22, 23}},
+			wantUIDs: [][]uint32{nil, {12}, {23}},
+			wantStandbys: [][]standbyView{
+				nil,
+				{{planned: 12, folder: "C", uidValidity: 102, uid: 22}},
+				nil,
+			},
+		},
+		{
+			name:     "two mappings share a source folder next to a third one",
+			sources:  []string{"S", "S", "C"},
+			refs:     [][]uint32{{1}, {11, 12}, {21, 22, 23}},
+			wantUIDs: [][]uint32{{1}, {12}, {23}},
+			wantStandbys: [][]standbyView{
+				{{planned: 1, folder: "C", uidValidity: 102, uid: 21}},
+				{{planned: 12, folder: "C", uidValidity: 102, uid: 22}},
+				nil,
+			},
+		},
+		{
+			name:         "only two mappings and they share a source folder",
+			sources:      []string{"S", "S"},
+			refs:         [][]uint32{{1}, {11}},
+			wantUIDs:     [][]uint32{{1}, nil},
+			wantStandbys: [][]standbyView{nil, nil},
+		},
+		{
+			name:         "the later mapping has no copy",
+			sources:      []string{"A", "B"},
+			refs:         [][]uint32{{1}, nil},
+			wantUIDs:     [][]uint32{{1}, nil},
+			wantStandbys: [][]standbyView{nil, nil},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mappings := make([]config.DirectoryMapping, len(tt.sources))
+			for i, source := range tt.sources {
+				mappings[i] = mapping(source, "X")
+			}
+			shared := newSharedDestinations(mappings)
+			plans := make([]FolderSyncPlan, len(mappings))
+			var totalNew atomic.Int64
+			var totalNewSize atomic.Uint64
+
+			for i := range mappings {
+				srcMap := map[string][]client.MessageRef{}
+				if len(tt.refs[i]) > 0 {
+					srcMap["m@x"] = msgRefs(tt.refs[i]...)
+				}
+				dstMap := map[string][]client.MessageRef{}
+				if tt.have > 0 {
+					dstMap["m@x"] = msgRefs(make([]uint32, tt.have)...)
+				}
+				s := &folderScan{srcMap: srcMap, dstMap: dstMap, srcMessages: countRefs(srcMap), srcUIDValidity: uint32(100 + i), dstExists: true}
+				diffBothSides(t, s, i, mappings, plans, &totalNew, &totalNewSize, shared)
+			}
+
+			for i := range mappings {
+				if !slices.Equal(plans[i].SrcUIDs, tt.wantUIDs[i]) {
+					t.Errorf("slot %d: SrcUIDs = %v, want %v", i, plans[i].SrcUIDs, tt.wantUIDs[i])
+				}
+				sources, copies := shared.standbysFor(i)
+				if got := resolveStandbys(t, sources, copies); !slices.Equal(got, tt.wantStandbys[i]) {
+					t.Errorf("slot %d: standbys = %+v, want %+v", i, got, tt.wantStandbys[i])
+				}
+			}
+		})
+	}
+}
+
+func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReservations(t *testing.T) {
+	t.Parallel()
+
+	ids := []string{"a@x", "b@x", "c@x"}
+	rng := rand.New(rand.NewPCG(13, 17))
+	for round := range 500 {
+		sharing := 2 + rng.IntN(3)
+		otherPos := rng.IntN(sharing + 1)
+		slots := sharing + 1
+		mappings := make([]config.DirectoryMapping, slots)
+		srcMaps := make([]map[string][]client.MessageRef, slots)
+		idOf := make([]map[uint32]string, slots)
+		slotOfFolder := make(map[string]int, slots)
+		have := make(map[string]int, len(ids))
+		for _, id := range ids {
+			have[id] = rng.IntN(4)
+		}
+		for i := range slots {
+			destination := "X"
+			if i == otherPos {
+				destination = "Y"
+			}
+			mappings[i] = mapping("S"+strconv.Itoa(i), destination)
+			slotOfFolder[mappings[i].Source] = i
+			srcMaps[i] = make(map[string][]client.MessageRef)
+			idOf[i] = make(map[uint32]string)
+			var nextUID uint32
+			for _, id := range ids {
+				for range rng.IntN(4) {
+					nextUID += uint32(1 + rng.IntN(3))
+					srcMaps[i][id] = append(srcMaps[i][id], client.MessageRef{UID: nextUID, Size: uint32(1 + rng.IntN(1000))})
+					idOf[i][nextUID] = id
+				}
+			}
+		}
+		shared := newSharedDestinations(mappings)
+		plans := make([]FolderSyncPlan, slots)
+		var totalNew atomic.Int64
+		var totalNewSize atomic.Uint64
+
+		for i := range slots {
+			dstMap := map[string][]client.MessageRef{}
+			if mappings[i].Destination == "X" {
+				for id, n := range have {
+					if n > 0 {
+						dstMap[id] = msgRefs(make([]uint32, n)...)
+					}
+				}
+			}
+			s := &folderScan{srcMap: maps.Clone(srcMaps[i]), dstMap: dstMap, srcMessages: countRefs(srcMaps[i]), srcUIDValidity: uint32(50 + i), dstExists: true}
+			diffBothSides(t, s, i, mappings, plans, &totalNew, &totalNewSize, shared)
+		}
+
+		// The reference: each plan pairs its next copies with the earlier reservations in order. A plan that is not last in X reserves what stays missing.
+		type copyAt struct {
+			slot int
+			uid  uint32
+		}
+		type pairing struct {
+			planned copyAt
+			standby copyAt
+		}
+		reservedRefs := make(map[string][]copyAt, len(ids))
+		wantPairs := make(map[pairing]bool)
+		lastX := slots - 1
+		if otherPos == slots-1 {
+			lastX = slots - 2
+		}
+		for i := range slots {
+			var wantUIDs []uint32
+			var wantSize uint64
+			for id, refs := range srcMaps[i] {
+				var held []copyAt
+				onDestination := 0
+				if mappings[i].Destination == "X" {
+					held = reservedRefs[id]
+					onDestination = have[id]
+				}
+				standbys := refs[min(onDestination, len(refs)):min(onDestination+len(held), len(refs))]
+				for j, ref := range standbys {
+					wantPairs[pairing{planned: held[j], standby: copyAt{i, ref.UID}}] = true
+				}
+				missing := refs[min(onDestination+len(held), len(refs)):]
+				if mappings[i].Destination == "X" && i != lastX {
+					for _, ref := range missing {
+						reservedRefs[id] = append(reservedRefs[id], copyAt{i, ref.UID})
+					}
+				}
+				for _, ref := range missing {
+					wantUIDs = append(wantUIDs, ref.UID)
+					wantSize += uint64(ref.Size)
+				}
+			}
+			slices.Sort(wantUIDs)
+			if !slices.Equal(plans[i].SrcUIDs, wantUIDs) || plans[i].NewSize != wantSize {
+				t.Fatalf("round %d slot %d: SrcUIDs, NewSize = %v, %d, want %v, %d (the reference)", round, i, plans[i].SrcUIDs, plans[i].NewSize, wantUIDs, wantSize)
+			}
+		}
+		gotPairs := make(map[pairing]bool, len(wantPairs))
+
+		type slotUID struct {
+			slot int
+			uid  uint32
+		}
+		used := make(map[slotUID]uint32)
+		for r := range slots {
+			sources, copies := shared.standbysFor(r)
+			if mappings[r].Destination == "Y" && len(copies) > 0 {
+				t.Fatalf("round %d slot %d: standbys %+v on a destination with one mapping, want none", round, r, copies)
+			}
+			for k, c := range copies {
+				src := sources[c.source]
+				s := slotOfFolder[src.folder]
+				switch {
+				case s <= r:
+					t.Fatalf("round %d: the standby for slot %d comes from slot %d, want a later slot", round, r, s)
+				case src.uidValidity != uint32(50+s):
+					t.Fatalf("round %d: standby UIDVALIDITY = %d, want %d", round, src.uidValidity, 50+s)
+				case !slices.Contains(plans[r].SrcUIDs, c.planned):
+					t.Fatalf("round %d: planned UID %d of slot %d is not in its plan %v", round, c.planned, r, plans[r].SrcUIDs)
+				case idOf[r][c.planned] != idOf[s][c.uid] || idOf[s][c.uid] == "":
+					t.Fatalf("round %d: standby UID %d of slot %d has Message-Id %q, want %q of UID %d in slot %d", round, c.uid, s, idOf[s][c.uid], idOf[r][c.planned], c.planned, r)
+				case slices.Contains(plans[s].SrcUIDs, c.uid):
+					t.Fatalf("round %d: standby UID %d of slot %d is also in its own plan %v", round, c.uid, s, plans[s].SrcUIDs)
+				}
+				if owner, taken := used[slotUID{s, c.uid}]; taken {
+					t.Fatalf("round %d: standby UID %d of slot %d serves planned UIDs %d and %d", round, c.uid, s, owner, c.planned)
+				}
+				used[slotUID{s, c.uid}] = c.planned
+				gotPairs[pairing{planned: copyAt{r, c.planned}, standby: copyAt{s, c.uid}}] = true
+				if k > 0 {
+					prev := copies[k-1]
+					if prev.planned > c.planned || (prev.planned == c.planned && prev.source >= c.source) {
+						t.Fatalf("round %d slot %d: standbys %+v are not sorted by planned UID and increasing source", round, r, copies)
+					}
+				}
+			}
+		}
+		if !maps.Equal(gotPairs, wantPairs) {
+			t.Fatalf("round %d: standbys = %v, want %v (the reference pairing)", round, gotPairs, wantPairs)
+		}
+		if len(shared.reserved) != 0 {
+			t.Fatalf("round %d: reserved = %v after the last slot, want none", round, shared.reserved)
+		}
+	}
+}
+
+func Test_standbysFor_When_ReceiverIsNilOrPlanHasNoStandbys_Then_ReturnsNothing(t *testing.T) {
+	t.Parallel()
+
+	var none *sharedDestinations
+	if sources, copies := none.standbysFor(0); sources != nil || copies != nil {
+		t.Errorf("standbysFor on a nil set = %v, %v, want nil, nil", sources, copies)
+	}
+	shared := newSharedDestinations([]config.DirectoryMapping{mapping("A", "X"), mapping("B", "X")})
+	if sources, copies := shared.standbysFor(1); sources != nil || copies != nil {
+		t.Errorf("standbysFor for a slot without standbys = %v, %v, want nil, nil", sources, copies)
+	}
+}
+
+func TestFolderSyncPlan_standbysOf(t *testing.T) {
+	t.Parallel()
+
+	plan := FolderSyncPlan{standbys: []standbyCopy{
+		{planned: 2, uid: 20, source: 0}, {planned: 2, uid: 21, source: 1}, {planned: 5, uid: 50, source: 1}, {planned: 9, uid: 90, source: 0},
+	}}
+	tests := []struct {
+		name    string
+		want    []standbyCopy
+		planned uint32
+	}{
+		{name: "first planned UID with two sources", planned: 2, want: plan.standbys[:2]},
+		{name: "middle planned UID", planned: 5, want: plan.standbys[2:3]},
+		{name: "last planned UID", planned: 9, want: plan.standbys[3:]},
+		{name: "UID below all", planned: 1},
+		{name: "UID between two", planned: 6},
+		{name: "UID above all", planned: 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := plan.standbysOf(tt.planned); !slices.Equal(got, tt.want) {
+				t.Errorf("standbysOf(%d) = %+v, want %+v", tt.planned, got, tt.want)
+			}
+		})
+	}
+	if got := (&FolderSyncPlan{}).standbysOf(1); len(got) != 0 {
+		t.Errorf("standbysOf on a plan without standbys = %+v, want none", got)
+	}
+}
+
+func TestFolderSyncPlan_standbysOf_When_Called_Then_DoesNotAllocate(t *testing.T) {
+	plan := FolderSyncPlan{standbys: []standbyCopy{{planned: 2, uid: 20}, {planned: 2, uid: 21, source: 1}, {planned: 5, uid: 50}}}
+
+	if n := testing.AllocsPerRun(100, func() { _ = plan.standbysOf(2) }); n != 0 {
+		t.Errorf("standbysOf allocates %v times per call, want 0", n)
+	}
+}
+
+func Test_buildSyncPlan_When_DestinationIsNotSharedOrSharesNoMessageId_Then_PlansHaveNoStandbys(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "every destination has one mapping", mappings: []config.DirectoryMapping{mapping("A", "X"), mapping("B", "Y")}},
+		{name: "a shared destination and no common Message-Id", mappings: []config.DirectoryMapping{mapping("A", "X"), mapping("C", "X")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": fakeMsgs("m1@x", "m2@x"), "B": fakeMsgs("m1@x"), "C": fakeMsgs("m3@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+			srcTr, dstTr := makePlanTrackers()
+
+			summary, err := buildSyncPlan(e2eContext(t), newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), tt.mappings, srcTr, dstTr, "src", "dst")
+
+			if err != nil {
+				t.Fatalf("buildSyncPlan: %v", err)
+			}
+			if len(summary.Plans) != 2 {
+				t.Fatalf("plans = %+v, want 2", summary.Plans)
+			}
+			for _, p := range summary.Plans {
+				if p.standbySources != nil || p.standbys != nil {
+					t.Errorf("plan %s → %s has standbys %+v from %+v, want nil", p.SourceFolder, p.DestinationFolder, p.standbys, p.standbySources)
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_EverySharedCopyHasAnEmptyBody_Then_EachRunFailsAndNothingEmptyIsAppended(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x"), "B": fakeMsgs("m1@x", "m3@x")})
+	src.answerBody("m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("A", "X"), mapping("B", "X"))
+
+	for run, wantUploaded := range []int{2, 0} {
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+
+		err := runSync(e2eContext(t), cfg, opts)
+
+		if !errors.Is(err, ErrSilentExit) {
+			t.Fatalf("run %d error = %v, want ErrSilentExit", run+1, err)
+		}
+		assertContainsAll(t, out.String(), fmt.Sprintf("%d messages uploaded, 1 errors occurred, 0 folders failed", wantUploaded))
+		assertContainsNone(t, out.String(), "Sync completed successfully")
+		if slices.Contains(dst.folderMsgIDs("X"), "m1@x") || slices.Contains(dst.appended("X"), "m1@x") {
+			t.Errorf("after run %d dst X holds %v and saw APPENDs %v, want no m1@x", run+1, dst.folderMsgIDs("X"), dst.appended("X"))
+		}
+		assertIDs(t, fmt.Sprintf("dst X after run %d", run+1), slices.Sorted(slices.Values(dst.folderMsgIDs("X"))), "m2@x", "m3@x")
+	}
+	if n := dst.callCount("APPEND"); n != 2 {
+		t.Errorf("destination saw %d APPEND commands over both runs, want 2", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SharedDestinationIsRecheckedAndTheReservedCopyHasAnEmptyBody_Then_TheStandbyArrives(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": fakeMsgs("m1@x", "m2@x"),
+		"B": {{msgID: "m1@x", body: bodyOfB}, {msgID: "m3@x"}},
+	})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "X": fakeMsgs("other@x")})
+	dst.hideFromList("X")
+	cfg := e2eConfig(src, dst, 2, mapping("A", "X"), mapping("B", "X"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if err != nil {
+		t.Fatalf("runSync error = %v, want nil\noutput: %s", err, out.String())
+	}
+	assertContainsAll(t, out.String(), "Sync completed successfully")
+	assertContainsNone(t, out.String(), "errors occurred")
+	assertIDs(t, "dst X", slices.Sorted(slices.Values(dst.folderMsgIDs("X"))), "m1@x", "m2@x", "m3@x", "other@x")
+	if !slices.Contains(dst.folderBodies("X"), bodyOfB) {
+		t.Errorf("dst X bodies = %q, want the copy of m1 from B %q", dst.folderBodies("X"), bodyOfB)
+	}
+	if n := dst.callCount("APPEND"); n != 3 {
+		t.Errorf("destination saw %d APPEND commands, want 3", n)
+	}
+	if n := dst.callCount("CREATE"); n != 1 {
+		t.Errorf("destination saw %d CREATE commands, want 1: the recheck path needs the CREATE that reports the existing folder", n)
+	}
+	assertReadOnly(t, "source", src)
 }

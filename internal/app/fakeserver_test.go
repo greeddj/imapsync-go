@@ -576,6 +576,12 @@ type storedMsg struct {
 	uid        uint32
 }
 
+// folderMsg names one message of a store-backed server: the store name of its folder and its Message-Id.
+type folderMsg struct {
+	folder string
+	msgID  string
+}
+
 type appendRecord struct {
 	folder string
 	msgID  string
@@ -595,6 +601,10 @@ type mailStore struct {
 	literal      map[string]bool
 	nilDelim     map[string]bool
 	rawBody      map[string]string
+	rawBodyIn    map[string]map[string]string
+	uidFetchEnd  map[string]string
+	omitBody     map[folderMsg]bool
+	omitFirst    map[folderMsg]bool
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -773,6 +783,49 @@ func (s *fakeServer) answerBody(msgID, value string) {
 	s.store.rawBody[msgID] = value
 }
 
+// answerBodyIn is answerBody for the messages of one folder only. The key is the store name the wire name resolves to.
+func (s *fakeServer) answerBodyIn(folder, msgID, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.rawBodyIn == nil {
+		s.store.rawBodyIn = make(map[string]map[string]string)
+	}
+	if s.store.rawBodyIn[folder] == nil {
+		s.store.rawBodyIn[folder] = make(map[string]string)
+	}
+	s.store.rawBodyIn[folder][msgID] = value
+}
+
+// omitBodyIn makes every FETCH of the message answer without any BODY[] item, as a server does that skips the body of a message it cannot read.
+func (s *fakeServer) omitBodyIn(folder, msgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.omitBody == nil {
+		s.store.omitBody = make(map[folderMsg]bool)
+	}
+	s.store.omitBody[folderMsg{folder, msgID}] = true
+}
+
+// omitBodyFirstIn makes every FETCH of the message send one response without BODY[] before the full response.
+func (s *fakeServer) omitBodyFirstIn(folder, msgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.omitFirst == nil {
+		s.store.omitFirst = make(map[folderMsg]bool)
+	}
+	s.store.omitFirst[folderMsg{folder, msgID}] = true
+}
+
+// endUIDFetchWith makes every UID FETCH of folder end with reply after the untagged responses. reply carries its own status word, as the tagged status line.
+func (s *fakeServer) endUIDFetchWith(folder, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.uidFetchEnd == nil {
+		s.store.uidFetchEnd = make(map[string]string)
+	}
+	s.store.uidFetchEnd[folder] = reply
+}
+
 // setUIDValidity sets the UIDVALIDITY of a folder; 0 makes the server send none.
 func (s *fakeServer) setUIDValidity(folder string, v uint32) {
 	s.mu.Lock()
@@ -882,7 +935,7 @@ func (s *fakeServer) refuseAppendWith(reply string) {
 }
 
 // capturedNames returns the mailbox names the clients passed to verb (CREATE
-// for store servers), in arrival order.
+// for store servers), in arrival order. For "UID FETCH" it returns the UID sets.
 func (s *fakeServer) capturedNames(verb string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1022,15 +1075,19 @@ func splitCommand(line string) (tag, verb, arg string) {
 	return tag, strings.ToUpper(verb), arg
 }
 
-// CREATE, EXAMINE, SELECT and STATUS names are recorded on arrival, whether or not the server accepts them.
+// CREATE, EXAMINE, SELECT and STATUS names and the UID set of each UID FETCH are recorded on arrival, whether or not the server accepts them.
 func (s *fakeServer) recordCommand(verb, arg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.counts[verb]++
 	switch verb {
 	case "UID":
-		sub, _, _ := strings.Cut(arg, " ")
+		sub, rest, _ := strings.Cut(arg, " ")
 		s.counts["UID "+strings.ToUpper(sub)]++
+		if strings.EqualFold(sub, "FETCH") {
+			set, _, _ := strings.Cut(rest, " ")
+			s.names["UID FETCH"] = append(s.names["UID FETCH"], set)
+		}
 	case "CREATE", "EXAMINE", "SELECT", "STATUS":
 		name, _ := parseMailboxArg(arg)
 		s.names[verb] = append(s.names[verb], name)
@@ -1157,6 +1214,13 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	}
 	msgs := slices.Clone(s.store.folders[selected])
 	rawBody := maps.Clone(s.store.rawBody)
+	rawBodyIn := maps.Clone(s.store.rawBodyIn[selected])
+	omitBody := maps.Clone(s.store.omitBody)
+	omitFirst := maps.Clone(s.store.omitFirst)
+	endReply := ""
+	if byUID {
+		endReply = s.store.uidFetchEnd[selected]
+	}
 	s.mu.Unlock()
 
 	if selected == "" {
@@ -1193,14 +1257,24 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			hdr := imapMsgIDHeader(m.msgID)
 			parts = append(parts, fmt.Sprintf("BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s", len(hdr), hdr))
 		}
-		if wantBody {
-			if raw, ok := rawBody[m.msgID]; ok {
+		key := folderMsg{selected, m.msgID}
+		if wantBody && omitFirst[key] {
+			rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
+		}
+		if wantBody && !omitBody[key] {
+			if raw, ok := rawBodyIn[m.msgID]; ok {
+				parts = append(parts, "BODY[] "+raw)
+			} else if raw, ok := rawBody[m.msgID]; ok {
 				parts = append(parts, "BODY[] "+raw)
 			} else {
 				parts = append(parts, fmt.Sprintf("BODY[] {%d}\r\n%s", len(m.body), m.body))
 			}
 		}
 		rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
+	}
+	if endReply != "" {
+		rw.line("%s %s", tag, endReply)
+		return
 	}
 	rw.line("%s OK FETCH completed", tag)
 }

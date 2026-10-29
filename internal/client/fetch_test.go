@@ -862,6 +862,52 @@ func TestMessage_MessageID(t *testing.T) {
 	}
 }
 
+func TestMessage_UID(t *testing.T) {
+	t.Parallel()
+
+	withUID := imap.NewMessage(1, nil)
+	withUID.Uid = 42
+	tests := []struct {
+		msg  Message
+		name string
+		want uint32
+	}{
+		{name: "zero value", msg: Message{}},
+		{name: "server sent no UID", msg: Message{m: imap.NewMessage(1, nil)}},
+		{name: "UID present", msg: Message{m: withUID}, want: 42},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.msg.UID(); got != tt.want {
+				t.Errorf("UID() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_MessagesAreDelivered_Then_UIDIsTheRequestedOne(t *testing.T) {
+	t.Parallel()
+
+	_, c := newScriptedClient(t, &mailboxScript{
+		folders:     []scriptFolder{{name: "INBOX", sizes: []uint32{1, 1, 1}}},
+		uidMessages: 3,
+	})
+	var got []uint32
+
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{12, 10, 11}, func(msg Message) error {
+		got = append(got, msg.UID())
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+	if want := []uint32{10, 11, 12}; !slices.Equal(got, want) {
+		t.Errorf("Message.UID() of the delivered messages = %v, want %v", got, want)
+	}
+}
+
 // Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip asserts
 // that time spent in onMessage, our own work, is never counted as server silence.
 func Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip(t *testing.T) {

@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -928,4 +930,381 @@ func Test_newSyncWorkerPool_When_WorkerListFails_Then_ErrorNamesTheWorkerLabel(t
 			}
 		})
 	}
+}
+
+// standbyFolder holds one other message and then m1@x, so the standby UID is 2 and a fetch of the whole folder would show.
+func standbyFolder(body string) []fakeMsg {
+	return []fakeMsg{{msgID: "other@x"}, {msgID: "m1@x", body: body}}
+}
+
+// standbyPlan is the plan of folder A to X for the UID 1. The UID 2 of each folder stands by for it, in the order given.
+func standbyPlan(folders ...string) FolderSyncPlan {
+	plan := FolderSyncPlan{
+		SourceFolder:            "A",
+		DestinationFolder:       "X",
+		SrcUIDs:                 []uint32{1},
+		NewMessages:             1,
+		SrcUIDValidity:          1,
+		DestinationFolderExists: true,
+	}
+	for i, folder := range folders {
+		plan.standbySources = append(plan.standbySources, standbySource{folder: folder, uidValidity: 1})
+		plan.standbys = append(plan.standbys, standbyCopy{planned: 1, uid: 2, source: uint32(i)})
+	}
+	return plan
+}
+
+type standbyRun struct {
+	tr     *progress.Tracker
+	log    string
+	synced int
+	errs   int
+}
+
+// runStandbyPlan runs the plan on one worker and returns what the worker counted and logged.
+func runStandbyPlan(ctx context.Context, t *testing.T, src, dst *fakeServer, plan FolderSyncPlan, verbose bool) standbyRun {
+	t.Helper()
+
+	w := &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}
+	sb := &syncBuffer{}
+	// The sentinel stays active so the render pass Stop triggers still prints the
+	// queued log lines.
+	pw := progress.NewWriter(2, true)
+	pw.SetOutputWriter(sb)
+	pw.Start()
+	pw.AppendTracker(progress.NewTracker("sentinel", 100))
+	tr := progress.NewTracker("test", 10)
+	pw.AppendTracker(tr)
+
+	synced, errs := runFolderSync(ctx, w, plan, tr, 0, 1, pw, verbose)
+	pw.Stop()
+	pw.WaitForRenderDone()
+	return standbyRun{tr: tr, log: sb.String(), synced: synced, errs: errs}
+}
+
+func Test_runFolderSync_When_PlannedMessageHasEmptyBodyAndAStandby_Then_CopiesTheStandbyOnce(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	if !got.tr.IsDone() || got.tr.IsErrored() {
+		t.Errorf("tracker done = %t, errored = %t, want done and not errored", got.tr.IsDone(), got.tr.IsErrored())
+	}
+	if want := "1/1 Synced messages 1 A → X"; got.tr.Message != want {
+		t.Errorf("final tracker message = %q, want %q", got.tr.Message, want)
+	}
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+	}
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1", "2")
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	assertReadOnly(t, "source", src)
+}
+
+func Test_runFolderSync_When_PlannedBodyIsMissingAndAStandby_Then_CopiesTheStandby(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+	src.omitBodyIn("A", "m1@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+	}
+}
+
+func Test_runFolderSync_When_BodylessResponseComesBeforeTheFullOne_Then_CopiesThePlannedMessageAndNoStandby(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(subjectBody("m1@x", "from B"))})
+	src.omitBodyFirstIn("A", "m1@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	assertIDs(t, "dst APPENDs", dst.appended("X"), "m1@x")
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{imapFullBody("m1@x")}) {
+		t.Errorf("dst X bodies = %q, want the copy of A", bodies)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
+}
+
+func Test_runFolderSync_When_FirstStandbyIsAlsoEmpty_Then_TheNextSourceIsTried(t *testing.T) {
+	t.Parallel()
+
+	bodyOfC := subjectBody("m1@x", "from C")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder(bodyOfC)})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	src.answerBodyIn("B", "m1@x", "{0}\r\n")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B", "C"), false)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfC}) {
+		t.Errorf("dst X bodies = %q, want only the copy of C %q", bodies, bodyOfC)
+	}
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B", "C")
+}
+
+func Test_runFolderSync_When_FirstStandbyCopiesTheMessage_Then_LaterSourcesAreNotFetched(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B", "C"), false)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+}
+
+func Test_runFolderSync_When_EveryStandbyIsEmpty_Then_CountsOneErrorAndAppendsNothing(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+	src.answerBody("m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B", "C"), true)
+
+	if got.synced != 0 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1: one error for the planned message, not one for each try", got.synced, got.errs)
+	}
+	if !got.tr.IsErrored() {
+		t.Error("tracker not marked as errored")
+	}
+	if want := "1/1 Synced messages 0 (errors: 1) A → X"; got.tr.Message != want {
+		t.Errorf("final tracker message = %q, want %q", got.tr.Message, want)
+	}
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+	assertContainsAll(t, got.log, "Failed to append message to X: [dst] source returned an empty body")
+	assertContainsNone(t, got.log, "Copied message")
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B", "C")
+}
+
+func Test_runFolderSync_When_DestinationRefusesThePlannedMessage_Then_NoStandbyIsFetched(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder("")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.refuseAppend()
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 0 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", got.synced, got.errs)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+}
+
+func Test_runFolderSync_When_DestinationRefusesTheStandby_Then_CountsOneErrorAndTriesNoOtherSource(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.refuseAppend()
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B", "C"), false)
+
+	if got.synced != 0 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", got.synced, got.errs)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+}
+
+func Test_runFolderSync_When_PlanHasNoStandbys_Then_EmptyBodyCountsOneError(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan(), false)
+
+	if got.synced != 0 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", got.synced, got.errs)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_MainStreamFailsAfterTheRefusal_Then_TheStandbyStillCopies(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 1, 1: the stream error is the only error", got.synced, got.errs)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "fetch cut short")
+	assertContainsNone(t, got.log, "Stream error for folder B")
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+	}
+}
+
+func Test_runFolderSync_When_StandbySourceUIDValidityChanged_Then_CountsOneErrorAndAppendsNothing(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(subjectBody("m1@x", "from B"))})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	src.setUIDValidity("B", 2)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 0 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", got.synced, got.errs)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder B: ", "source folder changed after the sync plan, run sync again (UIDVALIDITY 1, now 2)")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+	if n := src.callCount("UID FETCH"); n != 1 {
+		t.Errorf("source saw %d UID FETCH commands, want 1: only the main stream fetches", n)
+	}
+}
+
+func Test_runFolderSync_When_ContextEndsDuringTheMainStream_Then_NoStandbyIsFetched(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(subjectBody("m1@x", "from B"))})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	src.onCommand("UID", cancel)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(ctx, t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 0 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 0, 0", got.synced, got.errs)
+	}
+	if want := "1/1 Canceled A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_ContextEndsDuringTheStandbyStream_Then_ReturnsCanceledWithoutCounting(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(subjectBody("m1@x", "from B")), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	var fetches atomic.Int32
+	src.onCommand("UID", func() {
+		if fetches.Add(1) == 2 {
+			cancel()
+		}
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(ctx, t, src, dst, standbyPlan("B", "C"), false)
+
+	if got.synced != 0 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 0, 0", got.synced, got.errs)
+	}
+	if want := "1/1 Canceled A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_NamesCarryControlCharacters_Then_TheStandbyLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		hostileID        = "<m\x1b[2J@x\u202e>"
+		standbyName      = "Std\x1b[2J\u202ez"
+		standbyWireName  = "Std&ABs-[2J&IC4-z"
+		standbyShownName = `Std\x1b[2J\u202ez`
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		hostileWireName: {{msgID: "e1@x", envelopeID: hostileID}},
+		standbyWireName: {{msgID: "other@x"}, {msgID: "e1@x", envelopeID: hostileID}},
+	})
+	src.answerBodyIn(hostileWireName, "e1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: nil})
+	plan := FolderSyncPlan{
+		SourceFolder:            hostileName,
+		DestinationFolder:       hostileName,
+		SrcUIDs:                 []uint32{1},
+		NewMessages:             1,
+		SrcUIDValidity:          1,
+		DestinationFolderExists: true,
+		standbySources:          []standbySource{{folder: standbyName, uidValidity: 1}},
+		standbys:                []standbyCopy{{planned: 1, uid: 2, source: 0}},
+	}
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, true)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	want := "Copied message " + `<m\x1b[2J@x\u202e>` + " to " + hostileShownName + " from " + standbyShownName + ": the copy in " + hostileShownName + " has no usable body"
+	assertContainsAll(t, got.log, want)
+	assertContainsNone(t, got.log, hostileName, standbyName, "\u202e", "\x1b[2J")
+	for _, line := range strings.Split(got.log, "\n") {
+		// The writer puts its own erase-line sequence before each log line.
+		if _, text, found := strings.Cut(line, "Copied message"); found {
+			assertAllGraphic(t, "log line", "Copied message"+text)
+		}
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), hostileWireName, standbyWireName)
+	assertIDs(t, "dst APPEND names", dst.appended(hostileWireName), "e1@x")
 }

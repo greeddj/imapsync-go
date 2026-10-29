@@ -35,11 +35,13 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 		{
 			name:        "message has no body section",
 			message:     noBody,
+			wantErrIs:   ErrMissingBody,
 			wantErrText: "no body",
 		},
 		{
 			name:        "zero message",
 			message:     func() Message { return Message{} },
+			wantErrIs:   ErrMissingBody,
 			wantErrText: "no body",
 		},
 		{
@@ -58,6 +60,7 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 			name:        "message has no body section and the client has no session",
 			message:     noBody,
 			noSession:   true,
+			wantErrIs:   ErrMissingBody,
 			wantErrText: "no body",
 		},
 		{
@@ -77,19 +80,19 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 		{
 			name:        "body is NIL",
 			message:     nilBody,
-			wantErrIs:   errEmptyBody,
+			wantErrIs:   ErrEmptyBody,
 			wantErrText: "source returned an empty body",
 		},
 		{
 			name:      "body is a zero-length literal",
 			message:   func() Message { return messageWithBody(bytes.NewBuffer(nil)) },
-			wantErrIs: errEmptyBody,
+			wantErrIs: ErrEmptyBody,
 		},
 		{
 			name:      "body is NIL and the client has no session",
 			message:   nilBody,
 			noSession: true,
-			wantErrIs: errEmptyBody,
+			wantErrIs: ErrEmptyBody,
 		},
 	}
 	for _, tt := range tests {
@@ -231,8 +234,8 @@ func Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend(t *testing.T) 
 			if calls != 1 {
 				t.Errorf("callback ran %d times, want 1", calls)
 			}
-			if !errors.Is(appendErr, errEmptyBody) {
-				t.Fatalf("AppendMessage error = %v, want %v", appendErr, errEmptyBody)
+			if !errors.Is(appendErr, ErrEmptyBody) {
+				t.Fatalf("AppendMessage error = %v, want %v", appendErr, ErrEmptyBody)
 			}
 			if want := "source returned an empty body"; !strings.Contains(appendErr.Error(), want) {
 				t.Errorf("AppendMessage error = %q, want it to contain %q", appendErr, want)
@@ -1259,8 +1262,8 @@ func Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmp
 	if bodyLen != 0 {
 		t.Errorf("body length = %d, want 0: go-imap keeps no quoted string, so a change here needs a new look at the guard", bodyLen)
 	}
-	if !errors.Is(appendErr, errEmptyBody) {
-		t.Errorf("AppendMessage error = %v, want %v", appendErr, errEmptyBody)
+	if !errors.Is(appendErr, ErrEmptyBody) {
+		t.Errorf("AppendMessage error = %v, want %v", appendErr, ErrEmptyBody)
 	}
 	if got := dst.callCount("APPEND"); got != 0 {
 		t.Errorf("destination APPEND count = %d, want 0", got)
@@ -1312,8 +1315,8 @@ func Test_AppendMessage_When_BodyIsEmptyAndSessionIsGone_Then_SendsNoDialLoginOr
 				return c.AppendMessage(t.Context(), "INBOX", messageWithBody(nil))
 			})
 
-			if !errors.Is(err, errEmptyBody) {
-				t.Fatalf("AppendMessage error = %v, want %v", err, errEmptyBody)
+			if !errors.Is(err, ErrEmptyBody) {
+				t.Fatalf("AppendMessage error = %v, want %v", err, ErrEmptyBody)
 			}
 			if got := dials.Load(); got != 0 {
 				t.Errorf("dial count = %d, want 0", got)
