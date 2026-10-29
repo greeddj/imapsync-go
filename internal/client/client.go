@@ -55,6 +55,9 @@ const (
 	// reviveInterval is how long a client that gave up waits before one login attempt,
 	// so a dead server does not get one reconnect per message.
 	reviveInterval = 5 * time.Minute
+	// gmailExtension is the capability that Gmail advertises. Gmail keeps one message
+	// for each Message-Id in a folder, so the sync must not upload repeated copies.
+	gmailExtension = "X-GM-EXT-1"
 )
 
 var (
@@ -84,7 +87,7 @@ type Options struct {
 	ReadLimiter  *rate.Limiter
 	WriteLimiter *rate.Limiter
 	Auth         string // "", "login" or "cram-md5" in any letter case; New refuses other values
-	Label        string // prefixes log lines, LIST, CREATE and APPEND errors, the sync scan and copy errors, and a reconnect give-up; dial, LOGIN and show statistics errors carry none
+	Label        string // prefixes log lines, LIST, CAPABILITY, CREATE and APPEND errors, the sync scan and copy errors, and a reconnect give-up; dial, LOGIN and show statistics errors carry none
 	DialTimeout  time.Duration
 	UseTLS       bool
 	Verbose      bool
@@ -129,6 +132,7 @@ type Client struct {
 	cancelled      atomic.Bool
 	useTLS         bool
 	verbose        bool
+	oneCopyPerID   bool // set once by New before it returns, so readers need no lock
 }
 
 // progressWriterRef and progressTrackerRef carry an interface value through
@@ -229,8 +233,48 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	}
 	c.delimiter = c.mailboxCache.delimiter
 
+	if err := c.detectOneCopyPerID(ctx); err != nil {
+		_ = c.Logout()
+		return nil, fmt.Errorf("failed to read server capabilities: %w", err)
+	}
+
 	return c, nil
 }
+
+// detectOneCopyPerID asks after LOGIN, because go-imap drops the greeting list then. Support reuses a
+// list that LOGIN OK carried and sends CAPABILITY only when it has none.
+func (c *Client) detectOneCopyPerID(ctx context.Context) error {
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var supported bool
+	err := c.safeCall(func(cli *imapclient.Client) error {
+		ok, err := cli.Support(gmailExtension)
+		if err != nil {
+			return fmt.Errorf("[%s] capability: %w", c.prefix, err)
+		}
+		supported = ok
+		return nil
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.oneCopyPerID = supported
+	return nil
+}
+
+// KeepsOneCopyPerMessageID reports whether the server advertised X-GM-EXT-1 after LOGIN. Gmail keeps one message for each Message-Id in a folder.
+func (c *Client) KeepsOneCopyPerMessageID() bool { return c.oneCopyPerID }
 
 // supportedAuth lowers the value as connectAndLogin does, so the default branch
 // of its switch sees only an empty value or login.

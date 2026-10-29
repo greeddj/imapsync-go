@@ -687,8 +687,13 @@ func byeAfterLoginHandler(srv *fakeServer, release <-chan struct{}, farewell str
 // sees each command first: handled=true skips the default answer, keep=false
 // ends the connection.
 func interceptHandler(srv *fakeServer, intercept func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool)) func(net.Conn) {
+	return interceptHandlerGreeting(srv, scriptedGreeting, intercept)
+}
+
+// interceptHandlerGreeting is interceptHandler with its own greeting line.
+func interceptHandlerGreeting(srv *fakeServer, greeting string, intercept func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool)) func(net.Conn) {
 	return func(conn net.Conn) {
-		serveCommands(srv, conn, scriptedGreeting, func(rd *bufio.Reader, cmd command) bool {
+		serveCommands(srv, conn, greeting, func(rd *bufio.Reader, cmd command) bool {
 			if handled, keep := intercept(conn, rd, cmd); handled {
 				return keep
 			}
@@ -877,6 +882,33 @@ func examineAs(uidValidity uint32) func(net.Conn, *bufio.Reader, command) (handl
 			writeLine(conn, "* OK [UIDVALIDITY %d] UIDs valid", uidValidity)
 		}
 		writeLine(conn, "%s OK [READ-ONLY] EXAMINE completed", cmd.tag)
+		return true, true
+	}
+}
+
+// loginAs is an interceptHandler hook that answers LOGIN with OK and the response code text, for example "[CAPABILITY IMAP4rev1]". Empty leaves the code out.
+func loginAs(code string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LOGIN" {
+			return false, true
+		}
+		if code == "" {
+			writeLine(conn, "%s OK LOGIN completed", cmd.tag)
+		} else {
+			writeLine(conn, "%s OK %s LOGIN completed", cmd.tag, code)
+		}
+		return true, true
+	}
+}
+
+// capabilityAs is an interceptHandler hook that answers CAPABILITY with the given capability names.
+func capabilityAs(capabilities string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "CAPABILITY" {
+			return false, true
+		}
+		writeLine(conn, "* CAPABILITY %s", capabilities)
+		writeLine(conn, "%s OK CAPABILITY completed", cmd.tag)
 		return true, true
 	}
 }

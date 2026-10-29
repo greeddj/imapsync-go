@@ -1087,6 +1087,232 @@ func Test_New_whenMailboxListRefused(t *testing.T) {
 	}
 }
 
+// newReadyClient runs New against srv and stops the client when the test ends.
+func newReadyClient(t *testing.T, srv *fakeServer, opts Options) *Client {
+	t.Helper()
+
+	opts.DialTimeout = 5 * time.Second
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+	return c
+}
+
+func Test_New_When_ServerAdvertisesGmailExtensionAfterLogin_Then_KeepsOneCopyPerMessageID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		loginCode    string
+		wantCapCalls int
+	}{
+		{name: "LOGIN OK carries the list", loginCode: "[CAPABILITY IMAP4rev1 X-GM-EXT-1]"},
+		{name: "CAPABILITY reply lists it", wantCapCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs(tt.loginCode), capabilityAs("IMAP4rev1 X-GM-EXT-1"))))
+
+			c := newReadyClient(t, srv, Options{})
+
+			if !c.KeepsOneCopyPerMessageID() {
+				t.Error("KeepsOneCopyPerMessageID = false, want true")
+			}
+			if got := srv.callCount("CAPABILITY"); got != tt.wantCapCalls {
+				t.Errorf("CAPABILITY count = %d, want %d", got, tt.wantCapCalls)
+			}
+		})
+	}
+}
+
+func Test_New_When_ServerDoesNotAdvertiseGmailExtensionAfterLogin_Then_ReportsFalse(t *testing.T) {
+	t.Parallel()
+
+	const (
+		plainGreeting = "* OK [CAPABILITY IMAP4rev1] fake ready"
+		gmailGreeting = "* OK [CAPABILITY IMAP4rev1 X-GM-EXT-1] fake ready"
+	)
+	tests := []struct {
+		name         string
+		greeting     string
+		loginCode    string
+		wantCapCalls int
+	}{
+		{name: "nowhere", greeting: plainGreeting, wantCapCalls: 1},
+		{name: "only in the greeting, which go-imap drops at LOGIN", greeting: gmailGreeting, wantCapCalls: 1},
+		{name: "in the greeting, and LOGIN OK carries a list without it", greeting: gmailGreeting, loginCode: "[CAPABILITY IMAP4rev1]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandlerGreeting(srv, tt.greeting, chainHooks(loginAs(tt.loginCode), capabilityAs("IMAP4rev1"))))
+
+			c := newReadyClient(t, srv, Options{})
+
+			if c.KeepsOneCopyPerMessageID() {
+				t.Error("KeepsOneCopyPerMessageID = true, want false")
+			}
+			if got := srv.callCount("CAPABILITY"); got != tt.wantCapCalls {
+				t.Errorf("CAPABILITY count = %d, want %d", got, tt.wantCapCalls)
+			}
+		})
+	}
+}
+
+func Test_New_When_ContextEndsDuringCapabilityCheck_Then_ReturnsCanceled(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("CAPABILITY"))
+	ended := make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, st.intercept), ended))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var got *Client
+	errc := make(chan error, 1)
+	go func() {
+		var err error
+		got, err = New(ctx, srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second})
+		errc <- err
+	}()
+
+	awaitSignal(t, st.reached, "the server to receive CAPABILITY")
+	cancel()
+
+	err := awaitError(t, errc, "New")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("New error = %v, want context.Canceled", err)
+	}
+	if got != nil {
+		got.Cancel()
+		t.Error("New returned a client alongside the error")
+	}
+	awaitSignal(t, ended, "the client to close the socket")
+	if n := srv.callCount("LOGIN"); n != 1 {
+		t.Errorf("LOGIN count = %d, want 1: a cancel must not reconnect", n)
+	}
+}
+
+func Test_New_When_CapabilityIsRefused_Then_FailsAndNamesTheLabel(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "CAPABILITY" {
+			return false, true
+		}
+		writeLine(conn, "%s NO capability refused", cmd.tag)
+		return true, true
+	}))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "dst", DialTimeout: 5 * time.Second})
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the capability failure")
+	}
+
+	if c != nil {
+		t.Error("New returned a client alongside the error")
+	}
+	for _, want := range []string{"failed to read server capabilities", "[dst] capability", "capability refused"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	for verb, want := range map[string]int{"CAPABILITY": 1, "LOGIN": 1, "LOGOUT": 1} {
+		if got := srv.callCount(verb); got != want {
+			t.Errorf("%s count = %d, want %d", verb, got, want)
+		}
+	}
+}
+
+func Test_New_When_ConnectionDropsDuringCapabilityCheck_Then_ReconnectsAndReadsTheNewSession(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		return cmd.verb == "CAPABILITY", false
+	}))
+	srv.addConnHandler(interceptHandler(srv, loginAs("[CAPABILITY IMAP4rev1 X-GM-EXT-1]")))
+
+	c := newReadyClient(t, srv, Options{})
+
+	if !c.KeepsOneCopyPerMessageID() {
+		t.Error("KeepsOneCopyPerMessageID = false, want true: the answer comes from the new session")
+	}
+	for verb, want := range map[string]int{"LOGIN": 2, "LIST": 1, "CAPABILITY": 1} {
+		if got := srv.callCount(verb); got != want {
+			t.Errorf("%s count = %d, want %d", verb, got, want)
+		}
+	}
+}
+
+func Test_detectOneCopyPerID_When_ContextAlreadyEnded_Then_SendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := c.detectOneCopyPerID(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("detectOneCopyPerID error = %v, want context.Canceled", err)
+	}
+	if got := srv.callCount("CAPABILITY"); got != 0 {
+		t.Errorf("CAPABILITY count = %d, want 0", got)
+	}
+}
+
+// capabilityAnsweredContext reports cancellation once the server has seen CAPABILITY. Its Done
+// channel stays nil, so the client is not cancelled and the end lands after the reply.
+type capabilityAnsweredContext struct {
+	context.Context
+	srv *fakeServer
+}
+
+func (c capabilityAnsweredContext) Done() <-chan struct{} { return nil }
+
+func (c capabilityAnsweredContext) Err() error {
+	if c.srv.callCount("CAPABILITY") > 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+func Test_detectOneCopyPerID_When_ContextEndsAfterTheReply_Then_ReturnsErrorAndStoresNothing(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, capabilityAs("IMAP4rev1 X-GM-EXT-1")))
+	c := newClientWithFake(t, srv)
+
+	err := c.detectOneCopyPerID(capabilityAnsweredContext{Context: t.Context(), srv: srv})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("detectOneCopyPerID error = %v, want context.Canceled", err)
+	}
+	if got := srv.callCount("CAPABILITY"); got != 1 {
+		t.Errorf("CAPABILITY count = %d, want 1 (the context must end after the reply)", got)
+	}
+	if c.KeepsOneCopyPerMessageID() {
+		t.Error("KeepsOneCopyPerMessageID = true, want false: a cancelled check stores nothing")
+	}
+}
+
 // Test_cramMD5Auth covers the SASL client the CRAM-MD5 login hands to go-imap.
 func Test_cramMD5Auth(t *testing.T) {
 	t.Parallel()

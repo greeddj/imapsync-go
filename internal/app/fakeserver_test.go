@@ -616,6 +616,7 @@ type mailStore struct {
 	seenMutating int
 	bareInbox    bool
 	onePerID     bool
+	gmailExt     bool
 }
 
 // newStoreServer starts a fake IMAP server with in-memory mailboxes; queued connHandlers take precedence. An empty delimiter makes LIST answer NIL, and no folders means no LIST entry.
@@ -730,6 +731,22 @@ func (s *fakeServer) keepOnePerMessageID() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.onePerID = true
+}
+
+// advertiseGmailExtension makes CAPABILITY list X-GM-EXT-1, as Gmail does after LOGIN. The LOGIN reply carries no list, so the client has to ask.
+func (s *fakeServer) advertiseGmailExtension() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.gmailExt = true
+}
+
+func (s *fakeServer) capabilities() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.gmailExt {
+		return "IMAP4rev1 X-GM-EXT-1"
+	}
+	return "IMAP4rev1"
 }
 
 // A hidden folder stays selectable and keeps its messages, as with a mailbox that has the read right but no lookup right.
@@ -1051,7 +1068,7 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 			rw.line("%s OK LOGOUT completed", tag)
 			return
 		case "CAPABILITY":
-			rw.line("* CAPABILITY IMAP4rev1")
+			rw.line("* CAPABILITY %s", s.capabilities())
 			rw.line("%s OK CAPABILITY completed", tag)
 		case "LIST":
 			s.storeList(rw, tag)

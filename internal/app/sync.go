@@ -63,8 +63,33 @@ type FolderSyncPlan struct {
 	NewMessages             int
 	NewSize                 uint64
 	ExtraCopies             int
+	RepeatedCopies          int // source copies that the one-copy rule leaves out of the plan
 	SrcUIDValidity          uint32
+	copyRule                copyRule
 	DestinationFolderExists bool
+}
+
+// copyRule says how a plan counts the copies of one Message-Id. The zero value copies by count.
+type copyRule uint8
+
+const (
+	copyByCount         copyRule = iota
+	copyOnePerMessageID          // at most one copy, for a destination that keeps one message for each Message-Id
+)
+
+func copyRuleOf(dst *client.Client) copyRule {
+	if dst.KeepsOneCopyPerMessageID() {
+		return copyOnePerMessageID
+	}
+	return copyByCount
+}
+
+// sourceCopies cuts a group to its lowest UID under the one-copy rule. The scan sorts refs by ascending UID.
+func (r copyRule) sourceCopies(refs []client.MessageRef) []client.MessageRef {
+	if r == copyOnePerMessageID && len(refs) > 1 {
+		return refs[:1]
+	}
+	return refs
 }
 
 type standbySource struct {
@@ -364,6 +389,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 						plan.NewMessages, utils.FormatSize(plan.NewSize))
 					if plan.ExtraCopies > 0 {
 						_, _ = fmt.Fprintf(out, "  ℹ️  %d of these messages have a Message-Id that the destination folder already holds\n", plan.ExtraCopies)
+					}
+					if plan.RepeatedCopies > 0 {
+						_, _ = fmt.Fprintf(out, "  ℹ️  %d repeated copies of these messages are left out: the destination server keeps one message for each Message-Id\n", plan.RepeatedCopies)
 					}
 					if verbose {
 						// Dumping every UID before the confirm-prompt
@@ -676,8 +704,10 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 	fresh := make([]client.MessageRef, 0, len(srcMap))
 	onDst := make([]uint32, 0, min(len(srcMap), len(dstMap)))
 	var extra []uint32
-	for id, refs := range srcMap {
+	var repeated []repeatedCopies
+	for id, all := range srcMap {
 		held := dstMap[id]
+		refs := plan.copyRule.sourceCopies(all)
 		left := m.destinationLeft(refs, held)
 		fresh = append(fresh, left...)
 		if len(held) > 0 {
@@ -685,9 +715,15 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 				extra = append(extra, ref.UID)
 			}
 		}
-		// Both lists ascend by UID and left is a subsequence of refs, so one walk finds the covered refs.
+		// Only the one-copy rule cuts a group, so a plan that counts by copies never fills repeated.
+		if others := len(all) - len(refs); others > 0 {
+			for _, ref := range left {
+				repeated = append(repeated, repeatedCopies{uid: ref.UID, others: others})
+			}
+		}
+		// Both lists ascend by UID and left is a subsequence of all, so one walk finds the covered refs. Cut refs count as covered.
 		next := 0
-		for _, ref := range refs {
+		for _, ref := range all {
 			if next < len(left) && left[next].UID == ref.UID {
 				next++
 				continue
@@ -698,9 +734,10 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 	slices.SortFunc(fresh, func(a, b client.MessageRef) int { return cmp.Compare(a.UID, b.UID) })
 	slices.Sort(onDst)
 	slices.Sort(extra)
+	slices.SortFunc(repeated, func(a, b repeatedCopies) int { return cmp.Compare(a.uid, b.uid) })
 	var drops recheckDrops
 	var newSize uint64
-	var extraCopies int
+	var extraCopies, repeatedTotal int
 	kept := make([]uint32, 0, min(len(plan.SrcUIDs), len(fresh)))
 	for _, uid := range plan.SrcUIDs {
 		if i, ok := slices.BinarySearchFunc(fresh, uid, compareRefToUID); ok {
@@ -708,6 +745,9 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 			newSize += uint64(fresh[i].Size)
 			if _, ok := slices.BinarySearch(extra, uid); ok {
 				extraCopies++
+			}
+			if j, ok := slices.BinarySearchFunc(repeated, uid, compareRepeatedToUID); ok {
+				repeatedTotal += repeated[j].others
 			}
 			continue
 		}
@@ -721,9 +761,18 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 	plan.NewMessages = len(kept)
 	plan.NewSize = newSize
 	plan.ExtraCopies = extraCopies
+	plan.RepeatedCopies = repeatedTotal
 	plan.DestinationFolderExists = true
 	return plan, drops
 }
+
+// repeatedCopies says that the planned uid stands for others more source copies of its Message-Id.
+type repeatedCopies struct {
+	uid    uint32
+	others int
+}
+
+func compareRepeatedToUID(r repeatedCopies, uid uint32) int { return cmp.Compare(r.uid, uid) }
 
 func compareRefToUID(ref client.MessageRef, uid uint32) int { return cmp.Compare(ref.UID, uid) }
 
@@ -962,6 +1011,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 	scans := make([]folderScan, n)
 	plans := make([]FolderSyncPlan, n)
 	shared := newSharedDestinations(mappings)
+	rule := copyRuleOf(dstClient)
 	var totalNew atomic.Int64
 	var totalNewSize atomic.Uint64
 
@@ -986,7 +1036,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
 			srcTracker.Increment(1)
-			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize, shared)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize, shared, rule)
 		}
 		return nil
 	})
@@ -1019,7 +1069,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			}
 			dstTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", dstLabel, termsafe.Escape(m.Destination), idx+1, n))
 			dstTracker.Increment(1)
-			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize, shared)
+			maybeDiff(&scans[idx], idx, mappings, plans, &totalNew, &totalNewSize, shared, rule)
 			if scans[idx].dstErr != nil {
 				return fmt.Errorf("scan destination folder %q: %w", m.Destination, scans[idx].dstErr)
 			}
@@ -1079,7 +1129,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 }
 
 // maybeDiff frees srcMap and dstMap right after the diff, so peak memory stays proportional to one folder, not len(mappings).
-func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64, shared *sharedDestinations) bool {
+func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64, shared *sharedDestinations, rule copyRule) bool {
 	if s.done.Add(1) != 2 {
 		return false
 	}
@@ -1108,10 +1158,11 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	standby := standbySource{folder: mappings[idx].Source, uidValidity: s.srcUIDValidity}
 	newUIDs := make([]uint32, 0, s.srcMessages)
 	var newSize uint64
-	var extra int
+	var extra, repeated int
 	var m copyMatcher
-	for id, refs := range s.srcMap {
+	for id, all := range s.srcMap {
 		onDst := s.dstMap[id]
+		refs := rule.sourceCopies(all)
 		left := m.destinationLeft(refs, onDst)
 		held := reserved[id]
 		var owner []int32
@@ -1135,6 +1186,7 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 			}
 			newUIDs = append(newUIDs, ref.UID)
 			newSize += uint64(ref.Size)
+			repeated += len(all) - len(refs)
 			// Only copies that the destination already holds count. A copy reserved in this run is not there yet, and the next run sees it if the server keeps it.
 			if len(onDst) > 0 {
 				extra++
@@ -1154,8 +1206,10 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 		NewMessages:             len(newUIDs),
 		NewSize:                 newSize,
 		ExtraCopies:             extra,
+		RepeatedCopies:          repeated,
 		SrcUIDs:                 newUIDs,
 		SrcUIDValidity:          s.srcUIDValidity,
+		copyRule:                rule,
 	}
 	totalNew.Add(int64(len(newUIDs)))
 	totalNewSize.Add(newSize)
