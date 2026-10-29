@@ -70,18 +70,7 @@ const (
 	keepMissingUID
 )
 
-// FetchMessageMap returns Message-Id -> messages for every message in folder.
-//
-// Each value lists the messages with that Message-Id in ascending UID order,
-// each UID once. Messages without a Message-Id have no diff key: they are left
-// out and reported once.
-//
-// A message with a Message-Id but no UID fails the scan.
-//
-// It scans the source side, which plans copies by UID; FetchMessageCopies scans the destination side.
-//
-// The second result is the UIDVALIDITY that the UIDs belong to, or 0 when the
-// server sent none.
+// FetchMessageMap scans the source: Message-Id -> copies in ascending UID order, and the UIDVALIDITY of the UIDs, or 0 when the server sent none.
 func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, uint32, error) {
 	return c.scanMessageIDs(ctx, folder, failOnMissingUID)
 }
@@ -152,8 +141,7 @@ func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missing
 		seqset.AddRange(1, total)
 		messages := make(chan *imap.Message, messageChanBuffer)
 		done := make(chan error, 1)
-		// RFC822.SIZE is part of the same FETCH so the sizes come free with
-		// the diff scan - no extra round-trip per folder.
+		// RFC822.SIZE is part of the same FETCH, so the sizes come free with the diff scan.
 		items := []imap.FetchItem{messageIDHeaderSection.FetchItem(), imap.FetchUid, imap.FetchRFC822Size}
 		go func() { done <- cli.Fetch(seqset, items, messages) }()
 
@@ -280,21 +268,7 @@ func trimAngleBrackets(id string) string {
 	return id
 }
 
-// StreamMessagesByUIDs fetches the bodies for the given UIDs in batches and
-// invokes onMessage for each as it arrives. The caller is expected to feed in
-// UIDs already filtered against the destination - typically the result of a
-// Message-Id diff of FetchMessageMap on the source against FetchMessageCopies on the destination.
-//
-// Streaming avoids materializing every body into memory at once; large
-// mailboxes can produce many GB of cumulative body data.
-//
-// If onMessage returns an error, the channel from the in-flight batch is
-// drained (so the producer goroutine exits cleanly) and the error is
-// returned without scheduling further batches.
-//
-// The UIDs belong to uidValidity. A session that reports another value or none
-// gets no FETCH, and the stream ends with ErrUIDValidityChanged. A zero
-// uidValidity skips the check.
+// StreamMessagesByUIDs streams bodies, so no mailbox sits in memory. A session with another UIDVALIDITY, or none, gets no FETCH, and the stream returns ErrUIDValidityChanged; 0 skips the check.
 func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()

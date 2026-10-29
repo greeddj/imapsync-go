@@ -262,12 +262,11 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	return synced, errors
 }
 
-// refusedBody reports whether AppendMessage refused the message before it sent a command, because the source gave no usable body.
 func refusedBody(err error) bool {
 	return errors.Is(err, client.ErrEmptyBody) || errors.Is(err, client.ErrMissingBody)
 }
 
-// standbyRequest lists the standby UIDs in one source folder that can replace a pending copy, and maps each to its planned UID.
+// owner maps each returned standby UID to the planned UID that it can replace.
 func standbyRequest(p *FolderSyncPlan, pending map[uint32]struct{}, source uint32) (uids []uint32, owner map[uint32]uint32) {
 	if len(pending) == 0 {
 		return nil, nil

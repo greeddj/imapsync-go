@@ -23,7 +23,7 @@ You are reviewing Go in `imapsync-go`. The conventions are stricter than the com
 
 - `AppendMessage` - streams `msg.GetBody(...)` directly to `cli.Append`, no `ReadAll`.
 - `StreamMessagesByUIDs` - batched UID FETCH in chunks of 500, ranges a channel.
-- `FetchMessageMap` / `FetchMessageIDSet` - envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`, no full body.
+- `FetchMessageMap` / `FetchMessageCopies` - envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`, no full body.
 - `Client.pw` / `Client.tracker` - `atomic.Pointer`, never raw fields.
 - Per-folder `sync.Mutex` map (`folderLocks`) - fine-grained, not a global mutex.
 

@@ -53,21 +53,7 @@ func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Wri
 	return pw
 }
 
-// FolderSyncPlan describes how a single source folder should be copied to its
-// destination.
-//
-// SrcUIDs holds the sorted source UIDs that the destination count does not
-// cover. Planning fetches no bodies, so the prompt can show counts without
-// holding mail in memory.
-//
-// SrcUIDValidity is the UIDVALIDITY that SrcUIDs belong to, or 0 when the
-// server sent none. The copy uses the UIDs only while the folder reports this
-// value.
-//
-// standbys lists copies with the same Message-Id in later mappings of a shared
-// destination, for planned UIDs. It is sorted by planned UID, then by source.
-//
-// ExtraCopies counts planned messages whose Message-Id the destination folder already holds. A server that keeps one message per Message-Id drops these copies, so the preview shows the count.
+// FolderSyncPlan holds source UIDs that mean something only while the source folder reports SrcUIDValidity; 0 means the server sent none.
 type FolderSyncPlan struct {
 	SourceFolder            string
 	DestinationFolder       string
@@ -81,7 +67,6 @@ type FolderSyncPlan struct {
 	DestinationFolderExists bool
 }
 
-// standbySource is a source folder that holds standby copies, with the UIDVALIDITY of its scan.
 type standbySource struct {
 	folder      string
 	uidValidity uint32
@@ -98,7 +83,7 @@ func compareStandbyToPlanned(c standbyCopy, planned uint32) int {
 	return cmp.Compare(c.planned, planned)
 }
 
-// standbysOf returns the standbys of one planned UID, in source order. It allocates nothing.
+// standbys is sorted by planned UID, then by source, so the binary search finds a group that is already in source order.
 func (p *FolderSyncPlan) standbysOf(planned uint32) []standbyCopy {
 	i, _ := slices.BinarySearchFunc(p.standbys, planned, compareStandbyToPlanned)
 	end := i
@@ -122,11 +107,7 @@ type FolderSkip struct {
 	SourceFolder string
 }
 
-// SyncSummary aggregates the per-folder plans along with total message counts
-// and the total byte volume.
-//
-// TotalNewSize is the sum of RFC822.SIZE of the planned messages, read by the
-// planning FETCH.
+// SyncSummary is the result of the planning scan; TotalNewSize adds up the RFC822.SIZE values that the scan already read.
 type SyncSummary struct {
 	Plans        []FolderSyncPlan
 	Failures     []FolderFailure
@@ -368,7 +349,6 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if !quiet {
 			_, _ = fmt.Fprintf(out, "📤 Messages to be copied to destination:\n")
 			foldersToCreate := make([]string, 0, len(summary.Plans))
-			// Plans that share a destination list it once.
 			listed := make(map[string]struct{}, len(summary.Plans))
 			for _, plan := range summary.Plans {
 				// Preview only the folders we will actually create - the
@@ -757,7 +737,7 @@ type copyMatcher struct {
 	matched   []bool
 }
 
-// destinationLeft returns the refs that the destination copies leave, in UID order. It reads only dst sizes, so the plan and the recheck agree. Valid until the next call.
+// destinationLeft reads only dst sizes, so the plan and the recheck agree. The result is valid until the next call.
 func (m *copyMatcher) destinationLeft(refs, dst []client.MessageRef) []client.MessageRef {
 	if len(dst) == 0 {
 		return refs
@@ -873,12 +853,7 @@ func printSyncErrors(out io.Writer, synced, errs, failedFolders int) {
 		synced, errs, failedFolders)
 }
 
-// folderScan holds the per-slot results from the parallel src and dst scans.
-// done is incremented by each side; when it reaches 2, maybeDiff fires.
-// Pointer fields precede non-pointer fields to minimise the GC scan range.
-//
-// srcMessages counts the source messages that have a Message-Id. It is set
-// before srcMap is freed, so the \Noselect failure can use it after the diff.
+// folderScan counts finished sides in done, and maybeDiff fires at 2. srcMessages is set before srcMap is freed, so the \Noselect failure can use it after the diff.
 type folderScan struct {
 	srcMap         map[string][]client.MessageRef
 	dstMap         map[string][]client.MessageRef
@@ -892,20 +867,18 @@ type folderScan struct {
 	done           atomic.Int32
 }
 
-// reservation is a copy that a plan schedules for a shared destination: the UID and the size in the source of mapping slot.
 type reservation struct {
 	uid  uint32
 	size uint32
 	slot int32
 }
 
-// standbySet holds the standbys of one plan. Its sources are in mapping order.
 type standbySet struct {
 	sources []standbySource
 	copies  []standbyCopy
 }
 
-// sharedDestinations tracks the destinations of two or more mappings. Slot k is diffed before slot k+1, because both scans walk in index order.
+// Slot k is diffed before slot k+1, because both scans walk in index order.
 type sharedDestinations struct {
 	// last maps a shared destination to its last mapping index. It is read-only, so reads need no lock.
 	last map[string]int
@@ -948,7 +921,7 @@ func (d *sharedDestinations) lastIndex(destination string) (int, bool) {
 	return i, ok
 }
 
-// addStandby records that uid in src has the Message-Id of the reserved copy. The caller holds d.mu.
+// The caller holds d.mu.
 func (d *sharedDestinations) addStandby(r reservation, src standbySource, uid uint32) {
 	set := &d.standbys[r.slot]
 	// Slots are diffed in order, so the source is usually the last one.
@@ -963,7 +936,7 @@ func (d *sharedDestinations) addStandby(r reservation, src standbySource, uid ui
 	set.copies = append(set.copies, standbyCopy{planned: r.uid, uid: uid, source: uint32(i)})
 }
 
-// standbysFor returns the standbys of the plan of slot. Call it only after the scans end.
+// Call it only after the scans end.
 func (d *sharedDestinations) standbysFor(slot int) ([]standbySource, []standbyCopy) {
 	if d == nil {
 		return nil, nil
@@ -1105,21 +1078,12 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 	return summary, nil
 }
 
-// maybeDiff fires the Message-Id diff exactly once, when both the src and dst
-// sides have completed for slot idx. Returns false if only one side is done.
-// Frees srcMap and dstMap immediately after the diff to keep peak memory
-// proportional to one folder at a time, not len(mappings).
-// A shared destination keeps the earlier plans' reservations per Message-Id until its last mapping is diffed.
-//
-// NewSize sums the RFC822.SIZE values that the planning FETCH already returned,
-// so the preview needs no extra round-trip.
+// maybeDiff frees srcMap and dstMap right after the diff, so peak memory stays proportional to one folder, not len(mappings).
 func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans []FolderSyncPlan, totalNew *atomic.Int64, totalNewSize *atomic.Uint64, shared *sharedDestinations) bool {
 	if s.done.Add(1) != 2 {
 		return false
 	}
-	// done==2 guarantees we are the only goroutine here, but mu is still
-	// required: the race detector sees srcMap/dstMap written by the other
-	// goroutine and read here without synchronisation unless we take the lock.
+	// done==2 makes this the only goroutine here, but the race detector needs mu to see srcMap and dstMap that the other goroutine wrote.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1511,7 +1475,7 @@ func offerDelimiterFixes(ctx context.Context, out io.Writer, in *bufio.Reader, s
 	return nil
 }
 
-// expandMappingsWithSubfolders expands each mapping to include all subfolders. The most specific mapping decides where a folder goes, so the order of the map items does not change the plan.
+// expandMappingsWithSubfolders lets the most specific mapping decide where a folder goes, so the order of the map items does not change the plan.
 func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient, dstClient *client.Client, roots []folderMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]folderMapping, error) {
 	entries := make([]expansionEntry, 0, len(roots))
 	if err := ctx.Err(); err != nil {

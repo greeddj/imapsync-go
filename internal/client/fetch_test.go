@@ -517,8 +517,7 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 	}
 }
 
-// scanRow is one scripted Message-Id scan response. An empty msgID sends a header section with no Message-Id.
-// noUID leaves out the UID item.
+// scanRow is one scripted scan response. An empty msgID sends a header section with no Message-Id; noUID leaves out the UID item.
 type scanRow struct {
 	msgID string
 	uid   uint32
@@ -545,8 +544,7 @@ func writeScanRow(conn net.Conn, n int, r scanRow) {
 		n, uidItem, r.size, len(hdr), hdr)
 }
 
-// scanSession serves one session of a Message-Id scan. FETCH sends the first sent rows; with fewer than
-// len(rows) it hangs up before the tagged reply. Zero uidValidity sends none.
+// scanSession serves one scan session. FETCH sends the first sent rows, and with fewer than len(rows) it hangs up before the tagged reply. Zero uidValidity sends none.
 func scanSession(rows []scanRow, sent int, uidValidity uint32) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
 	return func(conn net.Conn, _ *bufio.Reader, cmd command) (bool, bool) {
 		switch cmd.verb {

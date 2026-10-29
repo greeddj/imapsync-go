@@ -184,9 +184,6 @@ func Test_AppendMessage_logsWhenVerbose(t *testing.T) {
 	}
 }
 
-// Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend asserts that a message
-// whose BODY[] arrives as NIL, a zero-length literal or a quoted string reaches the
-// callback once and gets no APPEND and no new LOGIN on the destination.
 func Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend(t *testing.T) {
 	t.Parallel()
 
@@ -1219,7 +1216,7 @@ func Test_readTracker(t *testing.T) {
 	}
 }
 
-// Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmpty pins that go-imap keeps BODY[] only from a literal, so a quoted string arrives empty.
+// go-imap keeps BODY[] only from a literal, so a quoted string arrives empty.
 func Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmpty(t *testing.T) {
 	t.Parallel()
 

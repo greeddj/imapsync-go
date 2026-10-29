@@ -472,9 +472,6 @@ func Test_buildSyncPlan_When_SourceScanFails_Then_RecordsFailureAndKeepsOtherPla
 	}
 }
 
-// Test_expandMappingsWithSubfolders_addsChildrenAndDedups asserts that
-// subfolders in the mailbox cache are appended and that an explicit mapping
-// for the same source replaces the one that the parent expansion derives.
 func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 	srcSrv := newFakeServer(t)
 
@@ -723,8 +720,7 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	delimiter := srcC.GetDelimiter()
 
-	// The explicit INBOX/Sub mapping and the derived one agree on the destination, so
-	// one of them is dropped. The verbose + !quiet path writes the found-subfolder and dropped-mapping lines.
+	// The explicit mapping and the derived one agree on the destination, so one is dropped. Verbose prints the found-subfolder and dropped-mapping lines.
 	mappings := rootMappings(mapping("INBOX", "INBOX"), mapping("INBOX/Sub", "INBOX/Sub"))
 	var out strings.Builder
 	dstC := newDestinationClient(t, delimiter)
@@ -1006,8 +1002,6 @@ func Test_expandMappingsWithSubfolders_When_ListOrderVaries_Then_SubfoldersFollo
 	}
 }
 
-// Test_maybeDiff_freesMaps asserts that maybeDiff releases srcMap and dstMap
-// after the diff, and that the resulting plan contains the correct SrcUIDs.
 func Test_maybeDiff_freesMaps(t *testing.T) {
 	t.Parallel()
 
@@ -6667,7 +6661,6 @@ func assertExtraCopiesNote(t *testing.T, got, folder string, planned, extra int)
 	}
 }
 
-// runSyncOnce runs a confirmed sync and returns its output.
 func runSyncOnce(t *testing.T, cfg *config.Config) string {
 	t.Helper()
 	out := &syncBuffer{}
@@ -6920,7 +6913,6 @@ func TestRunSync_When_CreateReportsExistingFolderHoldingASharedMessageId_Then_Co
 	assertReadOnly(t, "source", src)
 }
 
-// scanCopies returns three bodies that share a Message-Id, where the third one is longer than the other two.
 func scanCopies(t *testing.T, id string) (one, two, three string) {
 	t.Helper()
 
@@ -7539,7 +7531,6 @@ func Test_recheckExistingDestinations_When_PlannedMessagesAreDropped_Then_EachCa
 	}
 }
 
-// msgRefs returns one ref of size 100 for each uid.
 func msgRefs(uids ...uint32) []client.MessageRef {
 	refs := make([]client.MessageRef, len(uids))
 	for i, uid := range uids {
@@ -7548,7 +7539,6 @@ func msgRefs(uids ...uint32) []client.MessageRef {
 	return refs
 }
 
-// refsOfSizes builds refs with the UIDs 1, 2, 3 and so on, one for each size.
 func refsOfSizes(sizes ...uint32) []client.MessageRef {
 	refs := make([]client.MessageRef, len(sizes))
 	for i, size := range sizes {

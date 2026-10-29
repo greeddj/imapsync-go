@@ -51,7 +51,7 @@
   - `Test_FetchMessageMap_When_FolderStaysSelected_Then_StatusReportsUIDValidity` - when the folder stays selected, the scan sends no EXAMINE and reads the value from `STATUS (MESSAGES UIDVALIDITY)`;
   - `Test_FetchMessageMap_When_RetriedOnANewSession_Then_ReturnsTheNewSessionValue` - after a reconnect, the result holds the value of the new session;
   - `Test_StreamMessagesByUIDs_When_UIDValidityDiffers_Then_FetchesNothing` - a session with another value gets no UID FETCH and no reconnect. The error has the class `ClassUnknown`, also when the folder name holds a transient phrase;
-  - `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` - the check also reads the value of a kept selection;
+  - `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` - the check also reads the value of a kept selection. A plan value that differs fetches nothing. A plan value that matches fetches the UID, and the stream sends no EXAMINE: the one EXAMINE of the session comes from the scan;
   - `Test_StreamMessagesByUIDs_When_UIDValidityChangesAcrossReconnect_Then_StopsWithoutFetching` - a change after a BYE between two batches stops the stream. The first batch stays delivered, and the new session fetches nothing;
   - `Test_StreamMessagesByUIDs_When_UIDValidityChangesOnRetryInsideFirstBatch_Then_FetchesNoUndeliveredUID` - the retry inside one batch runs the check too, so the stream fetches no UID that it did not deliver;
   - `Test_StreamMessagesByUIDs_When_SessionReportsNoUIDValidity_Then_FetchesNothing` - a session that sends none fails the check when the plan holds a value. This holds after a new EXAMINE and after a kept selection;
@@ -371,6 +371,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **`AppendMessage` with a server that is silent between the `{N}` line and the `+` continuation** - go-imap blocks the caller on `<-w.continues`, and a closed socket does not release it. A test of this window would hang. The cause is the same as in the Known limitation in `CLAUDE.md`. Two nearby paths have tests:
   - `Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAndRepairs` covers a server that is silent after the literal;
   - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` covers a server that stops reading the literal.
+- **`StreamMessagesByUIDs`, the status check after the kept-selection fallback** - `status` is nil there only when a BYE arrives between the mailbox read in `selectIfNeeded` and the fallback read. go-imap v1 sets `LogoutState` and clears the mailbox under one lock, so the UID FETCH returns `ErrNoMailboxSelected` and sends no command. `classifyError` treats this error as `ClassTransient`, so `safeCall` reconnects and the retry session runs the check again. A deterministic test needs a hook between the two mailbox reads. `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` covers the kept-selection path on both sides of the UIDVALIDITY comparison.
 
 ### Deliberate exclusions in `internal/app`
 

@@ -52,8 +52,7 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 	if body == nil {
 		return fmt.Errorf("[%s] %w", c.prefix, ErrMissingBody)
 	}
-	// go-imap turns BODY[] NIL, {0} and quoted strings into an empty body.
-	// An empty APPEND has no Message-Id, so every later run would add one more.
+	// go-imap turns BODY[] NIL, {0} and quoted strings into an empty body, and an empty APPEND has no Message-Id, so every later run would add one more.
 	if body.Len() == 0 {
 		return fmt.Errorf("[%s] %w", c.prefix, ErrEmptyBody)
 	}
