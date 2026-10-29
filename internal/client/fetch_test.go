@@ -525,26 +525,43 @@ type scanRow struct {
 
 // scanIntercept answers EXAMINE with one EXISTS per row and each FETCH with the rows in the given order.
 func scanIntercept(rows []scanRow) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return scanSession(rows, len(rows), 0)
+}
+
+// writeScanRow sends the Message-Id scan response for row number n, counted from 1.
+func writeScanRow(conn net.Conn, n int, r scanRow) {
+	hdr := "\r\n"
+	if r.msgID != "" {
+		hdr = "Message-Id: <" + r.msgID + ">\r\n\r\n"
+	}
+	writeLine(conn, "* %d FETCH (UID %d RFC822.SIZE %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)",
+		n, r.uid, r.size, len(hdr), hdr)
+}
+
+// scanSession serves one session of a Message-Id scan. FETCH sends the first sent rows; with fewer than
+// len(rows) it hangs up before the tagged reply. Zero uidValidity sends none.
+func scanSession(rows []scanRow, sent int, uidValidity uint32) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
 	return func(conn net.Conn, _ *bufio.Reader, cmd command) (bool, bool) {
 		switch cmd.verb {
 		case "SELECT", "EXAMINE":
 			writeLine(conn, "* %d EXISTS", len(rows))
 			writeLine(conn, "* 0 RECENT")
+			if uidValidity != 0 {
+				writeLine(conn, "* OK [UIDVALIDITY %d] UIDs valid", uidValidity)
+			}
 			writeLine(conn, "%s OK [READ-ONLY] %s completed", cmd.tag, cmd.verb)
+			return true, true
 		case "FETCH":
-			for i, r := range rows {
-				hdr := "\r\n"
-				if r.msgID != "" {
-					hdr = "Message-Id: <" + r.msgID + ">\r\n\r\n"
-				}
-				writeLine(conn, "* %d FETCH (UID %d RFC822.SIZE %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)",
-					i+1, r.uid, r.size, len(hdr), hdr)
+			for i, r := range rows[:sent] {
+				writeScanRow(conn, i+1, r)
+			}
+			if sent < len(rows) {
+				return true, false
 			}
 			writeLine(conn, "%s OK FETCH completed", cmd.tag)
-		default:
-			return false, true
+			return true, true
 		}
-		return true, true
+		return false, true
 	}
 }
 
@@ -2100,5 +2117,87 @@ func Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_Fetche
 				t.Errorf("EXAMINE count = %d, want 1 (the stream reads the kept selection)", got)
 			}
 		})
+	}
+}
+
+func Test_FetchMessageMap_When_ConnectionDropsMidScan_Then_RetryKeepsEachMessageOnce(t *testing.T) {
+	t.Parallel()
+
+	rows := []scanRow{
+		{msgID: "dup@x", uid: 9, size: 10},
+		{uid: 8, size: 50},
+		{msgID: "dup@x", uid: 4, size: 20},
+		{msgID: "one@x", uid: 6, size: 30},
+		{msgID: "dup@x", uid: 7, size: 40},
+	}
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanSession(rows, 3, 3)))
+	srv.addConnHandler(interceptHandler(srv, scanSession(rows, len(rows), 4)))
+	c := newClientWithFake(t, srv)
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	got, uidValidity, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v, want success after the reconnect", err)
+	}
+	want := map[string][]MessageRef{
+		"dup@x": {{UID: 4, Size: 20}, {UID: 7, Size: 40}, {UID: 9, Size: 10}},
+		"one@x": {{UID: 6, Size: 30}},
+	}
+	if !equalMessageMaps(got, want) {
+		t.Errorf("map = %v, want %v (each message once, none from the first attempt twice)", got, want)
+	}
+	if uidValidity != 4 {
+		t.Errorf("UIDVALIDITY = %d, want 4 (the session that served the result)", uidValidity)
+	}
+	if n := srv.callCount("LOGIN"); n != 2 {
+		t.Errorf("LOGIN count = %d, want 2", n)
+	}
+	var warnings int
+	for _, msg := range logged {
+		if strings.Contains(msg, "1 message(s) without Message-Id") {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Errorf("got %d warnings about a missing Message-Id, want 1 (the first attempt must not add to it); log: %v", warnings, logged)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_UIDValidityChangesOnRetryInsideFirstBatch_Then_FetchesNoUndeliveredUID(t *testing.T) {
+	t.Parallel()
+
+	const delivered = 2
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(5), cutUIDFetch(fetches, delivered, true))))
+	srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(6), answerUIDFetch(fetches, requestedAsSent))))
+	c := newClientWithFake(t, srv)
+
+	uids := []uint32{1, 2, 3, 4, 5}
+	var got []uint32
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, func(msg Message) error {
+			got = append(got, msg.m.Uid)
+			return nil
+		})
+	})
+
+	if !errors.Is(err, ErrUIDValidityChanged) {
+		t.Fatalf("StreamMessagesByUIDs = %v, want ErrUIDValidityChanged", err)
+	}
+	if !slices.Equal(got, uids[:delivered]) {
+		t.Errorf("callback got UIDs %v, want only the %v delivered before the drop", got, uids[:delivered])
+	}
+	if gotSets, want := fetches.all(), [][]uint32{uids}; !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH asked for %v, want %v: the session with the new UIDVALIDITY must fetch nothing", gotSets, want)
+	}
+	if n := srv.callCount("LOGIN"); n != 2 {
+		t.Errorf("LOGIN count = %d, want 2 (the drop reconnects once, the mismatch does not)", n)
+	}
+	if n := srv.callCount("EXAMINE"); n != 2 {
+		t.Errorf("EXAMINE count = %d, want 2", n)
 	}
 }

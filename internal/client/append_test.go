@@ -1215,3 +1215,154 @@ func Test_readTracker(t *testing.T) {
 		})
 	}
 }
+
+// Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmpty pins that go-imap keeps BODY[] only from a literal, so a quoted string arrives empty.
+func Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmpty(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeServer(t)
+	src.addConnHandler(interceptHandler(src, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		writeLine(conn, `* 1 FETCH (UID 1 BODY[] "abc")`)
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	dst := newFakeServer(t)
+	dst.addConnHandler(appendOutcomeHandler(dst, "OK APPEND completed"))
+	srcClient := newClientWithFake(t, src)
+	dstClient := newClientWithFake(t, dst)
+
+	var (
+		calls     int
+		bodyLen   = -1
+		appendErr error
+	)
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		return srcClient.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(msg Message) error {
+			calls++
+			if lit := msg.m.GetBody(fullBodyPeekSection); lit != nil {
+				bodyLen = lit.Len()
+			}
+			appendErr = dstClient.AppendMessage(t.Context(), "INBOX", msg)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("callback ran %d times, want 1", calls)
+	}
+	if bodyLen != 0 {
+		t.Errorf("body length = %d, want 0: go-imap keeps no quoted string, so a change here needs a new look at the guard", bodyLen)
+	}
+	if !errors.Is(appendErr, errEmptyBody) {
+		t.Errorf("AppendMessage error = %v, want %v", appendErr, errEmptyBody)
+	}
+	if got := dst.callCount("APPEND"); got != 0 {
+		t.Errorf("destination APPEND count = %d, want 0", got)
+	}
+}
+
+// The guard runs before reconnectSession, because a reconnect for a message that cannot be sent costs a login attempt.
+func Test_AppendMessage_When_BodyIsEmptyAndSessionIsGone_Then_SendsNoDialLoginOrAppend(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		setup func(t *testing.T, srv *fakeServer) *Client
+		name  string
+	}{
+		{
+			name: "the client gave up its reconnect",
+			setup: func(t *testing.T, srv *fakeServer) *Client {
+				t.Helper()
+				c := newClientWithFake(t, srv)
+				_ = loseSession(t, srv, c)
+				return c
+			},
+		},
+		{
+			name: "the server sent a BYE while idle",
+			setup: func(t *testing.T, srv *fakeServer) *Client {
+				t.Helper()
+				return endIdleSession(t, srv, "* BYE server shutting down")
+			},
+		},
+		{
+			name: "the server hung up while idle",
+			setup: func(t *testing.T, srv *fakeServer) *Client {
+				t.Helper()
+				return endIdleSession(t, srv, "")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c := tt.setup(t, srv)
+			dials := countDials(c)
+			loginsBefore := srv.callCount("LOGIN")
+
+			err := awaitCall(t, "AppendMessage", func() error {
+				return c.AppendMessage(t.Context(), "INBOX", messageWithBody(nil))
+			})
+
+			if !errors.Is(err, errEmptyBody) {
+				t.Fatalf("AppendMessage error = %v, want %v", err, errEmptyBody)
+			}
+			if got := dials.Load(); got != 0 {
+				t.Errorf("dial count = %d, want 0", got)
+			}
+			if got := srv.callCount("LOGIN"); got != loginsBefore {
+				t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, got)
+			}
+			if got := srv.callCount("APPEND"); got != 0 {
+				t.Errorf("APPEND count = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// endIdleSession returns a Client whose only session the server ended with farewell. An empty farewell means a plain hang-up.
+func endIdleSession(t *testing.T, srv *fakeServer, farewell string) *Client {
+	t.Helper()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	srv.addConnHandler(byeAfterLoginHandler(srv, release, farewell))
+	c := newClientWithFake(t, srv)
+
+	loggedOut := c.c.Load().LoggedOut()
+	releaseOnce()
+	awaitSignal(t, loggedOut, "the client to notice the server ending the session")
+	return c
+}
+
+func Test_AppendMessage_When_BodyHasOneByte_Then_Appends(t *testing.T) {
+	t.Parallel()
+
+	appends := make(chan capturedAppend, 1)
+	srv := newFakeServer(t)
+	srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", appends))
+	c := newClientWithFake(t, srv)
+
+	err := awaitCall(t, "AppendMessage", func() error {
+		return c.AppendMessage(t.Context(), "INBOX", testMessage("x"))
+	})
+
+	if err != nil {
+		t.Fatalf("AppendMessage: %v, want a one-byte body to pass the empty-body guard", err)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count = %d, want 1", got)
+	}
+	if got := string(awaitAppend(t, appends).literal); got != "x" {
+		t.Errorf("literal = %q, want %q", got, "x")
+	}
+}
