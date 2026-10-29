@@ -1864,16 +1864,16 @@ func TestCheckUIDValidity(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		planned uint32
-		current uint32
-		wantErr bool
+		name     string
+		wantText string
+		planned  uint32
+		current  uint32
 	}{
 		{name: "server sent none on either side"},
 		{name: "plan holds none", current: 5},
-		{name: "server sends none now", planned: 5},
 		{name: "equal values", planned: 5, current: 5},
-		{name: "different values", planned: 5, current: 6, wantErr: true},
+		{name: "session sends none now", planned: 5, wantText: "(UIDVALIDITY 5, now none)"},
+		{name: "different values", planned: 5, current: 6, wantText: "(UIDVALIDITY 5, now 6)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1881,7 +1881,7 @@ func TestCheckUIDValidity(t *testing.T) {
 
 			err := CheckUIDValidity(tt.planned, tt.current)
 
-			if !tt.wantErr {
+			if tt.wantText == "" {
 				if err != nil {
 					t.Fatalf("CheckUIDValidity(%d, %d) = %v, want nil", tt.planned, tt.current, err)
 				}
@@ -1890,8 +1890,11 @@ func TestCheckUIDValidity(t *testing.T) {
 			if !errors.Is(err, ErrUIDValidityChanged) {
 				t.Fatalf("CheckUIDValidity(%d, %d) = %v, want ErrUIDValidityChanged", tt.planned, tt.current, err)
 			}
-			if want := "(UIDVALIDITY 5, now 6)"; !strings.Contains(err.Error(), want) {
-				t.Errorf("error = %q, want it to contain %q", err, want)
+			if !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantText)
+			}
+			if tt.current == 0 && strings.Contains(err.Error(), "now 0") {
+				t.Errorf("error = %q, want it to say none, not 0", err)
 			}
 		})
 	}
@@ -2085,7 +2088,69 @@ func Test_StreamMessagesByUIDs_When_UIDValidityChangesAcrossReconnect_Then_Stops
 	}
 }
 
-func Test_StreamMessagesByUIDs_When_EitherSideHasNoUIDValidity_Then_Streams(t *testing.T) {
+func Test_StreamMessagesByUIDs_When_SessionReportsNoUIDValidity_Then_FetchesNothing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		keepSelected bool
+	}{
+		{name: "fresh EXAMINE"},
+		{name: "kept selection", keepSelected: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fetches := new(uidFetchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(0), answerUIDFetch(fetches, requestedAsSent))))
+			c := newClientWithFake(t, srv)
+			uids := []uint32{1, 2, 3}
+			if tt.keepSelected {
+				if _, uidValidity, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil || uidValidity != 0 {
+					t.Fatalf("FetchMessageMap = %d, %v, want 0, nil", uidValidity, err)
+				}
+				uids = uids[:1]
+			}
+
+			var got []uint32
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, func(msg Message) error {
+				got = append(got, msg.m.Uid)
+				return nil
+			})
+
+			if !errors.Is(err, ErrUIDValidityChanged) {
+				t.Fatalf("StreamMessagesByUIDs = %v, want ErrUIDValidityChanged", err)
+			}
+			for _, want := range []string{"folder INBOX: ", "(UIDVALIDITY 5, now none)"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			if got := classifyError(err); got != ClassUnknown {
+				t.Errorf("classifyError(err) = %s, want %s", got, ClassUnknown)
+			}
+			if isRetryable(err) || canRevive(err) {
+				t.Errorf("isRetryable, canRevive = %t, %t, want false, false", isRetryable(err), canRevive(err))
+			}
+			if len(got) != 0 {
+				t.Errorf("callback got UIDs %v, want none", got)
+			}
+			if got := srv.callCount("UID FETCH"); got != 0 {
+				t.Errorf("UID FETCH count = %d, want 0", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 1 {
+				t.Errorf("LOGIN count = %d, want 1 (a mismatch is no reason to reconnect)", got)
+			}
+			if got := srv.callCount("EXAMINE"); got != 1 {
+				t.Errorf("EXAMINE count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_PlanHasNoUIDValidityOrValuesMatch_Then_Streams(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -2094,7 +2159,6 @@ func Test_StreamMessagesByUIDs_When_EitherSideHasNoUIDValidity_Then_Streams(t *t
 		server  uint32
 	}{
 		{name: "plan holds none", planned: 0, server: 7},
-		{name: "server sends none", planned: 7, server: 0},
 		{name: "values match", planned: 7, server: 7},
 	}
 	for _, tt := range tests {

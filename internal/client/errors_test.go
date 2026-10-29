@@ -151,6 +151,11 @@ func TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides(t *testing.
 			err:  fmt.Errorf("[src] folder %s: %w", "Quota exceeded", CheckUIDValidity(1, 2)),
 			want: ClassUnknown,
 		},
+		{
+			name: "stream wrapper over a UIDVALIDITY the session no longer sends, with a transient phrase in the folder name",
+			err:  fmt.Errorf("[src] folder %s: %w", "not logged in", CheckUIDValidity(1, 0)),
+			want: ClassUnknown,
+		},
 		{name: "wrap node without a cause is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w", nil), want: ClassThrottled},
 		{name: "multi-wrap node without causes is a leaf", err: fmt.Errorf("Too many simultaneous connections: %w %w", nil, nil), want: ClassThrottled},
 		{

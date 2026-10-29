@@ -190,12 +190,16 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	return ids, uidValidity, nil
 }
 
-// CheckUIDValidity returns ErrUIDValidityChanged when planned and current differ. Zero means the server sent no UIDVALIDITY, so it matches any value.
+// CheckUIDValidity returns ErrUIDValidityChanged when planned is not zero and current differs from it. A session that sends no UIDVALIDITY cannot prove that the planned UIDs still hold.
 func CheckUIDValidity(planned, current uint32) error {
-	if planned == 0 || current == 0 || planned == current {
+	switch {
+	case planned == 0 || planned == current:
 		return nil
+	case current == 0:
+		return fmt.Errorf("%w (UIDVALIDITY %d, now none)", ErrUIDValidityChanged, planned)
+	default:
+		return fmt.Errorf("%w (UIDVALIDITY %d, now %d)", ErrUIDValidityChanged, planned, current)
 	}
-	return fmt.Errorf("%w (UIDVALIDITY %d, now %d)", ErrUIDValidityChanged, planned, current)
 }
 
 // Sorting once after the FETCH keeps a hostile response order from costing quadratic time. Compacting stops a repeated response from counting one message twice.
@@ -270,9 +274,9 @@ func trimAngleBrackets(id string) string {
 // drained (so the producer goroutine exits cleanly) and the error is
 // returned without scheduling further batches.
 //
-// The UIDs belong to uidValidity. When a session reports another value, the
-// stream ends with ErrUIDValidityChanged and sends that session no FETCH.
-// Zero skips the check.
+// The UIDs belong to uidValidity. A session that reports another value or none
+// gets no FETCH, and the stream ends with ErrUIDValidityChanged. A zero
+// uidValidity skips the check.
 func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()

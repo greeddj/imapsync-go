@@ -57,7 +57,7 @@ var ErrMissingBody = errors.New("message has no body")
 // errMissingUID marks a scanned message that has a Message-Id but no UID; go-imap would send UID 0 as "*".
 var errMissingUID = errors.New("server sent no UID for a message")
 
-// ErrUIDValidityChanged marks a source folder whose UIDVALIDITY differs from the one its planned UIDs belong to.
+// ErrUIDValidityChanged marks a source folder that no longer reports the UIDVALIDITY its planned UIDs belong to.
 var ErrUIDValidityChanged = errors.New("source folder changed after the sync plan, run sync again")
 
 // classifyError inspects err and returns its class.

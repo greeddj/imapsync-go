@@ -7982,6 +7982,40 @@ func TestRunSync_When_SourceUIDValidityChangesBeforeCopy_Then_PlanFailsAndNothin
 	assertIDs(t, "dst APPENDs to INBOX after the second run", dst.appended("INBOX"), "c@x")
 }
 
+func TestRunSync_When_SourceStopsReportingUIDValidityBeforeCopy_Then_PlanFailsAndNothingIsAppended(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x", "b@x", "c@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x", "b@x")})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.in = &hookReader{r: strings.NewReader("y\n"), hook: func() { src.setUIDValidity("INBOX", 0) }}
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Errorf("runSync error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "a@x", "b@x")
+	assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"))
+	if n := src.callCount("UID FETCH"); n != 0 {
+		t.Errorf("source saw %d UID FETCH commands, want 0", n)
+	}
+	assertContainsAll(t, out.String(),
+		"source folder changed after the sync plan, run sync again", "UIDVALIDITY 1, now none", "Sync completed with errors")
+	assertContainsNone(t, out.String(), "Sync completed successfully")
+	assertReadOnly(t, "source", src)
+
+	next := e2eOptions(&syncBuffer{}, "")
+	next.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, next); err != nil {
+		t.Fatalf("second runSync: %v", err)
+	}
+	assertIDs(t, "dst INBOX after the second run", dst.folderMsgIDs("INBOX"), "a@x", "b@x", "c@x")
+	assertIDs(t, "dst APPENDs to INBOX after the second run", dst.appended("INBOX"), "c@x")
+}
+
 func TestRunSync_When_SourceUIDValidityChangesBeforeRecheck_Then_FolderFailsBeforeCopy(t *testing.T) {
 	t.Parallel()
 
@@ -8014,6 +8048,71 @@ func TestRunSync_When_SourceUIDValidityChangesBeforeRecheck_Then_FolderFailsBefo
 			var once sync.Once
 			// The new UIDs start above the planned ones, so no planned UID can match the missing message by chance.
 			dst.onCommand("CREATE", func() { once.Do(func() { src.rebuildFolderFrom("Work", 2, 10, 2, 0, 1) }) })
+			cfg := e2eConfig(src, dst, 1, tt.mappings...)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Errorf("runSync error = %v, want ErrSilentExit", err)
+			}
+			assertContainsAll(t, out.String(), failureLine, "1 folders failed")
+			assertContainsNone(t, out.String(), "already exists and holds", "no longer holds", "Sync completed successfully", "All folders already synced!")
+			assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "m1@x", "m2@x")
+			assertIDs(t, "dst APPENDs to Work", dst.appended("Work"))
+			assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), tt.wantExamine...)
+			assertIDs(t, "source STATUS names", src.capturedNames("STATUS"), tt.wantStatus...)
+			if len(tt.mappings) == 1 {
+				if n := src.callCount("LOGIN"); n != 1 {
+					t.Errorf("source saw %d LOGIN commands, want 1: no worker may connect", n)
+				}
+			} else {
+				assertIDs(t, "dst APPENDs to Other", dst.appended("Other"), "o1@x")
+			}
+
+			next := e2eOptions(&syncBuffer{}, "")
+			next.autoConfirm = true
+			if err := runSync(e2eContext(t), cfg, next); err != nil {
+				t.Fatalf("second runSync: %v", err)
+			}
+			assertIDs(t, "dst APPENDs to Work after the second run", dst.appended("Work"), "m3@x")
+		})
+	}
+}
+
+func TestRunSync_When_SourceStopsReportingUIDValidityBeforeRecheck_Then_FolderFailsBeforeCopy(t *testing.T) {
+	t.Parallel()
+
+	const failureLine = "• Work → Work: source folder changed after the sync plan, run sync again (UIDVALIDITY 1, now none)"
+	tests := []struct {
+		name        string
+		mappings    []config.DirectoryMapping
+		wantExamine []string
+		wantStatus  []string
+	}{
+		{
+			name:        "recheck keeps the planning selection",
+			mappings:    []config.DirectoryMapping{mapping("Work", "Work")},
+			wantExamine: []string{"Work"},
+			wantStatus:  []string{"Work"},
+		},
+		{
+			name:        "recheck selects the folder again",
+			mappings:    []config.DirectoryMapping{mapping("Work", "Work"), mapping("Other", "Other")},
+			wantExamine: []string{"Work", "Other", "Work", "Other"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x", "m3@x"), "Other": fakeMsgs("o1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x", "m2@x")})
+			dst.hideFromList("Work")
+			var once sync.Once
+			dst.onCommand("CREATE", func() { once.Do(func() { src.setUIDValidity("Work", 0) }) })
 			cfg := e2eConfig(src, dst, 1, tt.mappings...)
 			out := &syncBuffer{}
 			opts := e2eOptions(out, "")
