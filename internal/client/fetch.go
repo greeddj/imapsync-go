@@ -62,6 +62,14 @@ type MessageRef struct {
 	Size uint32
 }
 
+// missingUIDRule sets how a scan treats a response without a UID: the source plans copies by UID and fails, the destination only counts copies and keeps them.
+type missingUIDRule uint8
+
+const (
+	failOnMissingUID missingUIDRule = iota
+	keepMissingUID
+)
+
 // FetchMessageMap returns Message-Id -> messages for every message in folder.
 //
 // Each value lists the messages with that Message-Id in ascending UID order,
@@ -70,12 +78,21 @@ type MessageRef struct {
 //
 // A message with a Message-Id but no UID fails the scan.
 //
-// The map serves both sides of a Message-Id diff: the source reads the UIDs
-// and sizes, and the destination reads the length of each value.
+// It scans the source side, which plans copies by UID; FetchMessageCopies scans the destination side.
 //
 // The second result is the UIDVALIDITY that the UIDs belong to, or 0 when the
 // server sent none.
 func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, uint32, error) {
+	return c.scanMessageIDs(ctx, folder, failOnMissingUID)
+}
+
+// FetchMessageCopies returns Message-Id -> copies in folder for the destination side, where only the count and sizes matter. A copy without a UID keeps UID 0 and counts alone.
+func (c *Client) FetchMessageCopies(ctx context.Context, folder string) (map[string][]MessageRef, error) {
+	ids, _, err := c.scanMessageIDs(ctx, folder, keepMissingUID)
+	return ids, err
+}
+
+func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missingUIDRule) (map[string][]MessageRef, uint32, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -149,8 +166,8 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 				missingCount++
 				continue
 			}
-			// UID 0 is not a valid UID, and go-imap sends it as "*" in a UID set, so the message can be neither planned nor counted.
-			if msg.Uid == 0 {
+			// go-imap sends UID 0 as "*" in a UID set, so the source cannot plan such a message; the destination only counts copies.
+			if msg.Uid == 0 && rule == failOnMissingUID {
 				missingUIDs++
 				continue
 			}
@@ -209,7 +226,8 @@ func sortAndCompactRefs(ids map[string][]MessageRef) {
 			continue
 		}
 		slices.SortFunc(refs, func(a, b MessageRef) int { return cmp.Compare(a.UID, b.UID) })
-		ids[id] = slices.CompactFunc(refs, func(a, b MessageRef) bool { return a.UID == b.UID })
+		// Without a UID, a repeated response and a second copy look the same, so refs with UID 0 never merge.
+		ids[id] = slices.CompactFunc(refs, func(a, b MessageRef) bool { return a.UID == b.UID && a.UID != 0 })
 	}
 }
 
@@ -265,7 +283,7 @@ func trimAngleBrackets(id string) string {
 // StreamMessagesByUIDs fetches the bodies for the given UIDs in batches and
 // invokes onMessage for each as it arrives. The caller is expected to feed in
 // UIDs already filtered against the destination - typically the result of a
-// Message-Id diff produced from two FetchMessageMap calls.
+// Message-Id diff of FetchMessageMap on the source against FetchMessageCopies on the destination.
 //
 // Streaming avoids materializing every body into memory at once; large
 // mailboxes can produce many GB of cumulative body data.

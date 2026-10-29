@@ -664,7 +664,7 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 
 // The destination is read first: an empty folder holds nothing the plan could drop, so it needs no source scan.
 func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, recheckDrops, error) {
-	dstMap, _, err := dstClient.FetchMessageMap(ctx, plan.DestinationFolder)
+	dstMap, err := dstClient.FetchMessageCopies(ctx, plan.DestinationFolder)
 	if err != nil {
 		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errDestinationRecheck, err)
 	}
@@ -1036,7 +1036,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				scans[idx].dstNoSelect = true
 			default:
 				scans[idx].dstExists = true
-				mp, _, err := dstClient.FetchMessageMap(gCtx, m.Destination)
+				mp, err := dstClient.FetchMessageCopies(gCtx, m.Destination)
 				if err != nil {
 					scans[idx].dstErr = err
 				} else {

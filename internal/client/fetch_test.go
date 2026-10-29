@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -2378,6 +2379,73 @@ func Test_FetchMessageMap_When_UIDlessScanIsCutAndRetryIsClean_Then_Succeeds(t *
 	}
 	if n := srv.callCount("LOGIN"); n != 2 {
 		t.Errorf("LOGIN count = %d, want 2", n)
+	}
+}
+
+func Test_FetchMessageCopies_When_ResponseHasMessageIdButNoUID_Then_KeepsTheCopy(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+		{msgID: "a@x", noUID: true, size: 10},
+		{msgID: "b@x", uid: 0, size: 20},
+		{msgID: "c@x", uid: 3, size: 30},
+	})))
+	c := newClientWithFake(t, srv)
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	got, err := c.FetchMessageCopies(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageCopies: %v", err)
+	}
+	want := map[string][]MessageRef{
+		"a@x": {{UID: 0, Size: 10}},
+		"b@x": {{UID: 0, Size: 20}},
+		"c@x": {{UID: 3, Size: 30}},
+	}
+	if !equalMessageMaps(got, want) {
+		t.Errorf("map = %v, want %v", got, want)
+	}
+	if n := srv.callCount("LOGIN"); n != 1 {
+		t.Errorf("LOGIN count = %d, want 1 (no reconnect)", n)
+	}
+	if n := srv.callCount("FETCH"); n != 1 {
+		t.Errorf("FETCH count = %d, want 1 (no retry)", n)
+	}
+	for _, msg := range logged {
+		if strings.Contains(msg, "without Message-Id") {
+			t.Errorf("logged %q, want no missing Message-Id warning", msg)
+		}
+	}
+}
+
+func Test_FetchMessageCopies_When_UIDlessResponsesShareMessageId_Then_CountsEachCopy(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+		{msgID: "d@x", noUID: true, size: 10},
+		{msgID: "d@x", uid: 0, size: 20},
+		{msgID: "d@x", uid: 5, size: 30},
+		{msgID: "d@x", uid: 5, size: 30},
+	})))
+	c := newClientWithFake(t, srv)
+
+	got, err := c.FetchMessageCopies(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageCopies: %v", err)
+	}
+	// The order of refs with UID 0 is not defined, so the test fixes one.
+	refs := got["d@x"]
+	slices.SortFunc(refs, func(a, b MessageRef) int {
+		return cmp.Or(cmp.Compare(a.UID, b.UID), cmp.Compare(a.Size, b.Size))
+	})
+	want := []MessageRef{{UID: 0, Size: 10}, {UID: 0, Size: 20}, {UID: 5, Size: 30}}
+	if len(got) != 1 || !slices.Equal(refs, want) {
+		t.Errorf("map = %v, want d@x with %v (UID 0 never merges, a repeated UID 5 merges)", got, want)
 	}
 }
 

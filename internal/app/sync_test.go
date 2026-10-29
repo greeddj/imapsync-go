@@ -3393,26 +3393,27 @@ func TestRunSync_When_DestinationScanFails_Then_NothingIsWritten(t *testing.T) {
 	}
 }
 
-func TestRunSync_When_DestinationScanSendsNoUID_Then_NothingIsWritten(t *testing.T) {
+func TestRunSync_When_DestinationScanSendsNoUID_Then_CopiesOnlyTheMissingMessage(t *testing.T) {
 	t.Parallel()
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
 	dst.omitScanUIDIn("INBOX")
-	opts := e2eOptions(&syncBuffer{}, "")
-	opts.autoConfirm = true
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
 
-	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+	first := runSyncOnce(t, cfg)
 
-	if err == nil {
-		t.Fatal("runSync returned nil, want the destination scan failure")
-	}
-	if got := err.Error(); !strings.Contains(got, `scan destination folder "INBOX"`) || !strings.Contains(got, "server sent no UID for a message") {
-		t.Errorf("error = %q, want the destination scan failure for a message without a UID", got)
-	}
-	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
-		t.Errorf("dst saw %d CREATE or APPEND commands, want 0", n)
-	}
+	assertIDs(t, "dst INBOX after the first run", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x")
+	assertIDs(t, "dst APPENDs after the first run", dst.appended("INBOX"), "m2@x")
+	assertContainsAll(t, first, "Sync completed successfully")
+	assertContainsNone(t, first, "server sent no UID")
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "All folders already synced!")
+	assertContainsNone(t, second, "server sent no UID", "Sync completed successfully")
+	assertIDs(t, "dst APPENDs over both runs", dst.appended("INBOX"), "m2@x")
+	assertReadOnly(t, "source", src)
 }
 
 func TestRunSync_When_CanceledDuringFolderCreation_Then_ReportsCancelNotCreateFailure(t *testing.T) {
@@ -6776,6 +6777,64 @@ func TestRunSync_When_DestinationMissesAMiddleCopy_Then_CopiesOnlyThatCopy(t *te
 	if n := len(dst.appended("Scans")); n != 1 {
 		t.Errorf("dst saw %d APPENDs over both runs, want 1", n)
 	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_DestinationScanSendsNoUIDForSharedMessageIdCopies_Then_CopiesOnlyTheMissingCopy(t *testing.T) {
+	t.Parallel()
+
+	const id = "scan@printer"
+	one, two, three := scanCopies(t, id)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, one, two, three)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, one, three)})
+	dst.omitScanUIDIn("Scans")
+	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, fmt.Sprintf("• Scans → Scans will copy 1 messages (≈ %d B)", len(two)))
+	assertContainsNone(t, first, "server sent no UID")
+	if got, want := dst.folderBodies("Scans"), []string{one, three, two}; !slices.Equal(got, want) {
+		t.Errorf("dst Scans bodies after the first run = %q, want %q", got, want)
+	}
+	if n := len(dst.appended("Scans")); n != 1 {
+		t.Errorf("dst saw %d APPENDs in the first run, want 1", n)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "All folders already synced!")
+	assertContainsNone(t, second, "Sync completed successfully")
+	if n := len(dst.appended("Scans")); n != 1 {
+		t.Errorf("dst saw %d APPENDs over both runs, want 1", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_ExistingDestinationScanSendsNoUID_Then_TheRecheckDropsTheHeldMessage(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x")})
+	dst.hideFromList("Work")
+	dst.omitScanUIDIn("Work")
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first,
+		"  ℹ️  Destination folder Work already exists and holds 1 of the 2 planned messages from Work, so they are not copied\n",
+		"Sync completed successfully",
+	)
+	assertContainsNone(t, first, folderFailuresHeader, "server sent no UID")
+	assertIDs(t, "dst Work after the first run", dst.folderMsgIDs("Work"), "m1@x", "m2@x")
+	assertIDs(t, "dst APPENDs after the first run", dst.appended("Work"), "m2@x")
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "holds 2 of the 2 planned messages", "All folders already synced!")
+	assertContainsNone(t, second, folderFailuresHeader, "Sync completed successfully")
+	assertIDs(t, "dst APPENDs over both runs", dst.appended("Work"), "m2@x")
 	assertReadOnly(t, "source", src)
 }
 

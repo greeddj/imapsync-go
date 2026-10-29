@@ -3281,6 +3281,16 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 			},
 		},
 		{
+			name:         "FetchMessageCopies",
+			handler:      func(srv *fakeServer) func(net.Conn) { return interceptHandler(srv, serveNormally) },
+			wantCommands: map[string]int{"EXAMINE": 1},
+			run: func(t *testing.T, c *Client) error {
+				t.Helper()
+				_, err := c.FetchMessageCopies(t.Context(), "INBOX")
+				return err
+			},
+		},
+		{
 			name: "StreamMessagesByUIDs",
 			handler: func(srv *fakeServer) func(net.Conn) {
 				return (&mailboxScript{uidMessages: 3}).handler(srv)

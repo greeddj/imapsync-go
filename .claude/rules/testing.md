@@ -31,6 +31,8 @@
   - `ListMailboxes` for a `\Noselect` name, which gets no command and no error;
   - `ListMailboxes` for a reconnect that gives up in the middle of the list;
   - `FetchMessageMap`, which marks only a server refusal of EXAMINE with `ErrSelectRefused` and does not mark a dropped session;
+  - `FetchMessageMap` for a response with a Message-Id and no UID or UID 0, which fails the scan with no reconnect;
+  - `FetchMessageCopies` for the same responses, which keeps each one as a copy with UID 0. Two such responses with one Message-Id count as two copies;
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
 
@@ -132,6 +134,8 @@
   - a destination that refuses LOGIN in the middle of a run, where the worker sends one refused LOGIN (`TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin`);
   - a source folder that fails its scan: a refused EXAMINE, a mapping with a typo, a missing folder and a planning client that gives up;
   - a source scan failure, where the other folders still copy, the failure list shows also with `--quiet`, and the run returns `ErrSilentExit`;
+  - a destination that sends no UID in the Message-Id scan, in the planning scan and in the check after CREATE, where the run copies only the missing messages and a second run copies nothing;
+  - a source that sends no UID in the Message-Id scan, where the folder fails and the other folders copy;
   - a run with failed folders and nothing to copy, where the sync asks no question and ends non-zero;
   - a `\Noselect` source folder, where only the subfolders copy;
   - a `\Noselect` destination, where a source message with a Message-Id gives a folder failure and an empty source folder gives none;
