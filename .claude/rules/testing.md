@@ -15,6 +15,8 @@
   - content after the first document, and empty and null YAML documents after the first document;
   - empty files, and the load of both example files;
   - rejected `map` items (an empty or missing `src` or `dst`, and a null YAML item), where the error names the item and the key;
+  - two `map` items with one `src` and different `dst` values, which `config.New` rejects with `ErrMapSrcConflict`. The error names both items, also when other items or an equal item come between them (`TestNew_When_MapRepeatsSourceWithAnotherDestination_Then_ReturnsErrorNamingBothEntries`);
+  - two equal `map` items, two items with one `dst` and two `src` values that differ only in letter case, which all load (`TestNew_When_MapItemsRepeatOrShareADestination_Then_Loads`);
   - a folder name with spaces, which loads without change, and an empty or null `map`, which loads with no items;
   - a rate-limit flag that the user sets, which replaces the config value also when the flag is 0;
   - a rate-limit flag that the user does not set, which keeps the config value.
@@ -31,10 +33,33 @@
   - `ListMailboxes` for a `\Noselect` name, which gets no command and no error;
   - `ListMailboxes` for a reconnect that gives up in the middle of the list;
   - `FetchMessageMap`, which marks only a server refusal of EXAMINE with `ErrSelectRefused` and does not mark a dropped session;
-  - `FetchMessageMap` for a response with a Message-Id and no UID or UID 0, which fails the scan with no reconnect;
-  - `FetchMessageCopies` for the same responses, which keeps each one as a copy with UID 0. Two such responses with one Message-Id count as two copies;
+  - `FetchMessageMap` for a response with a Message-Id and no UID or UID 0, which fails the scan with no reconnect (`Test_FetchMessageMap_When_ResponseHasMessageIdButNoUID_Then_ScanFails`);
+  - `FetchMessageCopies` for the same responses, which keeps each one as a copy with UID 0. Two such responses with one Message-Id count as two copies (`Test_FetchMessageCopies_When_ResponseHasMessageIdButNoUID_Then_KeepsTheCopy` and `Test_FetchMessageCopies_When_UIDlessResponsesShareMessageId_Then_CountsEachCopy`);
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
+
+  The Message-Id scan has these tests:
+  - `Test_FetchMessageMap_When_MessagesShareMessageId_Then_KeepsEveryUIDInAscendingOrder` - the map value of one Message-Id lists each copy with its UID and size in ascending UID order. A message with no Message-Id gives one warning;
+  - `Test_FetchMessageMap_When_ServerRepeatsAResponse_Then_KeepsTheUIDOnce` - a repeated response with the same UID counts one time, also inside a group of copies;
+  - `Test_FetchMessageMap_When_ConnectionDropsMidScan_Then_RetryKeepsEachMessageOnce` - after a cut scan, the retry keeps each message one time and adds no second warning. The UIDVALIDITY is the value of the new session;
+  - `Test_FetchMessageMap_When_ResponseHasNeitherMessageIdNorUID_Then_ScanSucceeds` - a response with no Message-Id and no UID does not fail the scan;
+  - `Test_FetchMessageMap_When_UIDlessScanIsCutAndRetryIsClean_Then_Succeeds` - a dropped connection comes before the missing-UID error. The client reconnects, and the clean retry succeeds.
+
+  The UIDVALIDITY check has these tests:
+  - `TestCheckUIDValidity` - the check passes when the plan holds 0 or the two values are equal. It fails for a changed value, and for a session that sends none (`now none`, not `now 0`);
+  - `Test_FetchMessageMap_When_ExamineReportsUIDValidity_Then_ReturnsIt` - the second result is the value of the EXAMINE, or 0 when the server sends none;
+  - `Test_FetchMessageMap_When_FolderStaysSelected_Then_StatusReportsUIDValidity` - when the folder stays selected, the scan sends no EXAMINE and reads the value from `STATUS (MESSAGES UIDVALIDITY)`;
+  - `Test_FetchMessageMap_When_RetriedOnANewSession_Then_ReturnsTheNewSessionValue` - after a reconnect, the result holds the value of the new session;
+  - `Test_StreamMessagesByUIDs_When_UIDValidityDiffers_Then_FetchesNothing` - a session with another value gets no UID FETCH and no reconnect. The error has the class `ClassUnknown`, also when the folder name holds a transient phrase;
+  - `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` - the check also reads the value of a kept selection;
+  - `Test_StreamMessagesByUIDs_When_UIDValidityChangesAcrossReconnect_Then_StopsWithoutFetching` - a change after a BYE between two batches stops the stream. The first batch stays delivered, and the new session fetches nothing;
+  - `Test_StreamMessagesByUIDs_When_UIDValidityChangesOnRetryInsideFirstBatch_Then_FetchesNoUndeliveredUID` - the retry inside one batch runs the check too, so the stream fetches no UID that it did not deliver;
+  - `Test_StreamMessagesByUIDs_When_SessionReportsNoUIDValidity_Then_FetchesNothing` - a session that sends none fails the check when the plan holds a value. This holds after a new EXAMINE and after a kept selection;
+  - `Test_StreamMessagesByUIDs_When_PlanHasNoUIDValidityOrValuesMatch_Then_Streams` - a plan value of 0, or a value that matches, streams all UIDs.
+
+  The UID of a delivered message has these tests:
+  - `TestMessage_UID` - `Message.UID` gives the UID that the server sent, and 0 for a zero Message or a message with no UID;
+  - `Test_StreamMessagesByUIDs_When_MessagesAreDelivered_Then_UIDIsTheRequestedOne` - each delivered message reports one of the requested UIDs, in ascending order.
 
   The hierarchy delimiter has these tests:
   - `Test_loadMailboxCache_When_ListNamesNoDelimiter_Then_DelimiterStaysEmpty` - NIL entries leave the cache delimiter empty, and the first delimiter that an entry names sets it;
@@ -109,7 +134,7 @@
   The APPEND retry has these tests:
   - `Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends` - a session that ended with a BYE or a closed socket gets a reconnect before the APPEND;
   - `Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce` - a transient failure before go-imap reads the body gets one reconnect and one APPEND, and the first connection gets no APPEND;
-  - `Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry` - after go-imap read the body (an empty body too), the call repairs the session and sends no second APPEND;
+  - `Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry` - after go-imap read the body (a one-byte body too), the call repairs the session and sends no second APPEND;
   - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` - a failure in the middle of the literal gets a repair and no second APPEND;
   - `Test_AppendMessage_When_RevivedSessionFailsBeforeBodyIsRead_Then_DoesNotReconnectAgain`, `Test_AppendMessage_When_RevivedSessionFailsTransiently_Then_DoesNotReconnectAgain` and `Test_AppendMessage_When_RetryGoesSilent_Then_WatchdogTripsWithoutAnotherReconnect` - one call reconnects a maximum of one time;
   - `Test_AppendMessage_When_RetryReconnectIsRefused_Then_ReturnsReconnectError` - a refused login for the retry returns the reconnect error, and the next call returns the same refusal with no new login;
@@ -119,9 +144,15 @@
   - `Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectAppend` - the retry sends the same flags, date and bytes as an APPEND that needed no retry, and exactly one complete literal reaches the server;
   - `Test_readTracker` - `readTracker` marks a body as read only through `Read`, and it does not offer `WriteTo`, so `io.Copy` cannot move the body without a `Read`;
   - `Test_AppendMessage_When_RepairWasRefusedPermanently_Then_NextAppendSendsNoLogin` and `Test_AppendMessage_When_ReconnectWasRefusedPermanently_Then_LaterAppendsSendNoLogin` - after a permanent refusal, `AppendMessage` sends no LOGIN and no APPEND.
+
+  The refusal of an empty or missing body has these tests:
+  - `Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend` - a body that go-imap reads as empty (`NIL`, `{0}` or an empty quoted string) gives `ErrEmptyBody` and no APPEND;
+  - `Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmpty` - go-imap keeps no quoted string, so a quoted body that is not empty also reads as empty and gives `ErrEmptyBody`;
+  - `Test_AppendMessage_When_BodyIsEmptyAndSessionIsGone_Then_SendsNoDialLoginOrAppend` - the refusal comes before the reconnect, so a Client with no session sends no dial, LOGIN or APPEND. This holds after a give-up, after a BYE and after a hang-up while idle;
+  - `Test_AppendMessage_When_BodyHasOneByte_Then_Appends` - a body of one byte passes the guard and reaches the server.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
-- **`internal/app`** - sync plan diff (Message-Id intersection), subfolder expansion, delimiter reconciliation, worker pool dispatch.
+- **`internal/app`** - sync plan diff (count of copies for each Message-Id), subfolder expansion, delimiter reconciliation, worker pool dispatch.
   The `runSync` and `runShow` tests run end to end against a fake IMAP server that holds mailboxes in memory. These tests cover:
   - the plan-confirm-execute order, and the rule that `--quiet` needs `--confirm`;
   - an idempotent second run, and the delimiter rewrite on both sides;
@@ -134,8 +165,8 @@
   - a destination that refuses LOGIN in the middle of a run, where the worker sends one refused LOGIN (`TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin`);
   - a source folder that fails its scan: a refused EXAMINE, a mapping with a typo, a missing folder and a planning client that gives up;
   - a source scan failure, where the other folders still copy, the failure list shows also with `--quiet`, and the run returns `ErrSilentExit`;
-  - a destination that sends no UID in the Message-Id scan, in the planning scan and in the check after CREATE, where the run copies only the missing messages and a second run copies nothing;
-  - a source that sends no UID in the Message-Id scan, where the folder fails and the other folders copy;
+  - a destination that sends no UID in the Message-Id scan, in the planning scan and in the check after CREATE, where the run copies only the missing messages and a second run copies nothing (`TestRunSync_When_DestinationScanSendsNoUID_Then_CopiesOnlyTheMissingMessage`, `TestRunSync_When_DestinationScanSendsNoUIDForSharedMessageIdCopies_Then_CopiesOnlyTheMissingCopy` and `TestRunSync_When_ExistingDestinationScanSendsNoUID_Then_TheRecheckDropsTheHeldMessage`);
+  - a source that sends no UID in the Message-Id scan, where the folder fails and the other folders copy (`TestRunSync_When_SourceScanSendsNoUID_Then_FolderFailsAndOtherFoldersCopy`);
   - a run with failed folders and nothing to copy, where the sync asks no question and ends non-zero;
   - a `\Noselect` source folder, where only the subfolders copy;
   - a `\Noselect` destination, where a source message with a Message-Id gives a folder failure and an empty source folder gives none;
@@ -213,9 +244,96 @@
 
   The label of an error has these tests:
   - `TestRunSync_When_SourceListFailsAtConnect_Then_ErrorNamesTheLabel`, `TestRunSync_When_DestinationListFailsAtConnect_Then_ErrorNamesTheLabel` and `Test_newSyncWorkerPool_When_WorkerListFails_Then_ErrorNamesTheWorkerLabel` - a LIST that fails inside `client.New` names the side or the worker.
+
+  The count of copies has these tests:
+  - `Test_maybeDiff_When_MessagesShareMessageId_Then_PlansByCount` - the plan copies max(N - D, 0) source copies for each Message-Id. `NewSize` and `ExtraCopies` cover the planned copies only;
+  - `Test_maybeDiff_When_SourceAndDestinationCountsVary_Then_PlanAndRecheckPickTheSameMessages` - for each pair of counts, and for equal and different sizes, `maybeDiff` and `rediffPlan` choose the same UIDs;
+  - `Test_copyMatcher_match` - a destination copy matches a source copy with the same size. A copy that no size matches takes the lowest free UID;
+  - `Test_copyMatcher_When_GroupIsUncoveredOrFullyCovered_Then_AllocatesNothing` - a group that the destination does not touch, or covers in full, costs no allocation;
+  - `Test_copyMatcher_When_InputsAreRandom_Then_MatchesTheReference` - random inputs give the same result as a slow reference, and no destination copy matches two source copies;
+  - `Test_rediffPlan_When_CountsAndPlanVary_Then_ResultIsASubsetOfThePlan` - for random counts and plans, the recheck never adds a UID, and `NewMessages`, `NewSize`, `held` and `gone` follow the kept UIDs;
+  - `TestRunSync_When_SourceMessagesShareMessageId_Then_EachIsCopiedOnce` - each of three messages with one Message-Id arrives one time, and a second run copies nothing;
+  - `TestRunSync_When_DestinationHoldsCopiesOfASharedMessageId_Then_CopiesOnlyTheRest` - a destination that holds one, two, three or four copies gets only the copies that it misses;
+  - `TestRunSync_When_CreateReportsExistingFolderHoldingASharedMessageId_Then_CopiesTheRest` - the check after CREATE keeps only the copies that the folder misses;
+  - `TestRunSync_When_DestinationHoldsOnlyTheHighestUIDCopy_Then_CopiesTheOtherCopiesOnce` and `TestRunSync_When_DestinationMissesAMiddleCopy_Then_CopiesOnlyThatCopy` - the sizes decide which source copies the destination holds, and a second run copies nothing;
+  - `TestRunSync_When_ExistingFolderHoldsOnlyTheHighestUIDCopy_Then_TheRecheckCopiesTheOtherCopies` - the check after CREATE matches by size in the same way;
+  - `TestRunSync_When_FolderHasSkippedAndExistingMessages_Then_PreviewSizeCountsOnlyPlannedMessages` - the preview size adds up only the planned copies. It does not count the copies that the destination holds, or the messages with no Message-Id;
+  - `TestRunSync_When_NoSelectDestinationReceivesDuplicateMessageIds_Then_FailureCountsEveryMessage` - the failure of a `\Noselect` destination counts each source message, also the messages that share a Message-Id.
+
+  The note of extra copies has these tests:
+  - `TestRunSync_When_DestinationKeepsOneCopyPerMessageId_Then_EveryRunNotesTheExtraCopies` - a destination that keeps one message for each Message-Id gets the note on each later run. The first run prints none;
+  - `TestRunSync_When_DestinationHoldsOneOfThreeCopies_Then_QuietRunPrintsNoNote` - with `--quiet`, the run prints no note and no preview;
+  - `TestRunSync_When_VerbosePreviewHasCopiesTheDestinationHolds_Then_NoteComesBeforeTheUIDList` - with `--verbose`, the note comes after the "will copy" line and before the UID list.
+
+  The shared destinations have these tests:
+  - `Test_maybeDiff_When_PlansShareADestination_Then_LaterPlansCopyOnlyTheExcess` - a later plan copies only the copies that the earlier plans and the destination do not cover;
+  - `Test_maybeDiff_When_ThreeMappingsShareADestinationAmongOthers_Then_CountsAccumulateAndAreReleased` - the reservations of three mappings add up, a destination with one mapping reserves nothing, and the last mapping releases the reservations;
+  - `Test_maybeDiff_When_SharedCopiesDifferInSize_Then_SizesPairReservationsAndStandbys` - the sizes pair the copies of a later mapping with the reserved copies, and they choose the standbys;
+  - `Test_buildSyncPlan_When_SharedDestinationScansFinishInAnyOrder_Then_PlansAreIdentical` - a slow source scan or a slow destination scan changes neither the plans nor the standbys;
+  - `Test_lastIndex_When_ReceiverIsNil_Then_ReportsNoSharedDestination` - a run with no shared destination holds no set;
+  - `TestRunSync_When_TwoMappingsShareADestination_Then_ASharedMessageIdIsCopiedOnce` - a message that two source folders share arrives one time. This holds for one and for two workers, and for an existing and a missing destination;
+  - `TestRunSync_When_SharedDestinationHoldsCopies_Then_TheLargestCountWins` - the destination ends with the largest count of copies, not the sum, and a second run copies nothing;
+  - `TestRunSync_When_SharedDestinationMapsInAnotherOrder_Then_TheFirstMappingCopiesTheSharedMessage` - the first mapping in the list copies the shared message;
+  - `TestRunSync_When_TheFirstSharedMappingFails_Then_TheSecondCopiesTheSharedMessage` - a failed scan of the first mapping gives a folder failure, and the second mapping copies the shared message;
+  - `TestRunSync_When_TheLastSharedMappingFailsItsScan_Then_EarlierPlansStillCopy` - a failed scan of the last mapping releases the reservations, and the earlier plans still copy;
+  - `TestRunSync_When_TheFirstSharedMappingFailsAtCopyTime_Then_TheNextRunCopiesTheSharedMessageOnce` - after a failure during the copy, the next run copies the missing shared message one time;
+  - `TestRunSync_When_AnEarlierMappingCoversALaterOne_Then_TheLaterOneHasNoPlan` - a later mapping whose messages are all covered gets no plan;
+  - `TestRunSync_When_ExpandedSubfolderAndMappingShareADestination_Then_EachMessageIsCopiedOnce` - an expanded subfolder and a mapping with one destination copy each message one time;
+  - `TestRunSync_When_MappingsNameOneDestinationInTwoLetterCasesOfInbox_Then_TheyShareTheFolder` - two letter cases of an INBOX level in the destination names give one folder;
+  - `TestRunSync_When_SharedDestinationExistsButLISTHidesIt_Then_TheRecheckKeepsEachMessageOnce` - the check after CREATE keeps each message one time. This holds when the folder holds a message of the first plan, and when it holds a message of the second plan;
+  - `TestRunSync_When_SharedDestinationCopiesDifferInSize_Then_EachDistinctCopyArrivesOnce` - copies of one Message-Id that differ in size arrive one time each;
+  - `TestRunSync_When_SharedDestinationNameCarriesControlCharacters_Then_PreviewListsItOnceEscapedAndServerGetsOneExactCreate` - the list of folders to create names the destination one time, with escapes. The server gets one CREATE with the exact name.
+
+  The standbys and the refused bodies have these tests:
+  - `TestFolderSyncPlan_standbysOf` and `TestFolderSyncPlan_standbysOf_When_Called_Then_DoesNotAllocate` - the standbys of one planned UID come in source order, and the lookup costs no allocation;
+  - `Test_standbysFor_When_ReceiverIsNilOrPlanHasNoStandbys_Then_ReturnsNothing` - a nil set, or a slot with no standby, gives nothing;
+  - `Test_maybeDiff_When_SharedDestinationHasStandbyCopies_Then_EachPlannedCopyGetsThemInMapOrder` and `Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReservations` - each planned copy gets the copies of later mappings as standbys, in mapping order, also for random counts;
+  - `Test_buildSyncPlan_When_DestinationIsNotSharedOrSharesNoMessageId_Then_PlansHaveNoStandbys` - a plan has no standby when its destination is not shared, or when the mappings share no Message-Id;
+  - `Test_runFolderSync_When_PlanHasNoStandbys_Then_EmptyBodyCountsOneError` - without standbys, a refused body counts one error and the destination gets no APPEND;
+  - `Test_runFolderSync_When_PlannedMessageHasEmptyBodyAndAStandby_Then_CopiesTheStandbyOnce` and `Test_runFolderSync_When_PlannedBodyIsMissingAndAStandby_Then_CopiesTheStandby` - an empty body, or a missing body, gives way to the standby copy, which arrives one time;
+  - `Test_runFolderSync_When_FirstStandbyCopiesTheMessage_Then_LaterSourcesAreNotFetched` and `Test_runFolderSync_When_FirstStandbyIsAlsoEmpty_Then_TheNextSourceIsTried` - the worker tries the standby sources in order and stops at the first usable body;
+  - `Test_runFolderSync_When_EveryStandbyIsEmpty_Then_CountsOneErrorAndAppendsNothing` - when no standby has a usable body, the message counts one error and nothing reaches the destination;
+  - `Test_runFolderSync_When_DestinationRefusesThePlannedMessage_Then_NoStandbyIsFetched` and `Test_runFolderSync_When_DestinationRefusesTheStandby_Then_CountsOneErrorAndTriesNoOtherSource` - a refusal by the destination is no reason to fetch a standby, and it ends the search;
+  - `Test_runFolderSync_When_MainStreamFailsAfterTheRefusal_Then_TheStandbyStillCopies` - a stream error after the refusal does not stop the standby copy;
+  - `Test_runFolderSync_When_BodylessResponseComesBeforeTheFullOne_Then_CopiesThePlannedMessageAndNoStandby` - when a response without a body comes before the full response, the worker copies the planned message and fetches no standby;
+  - `Test_runFolderSync_When_ContextEndsDuringTheMainStream_Then_NoStandbyIsFetched` and `Test_runFolderSync_When_ContextEndsDuringTheStandbyStream_Then_ReturnsCanceledWithoutCounting` - a cancel stops the standby search and counts no error;
+  - `Test_runFolderSync_When_StandbySourceUIDValidityChanged_Then_CountsOneErrorAndAppendsNothing` - a standby stream checks the UIDVALIDITY of its own source folder;
+  - `Test_runFolderSync_When_NamesCarryControlCharacters_Then_TheStandbyLineShowsEscapes` - the verbose standby line escapes the names and the Message-Id;
+  - `TestRunSync_When_TheFirstSharedMappingHasAnEmptyBody_Then_TheLaterMappingsCopyArrivesInTheSameRun` and `TestRunSync_When_SharedDestinationIsRecheckedAndTheReservedCopyHasAnEmptyBody_Then_TheStandbyArrives` - the standby copy arrives in the same run, also after the check of an existing destination;
+  - `TestRunSync_When_EverySharedCopyHasAnEmptyBody_Then_EachRunFailsAndNothingEmptyIsAppended` - when every copy has an empty body, each run counts one error and the destination never gets an empty message;
+  - `TestRunSync_When_SourceReturnsEmptyBody_Then_MessageFailsOnEachRun` and `TestRunSync_When_SourceBodyStaysEmpty_Then_EveryRunFailsLoudAndTheDestinationNeverGrows` - a message with an empty body fails on each run with exit code 1. The destination never gets an empty message.
+
+  The UIDVALIDITY of a source folder has these tests:
+  - `Test_buildSyncPlan_When_SourceFoldersHaveOwnUIDValidity_Then_EachPlanCarriesIt` - each plan holds the UIDVALIDITY of its own source folder;
+  - `TestRunSync_When_SourceSendsNoUIDValidity_Then_SyncCopiesNormally` - a plan with no UIDVALIDITY is never checked, also in the check after CREATE;
+  - `TestRunSync_When_SourceUIDValidityChangesBeforeCopy_Then_PlanFailsAndNothingIsAppended` and `TestRunSync_When_SourceStopsReportingUIDValidityBeforeCopy_Then_PlanFailsAndNothingIsAppended` - a changed value, or no value, ends the stream before any UID FETCH. The run exits with code 1, and the next run copies the rest;
+  - `TestRunSync_When_SourceUIDValidityChangesBeforeRecheck_Then_FolderFailsBeforeCopy` and `TestRunSync_When_SourceStopsReportingUIDValidityBeforeRecheck_Then_FolderFailsBeforeCopy` - the check after CREATE gives a folder failure before any APPEND. This holds for a kept selection and for a new EXAMINE;
+  - `TestRunSync_When_CreateReportsExistingEmptyFolderAndSourceIsRebuilt_Then_TheStreamStopsBeforeAnyAppend` - an existing empty destination needs no source scan, so only the stream catches the change. The stream stops before any APPEND, and the next run copies all messages;
+  - `TestRunSync_When_OneOfTwoSourceFoldersIsRebuiltAfterThePlan_Then_OnlyThatFolderFails` - the other folder still copies, and the next run copies the failed folder;
+  - `TestRunSync_When_RebuiltFolderNameCarriesControlCharacters_Then_FailureLinesShowEscapesAndWireNamesStayExact` - the failure lines escape the names, and the names on the wire stay exact;
+  - `Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsOneErrorAndAppendsNothing` - the worker counts one error, logs the stream error and appends nothing.
+
+  The mapping precedence and the source conflicts have these tests:
+  - `Test_mostSpecific` - the longest root wins in any order. Equal roots keep the first entry. Two spellings of one INBOX level give the smaller root in byte order;
+  - `Test_checkSourceConflicts` - equal items and distinct sources pass, and two destinations for one source give an error that names both items;
+  - `Test_expandMappingsWithSubfolders_When_ExplicitMappingsNest_Then_MostSpecificWinsInEveryOrder` and `TestRunSync_When_ThreeNestedMappingsAreGiven_Then_MostSpecificWinsInEveryOrder` - the nearest mapping decides, whatever the order of the items;
+  - `Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_VerboseNamesBothDestinations` - with `--verbose`, the line "goes to ..., not to ..." names both destinations;
+  - `Test_expandMappingsWithSubfolders_When_ExplicitChildIsNoSelectOrUnlisted_Then_ItsChildrenFollowIt` - the children of a mapped `\Noselect` or unlisted folder follow the mapping of that folder;
+  - `Test_expandMappingsWithSubfolders_When_ExplicitDestinationEqualsRenamedDerivedName_Then_ExplicitEntryIsKept` - an explicit mapping keeps its typed destination when it equals a renamed derived name, and its entry is not marked renamed;
+  - `Test_expandMappingsWithSubfolders_When_OverrideNamesCarryControlCharacters_Then_LineShowsEscapes` - the override line escapes the names;
+  - `Test_expandMappingsWithSubfolders_When_QuietAndVerboseAreBothSet_Then_NothingIsPrinted` - `--quiet` hides the override lines;
+  - `TestRunSync_When_ParentAndChildFoldersAreBothMapped_Then_ChildMappingWinsInEitherOrder` - the child mapping decides, and a second run sends no APPEND;
+  - `TestRunSync_When_TwoMappingsNameOneSourceWithDifferentDestinations_Then_RunStopsBeforeThePlan` - two spellings of INBOX, or a rewritten delimiter, make one source and stop the run before the scan;
+  - `TestRunSync_When_MapRepeatsAnItemExactly_Then_RunMatchesASingleItem` - a repeated item causes no extra scan, CREATE or APPEND;
+  - `TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother` - in a mirror run, the own mapping of each folder wins;
+  - `TestRunSync_When_ExplicitChildDestinationEqualsRenamedSiblingDestination_Then_BothFailAsAClash` - a typed destination that equals a renamed destination gives a clash, and both folders fail.
+
+  The case-variant warning has these tests:
+  - `Test_printCaseVariantDestinations` - the groups, their order, the escapes and the rule that a group with every name listed gets no line;
+  - `TestRunSync_When_DestinationsDifferOnlyInLetterCase_Then_WarningShowsAndEachFolderCopies` - the warning shows before the prompt, also with `--quiet`, and each folder gets its messages.
 - **`internal/progress`** - interface compliance against the contract `internal/client` expects.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
-- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read. They also include the left-out lines, the rename notice and the "already exists and holds" lines (`TestRunSync_When_ExistingDestinationNamesCarryControlCharacters_Then_InfoLineShowsEscapesAndServersGetExactNames`).
+- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read. They also include the left-out lines, the rename notice and the "already exists and holds" lines (`TestRunSync_When_ExistingDestinationNamesCarryControlCharacters_Then_InfoLineShowsEscapesAndServersGetExactNames`). They include the case-variant warning, the mapping override line and the standby line. They also include the list of folders to create for a shared destination and the failure lines of a rebuilt source folder.
 - **`cmd/imapsync-go`** - `TestReportError` covers the exit code and the escaped `Error:` line. `TestFetchTag` covers `helpers.fetchTag` against an `httptest` server.
 
 ## What we deliberately don't test

@@ -126,6 +126,12 @@ map:
 > You can also use `--src-folder` / `--dest-folder` to sync a single
 > folder without a config file `map` section.
 
+A `map` item applies to its source folder and to all subfolders of this folder.
+If two `map` items apply to one folder, the item with the nearest source folder
+decides. The order of the items does not change the result. For example, with
+`INBOX` to `Old` and `INBOX/Work` to `Work`, the command copies `INBOX/Work` to
+`Work`.
+
 The command checks the configuration file when it loads the file.
 
 - The file can contain only these keys: `src` and `dst` (`label`, `server`,
@@ -136,6 +142,12 @@ The command checks the configuration file when it loads the file.
 - If a `map` item has no `src` or no `dst`, or one of them is empty, the
   command stops with an error. The error shows the number of the item, counted
   from 1, and the key.
+- If two `map` items have the same `src` and different `dst` values, the
+  command stops with an error. The error shows the numbers of the two items,
+  counted from 1.
+- Two identical items are valid. Two items with the same `dst` are also valid.
+- `sync` makes this check again after it finds the folder names on the server.
+  For example, `inbox` and `INBOX` are one source folder.
 - In a JSON file, the letter case of a key is not important. For example,
   `SRC` and `src` are the same key. In a YAML file, a key must have the same
   letter case as in this list. For example, `Src` causes an error.
@@ -215,7 +227,7 @@ sync -w 4
 - `-w, --workers` - Number of parallel workers (default: 4, max: 10) (env: `IMAPSYNC_WORKERS`)
 - `-y, --confirm, --yes` - Auto-confirm without prompt. The `-q` option needs this option. (env: `IMAPSYNC_CONFIRM`)
 - `-V, --verbose` - Enable verbose output (env: `IMAPSYNC_VERBOSE`)
-- `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice, the notice of a renamed folder, the notice of a left-out folder and the list `Folders that cannot be synced` still show. The final line also shows when the sync copies messages or has a failed folder. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
+- `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the list `Folders that cannot be synced` still show. The notices of a renamed folder, of a left-out folder and of destination folders that differ only in letter case also still show. The final line also shows when the sync copies messages or has a failed folder. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
 - `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
 - `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`). The limit is shared by all workers. Below about 110 bytes/sec for each worker, an upload can wait so long that the 5-minute idle limit closes the connection, so `sync` prints a warning before the plan.
 - `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
@@ -291,7 +303,7 @@ If `sync` cannot scan a source folder, it does not stop. It copies the other fol
 - After the copy, the final line shows the number of failed folders, and the command ends with exit code 1.
 - If no folder has new messages and a folder failed, the command asks no question. It prints the list and ends with exit code 1.
 - If you answer no to the question before the copy, the command copies no messages and ends with exit code 0. This is also true when a folder failed.
-- A destination folder that the command reads again after CREATE can fail in the same way. This happens when the command cannot scan this folder or its source folder again. The command prints the list at once. Refer to [Idempotency caveats](#idempotency-caveats).
+- A destination folder that the command reads again after CREATE can fail in the same way. This happens when the command cannot scan this folder or its source folder again. It also happens when the server changed the UIDVALIDITY of the source folder or did not send it. The command prints the list at once. Refer to [Idempotency caveats](#idempotency-caveats).
 
 Some servers list the subfolders of a folder, but not the folder. If such a folder refuses to open, `sync` skips it and copies the subfolders. The command prints one line for the folder, and the `-q` option hides this line. The exit code does not change. `sync` never skips INBOX in this way.
 
@@ -353,9 +365,14 @@ The escaping is for UTF-8 terminals.
 
 ## Idempotency caveats
 
-`imapsync-go` decides what to copy by diffing message **`Message-Id`** headers
-between source and destination. This is fast and re-running a partial sync is
-safe, but it has two known limitations:
+`imapsync-go` decides what to copy from the **`Message-Id`** headers of the
+messages. A copy is one message with a given `Message-Id`. For each
+`Message-Id`, the command counts the copies in the source folder and the copies
+in the destination folder. If the source folder holds more copies, the command
+copies the difference. The command never deletes a copy on the destination.
+This is fast, and a new run after a partial sync is safe.
+
+These limitations apply:
 
 - **Messages without a `Message-Id` are skipped.** Drafts, some bulk mail and
   messages from broken senders may not have one. They cannot be tracked across
@@ -367,10 +384,32 @@ safe, but it has two known limitations:
   see the original IDs as still "missing" on the destination and re-upload
   them. If you suspect this, do the sync in a single pass and avoid re-running
   it against the same destination.
+- **Messages that share a `Message-Id` are copied by count.**
+  - The command matches each destination copy to a source copy with the same size. Among equal sizes, the lowest UID goes first.
+  - A destination copy that matches no size takes the lowest free UID.
+  - The sizes only choose which source copies stay in the plan. The count never depends on the sizes.
+  - If the destination changes the size of a message on upload, the match uses UID order only. The count stays correct. But the command can copy a message that the destination already has and leave out a different message.
+  - Releases v1.2.1 and earlier copied only one message for each `Message-Id`. After an upgrade from such a release, the command matches the destination copy to its source copy by size. Then it copies the other copies. When the sizes stay the same, the upgrade is safe.
+- **Some servers keep one message for each `Message-Id`, for example Gmail.** Such a server accepts the upload of a second copy, but it drops the copy. So the extra copies upload again on each run, and each run reports success. Under the `will copy` line of the plan, the command prints the line `N of these messages have a Message-Id that the destination folder already holds`. N is the number of planned copies whose `Message-Id` the destination folder already holds. The `-q` option hides this line.
+- **Destination folders can differ only in letter case.** For example, a `map` can name `Archive` and `archive`. A server that ignores letter case, for example Exchange, treats these names as one folder. Then a message that the two source folders share is copied more than once. Before the scan, the command prints the line `Destination folders NAMES differ only in letter case. If the destination server ignores letter case, a message that their source folders share is copied more than once.` The line shows also with `-q`. It does not show when the destination server already lists every one of these names.
+- **A folder fails when the server changes its UIDVALIDITY or does not send it.** UIDVALIDITY is a number that the server sends for a folder. If it changes, the old UIDs can point to other messages. The plan holds this number for each source folder.
+  - The command checks the number before each fetch of message bodies. It also checks the number when it reads the source folder again after CREATE.
+  - If the number changes, or if the server does not send the number again, the folder fails with the error `source folder changed after the sync plan, run sync again`. The error ends with the old and the new number, for example `(UIDVALIDITY 5, now 6)` or `(UIDVALIDITY 5, now none)`.
+  - During the copy, the command copies no more messages from this folder in this run. The messages that it already copied stay on the destination. The run ends with exit code 1.
+  - During the check after CREATE, the folder shows in the list `Folders that cannot be synced`. The run ends with exit code 1.
+  - The next run scans the folder again and copies the rest. The command keeps the number only for one run.
+  - A folder that sent no UIDVALIDITY when the command made the plan gets no check.
+- **A message can come without a UID.** A destination copy without a UID counts as one copy. A source message that has a `Message-Id` but no UID makes the source folder fail. The folder shows in the list `Folders that cannot be synced`. The other folders still copy.
+- **Two or more mappings can copy into one destination folder.**
+  - For each `Message-Id`, the folder ends with the largest count of copies. This is the count that the folder already holds, or the count that one source folder holds. It is not the sum of the counts.
+  - The command creates the folder one time.
+  - The first mapping can have a copy with an empty body or no body. Then the command copies the copy of a later mapping in the same run.
+- **A message with an empty body, or with no body, fails on each run when no other copy can replace it.** The command never uploads an empty message. An empty message has no `Message-Id`, so each later run would add one more. The command counts one error for the message, and the run ends with exit code 1. With `-V`, the command shows the reason: `source returned an empty body` or `message has no body`. The message fails again on each run until the source sends a body.
 
 When CREATE answers that the destination folder already exists, the folder was not in the list of the destination server. The plan has no diff against this folder, so the command reads the folder again after your answer.
 
-- The command removes from the plan each message whose `Message-Id` the folder holds. It never adds a message.
+- The command counts the copies in the folder again, and it uses the same rules. It removes from the plan each message that a copy in the destination folder covers. It never adds a message.
+- When the command reads the source folder again, it also checks the UIDVALIDITY. If the number changed since the plan, or if the server did not send it, the folder fails. The command prints it in the list `Folders that cannot be synced`, and the run ends with exit code 1.
 - Without `-q`, the command prints the line `Destination folder ... already exists and holds N of the M planned messages from ..., so they are not copied`.
 - Without `-q`, if a planned message left the source, the command prints the line `Source folder ... no longer holds N of the M planned messages for ..., so they are not copied`.
 - The command also makes this check for a folder that it creates, if the destination server sent a name that is not valid modified UTF-7.

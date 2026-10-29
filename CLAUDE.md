@@ -31,16 +31,16 @@ Single-binary IMAP-to-IMAP sync tool. Six things to internalize before making ch
 ```
 cmd/imapsync-go/main.go         - urfave/cli/v3 wiring, version flags, signal-to-context
 cmd/imapsync-go/commands/       - thin subcommand definitions (sync, show); they only declare flags and call into internal/app
-internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, fixes typed delimiters, converts folder names, builds the plan, confirms, dispatches to worker pool
+internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, fixes typed delimiters, converts folder names, warns about destination names that differ only in letter case, builds the plan (matches copies by count and size), confirms, dispatches to worker pool
 internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table, the LIST names that are not valid modified UTF-7, then a list of the folders it cannot read (ErrSilentExit)
-internal/app/worker.go          - syncWorker pool + runFolderSync helper consumed by sync.go
+internal/app/worker.go          - syncWorker pool + runFolderSync helper consumed by sync.go, standby copies after an empty or missing body
 internal/client/client.go       - go-imap wrapper: Options, dial+TLS, guardConn wiring (watchdog, rate limit), bounded greeting and logout, reconnect with the give-up and revive gate, Select that trusts the go-imap session state
 internal/client/watchdog.go     - idleConn: inactivity watchdog for commands in flight
-internal/client/fetch.go        - single-pass FetchMessageMap (Message-Id+UID, source) and FetchMessageCopies (Message-Id copies, destination), StreamMessagesByUIDs (batched UID FETCH, a retry fetches only the UIDs not yet delivered)
+internal/client/fetch.go        - single-pass FetchMessageMap (Message-Id, UID and RFC822.SIZE of each copy, and the UIDVALIDITY, source) and FetchMessageCopies (Message-Id copies, destination), CheckUIDValidity, StreamMessagesByUIDs (batched UID FETCH, a UIDVALIDITY check before each one, a retry fetches only the UIDs not yet delivered)
 internal/client/mailbox.go      - MailboxExists / IsNoSelect / ListSubfolders / CreateMailbox via the cache, InvalidMailboxNames, ListMailboxes (a folder that cannot be read carries its reason in MailboxInfo.Err)
 internal/client/cache.go        - per-Client mailboxCache (one LIST "" "*" through listAll, which leaves out names that are not valid modified UTF-7), a created mailbox is added to it, the names that LIST marks \Noselect or \NonExistent are kept, ResolveName folds a leading INBOX level, the delimiter stays empty for a flat server
-internal/client/append.go       - AppendMessage streaming the literal directly from the fetched body, one retry only before go-imap reads the body
-internal/client/errors.go       - classifyError: Transient / Permanent / Throttled, text matched on leaf errors only; canRevive; isAlreadyExistsErr; ErrSelectRefused marks a server refusal of SELECT or EXAMINE
+internal/client/append.go       - AppendMessage streaming the literal directly from the fetched body, one retry only before go-imap reads the body, refuses an empty or missing body before any command
+internal/client/errors.go       - classifyError: Transient / Permanent / Throttled, text matched on leaf errors only; canRevive; isAlreadyExistsErr; ErrSelectRefused marks a server refusal of SELECT or EXAMINE; ErrEmptyBody and ErrMissingBody mark a message that AppendMessage refuses; ErrUIDValidityChanged marks a changed source UIDVALIDITY; errMissingUID marks a scanned message without a UID
 internal/client/provider.go     - DetectProvider, used by sync.go to print quota warnings
 internal/config/                - JSON+YAML config loader (extension-driven, unknown keys rejected), validation
 internal/progress/              - go-pretty progress writer/tracker abstraction (interfaces consumed by client)
@@ -71,7 +71,9 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - the cache lists the name when the server delimiter replaces this character. The function tries the three characters in this order and takes the first listed name.
    - A name that the cache lists never changes, because a delimiter character can be part of a name. A typed name that the cache does not list, and that has no listed rewrite, stays as typed and gives no question.
    - `offerDelimiterFixes` shows all rewrites in one notice and asks one question. `-y/--confirm` accepts without a question. If the user declines, the names stay as typed.
-   - `resolveMappings` replaces each typed name with the name that the mailbox cache lists (`Client.ResolveName`). So the dedup, the clash check and the subfolder cut compare the bytes of the server.
+   - `resolveMappings` replaces each typed name with the name that the mailbox cache lists (`Client.ResolveName`). So the conflict check, the clash check and the subfolder cut compare the bytes of the server.
+   - In a typed run, `checkSourceConflicts` runs after `offerDelimiterFixes` and `resolveMappings`. Two spellings of one INBOX source count as one source.
+   - Two items with one source and different destinations stop the run before the scan. The error wraps `errSourceConflict`: `map entries J and I: different destination folders for source folder NAME`. `reportError` escapes the `Error:` line. `config.New` makes a first check on the raw text (see Conventions).
    - A mirror run builds its mappings with `mirrorMappings`. It gives each listed source name to `convertFolderPath` and asks no question.
    - `convertFolderPath(path, srcDelimiter, dstDelimiter)` gives the destination name. These rules apply in this order:
      - If the destination has no delimiter, or the two delimiters are the same, the path does not change.
@@ -88,16 +90,54 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - The expansion sorts the subfolders of each mapping in byte order, because the cache lists names in map order. So the plans and the failure lines are the same on each run.
    - The relative path of a subfolder is the part of its listed name after the mapped name and one delimiter. The code cuts this part by length, because the listed name can spell a leading INBOX level in another letter case.
    - If the destination has a delimiter, `convertFolderPath` (step 1) converts the relative path. The destination name of the subfolder is then the destination root, the destination delimiter and the converted path. A flat destination has no hierarchy, so the name is the destination root, the source delimiter and the relative path.
-   - After the expansion, `resolveDestinations` replaces the INBOX level of each derived destination with the listed spelling.
+   - Inside the expansion, `dstClient.ResolveName` gives each mapped and each derived destination the listed spelling of its INBOX level.
+   - `mostSpecific` gives each source name one entry. The entry of the mapping whose source is the name itself, or its nearest ancestor, wins. This is the longest root.
+     - When two roots have the same length (two listed spellings of one INBOX level), the smaller root in byte order wins.
+     - The order of the map items does not change the result. In a mirror run, the own mapping of each folder wins.
+   - With `--verbose` and without `--quiet`, `printExpansion` prints one line for each entry that lost:
+     - an entry with another destination gives the escaped line `  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s`;
+     - an entry with the same destination gives the existing `%q` line `Mapping ... skipped - already covered by a parent mapping's expansion`.
+   - The found-subfolder line shows only a destination that the sync plan uses.
    - `splitDestinationClashes` groups the expanded mappings by destination. When a group holds two or more mappings and at least one is renamed, every mapping of the group fails. Its `FolderFailure` wraps `errDestinationClash` and names one other source folder of the group. A group with no renamed mapping stays unchanged.
    - `runSync` puts the clash failures before the failures of the scan in `SyncSummary.Failures`. A clash gives no plan, so the run creates no destination folder for it.
    - `printFolderRenames` prints one escaped warning line for each renamed mapping that remains, before the scan. The line shows the two names and the destination delimiter. It shows also without `--verbose` and with `--quiet`.
-3. **Build sync plan** (`buildSyncPlan`): two goroutines run under an `errgroup` - one walks every src mapping calling `FetchMessageMap`, the other walks every dst mapping calling `MailboxExists` + `FetchMessageCopies`. Trackers advance independently so a slow dst does not stall the src progress bar. After both sides complete a slot, `maybeDiff` fires (guarded by `atomic.Int32` reaching 2 + a `sync.Mutex` for race-detector cleanliness), computes the Message-Id diff, and immediately frees the maps to keep peak memory proportional to one folder at a time. All fetches are envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] + UID`; bodies are not pulled at planning time. The "what would be synced" preview is printed and confirmed before any writes. `--quiet` hides the preview and the prompt, so `runSync` refuses `--quiet` without `-y/--confirm` before it connects to a server.
+   - `printCaseVariantDestinations` prints one escaped warning line for each group of destination names that differ only in letter case. It runs after `printFolderRenames` and before the scan, in typed runs and in mirror runs. It reads the planned mappings, which come after `splitDestinationClashes`.
+     - A group holds destination names that are equal after `strings.ToLower` but have different bytes. INBOX levels already have the listed spelling, so INBOX spellings are not variants.
+     - A group gets no line when the destination LIST (`MailboxNames`) holds every name of the group, because that server keeps the names apart.
+     - The groups come in the order of the lower-case key, and the names of a group in byte order. The line joins the names with ", ". One empty line follows the groups.
+     - The line is `⚠️  Destination folders %s differ only in letter case. If the destination server ignores letter case, a message that their source folders share is copied more than once.` It shows also without `--verbose` and with `--quiet`.
+     - The plans, the prompt and the exit code do not change. An example of a server that ignores letter case is Exchange.
+3. **Build sync plan** (`buildSyncPlan`): two goroutines run under an `errgroup` - one walks every src mapping calling `FetchMessageMap`, the other walks every dst mapping calling `MailboxExists` + `FetchMessageCopies`. Trackers advance independently so a slow dst does not stall the src progress bar. After both sides complete a slot, `maybeDiff` fires (guarded by `atomic.Int32` reaching 2 + a `sync.Mutex` for race-detector cleanliness), computes the diff by the count of copies for each Message-Id, and immediately frees the maps to keep peak memory proportional to one folder at a time. All fetches are envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] + UID + RFC822.SIZE`; bodies are not pulled at planning time. The "what would be synced" preview is printed and confirmed before any writes. `--quiet` hides the preview and the prompt, so `runSync` refuses `--quiet` without `-y/--confirm` before it connects to a server.
    - The destination goroutine calls `IsNoSelect` after `MailboxExists`. It does not call `FetchMessageCopies` for a `\Noselect` destination.
+   - `FetchMessageMap(ctx, folder)` scans the source and returns `map[string][]MessageRef`, the UIDVALIDITY and an error. `FetchMessageCopies(ctx, folder)` scans the destination and returns the map and an error. Both use `scanMessageIDs`.
+     - One scan sends one FETCH of `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`, `UID` and `RFC822.SIZE`. A `MessageRef` holds the UID and the size of one copy.
+     - Each map value lists every copy of the Message-Id in ascending UID order.
    - A scan response can have a Message-Id but no UID, or UID 0. go-imap sends UID 0 as `*` in a UID set.
      - `FetchMessageMap` scans the source. It fails the scan for such a response, and the error wraps `errMissingUID`. The client does not reconnect for this error.
      - `FetchMessageCopies` scans the destination. It keeps such a response as a copy with UID 0, because the diff reads only the count and the sizes of the destination copies.
      - The scan counts each response with UID 0 as one copy, also when two such responses have the same Message-Id. A repeated response with the same UID that is not 0 counts one time.
+   - The count rule: take one Message-Id. The source holds N copies and the destination holds D copies. The plan copies max(N - D, 0) source copies. The program never deletes a copy on the destination.
+   - `copyMatcher.match` chooses which source copies the destination copies match:
+     - each destination copy matches a source copy with the same RFC822.SIZE. Among equal sizes, the lowest UID goes first;
+     - a destination copy that matches no size takes the lowest free UID;
+     - so the sizes only choose the copies, and the counts never depend on the sizes;
+     - the sorting keeps the cost at O(k log k) for k copies of one Message-Id, which stops a quadratic cost on a hostile server.
+   - `NewSize` adds up the RFC822.SIZE of the planned copies only.
+   - Two or more expanded mappings can have one destination. This applies to typed runs, mirror runs, and an expanded subfolder plus a mapping. `sharedDestinations` tracks them, and `buildSyncPlan` compares their scans in mapping order.
+     - Each mapping except the last of its destination reserves its planned copies for each Message-Id. A `reservation` holds the UID, the size and the slot.
+     - A later mapping first removes the copies that the destination holds, with the count rule. Then it pairs the copies that are left with the reserved copies, with the same size rule.
+     - A paired copy is not planned. A copy with no pair is planned, and it is also reserved when the mapping is not the last one.
+     - So the destination ends with the largest count of copies, which is its own count or the count of one source folder. It is not the sum.
+     - `maybeDiff` releases the reservations of a destination after it compares the last mapping of that destination, also when that mapping fails.
+     - A paired copy from another source folder becomes a standby of the reserved copy (`FolderSyncPlan.standbys`). A `standbySource` holds the folder and its UIDVALIDITY.
+     - The preview list "Folders to be created on destination" names a shared destination one time, and the program sends one CREATE for it.
+   - `FolderSyncPlan.ExtraCopies` counts the planned copies whose Message-Id the destination folder already holds. Copies that an earlier mapping of a shared destination reserves in the same run do not count.
+     - The preview prints one line under the "will copy" line, only when the count is more than 0 and only without `--quiet`. With `--verbose`, the line comes before the UID list.
+     - The format is `  ℹ️  %d of these messages have a Message-Id that the destination folder already holds`.
+     - A server that keeps one message for each Message-Id, for example Gmail, accepts a duplicate APPEND and drops the copy. So these copies upload again on each run, and each run reports success. The line warns about this.
+   - `buildSyncPlan` stores the UIDVALIDITY of each source scan in `FolderSyncPlan.SrcUIDValidity`. The value is 0 when the server sent none, and a plan with 0 is never checked.
+     - `FetchMessageMap` takes the value from the EXAMINE. When the folder stays selected and no EXAMINE runs, it takes the value from `STATUS (MESSAGES UIDVALIDITY)`. A retry on a new session returns the value of the new session.
+     - The value exists only in the sync plan of one run. It is not a record that stays between runs.
    - A failed source scan gives a folder failure (`FolderFailure` in `SyncSummary.Failures`). Its error wraps `errSourceScan` ("cannot scan source folder").
    - A source mapping is a skip (`FolderSkip` in `SyncSummary.Skipped`), not a folder failure, when all these conditions are true:
      - the scan error wraps `client.ErrSelectRefused`. `FetchMessageMap` adds this marker only when the server refuses the folder with a reply that is not transient and not throttled;
@@ -119,19 +159,33 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - `CreateMailbox` gives `created == false` and no error when the CREATE reply says that the folder exists, or when the mailbox cache already holds the name. The planning scan did not find that folder, so its plan has no diff against the folder. `runSync` keeps each such folder in a set.
    - If the destination LIST has names that are not valid modified UTF-7 (`InvalidMailboxNames`), the set also holds each folder that CREATE made. An OK reply does not prove that the folder is new.
    - After the creation loop and before the worker pool, `recheckExistingDestinations` checks each plan whose destination is in this set. It runs in sequence on the two planning clients, sends no LIST and starts no goroutine. All checks end before the first APPEND.
-   - `recheckPlan` reads the destination first with `FetchMessageCopies`. If the folder holds no Message-Id, the plan does not change and the run sends no source command. If not, it reads the source again with `FetchMessageMap`, and `rediffPlan` keeps the planned UIDs that the new diff still lists. `rediffPlan` also counts each dropped UID in a `recheckDrops` value, by cause.
+   - `recheckPlan` reads the destination first with `FetchMessageCopies`. If the folder holds no Message-Id, the plan does not change and the run sends no source command. If not, it reads the source again with `FetchMessageMap`. Then it calls `client.CheckUIDValidity` with the value of the plan (step 5), and `rediffPlan` keeps the planned UIDs that the new diff still lists. `rediffPlan` also counts each dropped UID in a `recheckDrops` value, by cause.
    - The check only removes messages. It never adds a UID to a plan and never shows a second prompt.
-   - The two counts of `recheckDrops` are `held` and `gone`. `held` counts the dropped UIDs that the source still lists and whose Message-Id the destination holds. `gone` counts the dropped UIDs that the source no longer lists. `held`, `gone` and the kept UIDs add up to the planned UIDs.
+   - `rediffPlan` uses the same `copyMatcher` as `maybeDiff`, with the destination sizes only. So the plan and the recheck choose the same messages.
+   - `rediffPlan` sets `NewSize` and `ExtraCopies` again for the kept UIDs. The run prints neither value after the prompt.
+   - The two counts of `recheckDrops` are `held` and `gone`. `held` counts the dropped UIDs that the source still lists and that the destination copies match, by the count rule. `gone` counts the dropped UIDs that the source no longer lists. `held`, `gone` and the kept UIDs add up to the planned UIDs.
    - Without `--quiet`, `runSync` prints up to two escaped lines for each plan that loses messages. M is the number of planned messages in both lines. Each line shows only when its count is more than 0.
      - First line, for `held`: `Destination folder ... already exists and holds N of the M planned messages from ..., so they are not copied`.
      - Second line, for `gone`: `Source folder ... no longer holds N of the M planned messages for ..., so they are not copied`.
    - With `--quiet`, the check prints neither line. The check removes a plan that has no UID left.
    - A scan that fails gives a folder failure. Its error wraps `errDestinationRecheck` for the destination or `errSourceScan` for the source. `runSync` adds it to `SyncSummary.Failures` and prints the new failures at once, also with `--quiet`. The run ends with exit code 1 (`ErrSilentExit`).
+   - A UIDVALIDITY failure of the source is also a folder failure. Its error wraps `client.ErrUIDValidityChanged`, not `errSourceScan`. It shows in `Folders that cannot be synced`, also with `--quiet`, and the run ends with exit code 1.
    - When the check leaves no plan, the run prints no "Syncing messages" line and opens no worker connection. It ends in the same way as the case with no message to copy.
    - When the context ends during the check, `runSync` returns the context error. It prints no failure line and sends no APPEND.
 5. **Execute via worker pool**: `newSyncWorkerPool` builds N persistent workers (each owns one src + one dst `Client` for the entire sync). Plans are dispatched through a chan-of-workers semaphore. A single `progress.Writer` covers all plans, with one tracker per plan appended up front. Per-message UI updates are throttled to ~10 Hz. At the end, `logoutAll` logs out all workers at the same time, then the two planning clients, so a silent server costs at most two logout limits.
+   - The copy checks the UIDVALIDITY. `runFolderSync` gives `SrcUIDValidity` to `StreamMessagesByUIDs`, which checks it on every attempt of every batch (Section 3).
+     - If the values differ, the worker logs `Stream error for folder ...` with the escaped error and counts one error for the plan. The run exits with code 1.
+     - The batches before the change stay copied, and the run copies no more messages from that folder. The next run scans again and copies the rest.
+     - `CheckUIDValidity(planned, current)` returns nil when `planned` is 0 or when the two values are equal. When `current` is 0, it returns an error that wraps `ErrUIDValidityChanged` with the suffix `(UIDVALIDITY N, now none)`. In all other cases, the suffix is `(UIDVALIDITY N, now M)`.
+     - A session that sends no UIDVALIDITY cannot prove that the planned UIDs still hold. So a plan value that is not 0 fails against a current value of 0.
+   - `AppendMessage` refuses a message with an empty or missing body (Section 5). `runFolderSync` handles the refusal in this way:
+     - if the plan has standbys for the refused UID (`FolderSyncPlan.standbysOf`), the UID waits;
+     - after the main stream, the worker streams the standby UIDs from each standby source, in mapping order. It appends the first copy that has a usable body. A standby stream uses the UIDVALIDITY of its own standby source;
+     - with `--verbose`, it logs `Copied message %s to %s from %s: the copy in %s has no usable body` (escaped);
+     - a waiting UID that no standby replaces counts as one error. Without standbys, the refusal counts as one error;
+     - the preview, the totals and the trackers do not change, and the destination gets no more copies than the sync plan shows.
 
-Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; re-running on a partially completed sync is safe and resumes.
+Idempotency comes from the count diff for each Message-Id. There is no UID-based bookkeeping; re-running on a partially completed sync is safe and resumes. The UIDVALIDITY check compares the sync plan of one run with the server and keeps no record between runs.
 
 **Folder names in the mailbox cache** (`internal/client/cache.go`):
 
@@ -200,8 +254,12 @@ Idempotency comes from the Message-Id diff. There is no UID-based bookkeeping; r
 - Each connection has one timer, and `Close` stops it. Without an open span the timer does not run. A timer that is pending when a span ends fires once, finds no span and stops.
 - `selectIfNeeded(cli, folder)` sends no EXAMINE only when `cli.State()` is `imap.SelectedState` and `cli.Mailbox()` has the name `folder`. go-imap clears the selected mailbox after a BYE and after a failed EXAMINE. A new session after a reconnect has no selected mailbox. The Client does not store a copy of the selected folder, because a copy can differ from the session. **Use it instead of `cli.Select` directly** - `StreamMessagesByUIDs` saves one round-trip per 500-message batch this way.
 - `StreamMessagesByUIDs` batches `UID FETCH` in chunks of `uidFetchBatchSize = 500` to avoid IMAP "Too long argument" errors. Don't unbatch.
-- `FetchMessageMap` sizes its map with `min(total, maxMessageMapHint)`, and `maxMessageMapHint = 1 << 16`. The server sets `total`, from EXAMINE or from STATUS MESSAGES. A very large count must not cause a large allocation. The map size still increases to the real number of messages.
+- Both scans (`FetchMessageMap` and `FetchMessageCopies`) size their map with `min(total, maxMessageMapHint)`, and `maxMessageMapHint = 1 << 16`. The server sets `total`, from EXAMINE or from STATUS MESSAGES. A very large count must not cause a large allocation. The map size still increases to the real number of messages.
 - A retry of a `StreamMessagesByUIDs` batch (after a transient error, through `safeCall`) fetches only the UIDs whose body `onMessage` did not receive. If `onMessage` received all of them, the retry sends no EXAMINE or FETCH command. The code does not deliver a second response with the body for the same UID. So a retry creates no duplicate APPEND on the destination. A response without a body does not mark its UID.
+- `StreamMessagesByUIDs(ctx, folder, uidValidity, uids, onMessage)` checks the UIDVALIDITY on every attempt of every batch, also a retry on a new session.
+  - After `selectIfNeeded`, it calls `CheckUIDValidity` with the value of the session. This value is the EXAMINE result, or `cli.Mailbox()` when no EXAMINE ran.
+  - If the values differ, it sends no UID FETCH and returns the error. A `uidValidity` of 0 skips the check. Batches that the stream already delivered stay delivered.
+  - The text of `ErrUIDValidityChanged` is `source folder changed after the sync plan, run sync again`. No `classifyMessage` rule matches it, so its class is `ClassUnknown`, and `safeCall` does not reconnect for it.
 - Folder creation uses a per-path `sync.Mutex` (`folderLocks` map) to make concurrent `CreateMailbox` calls for nested paths race-free; parents are created walking down the hierarchy.
 - `CreateMailbox` and `createParentFolders` treat a CREATE refusal as success when `isAlreadyExistsErr` matches the error text: `already exists`, `mailbox exists` or `duplicate folder name` (the Gmail text). go-imap v1 drops the `[ALREADYEXISTS]` code, so the text decides. They give `isAlreadyExistsErr` the error from `safeCall`, before a wrapper adds a folder name. They add the mailbox to the cache.
 - `c.pw` and `c.tracker` are `atomic.Pointer[progressWriterRef|progressTrackerRef]`. Read via `c.progressWriter()` / `c.progressTracker()`; do not access the fields directly.
@@ -226,6 +284,8 @@ Users can press Ctrl+\ (SIGQUIT) to get an immediate goroutine dump and exit. A 
 `StreamMessagesByUIDs` fetches via `BODY.PEEK[]` (`fullBodyPeekSection`), not `FetchRFC822`. The two are functionally equivalent for transferring the message but `FetchRFC822` sets `\Seen` on every message - a state mutation a sync tool must not introduce on the source. If you add new fetch sites, mirror this choice.
 
 `AppendMessage` passes `msg.GetBody(...)` straight to `cli.Append` - no `io.ReadAll` round-trip - to halve peak RAM with large attachments. go-imap reads the body one time.
+
+`AppendMessage` refuses some messages before it reconnects, logs in or sends an APPEND. A message with no `BODY[]` section gives `ErrMissingBody` (`message has no body`). A body of length 0 gives `ErrEmptyBody` (`source returned an empty body`). go-imap gives an empty body for `BODY[]` NIL, for `{0}` and for a quoted string. An empty APPEND has no Message-Id, so each later run would add one more empty message. Section 2, step 5, describes how `runFolderSync` handles the refusal. Without a standby copy, the message fails again on each run until the source sends a body.
 
 Before the APPEND, `AppendMessage` calls `reconnectSession` in these cases:
 
@@ -325,7 +385,9 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
   - the "already exists and holds" line and the "no longer holds" line of `recheckExistingDestinations`. Each line shows the destination folder and the source folder. `runSync` prints each line only without `--quiet`. The failures of the same check go through `printFolderFailures`;
   - the "is left out" line of `printInvalidNames`, which shows the raw name from LIST. `runSync` prints it also with `--quiet`;
   - the "is renamed to" line of `printFolderRenames`, which shows the source name, the destination name and the destination delimiter. `runSync` prints it also without `--verbose` and with `--quiet`;
-  - the clash failures of `splitDestinationClashes`. They go through `printFolderFailures`, and the reason names another source folder.
+  - the clash failures of `splitDestinationClashes`. They go through `printFolderFailures`, and the reason names another source folder;
+  - the case-variant warning of `printCaseVariantDestinations`, which shows the destination names. `runSync` prints it also without `--verbose` and with `--quiet`;
+  - the "goes to ..., not to ..." line of `printExpansion`, which shows the source folder, two destination names and two root names. `expandMappingsWithSubfolders` prints it only with `--verbose` and without `--quiet`.
 - `internal/app/show.go` escapes these sites:
   - the folder cell of each table row, also on the "unreadable" and "container" rows;
   - each line of the unreadable-folder list (`printUnreadableFolders`), which shows the folder name and the reason;
@@ -345,6 +407,7 @@ In go-imap v1.2.1, such lines are parse errors and network errors. A parse error
 - Workers are clamped to `[1, 10]` in `config.New`. A value out of range changes to the nearest limit.
 - Optional `rate_limit` block in config (`down_bps`, `up_bps`, `max_connections`); CLI flags `--bps-down`, `--bps-up`, `--max-connections` override it. A flag that the user sets, or its environment variable, overrides the config value also when it is 0. For `--bps-down` and `--bps-up`, 0 removes the limit. For `--max-connections`, 0 uses the `--workers` value. `config.New` tests `IsSet`, not a non-zero value.
 - `config.New` rejects a `map` item with an empty or missing `src` or `dst` (`ErrMapSrcRequired`, `ErrMapDstRequired`). The error gives the position of the item, counted from 1. A `map` with no items is valid: `sync` then mirrors every source folder.
+- `config.New` rejects two `map` items with the same raw `src` and different `dst` values (`ErrMapSrcConflict`: `one "src" folder has two different "dst" folders`). The error starts with `map entries J and I:`, where J and I are the positions of the two items, counted from 1. Two identical items load, and so do two items with the same `dst`. `config.New` compares the text only, so `runSync` makes the check again after `resolveMappings` (`checkSourceConflicts`).
 - `ErrSilentExit` makes `reportError` return exit code 1 and print no `Error:` line. A command returns it after it prints its failures on stdout. `sync` uses it for failed messages and failed folders. `show` uses it for folders that it cannot read.
 - `client.New(ctx, addr, user, pass, Options{...})` - keep call-sites using the `Options` struct rather than positional bools, and pass the parent context so the dial honours cancellation. Set `Options.Label`. It prefixes the log lines and the errors of LIST, CREATE and APPEND. It also prefixes the EXAMINE, STATUS and FETCH errors of the sync scan and copy, and the error of a reconnect give-up. So a LIST that fails inside `New` names the side. The errors of the dial, the greeting, LOGIN and the `show` statistics have no label.
 - Dependencies are vendored under `vendor/`. The module requires Go 1.27.3 or newer; an older host toolchain is refused unless `GOTOOLCHAIN` is left on `auto` to fetch one.
