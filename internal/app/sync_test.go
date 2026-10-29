@@ -1189,6 +1189,34 @@ func Test_maybeDiff_When_MessagesShareMessageId_Then_PlansByCount(t *testing.T) 
 			wantUIDs: []uint32{1, 3, 4, 7},
 			wantSize: 66,
 		},
+		{
+			name:     "the destination copy has the size of the last source copy",
+			src:      map[string][]client.MessageRef{"s@x": {{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}},
+			dst:      map[string][]client.MessageRef{"s@x": {{UID: 90, Size: 30}}},
+			wantUIDs: []uint32{4, 5},
+			wantSize: 30,
+		},
+		{
+			name:     "the destination copies have the sizes of the first and the last source copy",
+			src:      map[string][]client.MessageRef{"s@x": {{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}},
+			dst:      map[string][]client.MessageRef{"s@x": {{UID: 90, Size: 10}, {UID: 91, Size: 30}}},
+			wantUIDs: []uint32{5},
+			wantSize: 20,
+		},
+		{
+			name:     "one destination copy matches by size and the other falls back to the lowest UID",
+			src:      map[string][]client.MessageRef{"s@x": {{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}},
+			dst:      map[string][]client.MessageRef{"s@x": {{UID: 90, Size: 30}, {UID: 91, Size: 99}}},
+			wantUIDs: []uint32{5},
+			wantSize: 20,
+		},
+		{
+			name:     "all source copies have one size",
+			src:      map[string][]client.MessageRef{"s@x": {{UID: 4, Size: 10}, {UID: 5, Size: 10}, {UID: 6, Size: 10}}},
+			dst:      map[string][]client.MessageRef{"s@x": {{UID: 90, Size: 10}}},
+			wantUIDs: []uint32{5, 6},
+			wantSize: 20,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -6533,6 +6561,141 @@ func TestRunSync_When_CreateReportsExistingFolderHoldingASharedMessageId_Then_Co
 	assertReadOnly(t, "source", src)
 }
 
+// scanCopies returns three bodies that share a Message-Id, where the third one is longer than the other two.
+func scanCopies(t *testing.T, id string) (one, two, three string) {
+	t.Helper()
+
+	one, two, three = subjectBody(id, "one"), subjectBody(id, "two"), subjectBody(id, "three")
+	if len(three) == len(one) || len(three) == len(two) {
+		t.Fatalf("body sizes = %d, %d, %d, want the third to differ from the others", len(one), len(two), len(three))
+	}
+	return one, two, three
+}
+
+func TestRunSync_When_DestinationHoldsOnlyTheHighestUIDCopy_Then_CopiesTheOtherCopiesOnce(t *testing.T) {
+	t.Parallel()
+
+	const id = "scan@printer"
+	one, two, three := scanCopies(t, id)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, one, two, three)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, three)})
+	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, fmt.Sprintf("• Scans → Scans will copy 2 messages (≈ %d B)", len(one)+len(two)))
+	if got, want := dst.folderBodies("Scans"), []string{three, one, two}; !slices.Equal(got, want) {
+		t.Errorf("dst Scans bodies after the first run = %q, want %q", got, want)
+	}
+	if n := len(dst.appended("Scans")); n != 2 {
+		t.Errorf("dst saw %d APPENDs in the first run, want 2", n)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "All folders already synced!")
+	assertContainsNone(t, second, "Sync completed successfully")
+	if n := len(dst.appended("Scans")); n != 2 {
+		t.Errorf("dst saw %d APPENDs over both runs, want 2", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_DestinationMissesAMiddleCopy_Then_CopiesOnlyThatCopy(t *testing.T) {
+	t.Parallel()
+
+	const id = "scan@printer"
+	one, two, three := scanCopies(t, id)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, one, two, three)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, one, three)})
+	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, fmt.Sprintf("• Scans → Scans will copy 1 messages (≈ %d B)", len(two)))
+	if got, want := dst.folderBodies("Scans"), []string{one, three, two}; !slices.Equal(got, want) {
+		t.Errorf("dst Scans bodies after the first run = %q, want %q", got, want)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "All folders already synced!")
+	if n := len(dst.appended("Scans")); n != 1 {
+		t.Errorf("dst saw %d APPENDs over both runs, want 1", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_ExistingFolderHoldsOnlyTheHighestUIDCopy_Then_TheRecheckCopiesTheOtherCopies(t *testing.T) {
+	t.Parallel()
+
+	const id = "scan@printer"
+	one, two, three := scanCopies(t, id)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, one, two, three)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Scans": sharedIDMsgs(id, three)})
+	dst.hideFromList("Scans")
+	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first,
+		"  ℹ️  Destination folder Scans already exists and holds 1 of the 3 planned messages from Scans, so they are not copied\n",
+		"Sync completed successfully",
+	)
+	if got, want := dst.folderBodies("Scans"), []string{three, one, two}; !slices.Equal(got, want) {
+		t.Errorf("dst Scans bodies after the first run = %q, want %q", got, want)
+	}
+	if n := len(dst.appended("Scans")); n != 2 {
+		t.Errorf("dst saw %d APPENDs in the first run, want 2", n)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "holds 3 of the 3 planned messages", "All folders already synced!")
+	assertContainsNone(t, second, "Sync completed successfully")
+	if n := len(dst.appended("Scans")); n != 2 {
+		t.Errorf("dst saw %d APPENDs over both runs, want 2", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SharedDestinationCopiesDifferInSize_Then_EachDistinctCopyArrivesOnce(t *testing.T) {
+	t.Parallel()
+
+	const id = "m@x"
+	small, large := bodyOfSize(id, 300), bodyOfSize(id, 500)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": sharedIDMsgs(id, small),
+		"B": sharedIDMsgs(id, large, small),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("A", "X"), mapping("B", "X"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, "• A → X will copy 1 messages", "• B → X will copy 1 messages", "Sync completed successfully")
+	if got, want := slices.Sorted(slices.Values(dst.folderBodies("X"))), slices.Sorted(slices.Values([]string{small, large})); !slices.Equal(got, want) {
+		t.Errorf("dst X holds %d bodies of sizes %v, want one of 300 and one of 500 bytes", len(got), bodySizes(got))
+	}
+	if n := dst.callCount("APPEND"); n != 2 {
+		t.Errorf("destination saw %d APPEND commands, want 2", n)
+	}
+
+	assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
+	if n := dst.callCount("APPEND"); n != 2 {
+		t.Errorf("destination saw %d APPEND commands after the second run, want 2", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func bodySizes(bodies []string) []int {
+	sizes := make([]int, len(bodies))
+	for i, b := range bodies {
+		sizes[i] = len(b)
+	}
+	return sizes
+}
+
 func TestRunSync_When_ExistingDestinationIsEmpty_Then_SourceIsNotScannedAgain(t *testing.T) {
 	t.Parallel()
 
@@ -6966,6 +7129,197 @@ func msgRefs(uids ...uint32) []client.MessageRef {
 		refs[i] = client.MessageRef{UID: uid, Size: 100}
 	}
 	return refs
+}
+
+// refsOfSizes builds refs with the UIDs 1, 2, 3 and so on, one for each size.
+func refsOfSizes(sizes ...uint32) []client.MessageRef {
+	refs := make([]client.MessageRef, len(sizes))
+	for i, size := range sizes {
+		refs[i] = client.MessageRef{UID: uint32(i + 1), Size: size}
+	}
+	return refs
+}
+
+// referenceOwners is the quadratic oracle of copyMatcher.match: same-size copies take the lowest free ref, then the other copies do. The refs ascend by UID.
+func referenceOwners(refs []client.MessageRef, sizes []uint32) []int32 {
+	owner := make([]int32, len(refs))
+	for i := range owner {
+		owner[i] = -1
+	}
+	matched := make([]bool, len(sizes))
+	for c, size := range sizes {
+		for i, ref := range refs {
+			if owner[i] < 0 && ref.Size == size {
+				owner[i], matched[c] = int32(c), true
+				break
+			}
+		}
+	}
+	for c := range sizes {
+		if matched[c] {
+			continue
+		}
+		for i := range refs {
+			if owner[i] < 0 {
+				owner[i] = int32(c)
+				break
+			}
+		}
+	}
+	return owner
+}
+
+func Test_copyMatcher_match(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		refs  []client.MessageRef
+		sizes []uint32
+		want  []int32
+	}{
+		{
+			name: "the last ref has the size of the only copy",
+			refs: []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}, sizes: []uint32{30},
+			want: []int32{-1, -1, 0},
+		},
+		{
+			name: "two copies match the first and the last ref",
+			refs: []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}, sizes: []uint32{10, 30},
+			want: []int32{0, -1, 1},
+		},
+		{
+			name: "a copy that no size matches takes the lowest UID",
+			refs: []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}, sizes: []uint32{30, 99},
+			want: []int32{1, -1, 0},
+		},
+		{
+			name: "no size matches, so the first refs are taken",
+			refs: []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}, sizes: []uint32{7, 8},
+			want: []int32{0, 1, -1},
+		},
+		{
+			name: "one copy of the size that every ref has",
+			refs: []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 10}, {UID: 6, Size: 10}}, sizes: []uint32{10},
+			want: []int32{0, -1, -1},
+		},
+		{
+			name: "two copies of the size that every ref has",
+			refs: []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 10}, {UID: 6, Size: 10}}, sizes: []uint32{10, 10},
+			want: []int32{0, 1, -1},
+		},
+		{
+			name: "the middle copy matches and the others fall back in copy order",
+			refs: []client.MessageRef{{UID: 1, Size: 5}, {UID: 2, Size: 6}, {UID: 3, Size: 7}}, sizes: []uint32{9, 6, 8},
+			want: []int32{0, 1, 2},
+		},
+		{
+			name: "more copies than refs",
+			refs: []client.MessageRef{{UID: 1, Size: 100}, {UID: 2, Size: 200}}, sizes: []uint32{200, 100, 100},
+			want: []int32{1, 0},
+		},
+		{
+			name: "the pairing follows the size",
+			refs: []client.MessageRef{{UID: 1, Size: 200}, {UID: 2, Size: 100}}, sizes: []uint32{100, 200},
+			want: []int32{1, 0},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var m copyMatcher
+			if got := m.match(tt.refs, tt.sizes); !slices.Equal(got, tt.want) {
+				t.Errorf("match(%v, %v) = %v, want %v", tt.refs, tt.sizes, got, tt.want)
+			}
+		})
+	}
+
+	// One matcher serves every row in turn, so a buffer that the previous call left behind must not leak into the next result.
+	var m copyMatcher
+	for _, tt := range tests {
+		if got := m.match(tt.refs, tt.sizes); !slices.Equal(got, tt.want) {
+			t.Errorf("%s: reused match(%v, %v) = %v, want %v", tt.name, tt.refs, tt.sizes, got, tt.want)
+		}
+	}
+}
+
+func Test_copyMatcher_When_InputsAreRandom_Then_MatchesTheReference(t *testing.T) {
+	t.Parallel()
+
+	rng := rand.New(rand.NewPCG(21, 33))
+	var m copyMatcher
+	for round := range 3000 {
+		refs := make([]client.MessageRef, 1+rng.IntN(8))
+		var uid uint32
+		for i := range refs {
+			uid += uint32(1 + rng.IntN(3))
+			refs[i] = client.MessageRef{UID: uid, Size: uint32(1 + rng.IntN(3))}
+		}
+		sizes := make([]uint32, 1+rng.IntN(8))
+		held := make([]reservation, len(sizes))
+		for i := range sizes {
+			sizes[i] = uint32(1 + rng.IntN(3))
+			held[i] = reservation{uid: uint32(i), size: sizes[i]}
+		}
+		want := referenceOwners(refs, sizes)
+
+		got := slices.Clone(m.match(refs, sizes))
+
+		if !slices.Equal(got, want) {
+			t.Fatalf("round %d: match(%v, %v) = %v, want %v", round, refs, sizes, got, want)
+		}
+		owned := make(map[int32]bool, len(sizes))
+		for _, c := range got {
+			if c < 0 {
+				continue
+			}
+			if owned[c] {
+				t.Fatalf("round %d: copy %d owns two refs in %v", round, c, got)
+			}
+			owned[c] = true
+		}
+		if len(owned) != min(len(refs), len(sizes)) {
+			t.Fatalf("round %d: %d refs are owned, want min(%d, %d)", round, len(owned), len(refs), len(sizes))
+		}
+		if owners := m.reservationOwners(refs, held); !slices.Equal(owners, want) {
+			t.Fatalf("round %d: reservationOwners(%v, %v) = %v, want %v", round, refs, held, owners, want)
+		}
+		var wantLeft []client.MessageRef
+		for i, c := range want {
+			if c < 0 {
+				wantLeft = append(wantLeft, refs[i])
+			}
+		}
+		dst := refsOfSizes(sizes...)
+		if left := m.destinationLeft(refs, dst); !slices.Equal(left, wantLeft) {
+			t.Fatalf("round %d: destinationLeft(%v, %v) = %v, want %v", round, refs, dst, left, wantLeft)
+		}
+	}
+}
+
+// Not parallel: AllocsPerRun counts allocations of the whole process.
+func Test_copyMatcher_When_GroupIsUncoveredOrFullyCovered_Then_AllocatesNothing(t *testing.T) {
+	refs := []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}}
+	tests := []struct {
+		name string
+		dst  []client.MessageRef
+	}{
+		{name: "the destination holds no copy"},
+		{name: "the destination holds as many copies as the source", dst: refsOfSizes(30, 20, 10)},
+		{name: "the destination holds more copies than the source", dst: refsOfSizes(30, 20, 10, 10)},
+		{name: "the destination holds some of the copies", dst: refsOfSizes(30, 99)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var m copyMatcher
+			m.destinationLeft(refs, tt.dst)
+
+			if n := testing.AllocsPerRun(100, func() { m.destinationLeft(refs, tt.dst) }); n != 0 {
+				t.Errorf("destinationLeft allocates %v times per call, want 0", n)
+			}
+		})
+	}
 }
 
 func Test_rediffPlan(t *testing.T) {
@@ -9189,72 +9543,93 @@ func TestRunSync_When_ExplicitChildDestinationEqualsRenamedSiblingDestination_Th
 func Test_maybeDiff_When_SourceAndDestinationCountsVary_Then_PlanAndRecheckPickTheSameMessages(t *testing.T) {
 	t.Parallel()
 
+	// The UIDs rise in steps of five and the sizes differ, so a wrong pick shows in both.
+	three := []client.MessageRef{{UID: 10, Size: 100}, {UID: 15, Size: 200}, {UID: 20, Size: 300}}
 	tests := []struct {
-		name string
-		have int
-		n    int
+		name     string
+		src      []client.MessageRef
+		dstSizes []uint32
+		wantUIDs []uint32
 	}{
-		{name: "three messages and none on the destination", n: 3, have: 0},
-		{name: "three messages and one on the destination", n: 3, have: 1},
-		{name: "three messages and three on the destination", n: 3, have: 3},
-		{name: "one message and two on the destination", n: 1, have: 2},
+		{name: "three messages and none on the destination", src: three, wantUIDs: []uint32{10, 15, 20}},
+		{name: "three messages and one on the destination", src: three, dstSizes: []uint32{7}, wantUIDs: []uint32{15, 20}},
+		{name: "three messages and three on the destination", src: three, dstSizes: []uint32{7, 7, 7}},
+		{name: "one message and two on the destination", src: three[:1], dstSizes: []uint32{7, 7}},
+		{
+			name:     "the destination copy has the size of the last source copy",
+			src:      []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}},
+			dstSizes: []uint32{30},
+			wantUIDs: []uint32{4, 5},
+		},
+		{
+			name:     "the destination copies have the sizes of the first and the last source copy",
+			src:      []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}},
+			dstSizes: []uint32{10, 30},
+			wantUIDs: []uint32{5},
+		},
+		{
+			name:     "one destination copy matches by size and the other falls back to the lowest UID",
+			src:      []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 20}, {UID: 6, Size: 30}},
+			dstSizes: []uint32{30, 99},
+			wantUIDs: []uint32{5},
+		},
+		{
+			name:     "all source copies have one size",
+			src:      []client.MessageRef{{UID: 4, Size: 10}, {UID: 5, Size: 10}, {UID: 6, Size: 10}},
+			dstSizes: []uint32{10},
+			wantUIDs: []uint32{5, 6},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			// The UIDs rise in steps of five and the sizes differ, so a wrong pick shows in both.
-			refs := make([]client.MessageRef, tt.n)
-			for i := range refs {
-				refs[i] = client.MessageRef{UID: uint32(10 + 5*i), Size: uint32(100 * (i + 1))}
-			}
 			srcMap := func() map[string][]client.MessageRef {
-				return map[string][]client.MessageRef{"s@x": slices.Clone(refs)}
+				return map[string][]client.MessageRef{"s@x": slices.Clone(tt.src)}
 			}
-			dstMap := func(have int) map[string][]client.MessageRef {
-				held := make([]client.MessageRef, have)
-				for i := range held {
-					held[i] = client.MessageRef{UID: uint32(900 + i), Size: 7}
+			dstMap := func(sizes []uint32) map[string][]client.MessageRef {
+				held := make([]client.MessageRef, len(sizes))
+				for i, size := range sizes {
+					held[i] = client.MessageRef{UID: uint32(900 + i), Size: size}
 				}
 				return map[string][]client.MessageRef{"s@x": held}
 			}
-			plan := func(have int) FolderSyncPlan {
+			plan := func(sizes []uint32) FolderSyncPlan {
 				t.Helper()
 				plans := make([]FolderSyncPlan, 1)
 				var totalNew atomic.Int64
 				var totalNewSize atomic.Uint64
-				s := &folderScan{srcMap: srcMap(), dstMap: dstMap(have), srcMessages: tt.n, dstExists: true}
+				s := &folderScan{srcMap: srcMap(), dstMap: dstMap(sizes), srcMessages: len(tt.src), dstExists: true}
 				maybeDiff(s, 0, []config.DirectoryMapping{mapping("S", "D")}, plans, &totalNew, &totalNewSize, nil)
 				if !maybeDiff(s, 0, []config.DirectoryMapping{mapping("S", "D")}, plans, &totalNew, &totalNewSize, nil) {
 					t.Fatal("maybeDiff returned false on the second call, want true")
 				}
 				return plans[0]
 			}
-			kept := refs[min(tt.have, tt.n):]
-			var wantUIDs []uint32
 			var wantSize uint64
-			for _, r := range kept {
-				wantUIDs = append(wantUIDs, r.UID)
-				wantSize += uint64(r.Size)
+			for _, r := range tt.src {
+				if slices.Contains(tt.wantUIDs, r.UID) {
+					wantSize += uint64(r.Size)
+				}
 			}
 
-			planned := plan(tt.have)
+			planned := plan(tt.dstSizes)
 
-			if !slices.Equal(planned.SrcUIDs, wantUIDs) || planned.NewSize != wantSize {
-				t.Fatalf("plan = UIDs %v, size %d, want UIDs %v, size %d (refs[have:] in UID order)", planned.SrcUIDs, planned.NewSize, wantUIDs, wantSize)
+			if !slices.Equal(planned.SrcUIDs, tt.wantUIDs) || planned.NewSize != wantSize {
+				t.Fatalf("plan = UIDs %v, size %d, want UIDs %v, size %d", planned.SrcUIDs, planned.NewSize, tt.wantUIDs, wantSize)
 			}
-			// Rechecking the plan for an empty destination against have copies keeps exactly what a plan made with have copies picks.
-			rechecked, drops := rediffPlan(plan(0), srcMap(), dstMap(tt.have))
-			if !slices.Equal(rechecked.SrcUIDs, wantUIDs) || rechecked.NewSize != wantSize {
-				t.Errorf("recheck of the full plan = UIDs %v, size %d, want UIDs %v, size %d", rechecked.SrcUIDs, rechecked.NewSize, wantUIDs, wantSize)
+			// Rechecking the plan for an empty destination against the same copies keeps exactly what a plan made with those copies picks.
+			rechecked, drops := rediffPlan(plan(nil), srcMap(), dstMap(tt.dstSizes))
+			if !slices.Equal(rechecked.SrcUIDs, tt.wantUIDs) || rechecked.NewSize != wantSize {
+				t.Errorf("recheck of the full plan = UIDs %v, size %d, want UIDs %v, size %d", rechecked.SrcUIDs, rechecked.NewSize, tt.wantUIDs, wantSize)
 			}
-			if drops.held != min(tt.have, tt.n) || drops.gone != 0 {
-				t.Errorf("recheck drops = %+v, want held %d and gone 0", drops, min(tt.have, tt.n))
+			if wantHeld := len(tt.src) - len(tt.wantUIDs); drops.held != wantHeld || drops.gone != 0 {
+				t.Errorf("recheck drops = %+v, want held %d and gone 0", drops, wantHeld)
 			}
-			// The recheck of a plan made with the same counts changes nothing.
-			again, drops := rediffPlan(planned, srcMap(), dstMap(tt.have))
+			// The recheck of a plan made with the same copies changes nothing.
+			again, drops := rediffPlan(planned, srcMap(), dstMap(tt.dstSizes))
 			if !slices.Equal(again.SrcUIDs, planned.SrcUIDs) || again.NewSize != planned.NewSize || drops != (recheckDrops{}) {
-				t.Errorf("recheck with equal counts = UIDs %v, size %d, drops %+v, want the plan %v, %d and no drops", again.SrcUIDs, again.NewSize, drops, planned.SrcUIDs, planned.NewSize)
+				t.Errorf("recheck with equal copies = UIDs %v, size %d, drops %+v, want the plan %v, %d and no drops", again.SrcUIDs, again.NewSize, drops, planned.SrcUIDs, planned.NewSize)
 			}
 		})
 	}
@@ -9658,15 +10033,18 @@ func Test_rediffPlan_When_CountsAndPlanVary_Then_ResultIsASubsetOfThePlan(t *tes
 		for _, id := range ids {
 			for range rng.IntN(5) {
 				nextUID += uint32(1 + rng.IntN(3))
-				size := uint32(1 + rng.IntN(1000))
+				size := uint32(100 * (1 + rng.IntN(3)))
 				srcMap[id] = append(srcMap[id], client.MessageRef{UID: nextUID, Size: size})
 				sizeOf[nextUID] = size
 			}
 		}
 		dstMap := make(map[string][]client.MessageRef)
+		dstSizes := make(map[string][]uint32)
 		for _, id := range ids {
-			if n := rng.IntN(6); n > 0 {
-				dstMap[id] = msgRefs(make([]uint32, n)...)
+			for i := range rng.IntN(6) {
+				size := uint32(100 * (1 + rng.IntN(3)))
+				dstMap[id] = append(dstMap[id], client.MessageRef{UID: uint32(900 + i), Size: size})
+				dstSizes[id] = append(dstSizes[id], size)
 			}
 		}
 		// The plan holds a random share of the source UIDs and some UIDs that the source never had.
@@ -9686,8 +10064,10 @@ func Test_rediffPlan_When_CountsAndPlanVary_Then_ResultIsASubsetOfThePlan(t *tes
 		}
 		fresh := make(map[uint32]bool)
 		for id, refs := range srcMap {
-			for _, ref := range refs[min(len(dstMap[id]), len(refs)):] {
-				fresh[ref.UID] = true
+			for i, owner := range referenceOwners(refs, dstSizes[id]) {
+				if owner < 0 {
+					fresh[refs[i].UID] = true
+				}
 			}
 		}
 		var wantKept []uint32
@@ -9953,6 +10333,82 @@ func Test_maybeDiff_When_SharedDestinationHasStandbyCopies_Then_EachPlannedCopyG
 	}
 }
 
+func Test_maybeDiff_When_SharedCopiesDifferInSize_Then_SizesPairReservationsAndStandbys(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		srcs         [][]client.MessageRef
+		dst          []client.MessageRef
+		wantUIDs     [][]uint32
+		wantSize     []uint64
+		wantStandbys [][]standbyView
+	}{
+		{
+			name:     "the later source holds the larger copy first",
+			srcs:     [][]client.MessageRef{{{UID: 10, Size: 100}}, {{UID: 1, Size: 200}, {UID: 2, Size: 100}}},
+			wantUIDs: [][]uint32{{10}, {1}},
+			wantSize: []uint64{100, 200},
+			wantStandbys: [][]standbyView{
+				{{planned: 10, folder: "B", uidValidity: 101, uid: 2}},
+				nil,
+			},
+		},
+		{
+			name:     "every copy of the later source stands by for the copy of the same size",
+			srcs:     [][]client.MessageRef{{{UID: 1, Size: 100}, {UID: 2, Size: 200}}, {{UID: 11, Size: 200}, {UID: 12, Size: 100}}},
+			wantUIDs: [][]uint32{{1, 2}, nil},
+			wantSize: []uint64{300, 0},
+			wantStandbys: [][]standbyView{
+				{{planned: 1, folder: "B", uidValidity: 101, uid: 12}, {planned: 2, folder: "B", uidValidity: 101, uid: 11}},
+				nil,
+			},
+		},
+		{
+			name:         "the destination copy has the size of the later copy of the later source",
+			srcs:         [][]client.MessageRef{{{UID: 1, Size: 100}}, {{UID: 11, Size: 100}, {UID: 12, Size: 200}}},
+			dst:          []client.MessageRef{{UID: 90, Size: 200}},
+			wantUIDs:     [][]uint32{nil, {11}},
+			wantSize:     []uint64{0, 100},
+			wantStandbys: [][]standbyView{nil, nil},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mappings := []config.DirectoryMapping{mapping("A", "X"), mapping("B", "X")}
+			shared := newSharedDestinations(mappings)
+			plans := make([]FolderSyncPlan, len(mappings))
+			var totalNew atomic.Int64
+			var totalNewSize atomic.Uint64
+
+			for i, refs := range tt.srcs {
+				srcMap := map[string][]client.MessageRef{"m@x": slices.Clone(refs)}
+				dstMap := map[string][]client.MessageRef{}
+				if len(tt.dst) > 0 {
+					dstMap["m@x"] = slices.Clone(tt.dst)
+				}
+				s := &folderScan{srcMap: srcMap, dstMap: dstMap, srcMessages: len(refs), srcUIDValidity: uint32(100 + i), dstExists: true}
+				diffBothSides(t, s, i, mappings, plans, &totalNew, &totalNewSize, shared)
+			}
+
+			for i := range mappings {
+				if !slices.Equal(plans[i].SrcUIDs, tt.wantUIDs[i]) || plans[i].NewSize != tt.wantSize[i] {
+					t.Errorf("slot %d: SrcUIDs, NewSize = %v, %d, want %v, %d", i, plans[i].SrcUIDs, plans[i].NewSize, tt.wantUIDs[i], tt.wantSize[i])
+				}
+				sources, copies := shared.standbysFor(i)
+				if got := resolveStandbys(t, sources, copies); !slices.Equal(got, tt.wantStandbys[i]) {
+					t.Errorf("slot %d: standbys = %+v, want %+v", i, got, tt.wantStandbys[i])
+				}
+			}
+			if len(shared.reserved) != 0 {
+				t.Errorf("reserved = %v after the last slot, want none", shared.reserved)
+			}
+		})
+	}
+}
+
 func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReservations(t *testing.T) {
 	t.Parallel()
 
@@ -9965,10 +10421,13 @@ func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReser
 		mappings := make([]config.DirectoryMapping, slots)
 		srcMaps := make([]map[string][]client.MessageRef, slots)
 		idOf := make([]map[uint32]string, slots)
+		sizeOf := make([]map[uint32]uint32, slots)
 		slotOfFolder := make(map[string]int, slots)
-		have := make(map[string]int, len(ids))
+		haveSizes := make(map[string][]uint32, len(ids))
 		for _, id := range ids {
-			have[id] = rng.IntN(4)
+			for range rng.IntN(4) {
+				haveSizes[id] = append(haveSizes[id], uint32(100*(1+rng.IntN(3))))
+			}
 		}
 		for i := range slots {
 			destination := "X"
@@ -9979,12 +10438,15 @@ func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReser
 			slotOfFolder[mappings[i].Source] = i
 			srcMaps[i] = make(map[string][]client.MessageRef)
 			idOf[i] = make(map[uint32]string)
+			sizeOf[i] = make(map[uint32]uint32)
 			var nextUID uint32
 			for _, id := range ids {
 				for range rng.IntN(4) {
 					nextUID += uint32(1 + rng.IntN(3))
-					srcMaps[i][id] = append(srcMaps[i][id], client.MessageRef{UID: nextUID, Size: uint32(1 + rng.IntN(1000))})
+					size := uint32(100 * (1 + rng.IntN(3)))
+					srcMaps[i][id] = append(srcMaps[i][id], client.MessageRef{UID: nextUID, Size: size})
 					idOf[i][nextUID] = id
+					sizeOf[i][nextUID] = size
 				}
 			}
 		}
@@ -9996,9 +10458,9 @@ func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReser
 		for i := range slots {
 			dstMap := map[string][]client.MessageRef{}
 			if mappings[i].Destination == "X" {
-				for id, n := range have {
-					if n > 0 {
-						dstMap[id] = msgRefs(make([]uint32, n)...)
+				for id, sizes := range haveSizes {
+					for k, size := range sizes {
+						dstMap[id] = append(dstMap[id], client.MessageRef{UID: uint32(900 + k), Size: size})
 					}
 				}
 			}
@@ -10006,7 +10468,7 @@ func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReser
 			diffBothSides(t, s, i, mappings, plans, &totalNew, &totalNewSize, shared)
 		}
 
-		// The reference: each plan pairs its next copies with the earlier reservations in order. A plan that is not last in X reserves what stays missing.
+		// The reference: destination copies account for refs first, then earlier reservations pair with the rest. A plan that is not last in X reserves what stays missing.
 		type copyAt struct {
 			slot int
 			uid  uint32
@@ -10026,22 +10488,29 @@ func Test_maybeDiff_When_SharedDestinationCountsVary_Then_StandbysFollowTheReser
 			var wantSize uint64
 			for id, refs := range srcMaps[i] {
 				var held []copyAt
-				onDestination := 0
+				var dstSizes, heldSizes []uint32
 				if mappings[i].Destination == "X" {
 					held = reservedRefs[id]
-					onDestination = have[id]
-				}
-				standbys := refs[min(onDestination, len(refs)):min(onDestination+len(held), len(refs))]
-				for j, ref := range standbys {
-					wantPairs[pairing{planned: held[j], standby: copyAt{i, ref.UID}}] = true
-				}
-				missing := refs[min(onDestination+len(held), len(refs)):]
-				if mappings[i].Destination == "X" && i != lastX {
-					for _, ref := range missing {
-						reservedRefs[id] = append(reservedRefs[id], copyAt{i, ref.UID})
+					dstSizes = haveSizes[id]
+					for _, h := range held {
+						heldSizes = append(heldSizes, sizeOf[h.slot][h.uid])
 					}
 				}
-				for _, ref := range missing {
+				var left []client.MessageRef
+				for k, owner := range referenceOwners(refs, dstSizes) {
+					if owner < 0 {
+						left = append(left, refs[k])
+					}
+				}
+				for k, owner := range referenceOwners(left, heldSizes) {
+					ref := left[k]
+					if owner >= 0 {
+						wantPairs[pairing{planned: held[owner], standby: copyAt{i, ref.UID}}] = true
+						continue
+					}
+					if mappings[i].Destination == "X" && i != lastX {
+						reservedRefs[id] = append(reservedRefs[id], copyAt{i, ref.UID})
+					}
 					wantUIDs = append(wantUIDs, ref.UID)
 					wantSize += uint64(ref.Size)
 				}

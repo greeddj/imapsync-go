@@ -685,12 +685,19 @@ type recheckDrops struct {
 
 // The result intersects the planned UIDs with the fresh diff, so it never gains a UID. It gets a new slice, because plan.SrcUIDs backs summary.Plans.
 func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageRef) (FolderSyncPlan, recheckDrops) {
+	var m copyMatcher
 	fresh := make([]client.MessageRef, 0, len(srcMap))
 	onDst := make([]uint32, 0, min(len(srcMap), len(dstMap)))
 	for id, refs := range srcMap {
-		covered, missing := splitByDestinationCount(refs, len(dstMap[id]))
-		fresh = append(fresh, missing...)
-		for _, ref := range covered {
+		left := m.destinationLeft(refs, dstMap[id])
+		fresh = append(fresh, left...)
+		// Both lists ascend by UID and left is a subsequence of refs, so one walk finds the covered refs.
+		next := 0
+		for _, ref := range refs {
+			if next < len(left) && left[next].UID == ref.UID {
+				next++
+				continue
+			}
 			onDst = append(onDst, ref.UID)
 		}
 	}
@@ -720,10 +727,100 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 
 func compareRefToUID(ref client.MessageRef, uid uint32) int { return cmp.Compare(ref.UID, uid) }
 
-// The first have messages in UID order count as already on the destination, so each run and the recheck pick the same messages.
-func splitByDestinationCount(refs []client.MessageRef, have int) (covered, missing []client.MessageRef) {
-	n := min(have, len(refs))
-	return refs[:n], refs[n:]
+// copyMatcher is the scratch of one diff, reused across Message-Id groups. Never share it between goroutines.
+type copyMatcher struct {
+	left      []client.MessageRef
+	owner     []int32
+	refOrder  []int32
+	copyOrder []int32
+	sizes     []uint32
+	matched   []bool
+}
+
+// destinationLeft returns the refs that the destination copies leave, in UID order. It reads only dst sizes, so the plan and the recheck agree. Valid until the next call.
+func (m *copyMatcher) destinationLeft(refs, dst []client.MessageRef) []client.MessageRef {
+	if len(dst) == 0 {
+		return refs
+	}
+	if len(dst) >= len(refs) {
+		return nil
+	}
+	m.sizes = m.sizes[:0]
+	for _, d := range dst {
+		m.sizes = append(m.sizes, d.Size)
+	}
+	owner := m.match(refs, m.sizes)
+	m.left = m.left[:0]
+	for i, ref := range refs {
+		if owner[i] < 0 {
+			m.left = append(m.left, ref)
+		}
+	}
+	return m.left
+}
+
+// reservationOwners pairs the refs that remain after the destination step with the reserved copies. Call it with at least one of each.
+func (m *copyMatcher) reservationOwners(left []client.MessageRef, held []reservation) []int32 {
+	m.sizes = m.sizes[:0]
+	for _, r := range held {
+		m.sizes = append(m.sizes, r.size)
+	}
+	return m.match(left, m.sizes)
+}
+
+// match returns, for each ref in ascending UID order, the index of the copy that accounts for it, or -1. Valid until the next call.
+func (m *copyMatcher) match(refs []client.MessageRef, sizes []uint32) []int32 {
+	m.owner = m.owner[:0]
+	m.refOrder = m.refOrder[:0]
+	for i := range refs {
+		m.owner = append(m.owner, -1)
+		m.refOrder = append(m.refOrder, int32(i))
+	}
+	m.copyOrder = m.copyOrder[:0]
+	m.matched = m.matched[:0]
+	for c := range sizes {
+		m.copyOrder = append(m.copyOrder, int32(c))
+		m.matched = append(m.matched, false)
+	}
+	// Sorting keeps this O(k log k): a hostile server can send many copies of one Message-Id, so a loop over refs x copies is not an option.
+	slices.SortFunc(m.refOrder, func(a, b int32) int {
+		return cmp.Or(cmp.Compare(refs[a].Size, refs[b].Size), cmp.Compare(a, b))
+	})
+	slices.SortFunc(m.copyOrder, func(a, b int32) int {
+		return cmp.Or(cmp.Compare(sizes[a], sizes[b]), cmp.Compare(a, b))
+	})
+	// Size only picks which refs of one Message-Id a copy accounts for; counts never change, so a server that rewrites messages still converges.
+	r, c := 0, 0
+	for r < len(m.refOrder) && c < len(m.copyOrder) {
+		ref, cp := m.refOrder[r], m.copyOrder[c]
+		switch {
+		case refs[ref].Size < sizes[cp]:
+			r++
+		case refs[ref].Size > sizes[cp]:
+			c++
+		default:
+			m.owner[ref] = cp
+			m.matched[cp] = true
+			r++
+			c++
+		}
+	}
+	// A copy that no size matches takes the lowest free UID, so equal or rewritten sizes pick the first refs as a plain count would.
+	p := 0
+	for cp := range sizes {
+		if m.matched[cp] {
+			continue
+		}
+		for p < len(refs) && m.owner[p] >= 0 {
+			p++
+		}
+		if p == len(refs) {
+			break
+		}
+		m.owner[p] = int32(cp)
+		p++
+	}
+	return m.owner
 }
 
 func countRefs(byID map[string][]client.MessageRef) int {
@@ -775,9 +872,10 @@ type folderScan struct {
 	done           atomic.Int32
 }
 
-// reservation is a copy that a plan schedules for a shared destination: the UID in the source of mapping slot.
+// reservation is a copy that a plan schedules for a shared destination: the UID and the size in the source of mapping slot.
 type reservation struct {
 	uid  uint32
+	size uint32
 	slot int32
 }
 
@@ -1026,27 +1124,29 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	standby := standbySource{folder: mappings[idx].Source, uidValidity: s.srcUIDValidity}
 	newUIDs := make([]uint32, 0, s.srcMessages)
 	var newSize uint64
+	var m copyMatcher
 	for id, refs := range s.srcMap {
+		left := m.destinationLeft(refs, s.dstMap[id])
 		held := reserved[id]
-		covered := min(len(refs), len(s.dstMap[id]))
-		taken := min(len(refs), len(s.dstMap[id])+len(held))
-		// The refs between the destination copies and the missing ones stand by for the reserved copies.
-		for j, ref := range refs[covered:taken] {
-			if mappings[held[j].slot].Source != standby.folder {
-				shared.addStandby(held[j], standby, ref.UID)
-			}
+		var owner []int32
+		if len(held) > 0 && len(left) > 0 {
+			// Pairing by size decides which standby replaces which reserved copy, also when every ref is taken.
+			owner = m.reservationOwners(left, held)
 		}
-		missing := refs[taken:]
-		if reserve && len(missing) > 0 {
-			if reserved == nil {
-				reserved = make(map[string][]reservation)
-				shared.reserved[destination] = reserved
+		for i, ref := range left {
+			if len(owner) > 0 && owner[i] >= 0 {
+				if r := held[owner[i]]; mappings[r.slot].Source != standby.folder {
+					shared.addStandby(r, standby, ref.UID)
+				}
+				continue
 			}
-			for _, ref := range missing {
-				reserved[id] = append(reserved[id], reservation{uid: ref.UID, slot: int32(idx)})
+			if reserve {
+				if reserved == nil {
+					reserved = make(map[string][]reservation)
+					shared.reserved[destination] = reserved
+				}
+				reserved[id] = append(reserved[id], reservation{uid: ref.UID, size: ref.Size, slot: int32(idx)})
 			}
-		}
-		for _, ref := range missing {
 			newUIDs = append(newUIDs, ref.UID)
 			newSize += uint64(ref.Size)
 		}
