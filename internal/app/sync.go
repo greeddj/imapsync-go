@@ -66,6 +66,8 @@ func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Wri
 //
 // standbys lists copies with the same Message-Id in later mappings of a shared
 // destination, for planned UIDs. It is sorted by planned UID, then by source.
+//
+// ExtraCopies counts planned messages whose Message-Id the destination folder already holds. A server that keeps one message per Message-Id drops these copies, so the preview shows the count.
 type FolderSyncPlan struct {
 	SourceFolder            string
 	DestinationFolder       string
@@ -74,6 +76,7 @@ type FolderSyncPlan struct {
 	standbys                []standbyCopy
 	NewMessages             int
 	NewSize                 uint64
+	ExtraCopies             int
 	SrcUIDValidity          uint32
 	DestinationFolderExists bool
 }
@@ -378,6 +381,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 					_, _ = fmt.Fprintf(out, "• %s → %s will copy %d messages (≈ %s)\n",
 						termsafe.Escape(plan.SourceFolder), termsafe.Escape(plan.DestinationFolder),
 						plan.NewMessages, utils.FormatSize(plan.NewSize))
+					if plan.ExtraCopies > 0 {
+						_, _ = fmt.Fprintf(out, "  ℹ️  %d of these messages have a Message-Id that the destination folder already holds\n", plan.ExtraCopies)
+					}
 					if verbose {
 						// Dumping every UID before the confirm-prompt
 						// drowns the user in screens of integers - a
@@ -688,9 +694,16 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 	var m copyMatcher
 	fresh := make([]client.MessageRef, 0, len(srcMap))
 	onDst := make([]uint32, 0, min(len(srcMap), len(dstMap)))
+	var extra []uint32
 	for id, refs := range srcMap {
-		left := m.destinationLeft(refs, dstMap[id])
+		held := dstMap[id]
+		left := m.destinationLeft(refs, held)
 		fresh = append(fresh, left...)
+		if len(held) > 0 {
+			for _, ref := range left {
+				extra = append(extra, ref.UID)
+			}
+		}
 		// Both lists ascend by UID and left is a subsequence of refs, so one walk finds the covered refs.
 		next := 0
 		for _, ref := range refs {
@@ -703,13 +716,18 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 	}
 	slices.SortFunc(fresh, func(a, b client.MessageRef) int { return cmp.Compare(a.UID, b.UID) })
 	slices.Sort(onDst)
+	slices.Sort(extra)
 	var drops recheckDrops
 	var newSize uint64
+	var extraCopies int
 	kept := make([]uint32, 0, min(len(plan.SrcUIDs), len(fresh)))
 	for _, uid := range plan.SrcUIDs {
 		if i, ok := slices.BinarySearchFunc(fresh, uid, compareRefToUID); ok {
 			kept = append(kept, uid)
 			newSize += uint64(fresh[i].Size)
+			if _, ok := slices.BinarySearch(extra, uid); ok {
+				extraCopies++
+			}
 			continue
 		}
 		if _, ok := slices.BinarySearch(onDst, uid); ok {
@@ -721,6 +739,7 @@ func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageR
 	plan.SrcUIDs = kept
 	plan.NewMessages = len(kept)
 	plan.NewSize = newSize
+	plan.ExtraCopies = extraCopies
 	plan.DestinationFolderExists = true
 	return plan, drops
 }
@@ -1124,9 +1143,11 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	standby := standbySource{folder: mappings[idx].Source, uidValidity: s.srcUIDValidity}
 	newUIDs := make([]uint32, 0, s.srcMessages)
 	var newSize uint64
+	var extra int
 	var m copyMatcher
 	for id, refs := range s.srcMap {
-		left := m.destinationLeft(refs, s.dstMap[id])
+		onDst := s.dstMap[id]
+		left := m.destinationLeft(refs, onDst)
 		held := reserved[id]
 		var owner []int32
 		if len(held) > 0 && len(left) > 0 {
@@ -1149,6 +1170,10 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 			}
 			newUIDs = append(newUIDs, ref.UID)
 			newSize += uint64(ref.Size)
+			// Only copies that the destination already holds count. A copy reserved in this run is not there yet, and the next run sees it if the server keeps it.
+			if len(onDst) > 0 {
+				extra++
+			}
 		}
 	}
 	s.srcMap, s.dstMap = nil, nil
@@ -1163,6 +1188,7 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 		DestinationFolderExists: s.dstExists,
 		NewMessages:             len(newUIDs),
 		NewSize:                 newSize,
+		ExtraCopies:             extra,
 		SrcUIDs:                 newUIDs,
 		SrcUIDValidity:          s.srcUIDValidity,
 	}

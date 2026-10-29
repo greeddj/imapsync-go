@@ -615,6 +615,7 @@ type mailStore struct {
 	loginRefusal int
 	seenMutating int
 	bareInbox    bool
+	onePerID     bool
 }
 
 // newStoreServer starts a fake IMAP server with in-memory mailboxes; queued connHandlers take precedence. An empty delimiter makes LIST answer NIL, and no folders means no LIST entry.
@@ -722,6 +723,13 @@ func (s *fakeServer) foldOnlyBareInbox() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.bareInbox = true
+}
+
+// keepOnePerMessageID makes APPEND answer OK for a Message-Id that the folder already holds, and drop the copy. Gmail does this.
+func (s *fakeServer) keepOnePerMessageID() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.onePerID = true
 }
 
 // A hidden folder stays selectable and keeps its messages, as with a mailbox that has the read right but no lookup right.
@@ -1345,7 +1353,10 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	if m, err := mail.ReadMessage(bytes.NewReader(lit)); err == nil {
 		msgID = strings.Trim(m.Header.Get("Message-Id"), "<>")
 	}
-	s.store.add(key, msgID, string(lit))
+	dropped := s.store.onePerID && msgID != "" && slices.ContainsFunc(s.store.folders[key], func(m storedMsg) bool { return m.msgID == msgID })
+	if !dropped {
+		s.store.add(key, msgID, string(lit))
+	}
 	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID})
 	rw.line("%s OK APPEND completed", tag)
 	return true
