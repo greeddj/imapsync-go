@@ -22,6 +22,7 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 	t.Parallel()
 
 	noBody := func() Message { return Message{m: imap.NewMessage(1, []imap.FetchItem{imap.FetchEnvelope})} }
+	nilBody := func() Message { return messageWithBody(nil) }
 	tests := []struct {
 		message      func() Message
 		wantErrIs    error
@@ -72,6 +73,23 @@ func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
 			noSession: true,
 			cancelCtx: true,
 			wantErrIs: context.Canceled,
+		},
+		{
+			name:        "body is NIL",
+			message:     nilBody,
+			wantErrIs:   errEmptyBody,
+			wantErrText: "source returned an empty body",
+		},
+		{
+			name:      "body is a zero-length literal",
+			message:   func() Message { return messageWithBody(bytes.NewBuffer(nil)) },
+			wantErrIs: errEmptyBody,
+		},
+		{
+			name:      "body is NIL and the client has no session",
+			message:   nilBody,
+			noSession: true,
+			wantErrIs: errEmptyBody,
 		},
 	}
 	for _, tt := range tests {
@@ -163,9 +181,82 @@ func Test_AppendMessage_logsWhenVerbose(t *testing.T) {
 	}
 }
 
+// Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend asserts that a message
+// whose BODY[] arrives as NIL, a zero-length literal or a quoted string reaches the
+// callback once and gets no APPEND and no new LOGIN on the destination.
+func Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "NIL", value: "NIL"},
+		{name: "a zero-length literal", value: "{0}\r\n"},
+		{name: "an empty quoted string", value: `""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newFakeServer(t)
+			src.addConnHandler(interceptHandler(src, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+				if !isUIDFetch(cmd) {
+					return false, true
+				}
+				writeLine(conn, "* 1 FETCH (UID 1 BODY[] %s)", tt.value)
+				writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+				return true, true
+			}))
+			dst := newFakeServer(t)
+			dst.addConnHandler(appendOutcomeHandler(dst, "OK APPEND completed"))
+			srcClient := newClientWithFake(t, src)
+			dstClient := newClientWithFake(t, dst)
+
+			var (
+				calls     int
+				appendErr error
+			)
+			err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+				return srcClient.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(msg Message) error {
+					calls++
+					appendErr = dstClient.AppendMessage(t.Context(), "INBOX", msg)
+					return nil
+				})
+			})
+			if err != nil {
+				t.Fatalf("StreamMessagesByUIDs: %v", err)
+			}
+
+			if calls != 1 {
+				t.Errorf("callback ran %d times, want 1", calls)
+			}
+			if !errors.Is(appendErr, errEmptyBody) {
+				t.Fatalf("AppendMessage error = %v, want %v", appendErr, errEmptyBody)
+			}
+			if want := "source returned an empty body"; !strings.Contains(appendErr.Error(), want) {
+				t.Errorf("AppendMessage error = %q, want it to contain %q", appendErr, want)
+			}
+			if got := dst.callCount("APPEND"); got != 0 {
+				t.Errorf("destination APPEND count = %d, want 0", got)
+			}
+			if got := dst.callCount("LOGIN"); got != 1 {
+				t.Errorf("destination LOGIN count = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func testMessage(body string) Message {
 	msg := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
 	msg.Body[&imap.BodySectionName{}] = strings.NewReader(body)
+	msg.Envelope = &imap.Envelope{MessageId: "test-id@example.com"}
+	return Message{m: msg}
+}
+
+func messageWithBody(lit imap.Literal) Message {
+	msg := imap.NewMessage(1, []imap.FetchItem{fullBodyPeekSection.FetchItem()})
+	msg.Body[&imap.BodySectionName{}] = lit
 	msg.Envelope = &imap.Envelope{MessageId: "test-id@example.com"}
 	return Message{m: msg}
 }
@@ -347,7 +438,7 @@ func Test_AppendMessage_When_FailsBeforeBodyIsRead_Then_RetriesOnce(t *testing.T
 	}
 }
 
-// A retry after the body was sent would duplicate the message. An empty body counts as sent.
+// A retry after the body was sent would duplicate the message. A one-byte body counts as sent.
 func Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry(t *testing.T) {
 	t.Parallel()
 
@@ -356,7 +447,7 @@ func Test_AppendMessage_When_BodyWasSent_Then_RepairsWithoutRetry(t *testing.T) 
 		name    string
 	}{
 		{name: "a normal body", message: buildTestIMAPMessage},
-		{name: "an empty body", message: func() Message { return testMessage("") }},
+		{name: "a one-byte body", message: func() Message { return testMessage("x") }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

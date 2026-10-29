@@ -594,6 +594,7 @@ type mailStore struct {
 	statusReply  map[string]string
 	literal      map[string]bool
 	nilDelim     map[string]bool
+	rawBody      map[string]string
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -760,6 +761,16 @@ func (s *fakeServer) removeMessage(folder, msgID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.folders[folder] = slices.DeleteFunc(s.store.folders[folder], func(m storedMsg) bool { return m.msgID == msgID })
+}
+
+// answerBody makes every FETCH of msgID send value as the BODY[] item, for example NIL or {0}. The header, ENVELOPE and size items stay as they are.
+func (s *fakeServer) answerBody(msgID, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.rawBody == nil {
+		s.store.rawBody = make(map[string]string)
+	}
+	s.store.rawBody[msgID] = value
 }
 
 // setUIDValidity sets the UIDVALIDITY of a folder; 0 makes the server send none.
@@ -1145,6 +1156,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 		s.store.seenMutating++
 	}
 	msgs := slices.Clone(s.store.folders[selected])
+	rawBody := maps.Clone(s.store.rawBody)
 	s.mu.Unlock()
 
 	if selected == "" {
@@ -1182,7 +1194,11 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			parts = append(parts, fmt.Sprintf("BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s", len(hdr), hdr))
 		}
 		if wantBody {
-			parts = append(parts, fmt.Sprintf("BODY[] {%d}\r\n%s", len(m.body), m.body))
+			if raw, ok := rawBody[m.msgID]; ok {
+				parts = append(parts, "BODY[] "+raw)
+			} else {
+				parts = append(parts, fmt.Sprintf("BODY[] {%d}\r\n%s", len(m.body), m.body))
+			}
 		}
 		rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
 	}

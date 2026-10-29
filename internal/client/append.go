@@ -2,12 +2,15 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
 )
+
+var errEmptyBody = errors.New("source returned an empty body")
 
 // A body that go-imap never read never reached the server, so another
 // session can send it without a duplicate.
@@ -51,6 +54,11 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 	body := msg.m.GetBody(fullBodyPeekSection)
 	if body == nil {
 		return fmt.Errorf("[%s] message has no body", c.prefix)
+	}
+	// go-imap turns BODY[] NIL, {0} and quoted strings into an empty body.
+	// An empty APPEND has no Message-Id, so every later run would add one more.
+	if body.Len() == 0 {
+		return fmt.Errorf("[%s] %w", c.prefix, errEmptyBody)
 	}
 
 	cli := c.c.Load()

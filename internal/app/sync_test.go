@@ -2487,6 +2487,58 @@ func TestRunSync_When_AppendRefused_Then_ReportsErrorsAndExitsSilently(t *testin
 	assertContainsAll(t, out.String(), "Sync completed with errors", "0 messages uploaded, 1 errors occurred")
 }
 
+func TestRunSync_When_SourceReturnsEmptyBody_Then_MessageFailsOnEachRun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "NIL", value: "NIL"},
+		{name: "a zero-length literal", value: "{0}\r\n"},
+		{name: "an empty quoted string", value: `""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("good@x", "empty@x")})
+			src.answerBody("empty@x", tt.value)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+
+			first := &syncBuffer{}
+			opts := e2eOptions(first, "")
+			opts.autoConfirm = true
+			opts.verbose = true
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("first run error = %v, want ErrSilentExit", err)
+			}
+			assertContainsAll(t, first.String(), "1 messages uploaded, 1 errors occurred", "source returned an empty body")
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "good@x")
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("dst saw %d APPEND commands after the first run, want 1", n)
+			}
+
+			second := &syncBuffer{}
+			opts = e2eOptions(second, "")
+			opts.autoConfirm = true
+			err = runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("second run error = %v, want ErrSilentExit", err)
+			}
+			assertContainsAll(t, second.String(), "0 messages uploaded, 1 errors occurred")
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "good@x")
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("dst saw %d APPEND commands after the second run, want 1 (the empty message gets none)", n)
+			}
+		})
+	}
+}
+
 func TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin(t *testing.T) {
 	t.Parallel()
 
