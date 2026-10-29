@@ -605,6 +605,7 @@ type mailStore struct {
 	uidFetchEnd  map[string]string
 	omitBody     map[folderMsg]bool
 	omitFirst    map[folderMsg]bool
+	scanNoUID    map[string]bool
 	delimiter    string
 	loginReply   string
 	createReply  string
@@ -804,6 +805,16 @@ func (s *fakeServer) omitBodyIn(folder, msgID string) {
 		s.store.omitBody = make(map[folderMsg]bool)
 	}
 	s.store.omitBody[folderMsg{folder, msgID}] = true
+}
+
+// omitScanUIDIn makes plain FETCH responses for folder leave out the UID item; UID FETCH still sends it.
+func (s *fakeServer) omitScanUIDIn(folder string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.scanNoUID == nil {
+		s.store.scanNoUID = make(map[string]bool)
+	}
+	s.store.scanNoUID[folder] = true
 }
 
 // omitBodyFirstIn makes every FETCH of the message send one response without BODY[] before the full response.
@@ -1217,6 +1228,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	rawBodyIn := maps.Clone(s.store.rawBodyIn[selected])
 	omitBody := maps.Clone(s.store.omitBody)
 	omitFirst := maps.Clone(s.store.omitFirst)
+	scanNoUID := s.store.scanNoUID[selected]
 	endReply := ""
 	if byUID {
 		endReply = s.store.uidFetchEnd[selected]
@@ -1229,7 +1241,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	}
 
 	ranges := parseIDSet(set)
-	wantUID := byUID || hasToken(upper, "UID")
+	wantUID := byUID || (hasToken(upper, "UID") && !scanNoUID)
 	wantSize := hasToken(upper, "RFC822.SIZE")
 	wantHeader := strings.Contains(upper, "HEADER.FIELDS")
 	wantEnvelope := strings.Contains(upper, "ENVELOPE")

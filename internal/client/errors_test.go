@@ -60,6 +60,7 @@ func TestClassifyError(t *testing.T) {
 		{name: "unknown", err: errors.New("unrecognized server response"), want: ClassUnknown},
 		{name: "unknownServerNoMailboxSelected", err: errors.New("No mailbox selected."), want: ClassUnknown},
 		{name: "unknownGmailDuplicateFolderName", err: errors.New("Duplicate folder name Archive (Failure)"), want: ClassUnknown},
+		{name: "missingUIDIsUnknown", err: fmt.Errorf("[src] fetch IDs: %w (1 of 2 messages)", errMissingUID), want: ClassUnknown},
 	}
 
 	for _, tt := range tests {

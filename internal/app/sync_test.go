@@ -3323,6 +3323,28 @@ func TestRunSync_When_DestinationScanFails_Then_NothingIsWritten(t *testing.T) {
 	}
 }
 
+func TestRunSync_When_DestinationScanSendsNoUID_Then_NothingIsWritten(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst.omitScanUIDIn("INBOX")
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if err == nil {
+		t.Fatal("runSync returned nil, want the destination scan failure")
+	}
+	if got := err.Error(); !strings.Contains(got, `scan destination folder "INBOX"`) || !strings.Contains(got, "server sent no UID for a message") {
+		t.Errorf("error = %q, want the destination scan failure for a message without a UID", got)
+	}
+	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d CREATE or APPEND commands, want 0", n)
+	}
+}
+
 func TestRunSync_When_CanceledDuringFolderCreation_Then_ReportsCancelNotCreateFailure(t *testing.T) {
 	t.Parallel()
 
@@ -4688,6 +4710,41 @@ func TestRunSync_When_SourceRefusesExamineWithoutMapping_Then_FolderIsReported(t
 		"Temporary server failure",
 		"1 folders failed",
 	)
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceScanSendsNoUID_Then_FolderFailsAndOtherFoldersCopy(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Work":  fakeMsgs("w1@x", "w2@x"),
+	})
+	src.omitScanUIDIn("Work")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	if dst.hasFolder("Work") {
+		t.Error("dst holds Work, want none: the source folder cannot be scanned")
+	}
+	assertContainsAll(t, out.String(),
+		"• Work → Work: cannot scan source folder:",
+		"server sent no UID for a message",
+		"1 folders failed",
+	)
+	for _, set := range src.capturedNames("UID FETCH") {
+		if strings.Contains(set, "*") {
+			t.Errorf("source received UID FETCH %q, want no set that holds *", set)
+		}
+	}
 	assertReadOnly(t, "source", src)
 }
 

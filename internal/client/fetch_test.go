@@ -517,10 +517,12 @@ func Test_FetchMessageMap_reportsMissingMessageId(t *testing.T) {
 }
 
 // scanRow is one scripted Message-Id scan response. An empty msgID sends a header section with no Message-Id.
+// noUID leaves out the UID item.
 type scanRow struct {
 	msgID string
 	uid   uint32
 	size  uint32
+	noUID bool
 }
 
 // scanIntercept answers EXAMINE with one EXISTS per row and each FETCH with the rows in the given order.
@@ -534,8 +536,12 @@ func writeScanRow(conn net.Conn, n int, r scanRow) {
 	if r.msgID != "" {
 		hdr = "Message-Id: <" + r.msgID + ">\r\n\r\n"
 	}
-	writeLine(conn, "* %d FETCH (UID %d RFC822.SIZE %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)",
-		n, r.uid, r.size, len(hdr), hdr)
+	uidItem := fmt.Sprintf("UID %d ", r.uid)
+	if r.noUID {
+		uidItem = ""
+	}
+	writeLine(conn, "* %d FETCH (%sRFC822.SIZE %d BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s)",
+		n, uidItem, r.size, len(hdr), hdr)
 }
 
 // scanSession serves one session of a Message-Id scan. FETCH sends the first sent rows; with fewer than
@@ -2209,6 +2215,105 @@ func Test_FetchMessageMap_When_ConnectionDropsMidScan_Then_RetryKeepsEachMessage
 	}
 	if warnings != 1 {
 		t.Errorf("got %d warnings about a missing Message-Id, want 1 (the first attempt must not add to it); log: %v", warnings, logged)
+	}
+}
+
+func Test_FetchMessageMap_When_ResponseHasMessageIdButNoUID_Then_ScanFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		rows []scanRow
+	}{
+		{
+			name: "the response has no UID item",
+			rows: []scanRow{{msgID: "a@x", noUID: true, size: 10}, {msgID: "b@x", uid: 2, size: 20}},
+		},
+		{
+			name: "the response sends UID 0",
+			rows: []scanRow{{msgID: "a@x", uid: 0, size: 10}, {msgID: "b@x", uid: 2, size: 20}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, scanIntercept(tt.rows)))
+			c := newClientWithFake(t, srv)
+			var logged []string
+			c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+			got, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+			if !errors.Is(err, errMissingUID) {
+				t.Fatalf("FetchMessageMap error = %v, want errMissingUID", err)
+			}
+			if !strings.Contains(err.Error(), "(1 of 2 messages)") {
+				t.Errorf("error = %q, want it to count 1 of 2 messages", err)
+			}
+			if got != nil {
+				t.Errorf("map = %v, want nil", got)
+			}
+			if errors.Is(err, ErrSelectRefused) {
+				t.Errorf("error = %v, must not be a select refusal (it would skip a hierarchy level)", err)
+			}
+			if n := srv.callCount("LOGIN"); n != 1 {
+				t.Errorf("LOGIN count = %d, want 1 (no reconnect)", n)
+			}
+			if n := srv.callCount("FETCH"); n != 1 {
+				t.Errorf("FETCH count = %d, want 1 (no retry)", n)
+			}
+			for _, msg := range logged {
+				if strings.Contains(msg, "without Message-Id") {
+					t.Errorf("logged %q, want no missing Message-Id warning", msg)
+				}
+			}
+		})
+	}
+}
+
+func Test_FetchMessageMap_When_ResponseHasNeitherMessageIdNorUID_Then_ScanSucceeds(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+		{noUID: true, size: 5},
+		{msgID: "b@x", uid: 2, size: 20},
+	})))
+	c := newClientWithFake(t, srv)
+
+	got, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v", err)
+	}
+	if want := map[string][]MessageRef{"b@x": {{UID: 2, Size: 20}}}; !equalMessageMaps(got, want) {
+		t.Errorf("map = %v, want %v", got, want)
+	}
+}
+
+func Test_FetchMessageMap_When_UIDlessScanIsCutAndRetryIsClean_Then_Succeeds(t *testing.T) {
+	t.Parallel()
+
+	uidless := []scanRow{{msgID: "a@x", noUID: true, size: 10}, {msgID: "b@x", uid: 2, size: 20}}
+	clean := []scanRow{{msgID: "a@x", uid: 1, size: 10}, {msgID: "b@x", uid: 2, size: 20}}
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanSession(uidless, 1, 0)))
+	srv.addConnHandler(interceptHandler(srv, scanSession(clean, len(clean), 0)))
+	c := newClientWithFake(t, srv)
+
+	got, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v, want success after the reconnect", err)
+	}
+	want := map[string][]MessageRef{"a@x": {{UID: 1, Size: 10}}, "b@x": {{UID: 2, Size: 20}}}
+	if !equalMessageMaps(got, want) {
+		t.Errorf("map = %v, want %v", got, want)
+	}
+	if n := srv.callCount("LOGIN"); n != 2 {
+		t.Errorf("LOGIN count = %d, want 2", n)
 	}
 }
 

@@ -68,6 +68,8 @@ type MessageRef struct {
 // each UID once. Messages without a Message-Id have no diff key: they are left
 // out and reported once.
 //
+// A message with a Message-Id but no UID fails the scan.
+//
 // The map serves both sides of a Message-Id diff: the source reads the UIDs
 // and sizes, and the destination reads the length of each value.
 //
@@ -86,6 +88,7 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	var (
 		ids          map[string][]MessageRef
 		missingCount int
+		missingUIDs  int
 		uidValidity  uint32
 		repeated     bool
 	)
@@ -93,6 +96,7 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		ids = nil
 		uidValidity = 0
 		missingCount = 0
+		missingUIDs = 0
 		repeated = false
 		mbox, err := c.selectIfNeeded(cli, folder)
 		if err != nil {
@@ -145,6 +149,11 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 				missingCount++
 				continue
 			}
+			// UID 0 is not a valid UID, and go-imap sends it as "*" in a UID set, so the message can be neither planned nor counted.
+			if msg.Uid == 0 {
+				missingUIDs++
+				continue
+			}
 			refs, seen := ids[id]
 			if seen {
 				repeated = true
@@ -153,6 +162,9 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		}
 		if err := <-done; err != nil {
 			return fmt.Errorf("[%s] fetch IDs: %w", c.prefix, err)
+		}
+		if missingUIDs > 0 {
+			return fmt.Errorf("[%s] fetch IDs: %w (%d of %d messages)", c.prefix, errMissingUID, missingUIDs, total)
 		}
 		if repeated {
 			sortAndCompactRefs(ids)
