@@ -62,12 +62,15 @@ type MessageRef struct {
 //
 // The map serves both sides of a Message-Id diff: the source reads the UIDs
 // and sizes, and the destination reads the length of each value.
-func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, error) {
+//
+// The second result is the UIDVALIDITY that the UIDs belong to, or 0 when the
+// server sent none.
+func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, uint32, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
@@ -75,10 +78,12 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	var (
 		ids          map[string][]MessageRef
 		missingCount int
+		uidValidity  uint32
 		repeated     bool
 	)
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		ids = nil
+		uidValidity = 0
 		missingCount = 0
 		repeated = false
 		mbox, err := c.selectIfNeeded(cli, folder)
@@ -96,12 +101,15 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 		var total uint32
 		if mbox != nil {
 			total = mbox.Messages
+			uidValidity = mbox.UidValidity
 		} else {
-			st, serr := cli.Status(folder, []imap.StatusItem{imap.StatusMessages})
+			// STATUS, not the session copy: it gives the value a fresh EXAMINE sees, so a change since the selection shows.
+			st, serr := cli.Status(folder, []imap.StatusItem{imap.StatusMessages, imap.StatusUidValidity})
 			if serr != nil {
 				return fmt.Errorf("[%s] status %s: %w", c.prefix, folder, serr)
 			}
 			total = st.Messages
+			uidValidity = st.UidValidity
 		}
 		c.log("[%s] Selected folder %s (%d messages)", c.prefix, folder, total)
 		if total == 0 {
@@ -152,14 +160,22 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return ids, nil
+	return ids, uidValidity, nil
+}
+
+// CheckUIDValidity returns ErrUIDValidityChanged when planned and current differ. Zero means the server sent no UIDVALIDITY, so it matches any value.
+func CheckUIDValidity(planned, current uint32) error {
+	if planned == 0 || current == 0 || planned == current {
+		return nil
+	}
+	return fmt.Errorf("%w (UIDVALIDITY %d, now %d)", ErrUIDValidityChanged, planned, current)
 }
 
 // Sorting once after the FETCH keeps a hostile response order from costing quadratic time. Compacting stops a repeated response from counting one message twice.
@@ -233,7 +249,11 @@ func trimAngleBrackets(id string) string {
 // If onMessage returns an error, the channel from the in-flight batch is
 // drained (so the producer goroutine exits cleanly) and the error is
 // returned without scheduling further batches.
-func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids []uint32, onMessage func(Message) error) error {
+//
+// The UIDs belong to uidValidity. When a session reports another value, the
+// stream ends with ErrUIDValidityChanged and sends that session no FETCH.
+// Zero skips the check.
+func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -277,8 +297,18 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uids [
 			}
 			// A retry after a reconnect runs on a fresh session, which has no
 			// selection, so selectIfNeeded selects the folder again.
-			if _, err := c.selectIfNeeded(cli, folder); err != nil {
+			status, err := c.selectIfNeeded(cli, folder)
+			if err != nil {
 				return fmt.Errorf("[%s] select folder %s: %w", c.prefix, folder, err)
+			}
+			// A nil status means the folder stayed selected and no EXAMINE ran; the session still holds the value from its EXAMINE.
+			if status == nil {
+				status = cli.Mailbox()
+			}
+			if status != nil {
+				if err := CheckUIDValidity(uidValidity, status.UidValidity); err != nil {
+					return fmt.Errorf("[%s] folder %s: %w", c.prefix, folder, err)
+				}
 			}
 			messages := make(chan *imap.Message, messageChanBuffer)
 			batchDone := make(chan error, 1)

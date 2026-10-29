@@ -663,7 +663,7 @@ func Test_Cancel_interruptsBlockingCall(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		_, err := c.FetchMessageMap(context.Background(), "INBOX")
+		_, _, err := c.FetchMessageMap(context.Background(), "INBOX")
 		errc <- err
 	}()
 
@@ -1289,7 +1289,7 @@ func Test_safeCall_When_ServerClosesMidCommand_Then_ReconnectsAndRetries(t *test
 		_ = c.Logout()
 	})
 
-	if _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+	if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
 		t.Fatalf("FetchMessageMap: %v, want success after a reconnect", err)
 	}
 	if got := srv.callCount("LOGIN"); got != 2 {
@@ -1908,7 +1908,7 @@ func Test_safeCall_When_ServerStopsAnswering_Then_WatchdogReconnectsAndRetries(t
 
 	start := time.Now()
 	err := awaitCall(t, "FetchMessageMap", func() error {
-		_, err := c.FetchMessageMap(t.Context(), "INBOX")
+		_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
 		return err
 	})
 	if err != nil {
@@ -1952,7 +1952,7 @@ func Test_safeCall_When_ReplyTricklesWithinLimit_Then_WatchdogDoesNotCut(t *test
 	c := newWatchedClient(t, srv, holdLimit)
 
 	start := time.Now()
-	if _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
+	if _, _, err := c.FetchMessageMap(t.Context(), "INBOX"); err != nil {
 		t.Fatalf("FetchMessageMap: %v, want the trickled reply to complete", err)
 	}
 	if elapsed := time.Since(start); elapsed < 3*holdLimit {
@@ -2074,7 +2074,7 @@ func Test_FetchMessageMap_When_CancelledDuringStall_Then_ReturnsCanceledNotIdleT
 	t.Cleanup(cancel)
 	errc := make(chan error, 1)
 	go func() {
-		_, err := c.FetchMessageMap(ctx, "INBOX")
+		_, _, err := c.FetchMessageMap(ctx, "INBOX")
 		errc <- err
 	}()
 	awaitSignal(t, examine.reached, "the server to receive EXAMINE")
@@ -2108,7 +2108,7 @@ func Test_FetchMessageMap_When_CancelledDuringReconnectAfterTrip_Then_ReturnsCan
 	t.Cleanup(cancel)
 	errc := make(chan error, 1)
 	go func() {
-		_, err := c.FetchMessageMap(ctx, "INBOX")
+		_, _, err := c.FetchMessageMap(ctx, "INBOX")
 		errc <- err
 	}()
 	awaitSignal(t, login.reached, "the reconnect LOGIN to reach the server")
@@ -2381,7 +2381,7 @@ func Test_Client_When_OperationReturns_Then_NoWatchdogSpanStaysOpen(t *testing.T
 			name:    "FetchMessageMap succeeds",
 			handler: normal,
 			run: func(c *Client) error {
-				_, err := c.FetchMessageMap(context.Background(), "INBOX")
+				_, _, err := c.FetchMessageMap(context.Background(), "INBOX")
 				return err
 			},
 		},
@@ -2606,7 +2606,7 @@ func Test_safeCall_When_WatchdogTrips_Then_LogsWhyItReconnects(t *testing.T) {
 	}})
 
 	err := awaitCall(t, "FetchMessageMap", func() error {
-		_, err := c.FetchMessageMap(t.Context(), "INBOX")
+		_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
 		return err
 	})
 	if err != nil {
@@ -3276,7 +3276,7 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 			wantCommands: map[string]int{"EXAMINE": 1},
 			run: func(t *testing.T, c *Client) error {
 				t.Helper()
-				_, err := c.FetchMessageMap(t.Context(), "INBOX")
+				_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
 				return err
 			},
 		},
@@ -3289,7 +3289,7 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 			run: func(t *testing.T, c *Client) error {
 				t.Helper()
 				delivered := make(map[uint32]int)
-				err := c.StreamMessagesByUIDs(t.Context(), "INBOX", []uint32{1, 2, 3}, func(msg Message) error {
+				err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
 					delivered[msg.m.Uid]++
 					return nil
 				})

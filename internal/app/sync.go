@@ -59,12 +59,17 @@ func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Wri
 // SrcUIDs holds the sorted source UIDs that the destination count does not
 // cover. Planning fetches no bodies, so the prompt can show counts without
 // holding mail in memory.
+//
+// SrcUIDValidity is the UIDVALIDITY that SrcUIDs belong to, or 0 when the
+// server sent none. The copy uses the UIDs only while the folder reports this
+// value.
 type FolderSyncPlan struct {
 	SourceFolder            string
 	DestinationFolder       string
 	SrcUIDs                 []uint32
 	NewMessages             int
 	NewSize                 uint64
+	SrcUIDValidity          uint32
 	DestinationFolderExists bool
 }
 
@@ -621,7 +626,7 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 
 // The destination is read first: an empty folder holds nothing the plan could drop, so it needs no source scan.
 func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, recheckDrops, error) {
-	dstMap, err := dstClient.FetchMessageMap(ctx, plan.DestinationFolder)
+	dstMap, _, err := dstClient.FetchMessageMap(ctx, plan.DestinationFolder)
 	if err != nil {
 		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errDestinationRecheck, err)
 	}
@@ -629,9 +634,13 @@ func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan 
 		plan.DestinationFolderExists = true
 		return plan, recheckDrops{}, nil
 	}
-	srcMap, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
+	srcMap, uidValidity, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
 	if err != nil {
 		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errSourceScan, err)
+	}
+	// A new UIDVALIDITY means the planned UIDs point elsewhere, and a diff would mix two UID spaces.
+	if err := client.CheckUIDValidity(plan.SrcUIDValidity, uidValidity); err != nil {
+		return plan, recheckDrops{}, err
 	}
 	rechecked, drops := rediffPlan(plan, srcMap, dstMap)
 	return rechecked, drops, nil
@@ -722,15 +731,16 @@ func printSyncErrors(out io.Writer, synced, errs, failedFolders int) {
 // srcMessages counts the source messages that have a Message-Id. It is set
 // before srcMap is freed, so the \Noselect failure can use it after the diff.
 type folderScan struct {
-	srcMap      map[string][]client.MessageRef
-	dstMap      map[string][]client.MessageRef
-	srcErr      error
-	dstErr      error
-	srcMessages int
-	dstExists   bool
-	dstNoSelect bool
-	mu          sync.Mutex
-	done        atomic.Int32
+	srcMap         map[string][]client.MessageRef
+	dstMap         map[string][]client.MessageRef
+	srcErr         error
+	dstErr         error
+	srcMessages    int
+	srcUIDValidity uint32
+	dstExists      bool
+	dstNoSelect    bool
+	mu             sync.Mutex
+	done           atomic.Int32
 }
 
 // sharedDestinations counts copies that earlier plans schedule for a destination of two or more mappings. Slot k is diffed before slot k+1, because both scans walk in index order.
@@ -796,12 +806,13 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				return err
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanning %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
-			mp, err := srcClient.FetchMessageMap(gCtx, m.Source)
+			mp, uidValidity, err := srcClient.FetchMessageMap(gCtx, m.Source)
 			if err != nil {
 				scans[idx].srcErr = err
 			} else {
 				scans[idx].srcMap = mp
 				scans[idx].srcMessages = countRefs(mp)
+				scans[idx].srcUIDValidity = uidValidity
 			}
 			srcTracker.UpdateMessage(fmt.Sprintf("[%s] Scanned %s (%d/%d)", srcLabel, termsafe.Escape(m.Source), idx+1, n))
 			srcTracker.Increment(1)
@@ -829,7 +840,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 				scans[idx].dstNoSelect = true
 			default:
 				scans[idx].dstExists = true
-				mp, err := dstClient.FetchMessageMap(gCtx, m.Destination)
+				mp, _, err := dstClient.FetchMessageMap(gCtx, m.Destination)
 				if err != nil {
 					scans[idx].dstErr = err
 				} else {
@@ -960,6 +971,7 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 		NewMessages:             len(newUIDs),
 		NewSize:                 newSize,
 		SrcUIDs:                 newUIDs,
+		SrcUIDValidity:          s.srcUIDValidity,
 	}
 	totalNew.Add(int64(len(newUIDs)))
 	totalNewSize.Add(newSize)

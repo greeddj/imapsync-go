@@ -836,6 +836,51 @@ func Test_runFolderSync_When_StreamFailsWithHostileReply_Then_LogAndTrackerShowE
 	}
 }
 
+func Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsOneErrorAndAppendsNothing(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x", "b@x")})
+	src.setUIDValidity("INBOX", 2)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	w := &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}
+	plan := FolderSyncPlan{
+		SourceFolder:            "INBOX",
+		DestinationFolder:       "INBOX",
+		SrcUIDs:                 []uint32{1, 2},
+		NewMessages:             2,
+		SrcUIDValidity:          1,
+		DestinationFolderExists: true,
+	}
+	sb := &syncBuffer{}
+	// The sentinel stays active so the render pass Stop triggers still prints the
+	// queued log lines.
+	pw := progress.NewWriter(2, true)
+	pw.SetOutputWriter(sb)
+	pw.Start()
+	pw.AppendTracker(progress.NewTracker("sentinel", 100))
+	tr := progress.NewTracker("test", 10)
+	pw.AppendTracker(tr)
+
+	synced, errs := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
+	pw.Stop()
+	pw.WaitForRenderDone()
+
+	if synced != 0 || errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", synced, errs)
+	}
+	if !tr.IsErrored() {
+		t.Error("tracker not marked as errored after the mismatch")
+	}
+	if got := dst.callCount("APPEND"); got != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", got)
+	}
+	if got := src.callCount("UID FETCH"); got != 0 {
+		t.Errorf("source saw %d UID FETCH commands, want 0", got)
+	}
+	assertContainsAll(t, sb.String(),
+		"Stream error for folder INBOX: ", "source folder changed after the sync plan, run sync again (UIDVALIDITY 1, now 2)")
+}
+
 func Test_newSyncWorkerPool_When_WorkerListFails_Then_ErrorNamesTheWorkerLabel(t *testing.T) {
 	t.Parallel()
 

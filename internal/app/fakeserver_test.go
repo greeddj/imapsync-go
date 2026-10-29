@@ -587,6 +587,7 @@ type appendRecord struct {
 type mailStore struct {
 	folders      map[string][]storedMsg
 	nextUID      map[string]uint32
+	uidValidity  map[string]uint32 // absent means 1; 0 means the server sends none
 	noSelect     map[string]bool
 	hidden       map[string]bool
 	openReply    map[string]string
@@ -657,6 +658,14 @@ func inboxRest(name, delimiter string) (rest string, isInbox bool) {
 		}
 	}
 	return rest, strings.EqualFold(level, "INBOX")
+}
+
+// uidValidityOf returns the UIDVALIDITY of a store key, where 0 means the server sends none. The caller holds the server mu.
+func (st *mailStore) uidValidityOf(key string) uint32 {
+	if v, ok := st.uidValidity[key]; ok {
+		return v
+	}
+	return 1
 }
 
 func (st *mailStore) add(folder, msgID, body string) {
@@ -751,6 +760,38 @@ func (s *fakeServer) removeMessage(folder, msgID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.folders[folder] = slices.DeleteFunc(s.store.folders[folder], func(m storedMsg) bool { return m.msgID == msgID })
+}
+
+// setUIDValidity sets the UIDVALIDITY of a folder; 0 makes the server send none.
+func (s *fakeServer) setUIDValidity(folder string, v uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.setUIDValidity(folder, v)
+}
+
+func (st *mailStore) setUIDValidity(folder string, v uint32) {
+	if st.uidValidity == nil {
+		st.uidValidity = make(map[string]uint32)
+	}
+	st.uidValidity[folder] = v
+}
+
+// rebuildFolder acts like a server index rebuild: a new UIDVALIDITY, and the messages at the positions in order return in that order with new UIDs from 1.
+func (s *fakeServer) rebuildFolder(folder string, uidValidity uint32, order ...int) {
+	s.rebuildFolderFrom(folder, uidValidity, 1, order...)
+}
+
+// rebuildFolderFrom is rebuildFolder with the first new UID set by the caller.
+func (s *fakeServer) rebuildFolderFrom(folder string, uidValidity, firstUID uint32, order ...int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.store.folders[folder]
+	s.store.folders[folder] = nil
+	s.store.nextUID[folder] = firstUID
+	for _, i := range order {
+		s.store.addStored(folder, old[i])
+	}
+	s.store.setUIDValidity(folder, uidValidity)
 }
 
 func (s *fakeServer) refuseLogin() {
@@ -1040,6 +1081,7 @@ func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) (string
 	msgs, ok := s.store.folders[key]
 	n := len(msgs)
 	next := s.store.nextUID[key]
+	validity := s.store.uidValidityOf(key)
 	noSelect := s.store.noSelect[key]
 	refusal := s.store.openReply[key]
 	s.mu.Unlock()
@@ -1058,18 +1100,21 @@ func (s *fakeServer) storeSelect(rw replyWriter, tag, verb, name string) (string
 	rw.line("* %d EXISTS", n)
 	rw.line("* 0 RECENT")
 	rw.line(`* FLAGS (\Answered \Flagged \Deleted \Seen \Draft)`)
-	rw.line("* OK [UIDVALIDITY 1] UIDs valid")
+	if validity != 0 {
+		rw.line("* OK [UIDVALIDITY %d] UIDs valid", validity)
+	}
 	rw.line("* OK [UIDNEXT %d] Predicted next UID", next)
 	rw.line("%s OK [%s] %s completed", tag, access, verb)
 	return key, true
 }
 
 func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
-	name, _ := parseMailboxArg(arg)
+	name, items := parseMailboxArg(arg)
 	s.mu.Lock()
 	key := s.store.resolve(name)
 	msgs, ok := s.store.folders[key]
 	n := len(msgs)
+	validity := s.store.uidValidityOf(key)
 	noSelect := s.store.noSelect[key]
 	refusal := s.store.statusReply[key]
 	s.mu.Unlock()
@@ -1081,7 +1126,11 @@ func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
 		rw.line("%s NO [NONEXISTENT] Unknown Mailbox", tag)
 		return
 	}
-	rw.line(`* STATUS "%s" (MESSAGES %d)`, name, n)
+	if validity != 0 && strings.Contains(strings.ToUpper(items), "UIDVALIDITY") {
+		rw.line(`* STATUS "%s" (MESSAGES %d UIDVALIDITY %d)`, name, n, validity)
+	} else {
+		rw.line(`* STATUS "%s" (MESSAGES %d)`, name, n)
+	}
 	rw.line("%s OK STATUS completed", tag)
 }
 

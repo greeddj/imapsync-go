@@ -853,6 +853,55 @@ func byeAfterExamine(release <-chan struct{}) func(net.Conn, *bufio.Reader, comm
 	}
 }
 
+// chainHooks gives each command to the interceptHandler hooks in order; the first hook that handles it wins.
+func chainHooks(hooks ...func(net.Conn, *bufio.Reader, command) (handled, keep bool)) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		for _, hook := range hooks {
+			if handled, keep := hook(conn, rd, cmd); handled {
+				return true, keep
+			}
+		}
+		return false, true
+	}
+}
+
+// examineAs is an interceptHandler hook that answers EXAMINE with one message and the given UIDVALIDITY. Zero leaves the response code out.
+func examineAs(uidValidity uint32) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "EXAMINE" {
+			return false, true
+		}
+		writeLine(conn, "* 1 EXISTS")
+		writeLine(conn, "* 0 RECENT")
+		if uidValidity != 0 {
+			writeLine(conn, "* OK [UIDVALIDITY %d] UIDs valid", uidValidity)
+		}
+		writeLine(conn, "%s OK [READ-ONLY] EXAMINE completed", cmd.tag)
+		return true, true
+	}
+}
+
+// statusMessagesAndUIDValidity is the event statusAs counts for a STATUS that asks for both items.
+const statusMessagesAndUIDValidity = "STATUS MESSAGES UIDVALIDITY"
+
+// statusAs is an interceptHandler hook that answers STATUS with one message and the given UIDVALIDITY. It counts each request that lists both items under statusMessagesAndUIDValidity.
+func statusAs(srv *fakeServer, uidValidity uint32) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "STATUS" {
+			return false, true
+		}
+		items := strings.ToUpper(cmd.arg)
+		if strings.Contains(items, "MESSAGES") && strings.Contains(items, "UIDVALIDITY") {
+			srv.bump(statusMessagesAndUIDValidity)
+			writeLine(conn, `* STATUS "%s" (MESSAGES 1 UIDVALIDITY %d)`, firstArg(cmd.arg), uidValidity)
+		} else {
+			writeLine(conn, `* STATUS "%s" (MESSAGES 1)`, firstArg(cmd.arg))
+		}
+		writeLine(conn, "%s OK STATUS completed", cmd.tag)
+		return true, true
+	}
+}
+
 // awaitSignal fails the test when ch stays open for too long.
 func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
