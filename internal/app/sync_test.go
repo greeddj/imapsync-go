@@ -5766,6 +5766,211 @@ func TestRunSync_When_RenamedNameCarriesControlCharacters_Then_WarningShowsEscap
 	}
 }
 
+func caseVariantLine(names ...string) string {
+	return "⚠️  Destination folders " + strings.Join(names, ", ") +
+		" differ only in letter case. If the destination server ignores letter case, a message that their source folders share is copied more than once.\n"
+}
+
+func Test_printCaseVariantDestinations(t *testing.T) {
+	t.Parallel()
+
+	const (
+		upperHostileName  = "EVIL\x1b[2J\rX\u202eGPJ"
+		upperHostileShown = `EVIL\x1b[2J\rX\u202eGPJ`
+	)
+	tests := []struct {
+		name     string
+		want     string
+		listed   []string
+		mappings []config.DirectoryMapping
+	}{
+		{
+			name:     "two spellings of one name",
+			mappings: []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "archive")},
+			listed:   []string{"INBOX"},
+			want:     caseVariantLine("Archive", "archive") + "\n",
+		},
+		{
+			name:     "two mappings with the same destination",
+			mappings: []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "Archive")},
+			listed:   []string{"INBOX"},
+		},
+		{
+			name:     "both spellings are listed",
+			mappings: []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "archive")},
+			listed:   []string{"Archive", "archive"},
+		},
+		{
+			name:     "only one spelling is listed",
+			mappings: []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "archive")},
+			listed:   []string{"Archive"},
+			want:     caseVariantLine("Archive", "archive") + "\n",
+		},
+		{
+			name: "three spellings and a repeat in unsorted order",
+			mappings: []config.DirectoryMapping{
+				mapping("A", "archive"), mapping("B", "ARCHIVE"), mapping("C", "Archive"), mapping("D", "archive"),
+			},
+			want: caseVariantLine("ARCHIVE", "Archive", "archive") + "\n",
+		},
+		{
+			name: "two groups in reverse key order",
+			mappings: []config.DirectoryMapping{
+				mapping("B", "beta"), mapping("C", "Beta"), mapping("D", "alpha"), mapping("E", "Alpha"),
+			},
+			want: caseVariantLine("Alpha", "alpha") + caseVariantLine("Beta", "beta") + "\n",
+		},
+		{
+			name: "one group is listed and the other is not",
+			mappings: []config.DirectoryMapping{
+				mapping("A", "Archive"), mapping("B", "archive"), mapping("C", "Beta"), mapping("D", "beta"),
+			},
+			listed: []string{"Archive", "archive"},
+			want:   caseVariantLine("Beta", "beta") + "\n",
+		},
+		{
+			name:     "a listed folder outside the plan does not count",
+			mappings: []config.DirectoryMapping{mapping("Sent", "sent")},
+			listed:   []string{"Sent"},
+		},
+		{
+			name:     "names with control and bidi characters",
+			mappings: []config.DirectoryMapping{mapping("A", hostileName), mapping("B", upperHostileName)},
+			want:     caseVariantLine(upperHostileShown, hostileShownName) + "\n",
+		},
+		{
+			name: "no mappings",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out strings.Builder
+			printCaseVariantDestinations(&out, tt.mappings, tt.listed)
+
+			if got := out.String(); got != tt.want {
+				t.Errorf("output = %q, want %q", got, tt.want)
+			}
+			assertContainsNone(t, out.String(), "\x1b", "\r", "\u202e")
+		})
+	}
+}
+
+func TestRunSync_When_DestinationsDifferOnlyInLetterCase_Then_WarningShowsAndEachFolderCopies(t *testing.T) {
+	t.Parallel()
+
+	line := caseVariantLine("Archive", "archive")
+	tests := []struct {
+		srcFolders  map[string][]fakeMsg
+		dstFolders  map[string][]fakeMsg
+		wantFolders map[string][]string
+		name        string
+		input       string
+		mappings    []config.DirectoryMapping
+		wantOrdered []string
+		wantCreates []string
+		wantLines   int
+		quiet       bool
+	}{
+		{
+			name: "typed and interactive",
+			srcFolders: map[string][]fakeMsg{
+				"INBOX": nil,
+				"A":     fakeMsgs("a1@x", "shared@x"),
+				"B":     fakeMsgs("b1@x", "shared@x"),
+			},
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil},
+			mappings:    []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "archive")},
+			input:       "y\n",
+			wantOrdered: []string{line, "Messages to be copied to destination", "Proceed with synchronization?", "Sync completed successfully"},
+			wantCreates: []string{"Archive", "archive"},
+			wantLines:   1,
+			wantFolders: map[string][]string{"Archive": {"a1@x", "shared@x"}, "archive": {"b1@x", "shared@x"}},
+		},
+		{
+			name: "typed and quiet",
+			srcFolders: map[string][]fakeMsg{
+				"INBOX": nil,
+				"A":     fakeMsgs("a1@x", "shared@x"),
+				"B":     fakeMsgs("b1@x", "shared@x"),
+			},
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil},
+			mappings:    []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "archive")},
+			quiet:       true,
+			wantOrdered: []string{line, "Sync completed successfully"},
+			wantCreates: []string{"Archive", "archive"},
+			wantLines:   1,
+			wantFolders: map[string][]string{"Archive": {"a1@x", "shared@x"}, "archive": {"b1@x", "shared@x"}},
+		},
+		{
+			name: "mirror and quiet",
+			srcFolders: map[string][]fakeMsg{
+				"INBOX":   nil,
+				"Archive": fakeMsgs("c1@x", "shared@x"),
+				"archive": fakeMsgs("c2@x", "shared@x"),
+			},
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil},
+			quiet:       true,
+			wantOrdered: []string{line, "Sync completed successfully"},
+			wantCreates: []string{"Archive", "archive"},
+			wantLines:   1,
+			wantFolders: map[string][]string{"Archive": {"c1@x", "shared@x"}, "archive": {"c2@x", "shared@x"}},
+		},
+		{
+			name: "destination lists both spellings",
+			srcFolders: map[string][]fakeMsg{
+				"INBOX": nil,
+				"A":     fakeMsgs("a1@x", "shared@x"),
+				"B":     fakeMsgs("b1@x", "shared@x"),
+			},
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil, "Archive": nil, "archive": nil},
+			mappings:    []config.DirectoryMapping{mapping("A", "Archive"), mapping("B", "archive")},
+			quiet:       true,
+			wantOrdered: []string{"Sync completed successfully"},
+			wantFolders: map[string][]string{"Archive": {"a1@x", "shared@x"}, "archive": {"b1@x", "shared@x"}},
+		},
+		{
+			name: "destination names that resolve to one folder",
+			srcFolders: map[string][]fakeMsg{
+				"INBOX": nil,
+				"A":     fakeMsgs("a1@x"),
+				"B":     fakeMsgs("b1@x"),
+			},
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil},
+			mappings:    []config.DirectoryMapping{mapping("A", "INBOX/Sub"), mapping("B", "inbox/Sub")},
+			quiet:       true,
+			wantOrdered: []string{"Sync completed successfully"},
+			wantCreates: []string{"INBOX/Sub"},
+			wantFolders: map[string][]string{"INBOX/Sub": {"a1@x", "b1@x"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.srcFolders)
+			dst := newStoreServer(t, "/", tt.dstFolders)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, tt.input)
+			opts.quiet, opts.autoConfirm = tt.quiet, tt.quiet
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v", err)
+			}
+
+			if n := strings.Count(out.String(), "differ only in letter case"); n != tt.wantLines {
+				t.Errorf("warning lines = %d, want %d\noutput: %q", n, tt.wantLines, out.String())
+			}
+			assertInOrder(t, out.String(), tt.wantOrdered...)
+			assertIDs(t, "dst CREATE names", slices.Sorted(slices.Values(dst.capturedNames("CREATE"))), tt.wantCreates...)
+			for folder, ids := range tt.wantFolders {
+				assertIDs(t, "dst "+folder, slices.Sorted(slices.Values(dst.folderMsgIDs(folder))), ids...)
+			}
+		})
+	}
+}
+
 func TestRunSync_When_RenameMakesTwoSourcesShareADestination_Then_BothFailAndNothingMerges(t *testing.T) {
 	t.Parallel()
 

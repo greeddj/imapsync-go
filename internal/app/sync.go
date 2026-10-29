@@ -318,6 +318,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	planned, clashes := splitDestinationClashes(expanded)
 	printFolderRenames(out, planned, dstDelimiter)
 	mappings = directoryMappings(planned)
+	printCaseVariantDestinations(out, mappings, dstClient.MailboxNames())
 
 	// Setup progress writer for scanning phase
 	pw := newProgressWriter(2, quiet, out)
@@ -1348,6 +1349,56 @@ func printFolderRenames(out io.Writer, mappings []folderMapping, dstDelimiter st
 		}
 		_, _ = fmt.Fprintf(out, "⚠️  Folder %s is renamed to %s: the destination server uses \"%s\" as its hierarchy delimiter\n",
 			termsafe.Escape(m.Source), termsafe.Escape(m.Destination), termsafe.Escape(dstDelimiter))
+		printed = true
+	}
+	if printed {
+		_, _ = fmt.Fprintln(out)
+	}
+}
+
+// RFC 3501 names are case-sensitive, so the plan keeps case variants apart, but a server that ignores case merges them. Names are server text, so they go through termsafe.Escape.
+func printCaseVariantDestinations(out io.Writer, mappings []config.DirectoryMapping, listed []string) {
+	firstName := make(map[string]string, len(mappings))
+	var variants map[string][]string
+	for _, m := range mappings {
+		key := strings.ToLower(m.Destination)
+		first, seen := firstName[key]
+		if !seen {
+			firstName[key] = m.Destination
+			continue
+		}
+		group := variants[key]
+		if group == nil {
+			if m.Destination == first {
+				continue
+			}
+			group = []string{first}
+		}
+		if slices.Contains(group, m.Destination) {
+			continue
+		}
+		if variants == nil {
+			variants = make(map[string][]string)
+		}
+		variants[key] = append(group, m.Destination)
+	}
+
+	if len(variants) == 0 {
+		return
+	}
+	unlisted := func(name string) bool { return !slices.Contains(listed, name) }
+	printed := false
+	for _, key := range slices.Sorted(maps.Keys(variants)) {
+		names := variants[key]
+		if !slices.ContainsFunc(names, unlisted) {
+			continue
+		}
+		slices.Sort(names)
+		for i, name := range names {
+			names[i] = termsafe.Escape(name)
+		}
+		_, _ = fmt.Fprintf(out, "⚠️  Destination folders %s differ only in letter case. If the destination server ignores letter case, a message that their source folders share is copied more than once.\n",
+			strings.Join(names, ", "))
 		printed = true
 	}
 	if printed {
