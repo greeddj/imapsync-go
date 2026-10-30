@@ -12090,6 +12090,101 @@ func TestRunSync_When_OnlyTheSourceAdvertisesGmailExtension_Then_CopyByCountStay
 	assertReadOnly(t, "source", src)
 }
 
+func TestRunSync_When_DestinationAdvertisesGmailExtension_Then_VerboseRunNamesTheOneCopyRule(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ruleLine   = "  ℹ️  [dst] The destination server advertises X-GM-EXT-1, so each destination folder gets at most one copy of each Message-Id\n"
+		ruleMarker = "advertises X-GM-EXT-1"
+		delimiters = "  Destination [dst]: \"/\"\n\n"
+	)
+	tests := []struct {
+		dst          func(t *testing.T) *fakeServer
+		name         string
+		wantAll      []string
+		wantNone     []string
+		srcAdvertise bool
+		verbose      bool
+		quiet        bool
+		wantLine     bool
+	}{
+		{
+			name:     "destination advertises it and the run is verbose",
+			dst:      func(t *testing.T) *fakeServer { return newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil}) },
+			verbose:  true,
+			wantLine: true,
+			wantAll:  []string{delimiters + ruleLine + "\n", "Messages to be copied to destination"},
+		},
+		{
+			name:     "destination advertises it and the run is not verbose",
+			dst:      func(t *testing.T) *fakeServer { return newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil}) },
+			wantAll:  []string{"Messages to be copied to destination"},
+			wantNone: []string{ruleMarker},
+		},
+		{
+			name:     "destination advertises it and the run is verbose and quiet",
+			dst:      func(t *testing.T) *fakeServer { return newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil}) },
+			verbose:  true,
+			quiet:    true,
+			wantNone: []string{ruleMarker},
+		},
+		{
+			name:         "only the source advertises it and the run is verbose",
+			dst:          func(t *testing.T) *fakeServer { return newStoreServer(t, "/", map[string][]fakeMsg{}) },
+			srcAdvertise: true,
+			verbose:      true,
+			wantAll:      []string{"Server delimiters", "Messages to be copied to destination"},
+			wantNone:     []string{ruleMarker},
+		},
+		{
+			name: "destination advertises it and already holds the Message-Id",
+			dst: func(t *testing.T) *fakeServer {
+				return newGmailDestination(t, map[string][]fakeMsg{"Scans": fakeMsgs("m1@x")})
+			},
+			verbose:  true,
+			wantLine: true,
+			wantAll:  []string{delimiters + ruleLine + "\n", "All folders already synced!"},
+			wantNone: []string{"Messages to be copied to destination"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": fakeMsgs("m1@x")})
+			if tt.srcAdvertise {
+				src.advertiseGmailExtension()
+			}
+			dst := tt.dst(t)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose, opts.quiet = true, tt.verbose, tt.quiet
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Scans", "Scans")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			assertContainsAll(t, got, tt.wantAll...)
+			assertContainsNone(t, got, tt.wantNone...)
+			if tt.wantLine {
+				if n := strings.Count(got, ruleLine); n != 1 {
+					t.Errorf("output holds the rule line %d times, want 1\noutput: %q", n, got)
+				}
+				line := strings.Index(got, ruleLine)
+				next := strings.Index(got, "Messages to be copied to destination")
+				if next < 0 {
+					next = strings.Index(got, "All folders already synced!")
+				}
+				if line < 0 || next < 0 || line >= next {
+					t.Errorf("positions: rule line %d, next section %d, want the rule line first\noutput: %q", line, next, got)
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
 func TestRunSync_When_LowestGmailCopyHasAnEmptyBody_Then_AHigherCopyOfTheMessageIdArrivesInTheSameRun(t *testing.T) {
 	t.Parallel()
 

@@ -317,6 +317,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		_, _ = fmt.Fprintf(out, "📁 Server delimiters:\n")
 		_, _ = fmt.Fprintf(out, "  Source [%s]: %q\n", cfg.Src.Label, srcDelimiter)
 		_, _ = fmt.Fprintf(out, "  Destination [%s]: %q\n\n", cfg.Dst.Label, dstDelimiter)
+		if dstClient.KeepsOneCopyPerMessageID() {
+			_, _ = fmt.Fprintf(out, "  ℹ️  [%s] The destination server advertises X-GM-EXT-1, so each destination folder gets at most one copy of each Message-Id\n\n", cfg.Dst.Label)
+		}
 	}
 
 	var roots []folderMapping
