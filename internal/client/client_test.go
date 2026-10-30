@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"runtime"
@@ -1107,12 +1108,11 @@ func Test_New_When_ServerAdvertisesGmailExtensionAfterLogin_Then_KeepsOneCopyPer
 	t.Parallel()
 
 	tests := []struct {
-		name         string
-		loginCode    string
-		wantCapCalls int
+		name      string
+		loginCode string
 	}{
 		{name: "LOGIN OK carries the list", loginCode: "[CAPABILITY IMAP4rev1 X-GM-EXT-1]"},
-		{name: "CAPABILITY reply lists it", wantCapCalls: 1},
+		{name: "CAPABILITY reply lists it"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1126,8 +1126,40 @@ func Test_New_When_ServerAdvertisesGmailExtensionAfterLogin_Then_KeepsOneCopyPer
 			if !c.KeepsOneCopyPerMessageID() {
 				t.Error("KeepsOneCopyPerMessageID = false, want true")
 			}
-			if got := srv.callCount("CAPABILITY"); got != tt.wantCapCalls {
-				t.Errorf("CAPABILITY count = %d, want %d", got, tt.wantCapCalls)
+			if got := srv.callCount("CAPABILITY"); got != 1 {
+				t.Errorf("CAPABILITY count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func Test_New_When_ServerSpellsTheGmailExtensionInAnotherLetterCase_Then_KeepsOneCopyPerMessageID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		loginCode string
+		spelling  string
+	}{
+		{name: "lower case in the CAPABILITY reply", spelling: "x-gm-ext-1"},
+		{name: "mixed case in the CAPABILITY reply", spelling: "X-Gm-Ext-1"},
+		{name: "lower case in LOGIN OK and the CAPABILITY reply", spelling: "x-gm-ext-1", loginCode: "[CAPABILITY IMAP4rev1 x-gm-ext-1]"},
+		{name: "mixed case in LOGIN OK and the CAPABILITY reply", spelling: "X-Gm-Ext-1", loginCode: "[CAPABILITY IMAP4rev1 X-Gm-Ext-1]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs(tt.loginCode), capabilityAs("IMAP4rev1 "+tt.spelling))))
+
+			c := newReadyClient(t, srv, Options{})
+
+			if !c.KeepsOneCopyPerMessageID() {
+				t.Error("KeepsOneCopyPerMessageID = false, want true: letter case carries no meaning in a capability name")
+			}
+			if got := srv.callCount("CAPABILITY"); got != 1 {
+				t.Errorf("CAPABILITY count = %d, want 1", got)
 			}
 		})
 	}
@@ -1141,14 +1173,14 @@ func Test_New_When_ServerDoesNotAdvertiseGmailExtensionAfterLogin_Then_ReportsFa
 		gmailGreeting = "* OK [CAPABILITY IMAP4rev1 X-GM-EXT-1] fake ready"
 	)
 	tests := []struct {
-		name         string
-		greeting     string
-		loginCode    string
-		wantCapCalls int
+		name      string
+		greeting  string
+		loginCode string
 	}{
-		{name: "nowhere", greeting: plainGreeting, wantCapCalls: 1},
-		{name: "only in the greeting, which go-imap drops at LOGIN", greeting: gmailGreeting, wantCapCalls: 1},
+		{name: "nowhere", greeting: plainGreeting},
+		{name: "only in the greeting, which go-imap drops at LOGIN", greeting: gmailGreeting},
 		{name: "in the greeting, and LOGIN OK carries a list without it", greeting: gmailGreeting, loginCode: "[CAPABILITY IMAP4rev1]"},
+		{name: "LOGIN OK lists it, the CAPABILITY reply does not", greeting: plainGreeting, loginCode: "[CAPABILITY IMAP4rev1 X-GM-EXT-1]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1162,8 +1194,8 @@ func Test_New_When_ServerDoesNotAdvertiseGmailExtensionAfterLogin_Then_ReportsFa
 			if c.KeepsOneCopyPerMessageID() {
 				t.Error("KeepsOneCopyPerMessageID = true, want false")
 			}
-			if got := srv.callCount("CAPABILITY"); got != tt.wantCapCalls {
-				t.Errorf("CAPABILITY count = %d, want %d", got, tt.wantCapCalls)
+			if got := srv.callCount("CAPABILITY"); got != 1 {
+				t.Errorf("CAPABILITY count = %d, want 1", got)
 			}
 		})
 	}
@@ -1245,14 +1277,14 @@ func Test_New_When_ConnectionDropsDuringCapabilityCheck_Then_ReconnectsAndReadsT
 	srv.addConnHandler(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
 		return cmd.verb == "CAPABILITY", false
 	}))
-	srv.addConnHandler(interceptHandler(srv, loginAs("[CAPABILITY IMAP4rev1 X-GM-EXT-1]")))
+	srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs("[CAPABILITY IMAP4rev1 X-GM-EXT-1]"), capabilityAs("IMAP4rev1 X-GM-EXT-1"))))
 
 	c := newReadyClient(t, srv, Options{})
 
 	if !c.KeepsOneCopyPerMessageID() {
 		t.Error("KeepsOneCopyPerMessageID = false, want true: the answer comes from the new session")
 	}
-	for verb, want := range map[string]int{"LOGIN": 2, "LIST": 1, "CAPABILITY": 1} {
+	for verb, want := range map[string]int{"LOGIN": 2, "LIST": 1, "CAPABILITY": 2} {
 		if got := srv.callCount(verb); got != want {
 			t.Errorf("%s count = %d, want %d", verb, got, want)
 		}
@@ -1311,6 +1343,67 @@ func Test_detectOneCopyPerID_When_ContextEndsAfterTheReply_Then_ReturnsErrorAndS
 	if c.KeepsOneCopyPerMessageID() {
 		t.Error("KeepsOneCopyPerMessageID = true, want false: a cancelled check stores nothing")
 	}
+}
+
+func Test_hasCapability(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		caps map[string]bool
+		name string
+		find string
+		want bool
+	}{
+		{name: "exact name", caps: map[string]bool{"X-GM-EXT-1": true}, want: true},
+		{name: "lower case", caps: map[string]bool{"x-gm-ext-1": true}, want: true},
+		{name: "mixed case", caps: map[string]bool{"X-Gm-Ext-1": true}, want: true},
+		{name: "among other names", caps: map[string]bool{"IMAP4rev1": true, "UIDPLUS": true, "x-gm-ext-1": true, "IDLE": true}, want: true},
+		{name: "nil map"},
+		{name: "empty map", caps: map[string]bool{}},
+		{name: "longer name with the same prefix", caps: map[string]bool{"X-GM-EXT-10": true}},
+		{name: "shorter name", caps: map[string]bool{"X-GM-EXT": true}},
+		{name: "other version", caps: map[string]bool{"X-GM-EXT-2": true}},
+		{name: "extra leading letter", caps: map[string]bool{"XX-GM-EXT-1": true}},
+		{name: "Cyrillic look-alike", caps: map[string]bool{"\u0425-GM-EXT-1": true}},
+		{name: "matching key with a false value", caps: map[string]bool{"X-GM-EXT-1": false}},
+		{name: "another name in another letter case", caps: map[string]bool{"UidPlus": true}, find: "UIDPLUS", want: true},
+		{name: "another name that the map lacks", caps: map[string]bool{"X-GM-EXT-1": true}, find: "UIDPLUS"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			find := tt.find
+			if find == "" {
+				find = gmailExtension
+			}
+			if got := hasCapability(tt.caps, find); got != tt.want {
+				t.Errorf("hasCapability(%v, %q) = %t, want %t", tt.caps, find, got, tt.want)
+			}
+		})
+	}
+}
+
+// Test_hasCapability_When_Called_Then_AllocatesNothing does not run in parallel, because AllocsPerRun counts the allocations of the whole process.
+func Test_hasCapability_When_Called_Then_AllocatesNothing(t *testing.T) {
+	caps := make(map[string]bool, 20)
+	for _, name := range []string{
+		"IMAP4rev1", "STARTTLS", "AUTH=PLAIN", "AUTH=LOGIN", "UIDPLUS", "IDLE", "NAMESPACE", "CHILDREN", "ID", "MOVE",
+		"UNSELECT", "LITERAL+", "SASL-IR", "ENABLE", "QUOTA", "CONDSTORE", "ESEARCH", "SPECIAL-USE", "LIST-STATUS", "x-gm-ext-1",
+	} {
+		caps[name] = true
+	}
+	missing := maps.Clone(caps)
+	delete(missing, "x-gm-ext-1")
+
+	var sink bool
+	if got := testing.AllocsPerRun(100, func() { sink = hasCapability(caps, gmailExtension) }); got != 0 {
+		t.Errorf("allocations on a match = %v, want 0", got)
+	}
+	if got := testing.AllocsPerRun(100, func() { sink = hasCapability(missing, gmailExtension) }); got != 0 {
+		t.Errorf("allocations on a miss = %v, want 0", got)
+	}
+	_ = sink
 }
 
 // Test_cramMD5Auth covers the SASL client the CRAM-MD5 login hands to go-imap.

@@ -1091,9 +1091,6 @@ func Test_New_When_ListIsInterleavedWithOtherUntaggedResponses_Then_CacheKeepsEv
 	if supported, err := c.c.Load().Support("UIDPLUS"); err != nil || !supported {
 		t.Errorf("Support(UIDPLUS) = %t, %v, want true: the response during LIST must reach go-imap", supported, err)
 	}
-	if n := srv.callCount("CAPABILITY"); n != 0 {
-		t.Errorf("CAPABILITY count = %d, want 0: the response during LIST already told the client", n)
-	}
 }
 
 func FuzzCanonicalName(f *testing.F) {

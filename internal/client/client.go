@@ -241,8 +241,8 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	return c, nil
 }
 
-// detectOneCopyPerID asks after LOGIN, because go-imap drops the greeting list then. Support reuses a
-// list that LOGIN OK carried and sends CAPABILITY only when it has none.
+// detectOneCopyPerID sends one CAPABILITY after LOGIN. go-imap keeps names as the server spelled them and
+// Support compares exactly, but RFC 3501 gives letter case no meaning.
 func (c *Client) detectOneCopyPerID(ctx context.Context) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -253,11 +253,11 @@ func (c *Client) detectOneCopyPerID(ctx context.Context) error {
 
 	var supported bool
 	err := c.safeCall(func(cli *imapclient.Client) error {
-		ok, err := cli.Support(gmailExtension)
+		caps, err := cli.Capability()
 		if err != nil {
 			return fmt.Errorf("[%s] capability: %w", c.prefix, err)
 		}
-		supported = ok
+		supported = hasCapability(caps, gmailExtension)
 		return nil
 	})
 	if err != nil {
@@ -273,7 +273,17 @@ func (c *Client) detectOneCopyPerID(ctx context.Context) error {
 	return nil
 }
 
-// KeepsOneCopyPerMessageID reports whether the server advertised X-GM-EXT-1 after LOGIN. Gmail keeps one message for each Message-Id in a folder.
+// hasCapability reports whether caps lists name in any letter case. A nil map lists nothing.
+func hasCapability(caps map[string]bool, name string) bool {
+	for key, ok := range caps {
+		if ok && strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// KeepsOneCopyPerMessageID reports whether the server advertised X-GM-EXT-1, in any letter case, after LOGIN. Gmail keeps one message for each Message-Id in a folder.
 func (c *Client) KeepsOneCopyPerMessageID() bool { return c.oneCopyPerID }
 
 // supportedAuth lowers the value as connectAndLogin does, so the default branch
