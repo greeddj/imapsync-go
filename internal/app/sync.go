@@ -108,7 +108,32 @@ func compareStandbyToPlanned(c standbyCopy, planned uint32) int {
 	return cmp.Compare(c.planned, planned)
 }
 
-// standbys is sorted by planned UID, then by source, so the binary search finds a group that is already in source order.
+func compareStandbyCopies(a, b standbyCopy) int {
+	return cmp.Or(cmp.Compare(a.planned, b.planned), cmp.Compare(a.source, b.source), cmp.Compare(a.uid, b.uid))
+}
+
+// Own-folder standbys come first, so a planned copy tries its folder before later mappings. The inputs belong to the shared set, so this never writes to them.
+func (p *FolderSyncPlan) mergeStandbys(sources []standbySource, copies []standbyCopy) {
+	if len(copies) == 0 {
+		return
+	}
+	if len(p.standbys) == 0 {
+		p.standbySources, p.standbys = sources, copies
+		return
+	}
+	shift := uint32(len(p.standbySources))
+	merged := make([]standbyCopy, len(p.standbys), len(p.standbys)+len(copies))
+	copy(merged, p.standbys)
+	for _, c := range copies {
+		c.source += shift
+		merged = append(merged, c)
+	}
+	slices.SortFunc(merged, compareStandbyCopies)
+	p.standbySources = slices.Concat(p.standbySources, sources)
+	p.standbys = merged
+}
+
+// standbys is sorted by planned UID, then by source, then by UID. The binary search finds a group that is already in source order, and each source's copies ascend.
 func (p *FolderSyncPlan) standbysOf(planned uint32) []standbyCopy {
 	i, _ := slices.BinarySearchFunc(p.standbys, planned, compareStandbyToPlanned)
 	end := i
@@ -993,9 +1018,7 @@ func (d *sharedDestinations) standbysFor(slot int) ([]standbySource, []standbyCo
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	set := &d.standbys[slot]
-	slices.SortFunc(set.copies, func(a, b standbyCopy) int {
-		return cmp.Or(cmp.Compare(a.planned, b.planned), cmp.Compare(a.source, b.source))
-	})
+	slices.SortFunc(set.copies, compareStandbyCopies)
 	return set.sources, set.copies
 }
 
@@ -1120,7 +1143,7 @@ func buildSyncPlan(ctx context.Context, srcClient, dstClient *client.Client, map
 			continue
 		}
 		plan := plans[idx]
-		plan.standbySources, plan.standbys = shared.standbysFor(idx)
+		plan.mergeStandbys(shared.standbysFor(idx))
 		summary.Plans = append(summary.Plans, plan)
 	}
 	summary.TotalNew = int(totalNew.Load())
@@ -1159,10 +1182,12 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 	newUIDs := make([]uint32, 0, s.srcMessages)
 	var newSize uint64
 	var extra, repeated int
+	var ownStandbys []standbyCopy
 	var m copyMatcher
 	for id, all := range s.srcMap {
 		onDst := s.dstMap[id]
 		refs := rule.sourceCopies(all)
+		cut := all[len(refs):]
 		left := m.destinationLeft(refs, onDst)
 		held := reserved[id]
 		var owner []int32
@@ -1170,10 +1195,13 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 			// Pairing by size decides which standby replaces which reserved copy, also when every ref is taken.
 			owner = m.reservationOwners(left, held)
 		}
+		var holder reservation
+		paired := false
 		for i, ref := range left {
 			if len(owner) > 0 && owner[i] >= 0 {
-				if r := held[owner[i]]; mappings[r.slot].Source != standby.folder {
-					shared.addStandby(r, standby, ref.UID)
+				holder, paired = held[owner[i]], true
+				if mappings[holder.slot].Source != standby.folder {
+					shared.addStandby(holder, standby, ref.UID)
 				}
 				continue
 			}
@@ -1190,6 +1218,19 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 			// Only copies that the destination already holds count. A copy reserved in this run is not there yet, and the next run sees it if the server keeps it.
 			if len(onDst) > 0 {
 				extra++
+			}
+		}
+		// The one-copy rule keeps one ref and cuts the rest. The cut copies stand by for it, in case its body is empty or missing.
+		if len(cut) > 0 && len(left) == 1 {
+			switch {
+			case !paired:
+				for _, c := range cut {
+					ownStandbys = append(ownStandbys, standbyCopy{planned: left[0].UID, uid: c.UID})
+				}
+			case mappings[holder.slot].Source != standby.folder:
+				for _, c := range cut {
+					shared.addStandby(holder, standby, c.UID)
+				}
 			}
 		}
 	}
@@ -1210,6 +1251,11 @@ func maybeDiff(s *folderScan, idx int, mappings []config.DirectoryMapping, plans
 		SrcUIDs:                 newUIDs,
 		SrcUIDValidity:          s.srcUIDValidity,
 		copyRule:                rule,
+	}
+	if len(ownStandbys) > 0 {
+		slices.SortFunc(ownStandbys, compareStandbyCopies)
+		plans[idx].standbySources = []standbySource{standby}
+		plans[idx].standbys = ownStandbys
 	}
 	totalNew.Add(int64(len(newUIDs)))
 	totalNewSize.Add(newSize)

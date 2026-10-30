@@ -1308,3 +1308,74 @@ func Test_runFolderSync_When_NamesCarryControlCharacters_Then_TheStandbyLineShow
 	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), hostileWireName, standbyWireName)
 	assertIDs(t, "dst APPEND names", dst.appended(hostileWireName), "e1@x")
 }
+
+func Test_runFolderSync_When_PlannedCopyIsEmptyAndItsOwnFolderHoldsAnotherCopy_Then_CopiesItWithoutASecondExamine(t *testing.T) {
+	t.Parallel()
+
+	const id = "m1@x"
+	bodyOfB := subjectBody(id, "from B")
+	copiesOfA := []string{subjectBody(id, "a1"), subjectBody(id, "a2")}
+	tests := []struct {
+		name         string
+		wantBody     string
+		wantFrom     string
+		folders      []string
+		wantExamines []string
+		wantFetches  []string
+		emptyAtTwo   bool
+	}{
+		{
+			name:         "the own folder holds the usable copy",
+			folders:      []string{"A"},
+			wantBody:     copiesOfA[1],
+			wantExamines: []string{"A"},
+			wantFetches:  []string{"1", "2"},
+			wantFrom:     "from A: the copy in A has no usable body",
+		},
+		{
+			name:         "the own folder comes before a later source",
+			folders:      []string{"A", "B"},
+			wantBody:     copiesOfA[1],
+			wantExamines: []string{"A"},
+			wantFetches:  []string{"1", "2"},
+			wantFrom:     "from A: the copy in A has no usable body",
+		},
+		{
+			name:         "the own copy is empty too and a later source holds a usable copy",
+			folders:      []string{"A", "B"},
+			emptyAtTwo:   true,
+			wantBody:     bodyOfB,
+			wantExamines: []string{"A", "B"},
+			wantFetches:  []string{"1", "2", "2"},
+			wantFrom:     "from B: the copy in A has no usable body",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": sharedIDMsgs(id, copiesOfA...), "B": standbyFolder(bodyOfB)})
+			src.answerBodyAt("A", 1, "NIL")
+			if tt.emptyAtTwo {
+				src.answerBodyAt("A", 2, "NIL")
+			}
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+			got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan(tt.folders...), true)
+
+			if got.synced != 1 || got.errs != 0 {
+				t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+			}
+			if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{tt.wantBody}) {
+				t.Errorf("dst X bodies = %q, want only %q", bodies, tt.wantBody)
+			}
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("destination saw %d APPEND commands, want 1", n)
+			}
+			assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), tt.wantExamines...)
+			assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), tt.wantFetches...)
+			assertContainsAll(t, got.log, "Copied message", tt.wantFrom)
+			assertReadOnly(t, "source", src)
+		})
+	}
+}

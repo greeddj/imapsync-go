@@ -582,6 +582,12 @@ type folderMsg struct {
 	msgID  string
 }
 
+// folderUID names one message of a store-backed server by the store name of its folder and its UID.
+type folderUID struct {
+	folder string
+	uid    uint32
+}
+
 type appendRecord struct {
 	folder string
 	msgID  string
@@ -602,6 +608,7 @@ type mailStore struct {
 	nilDelim     map[string]bool
 	rawBody      map[string]string
 	rawBodyIn    map[string]map[string]string
+	rawBodyAt    map[folderUID]string
 	uidFetchEnd  map[string]string
 	omitBody     map[folderMsg]bool
 	omitFirst    map[folderMsg]bool
@@ -820,6 +827,16 @@ func (s *fakeServer) answerBodyIn(folder, msgID, value string) {
 		s.store.rawBodyIn[folder] = make(map[string]string)
 	}
 	s.store.rawBodyIn[folder][msgID] = value
+}
+
+// answerBodyAt is answerBodyIn for one message, named by its UID. It also tells apart the copies of one Message-Id in a folder.
+func (s *fakeServer) answerBodyAt(folder string, uid uint32, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.rawBodyAt == nil {
+		s.store.rawBodyAt = make(map[folderUID]string)
+	}
+	s.store.rawBodyAt[folderUID{folder, uid}] = value
 }
 
 // omitBodyIn makes every FETCH of the message answer without any BODY[] item, as a server does that skips the body of a message it cannot read.
@@ -1251,6 +1268,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	msgs := slices.Clone(s.store.folders[selected])
 	rawBody := maps.Clone(s.store.rawBody)
 	rawBodyIn := maps.Clone(s.store.rawBodyIn[selected])
+	rawBodyAt := maps.Clone(s.store.rawBodyAt)
 	omitBody := maps.Clone(s.store.omitBody)
 	omitFirst := maps.Clone(s.store.omitFirst)
 	scanNoUID := s.store.scanNoUID[selected]
@@ -1299,7 +1317,9 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
 		}
 		if wantBody && !omitBody[key] {
-			if raw, ok := rawBodyIn[m.msgID]; ok {
+			if raw, ok := rawBodyAt[folderUID{selected, m.uid}]; ok {
+				parts = append(parts, "BODY[] "+raw)
+			} else if raw, ok := rawBodyIn[m.msgID]; ok {
 				parts = append(parts, "BODY[] "+raw)
 			} else if raw, ok := rawBody[m.msgID]; ok {
 				parts = append(parts, "BODY[] "+raw)
