@@ -421,6 +421,14 @@ These limitations apply:
   - The command creates the folder one time.
   - The first mapping can have a copy with an empty body or no body. Then the command copies the copy of a later mapping in the same run. With `X-GM-EXT-1`, the command first tries the other copies in the same source folder.
 - **A message with an empty body, or with no body, fails on each run when no other copy can replace it.** The command never uploads an empty message. An empty message has no `Message-Id`, so each later run would add one more. The command counts one error for the message, and the run ends with exit code 1. With `-V`, the command shows the reason: `source returned an empty body` or `message has no body`. The message fails again on each run until the source sends a body.
+- **A refused empty body or missing body can download more copies than the command uses.** This applies only to a destination server that advertises `X-GM-EXT-1`.
+  - The command refuses to upload a planned message that has an empty body or no body. Other copies of the message can replace it.
+  - Under the copy-by-count rule, the plan gives each refused message at most one other copy from each source folder.
+  - The command tries the source folders that hold these copies in order. For each folder, it downloads in one stream all the copies of the messages that no earlier folder replaced, in batches of 500 messages.
+  - The stream does not stop when the first copy with a usable body replaces the planned message. The other copies of this message in this folder still download.
+  - The command uploads only the first copy with a usable body. The destination gets no duplicate.
+  - The flag `--bps-down` limits this download, as it limits each other read from the source server.
+  - The command accepts this cost. It occurs only after a refused body. The command uploads none of the extra copies.
 
 When CREATE answers that the destination folder already exists, the folder was not in the list of the destination server. The plan has no diff against this folder, so the command reads the folder again after your answer.
 
