@@ -1119,6 +1119,7 @@ func Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectApp
 	dated := func() Message {
 		msg := buildTestIMAPMessage()
 		msg.m.Envelope.Date = time.Date(2026, 10, 25, 9, 8, 7, 0, time.UTC)
+		msg.m.InternalDate = time.Date(2012, 7, 17, 9, 30, 0, 0, time.FixedZone("", 2*3600))
 		msg.m.Flags = []string{`\Flagged`, "$Forwarded", `\Recent`}
 		return msg
 	}
@@ -1152,12 +1153,12 @@ func Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectApp
 		t.Errorf("APPEND count = %d, want 1", got)
 	}
 	got := awaitAppend(t, retryOut)
-	for _, part := range []string{`(\Flagged $Forwarded)`, "25-Oct-2026 09:08:07 +0000"} {
+	for _, part := range []string{`(\Flagged $Forwarded)`, `"17-Jul-2012 09:30:00 +0200"`} {
 		if !strings.Contains(want.arg, part) {
 			t.Errorf("direct APPEND arguments %q do not contain %q", want.arg, part)
 		}
 	}
-	for _, part := range []string{`\Seen`, `\Recent`} {
+	for _, part := range []string{`\Seen`, `\Recent`, "25-Oct-2026"} {
 		if strings.Contains(want.arg, part) {
 			t.Errorf("direct APPEND arguments %q contain %q", want.arg, part)
 		}
@@ -1675,5 +1676,109 @@ func Test_AppendMessage_When_FlagWouldBreakTheCommandLine_Then_DropsItAndSendsOn
 	}
 	if verbs := seenVerbs(srv); !slices.Equal(verbs, []string{"APPEND", "LOGIN"}) {
 		t.Errorf("the server saw the commands %q, want only LOGIN and APPEND", verbs)
+	}
+}
+
+func Test_appendDate(t *testing.T) {
+	t.Parallel()
+
+	plus2 := time.FixedZone("", 2*3600)
+	minus7 := time.FixedZone("", -7*3600)
+	arrival := time.Date(2012, 7, 17, 9, 30, 0, 0, plus2)
+	header := time.Date(2026, 10, 25, 9, 8, 7, 0, minus7)
+	tests := []struct {
+		internal time.Time
+		want     time.Time
+		envelope *imap.Envelope
+		name     string
+	}{
+		{name: "INTERNALDATE and the Date header are both set", internal: arrival, envelope: &imap.Envelope{Date: header}, want: arrival},
+		{name: "INTERNALDATE is set and there is no envelope", internal: arrival, want: arrival},
+		{name: "INTERNALDATE is zero and the Date header is set", envelope: &imap.Envelope{Date: header}, want: header},
+		{name: "INTERNALDATE and the Date header are both zero", envelope: &imap.Envelope{}},
+		{name: "INTERNALDATE is zero and there is no envelope"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := appendDate(&imap.Message{InternalDate: tt.internal, Envelope: tt.envelope})
+
+			if !got.Equal(tt.want) {
+				t.Errorf("appendDate = %v, want %v", got, tt.want)
+			}
+			_, gotOffset := got.Zone()
+			_, wantOffset := tt.want.Zone()
+			if gotOffset != wantOffset {
+				t.Errorf("offset = %d, want %d", gotOffset, wantOffset)
+			}
+		})
+	}
+}
+
+func Test_AppendMessage_When_SourceHasInternalDate_Then_AppendCarriesItNotTheDateHeader(t *testing.T) {
+	t.Parallel()
+
+	plus2 := time.FixedZone("", 2*3600)
+	header := time.Date(2026, 10, 25, 9, 8, 7, 0, time.UTC)
+	tests := []struct {
+		internalDate time.Time
+		headerDate   time.Time
+		name         string
+		wantArg      string
+		flags        []string
+		noEnvelope   bool
+	}{
+		{
+			name:         "INTERNALDATE wins over the Date header",
+			internalDate: time.Date(2012, 7, 17, 9, 30, 0, 0, plus2),
+			headerDate:   header,
+			wantArg:      `INBOX "17-Jul-2012 09:30:00 +0200"`,
+		},
+		{
+			name:       "the Date header is the fallback",
+			headerDate: header,
+			wantArg:    `INBOX "25-Oct-2026 09:08:07 +0000"`,
+		},
+		{
+			name:         "a day below 10 keeps the leading space of go-imap",
+			internalDate: time.Date(2006, 1, 2, 15, 4, 5, 0, time.FixedZone("", -7*3600)),
+			wantArg:      `INBOX " 2-Jan-2006 15:04:05 -0700"`,
+		},
+		{name: "no date at all sends no date", wantArg: "INBOX"},
+		{name: "no INTERNALDATE and no envelope sends no date", noEnvelope: true, wantArg: "INBOX"},
+		{
+			name:         "flags and INTERNALDATE come in the order of the grammar",
+			flags:        []string{`\Flagged`},
+			internalDate: time.Date(2012, 7, 17, 9, 30, 0, 0, plus2),
+			wantArg:      `INBOX (\Flagged) "17-Jul-2012 09:30:00 +0200"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			appends := make(chan capturedAppend, 1)
+			srv := newFakeServer(t)
+			srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", appends))
+			c := newClientWithFake(t, srv)
+			msg := buildTestIMAPMessage()
+			msg.m.Flags = tt.flags
+			msg.m.InternalDate = tt.internalDate
+			msg.m.Envelope.Date = tt.headerDate
+			if tt.noEnvelope {
+				msg.m.Envelope = nil
+			}
+
+			err := awaitCall(t, "AppendMessage", func() error { return c.AppendMessage(t.Context(), "INBOX", msg) })
+
+			if err != nil {
+				t.Fatalf("AppendMessage: %v", err)
+			}
+			want := fmt.Sprintf("%s {%d}", tt.wantArg, len(testMessageBody(t)))
+			if got := awaitAppend(t, appends).arg; got != want {
+				t.Errorf("APPEND arguments = %q, want %q", got, want)
+			}
+		})
 	}
 }

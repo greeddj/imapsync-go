@@ -13468,6 +13468,79 @@ func TestRunSync_When_SourceMessagesHaveFlags_Then_EachCopyKeepsTheFlagsOfItsSou
 	assertReadOnly(t, "source", src)
 }
 
+func TestRunSync_When_SourceMessagesHaveInternalDates_Then_EachCopyKeepsTheDateOfItsSource(t *testing.T) {
+	t.Parallel()
+
+	rows := []struct {
+		id           string
+		internalDate string
+		envelopeDate string
+		flags        string
+		wantDate     string
+		wantList     string
+	}{
+		{
+			id: "m1@x", internalDate: "17-Jul-2012 09:30:00 +0200", envelopeDate: "Tue, 17 Jul 2012 07:29:58 +0000",
+			wantDate: "17-Jul-2012 09:30:00 +0200",
+		},
+		{id: "m2@x", internalDate: "02-Jan-2006 15:04:05 -0700", wantDate: " 2-Jan-2006 15:04:05 -0700"},
+		{id: "m3@x", envelopeDate: "Mon, 02 Jan 2006 15:04:05 +0100", wantDate: " 2-Jan-2006 15:04:05 +0100"},
+		{
+			id: "m4@x", internalDate: "not a date", envelopeDate: "Tue, 17 Jul 2012 07:29:58 +0000",
+			wantDate: "17-Jul-2012 07:29:58 +0000",
+		},
+		{id: "m5@x"},
+		{
+			id: "m6@x", flags: `\Flagged`, internalDate: "17-Jul-2012 09:30:00 +0200",
+			wantDate: "17-Jul-2012 09:30:00 +0200", wantList: `(\Flagged)`,
+		},
+	}
+	msgs := make([]fakeMsg, len(rows))
+	ids := make([]string, len(rows))
+	wantDates := make([]string, len(rows))
+	wantLists := make([]string, len(rows))
+	for i, row := range rows {
+		msgs[i] = fakeMsg{msgID: row.id, internalDate: row.internalDate, envelopeDate: row.envelopeDate, flags: row.flags}
+		ids[i] = row.id
+		wantDates[i] = row.wantDate
+		wantLists[i] = row.wantList
+	}
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": msgs})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	first := e2eOptions(&syncBuffer{}, "")
+	first.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, first); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), ids...)
+	assertIDs(t, "dst APPEND dates", dst.appendedDates("INBOX"), wantDates...)
+	assertIDs(t, "dst APPEND flag lists", dst.appendedFlagLists("INBOX"), wantLists...)
+	for _, row := range rows {
+		if got := dst.internalDateOf("INBOX", row.id); got != row.wantDate {
+			t.Errorf("INTERNALDATE of %s on the destination = %q, want %q", row.id, got, row.wantDate)
+		}
+		if got := src.internalDateOf("INBOX", row.id); got != row.internalDate {
+			t.Errorf("INTERNALDATE of %s on the source = %q, want it unchanged %q", row.id, got, row.internalDate)
+		}
+	}
+	assertReadOnly(t, "source", src)
+
+	appends := dst.callCount("APPEND")
+	out := &syncBuffer{}
+	second := e2eOptions(out, "")
+	second.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, second); err != nil {
+		t.Fatalf("second runSync: %v", err)
+	}
+	assertContainsAll(t, out.String(), "All folders already synced!")
+	if n := dst.callCount("APPEND"); n != appends {
+		t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+	}
+}
+
 func TestRunSync_When_SourceFlagsChangeAfterTheCopy_Then_ALaterRunLeavesTheDestinationFlags(t *testing.T) {
 	t.Parallel()
 

@@ -76,6 +76,17 @@ func appendFlags(flags []string) []string {
 	return flags
 }
 
+// The source INTERNALDATE is the arrival time; the Date header is only the claim of the sender. A zero result makes go-imap send no date.
+func appendDate(m *imap.Message) time.Time {
+	if !m.InternalDate.IsZero() {
+		return m.InternalDate
+	}
+	if m.Envelope != nil {
+		return m.Envelope.Date
+	}
+	return time.Time{}
+}
+
 // AppendMessage streams the body with no copy, so only a failure before go-imap
 // reads it is retried; the next run's Message-Id diff covers the rest.
 func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) error {
@@ -115,12 +126,7 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 		}
 	}
 
-	// A server may omit ENVELOPE; the zero date makes go-imap leave the
-	// optional APPEND date out, so the destination stamps its own.
-	var date time.Time
-	if env := msg.m.Envelope; env != nil {
-		date = env.Date
-	}
+	date := appendDate(msg.m)
 	flags := appendFlags(msg.m.Flags)
 	literal := &readTracker{Literal: body}
 	send := func(cli *imapclient.Client) error { return cli.Append(folder, flags, date, literal) }

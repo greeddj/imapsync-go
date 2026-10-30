@@ -290,10 +290,17 @@ func imapFullBody(msgID string) string {
 var imapQuoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 
 func envelopeFor(m storedMsg) string {
-	if m.envelopeID == "" {
+	if m.envelopeID == "" && m.envelopeDate == "" {
 		return nilEnvelope
 	}
-	return "(NIL NIL NIL NIL NIL NIL NIL NIL NIL \"" + imapQuoteEscaper.Replace(m.envelopeID) + "\")"
+	date, id := "NIL", "NIL"
+	if m.envelopeDate != "" {
+		date = `"` + imapQuoteEscaper.Replace(m.envelopeDate) + `"`
+	}
+	if m.envelopeID != "" {
+		id = `"` + imapQuoteEscaper.Replace(m.envelopeID) + `"`
+	}
+	return "(" + date + " NIL NIL NIL NIL NIL NIL NIL NIL " + id + ")"
 }
 
 // parseLiteralSize extracts n from a `{n}` or `{n+}` literal marker at the
@@ -564,18 +571,22 @@ func uidFetchBodyHandler(srv *fakeServer, mailboxes []string, uidBodies map[stri
 // imapFullBody(msgID). A non-empty envelopeID is the Message-Id its ENVELOPE
 // reports; empty leaves it NIL.
 type fakeMsg struct {
-	msgID      string
-	body       string
-	envelopeID string
-	flags      string // raw text between the parentheses of FLAGS
+	msgID        string
+	body         string
+	envelopeID   string
+	envelopeDate string // raw Date text in the ENVELOPE; empty leaves it NIL
+	internalDate string // text between the quotes of INTERNALDATE; empty sends no INTERNALDATE item
+	flags        string // raw text between the parentheses of FLAGS
 }
 
 type storedMsg struct {
-	msgID      string
-	body       string
-	envelopeID string
-	flags      string
-	uid        uint32
+	msgID        string
+	body         string
+	envelopeID   string
+	envelopeDate string
+	internalDate string
+	flags        string
+	uid          uint32
 }
 
 // folderMsg names one message of a store-backed server: the store name of its folder and its Message-Id.
@@ -594,6 +605,7 @@ type appendRecord struct {
 	folder   string
 	msgID    string
 	flagList string // the flag list of the APPEND with its parentheses, or "" when the APPEND has none
+	date     string // the text between the quotes of the date-time of the APPEND, or "" when the APPEND has none
 }
 
 // mailStore is the mailbox state behind a store-backed fakeServer; the server's
@@ -645,7 +657,10 @@ func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg
 			if body == "" {
 				body = imapFullBody(m.msgID)
 			}
-			st.addStored(name, storedMsg{msgID: m.msgID, body: body, envelopeID: m.envelopeID, flags: m.flags})
+			st.addStored(name, storedMsg{
+				msgID: m.msgID, body: body, envelopeID: m.envelopeID, envelopeDate: m.envelopeDate,
+				internalDate: m.internalDate, flags: m.flags,
+			})
 		}
 	}
 	return listenFakeServer(t, st)
@@ -692,8 +707,8 @@ func (st *mailStore) uidValidityOf(key string) uint32 {
 	return 1
 }
 
-func (st *mailStore) add(folder, msgID, body, flags string) {
-	st.addStored(folder, storedMsg{msgID: msgID, body: body, flags: flags})
+func (st *mailStore) add(folder, msgID, body, flags, internalDate string) {
+	st.addStored(folder, storedMsg{msgID: msgID, body: body, flags: flags, internalDate: internalDate})
 }
 
 func (st *mailStore) addStored(folder string, m storedMsg) {
@@ -1031,6 +1046,31 @@ func (s *fakeServer) appendedFlagLists(folder string) []string {
 	return lists
 }
 
+// appendedDates returns the date-time text of each APPEND to folder in arrival order, without the quotes. An APPEND with no date gives "".
+func (s *fakeServer) appendedDates(folder string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var dates []string
+	for _, rec := range s.store.appends {
+		if rec.folder == folder {
+			dates = append(dates, rec.date)
+		}
+	}
+	return dates
+}
+
+// internalDateOf returns the INTERNALDATE text stored for the first message of folder with msgID, or "" when there is none.
+func (s *fakeServer) internalDateOf(folder, msgID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.store.folders[folder] {
+		if m.msgID == msgID {
+			return m.internalDate
+		}
+	}
+	return ""
+}
+
 // flagsOf returns the raw flags stored for the first message of folder with msgID, or "" when there is none.
 func (s *fakeServer) flagsOf(folder, msgID string) string {
 	s.mu.Lock()
@@ -1337,6 +1377,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	wantEnvelope := strings.Contains(upper, "ENVELOPE")
 	wantBody := strings.Contains(upper, "BODY.PEEK[]") || strings.Contains(upper, "BODY[]")
 	wantFlags := hasToken(upper, "FLAGS")
+	wantInternalDate := hasToken(upper, "INTERNALDATE")
 
 	for i, m := range msgs {
 		id := uint32(i + 1)
@@ -1362,6 +1403,9 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 		}
 		if wantFlags {
 			parts = append(parts, "FLAGS ("+m.flags+")")
+		}
+		if wantInternalDate && m.internalDate != "" {
+			parts = append(parts, `INTERNALDATE "`+imapQuoteEscaper.Replace(m.internalDate)+`"`)
 		}
 		key := folderMsg{selected, m.msgID}
 		if wantBody && omitFirst[key] {
@@ -1411,7 +1455,8 @@ func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {
 func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg string) bool {
 	name, rest := parseMailboxArg(arg)
 	size := parseLiteralSize(arg)
-	flagList, flags := parseAppendFlags(rest)
+	flagList, flags, tail := parseAppendFlags(rest)
+	date := parseAppendDate(tail)
 
 	rw.line("+ Ready for literal data")
 	lit := make([]byte, size)
@@ -1444,24 +1489,37 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	}
 	dropped := s.store.onePerID && msgID != "" && slices.ContainsFunc(s.store.folders[key], func(m storedMsg) bool { return m.msgID == msgID })
 	if !dropped {
-		s.store.add(key, msgID, string(lit), flags)
+		s.store.add(key, msgID, string(lit), flags, date)
 	}
-	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID, flagList: flagList})
+	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID, flagList: flagList, date: date})
 	rw.line("%s OK APPEND completed", tag)
 	return true
 }
 
-// parseAppendFlags reads the optional flag list after the mailbox name of an APPEND. flagList keeps the parentheses, and flags is the text between them. Both are "" for no list.
-func parseAppendFlags(rest string) (flagList, flags string) {
+// parseAppendFlags splits the text after the APPEND mailbox name. flagList keeps the parentheses and flags drops them; both are "" for no list. tail is the rest.
+func parseAppendFlags(rest string) (flagList, flags, tail string) {
 	rest = strings.TrimLeft(rest, " ")
 	if !strings.HasPrefix(rest, "(") {
-		return "", ""
+		return "", "", rest
 	}
 	end := strings.IndexByte(rest, ')')
 	if end < 0 {
-		return "", ""
+		return "", "", rest
 	}
-	return rest[:end+1], rest[1:end]
+	return rest[:end+1], rest[1:end], rest[end+1:]
+}
+
+// parseAppendDate reads the optional quoted date-time at the start of tail and keeps the exact text between the quotes, a leading space too. It returns "" for no date.
+func parseAppendDate(tail string) string {
+	tail = strings.TrimLeft(tail, " ")
+	if !strings.HasPrefix(tail, `"`) {
+		return ""
+	}
+	date, _, ok := strings.Cut(tail[1:], `"`)
+	if !ok {
+		return ""
+	}
+	return date
 }
 
 // parseMailboxArg reads a quoted or atom mailbox name from the start of arg

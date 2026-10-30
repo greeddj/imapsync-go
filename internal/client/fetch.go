@@ -414,7 +414,7 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 			// No buffer: go-imap holds each body fully in memory, so every slot would keep one more message per worker.
 			messages := make(chan *imap.Message)
 			batchDone := make(chan error, 1)
-			items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, fullBodyPeekSection.FetchItem()}
+			items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchInternalDate, fullBodyPeekSection.FetchItem()}
 			go func() { batchDone <- uidFetchBodies(cli, uidSet, items, messages) }()
 
 			w := c.idle.Load()

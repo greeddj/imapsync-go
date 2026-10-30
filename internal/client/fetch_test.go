@@ -2587,6 +2587,94 @@ func Test_StreamMessagesByUIDs_When_ResponseCarriesFlags_Then_MessageKeepsTheSer
 	}
 }
 
+func Test_StreamMessagesByUIDs_When_ResponseCarriesInternalDate_Then_MessageKeepsIt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		want  time.Time
+		name  string
+		extra string
+		uid   uint32
+	}{
+		{
+			name:  "a date with a positive offset",
+			uid:   1,
+			extra: ` INTERNALDATE "17-Jul-2012 09:30:00 +0200"`,
+			want:  time.Date(2012, 7, 17, 9, 30, 0, 0, time.FixedZone("", 2*3600)),
+		},
+		{
+			name:  "a day padded with a space, as Cyrus sends it",
+			uid:   2,
+			extra: ` INTERNALDATE " 2-Jan-2006 15:04:05 -0700"`,
+			want:  time.Date(2006, 1, 2, 15, 4, 5, 0, time.FixedZone("", -7*3600)),
+		},
+		{
+			name:  "a day with no padding",
+			uid:   3,
+			extra: ` INTERNALDATE "2-Jan-2006 15:04:05 -0700"`,
+			want:  time.Date(2006, 1, 2, 15, 4, 5, 0, time.FixedZone("", -7*3600)),
+		},
+		{name: "a response with no INTERNALDATE item", uid: 4},
+		{name: "text that is not a date", uid: 5, extra: ` INTERNALDATE "not a date"`},
+		{name: "a NIL date", uid: 6, extra: ` INTERNALDATE NIL`},
+	}
+	uids := make([]uint32, len(tests))
+	extras := make(map[uint32]string, len(tests))
+	for i, tt := range tests {
+		uids[i] = tt.uid
+		extras[tt.uid] = tt.extra
+	}
+
+	args := make(chan string, 1)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		args <- cmd.arg
+		for _, uid := range uids {
+			writeUIDMessageWithItems(conn, uid, extras[uid])
+		}
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	got := make(map[uint32]time.Time)
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+		got[msg.UID()] = msg.m.InternalDate
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	arg := <-args
+	for _, item := range []string{"ENVELOPE", "FLAGS", "INTERNALDATE", "BODY.PEEK[]"} {
+		if !strings.Contains(arg, item) {
+			t.Errorf("UID FETCH arguments = %q, want %s", arg, item)
+		}
+	}
+	if strings.Contains(strings.ReplaceAll(arg, "BODY.PEEK[]", ""), "BODY[") {
+		t.Errorf("UID FETCH arguments = %q, want no BODY[] without PEEK", arg)
+	}
+	for _, tt := range tests {
+		date, ok := got[tt.uid]
+		if !ok {
+			t.Errorf("%s: the callback got no message for UID %d", tt.name, tt.uid)
+			continue
+		}
+		if !date.Equal(tt.want) {
+			t.Errorf("%s: InternalDate = %v, want %v", tt.name, date, tt.want)
+		}
+		_, gotOffset := date.Zone()
+		_, wantOffset := tt.want.Zone()
+		if gotOffset != wantOffset {
+			t.Errorf("%s: offset = %d, want %d", tt.name, gotOffset, wantOffset)
+		}
+	}
+}
+
 func Test_StreamMessagesByUIDs_When_UnilateralOrUnrequestedFetchArrives_Then_CallbackSkipsIt(t *testing.T) {
 	t.Parallel()
 
