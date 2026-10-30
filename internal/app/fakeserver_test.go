@@ -528,6 +528,22 @@ func uidFetchBodyHandler(srv *fakeServer, mailboxes []string, uidBodies map[stri
 				_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
 				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, verb)
 			case "UID":
+				if sub, rest, _ := strings.Cut(arg, " "); strings.EqualFold(sub, "SEARCH") {
+					set := searchUIDSet(rest)
+					srv.mu.Lock()
+					srv.counts["UID SEARCH"]++
+					srv.names["UID SEARCH"] = append(srv.names["UID SEARCH"], set)
+					srv.mu.Unlock()
+					_, _ = fmt.Fprintf(conn, "* SEARCH")
+					ranges := parseIDSet(set)
+					for _, m := range uidBodies[selectedFolder] {
+						if inIDSet(ranges, m.uid) {
+							_, _ = fmt.Fprintf(conn, " %d", m.uid)
+						}
+					}
+					_, _ = fmt.Fprintf(conn, "\r\n%s OK UID SEARCH completed\r\n", tag)
+					continue
+				}
 				srv.mu.Lock()
 				srv.counts["UID FETCH"]++
 				srv.mu.Unlock()
@@ -627,6 +643,8 @@ type mailStore struct {
 	uidFetchEnd  map[string]string
 	omitBody     map[folderMsg]bool
 	omitFirst    map[folderMsg]bool
+	omitFetch    map[folderMsg]bool
+	searchReply  map[string]string
 	scanNoUID    map[string]bool
 	delimiter    string
 	loginReply   string
@@ -892,6 +910,26 @@ func (s *fakeServer) omitBodyFirstIn(folder, msgID string) {
 		s.store.omitFirst = make(map[folderMsg]bool)
 	}
 	s.store.omitFirst[folderMsg{folder, msgID}] = true
+}
+
+// omitInUIDFetch makes every UID FETCH leave out the response of the message, after an untagged NO that names it. The message stays in the store.
+func (s *fakeServer) omitInUIDFetch(folder, msgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.omitFetch == nil {
+		s.store.omitFetch = make(map[folderMsg]bool)
+	}
+	s.store.omitFetch[folderMsg{folder, msgID}] = true
+}
+
+// refuseUIDSearchWith makes every UID SEARCH in folder end with reply, which carries its own status word, as the tagged status line.
+func (s *fakeServer) refuseUIDSearchWith(folder, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.searchReply == nil {
+		s.store.searchReply = make(map[string]string)
+	}
+	s.store.searchReply[folder] = reply
 }
 
 // endUIDFetchWith makes every UID FETCH of folder end with reply after the untagged responses. reply carries its own status word, as the tagged status line.
@@ -1191,9 +1229,12 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 			s.storeFetch(rw, tag, selected, arg, false)
 		case "UID":
 			sub, rest, _ := strings.Cut(arg, " ")
-			if strings.EqualFold(sub, "FETCH") {
+			switch {
+			case strings.EqualFold(sub, "FETCH"):
 				s.storeFetch(rw, tag, selected, rest, true)
-			} else {
+			case strings.EqualFold(sub, "SEARCH"):
+				s.storeSearch(rw, tag, selected, rest)
+			default:
 				rw.line("%s OK UID %s completed", tag, strings.ToUpper(sub))
 			}
 		case "CREATE":
@@ -1215,7 +1256,7 @@ func splitCommand(line string) (tag, verb, arg string) {
 	return tag, strings.ToUpper(verb), arg
 }
 
-// CREATE, EXAMINE, SELECT and STATUS names and the UID set of each UID FETCH are recorded on arrival, whether or not the server accepts them.
+// CREATE, EXAMINE, SELECT and STATUS names and the UID set of each UID FETCH and UID SEARCH are recorded on arrival, whether or not the server accepts them.
 func (s *fakeServer) recordCommand(verb, arg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1224,9 +1265,12 @@ func (s *fakeServer) recordCommand(verb, arg string) {
 	case "UID":
 		sub, rest, _ := strings.Cut(arg, " ")
 		s.counts["UID "+strings.ToUpper(sub)]++
-		if strings.EqualFold(sub, "FETCH") {
+		switch {
+		case strings.EqualFold(sub, "FETCH"):
 			set, _, _ := strings.Cut(rest, " ")
 			s.names["UID FETCH"] = append(s.names["UID FETCH"], set)
+		case strings.EqualFold(sub, "SEARCH"):
+			s.names["UID SEARCH"] = append(s.names["UID SEARCH"], searchUIDSet(rest))
 		}
 	case "CREATE", "EXAMINE", "SELECT", "STATUS":
 		name, _ := parseMailboxArg(arg)
@@ -1358,6 +1402,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	rawBodyAt := maps.Clone(s.store.rawBodyAt)
 	omitBody := maps.Clone(s.store.omitBody)
 	omitFirst := maps.Clone(s.store.omitFirst)
+	omitFetch := maps.Clone(s.store.omitFetch)
 	scanNoUID := s.store.scanNoUID[selected]
 	endReply := ""
 	if byUID {
@@ -1408,6 +1453,10 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			parts = append(parts, `INTERNALDATE "`+imapQuoteEscaper.Replace(m.internalDate)+`"`)
 		}
 		key := folderMsg{selected, m.msgID}
+		if byUID && omitFetch[key] {
+			rw.line("* NO Message %d could not be read", i+1)
+			continue
+		}
 		if wantBody && omitFirst[key] {
 			rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
 		}
@@ -1429,6 +1478,42 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 		return
 	}
 	rw.line("%s OK FETCH completed", tag)
+}
+
+// searchUIDSet returns the UID set of the criteria "UID <set>", or the whole criteria text when they hold anything else.
+func searchUIDSet(criteria string) string {
+	if fields := strings.Fields(criteria); len(fields) == 2 && strings.EqualFold(fields[0], "UID") {
+		return fields[1]
+	}
+	return criteria
+}
+
+// storeSearch answers UID SEARCH UID <set> with the UIDs of the selected folder that the set names. Other criteria, a CHARSET too, get BAD.
+func (s *fakeServer) storeSearch(rw replyWriter, tag, selected, criteria string) {
+	s.mu.Lock()
+	msgs := slices.Clone(s.store.folders[selected])
+	refusal := s.store.searchReply[selected]
+	s.mu.Unlock()
+
+	fields := strings.Fields(criteria)
+	switch {
+	case selected == "":
+		rw.line("%s BAD No mailbox selected", tag)
+	case len(fields) != 2 || !strings.EqualFold(fields[0], "UID"):
+		rw.line("%s BAD Unsupported search criteria", tag)
+	case refusal != "":
+		rw.line("%s %s", tag, refusal)
+	default:
+		ranges := parseIDSet(fields[1])
+		var hits strings.Builder
+		for _, m := range msgs {
+			if inIDSet(ranges, m.uid) {
+				hits.WriteString(" " + strconv.FormatUint(uint64(m.uid), 10))
+			}
+		}
+		rw.line("* SEARCH%s", hits.String())
+		rw.line("%s OK UID SEARCH completed", tag)
+	}
 }
 
 func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {

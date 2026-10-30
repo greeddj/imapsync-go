@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -93,19 +94,24 @@ func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts
 	return pool, nil
 }
 
-// runFolderSync executes one FolderSyncPlan on the given worker and returns
-// (synced, errors). It owns the lifecycle of one tracker and posts log lines
-// to pw on a per-message error.
-//
-// planIdx is zero-based; planCount is len(activePlans) for human display.
-func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *progress.Tracker, planIdx, planCount int, pw *progress.Writer, verbose bool) (synced, errors int) {
+// pendingCause says why a planned UID waits for a standby copy.
+type pendingCause uint8
+
+const (
+	causeRefusedBody  pendingCause = iota // the source delivered the message, but its body was empty or missing
+	causeNotDelivered                     // the source did not deliver the message, and it still holds it
+	causeGone                             // the source no longer holds the message
+)
+
+// runFolderSync copies one plan on the worker. Each planned UID ends as exactly one of synced, errors or gone, unless the context ends. planIdx is zero-based.
+func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *progress.Tracker, planIdx, planCount int, pw *progress.Writer, verbose bool) (synced, errors, gone int) {
 	// Display only: the IMAP calls below keep the exact names from the plan.
 	srcShown, dstShown := termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)
 
 	if err := ctx.Err(); err != nil {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Canceled", planIdx+1, planCount))
 		tr.MarkAsErrored()
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	tr.UpdateTotal(int64(p.NewMessages))
@@ -143,21 +149,32 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		tr.MarkAsErrored()
 	}
 
-	// pending holds the planned UIDs whose source body was refused and that a standby copy can still replace.
-	var pending map[uint32]struct{}
+	// pending holds the planned UIDs that a standby copy can still replace. The cause decides whether one that no copy replaces counts as an error or as gone.
+	var pending map[uint32]pendingCause
+	addPending := func(uid uint32, cause pendingCause) {
+		if pending == nil {
+			pending = make(map[uint32]pendingCause)
+		}
+		pending[uid] = cause
+	}
+
+	sortedUIDs := slices.Clone(p.SrcUIDs)
+	slices.Sort(sortedUIDs)
+	delivered := make([]bool, len(sortedUIDs))
+	deliveredCount := 0
 
 	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDValidity, p.SrcUIDs, func(msg client.Message) error {
+		if i, found := slices.BinarySearch(sortedUIDs, msg.UID()); found && !delivered[i] {
+			delivered[i] = true
+			deliveredCount++
+		}
 		if err := w.dst.AppendMessage(ctx, p.DestinationFolder, msg); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if refusedBody(err) && len(p.standbysOf(msg.UID())) > 0 {
-				if pending == nil {
-					pending = make(map[uint32]struct{})
-				}
-				pending[msg.UID()] = struct{}{}
+				addPending(msg.UID(), causeRefusedBody)
 			} else {
-				delete(pending, msg.UID())
 				errors++
 				lastErrMsg = err.Error()
 			}
@@ -172,8 +189,6 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			refreshTracker()
 			return nil
 		}
-		// A response without a body can come before the full one for the same UID.
-		delete(pending, msg.UID())
 		synced++
 		tr.Increment(1)
 		refreshTracker()
@@ -191,11 +206,48 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	})
 	if ctx.Err() != nil {
 		reportCanceled()
-		return synced, errors
+		return synced, errors, 0
 	}
 	if streamErr != nil {
 		pw.Log("Stream error for folder %s: %s", srcShown, termsafe.Escape(streamErr.Error()))
-		errors++
+	}
+
+	// A UID that the stream did not deliver, also one in a batch that it never requested, ends here as an error or as gone.
+	var strandedErrors, strandedGone int
+	if deliveredCount < len(sortedUIDs) {
+		undelivered := make([]uint32, 0, len(sortedUIDs)-deliveredCount)
+		for i, uid := range sortedUIDs {
+			if !delivered[i] {
+				undelivered = append(undelivered, uid)
+			}
+		}
+		held, err := w.src.ExistingUIDs(ctx, p.SourceFolder, p.SrcUIDValidity, undelivered)
+		if ctx.Err() != nil {
+			reportCanceled()
+			return synced, errors, 0
+		}
+		// A failed check proves nothing, so every UID of the call counts as still held.
+		if err != nil {
+			held = undelivered
+		}
+		next := 0
+		for _, uid := range undelivered {
+			for next < len(held) && held[next] < uid {
+				next++
+			}
+			cause := causeGone
+			if next < len(held) && held[next] == uid {
+				cause = causeNotDelivered
+			}
+			switch {
+			case len(p.standbysOf(uid)) > 0:
+				addPending(uid, cause)
+			case cause == causeGone:
+				strandedGone++
+			default:
+				strandedErrors++
+			}
+		}
 	}
 
 	// The main FETCH has ended, so the source session can run the next command.
@@ -246,10 +298,23 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	}
 	if ctx.Err() != nil {
 		reportCanceled()
-		return synced, errors
+		return synced, errors, 0
 	}
-	errors += len(pending)
+	errors += strandedErrors
+	gone += strandedGone
+	for _, cause := range pending {
+		if cause == causeGone {
+			gone++
+		} else {
+			errors++
+		}
+	}
 
+	// The log comes before MarkAsDone: go-pretty drops a queued log line once no tracker is active.
+	if gone > 0 {
+		pw.Log("  ℹ️  Source folder %s no longer holds %d of the %d planned messages for %s, so they are not copied",
+			srcShown, gone, p.NewMessages, dstShown)
+	}
 	if errors > 0 {
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s",
 			planIdx+1, planCount, synced, errors, srcShown, dstShown))
@@ -259,7 +324,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			planIdx+1, planCount, synced, srcShown, dstShown))
 		tr.MarkAsDone()
 	}
-	return synced, errors
+	return synced, errors, gone
 }
 
 func refusedBody(err error) bool {
@@ -267,7 +332,7 @@ func refusedBody(err error) bool {
 }
 
 // owner maps each returned standby UID to the planned UID that it can replace.
-func standbyRequest(p *FolderSyncPlan, pending map[uint32]struct{}, source uint32) (uids []uint32, owner map[uint32]uint32) {
+func standbyRequest(p *FolderSyncPlan, pending map[uint32]pendingCause, source uint32) (uids []uint32, owner map[uint32]uint32) {
 	if len(pending) == 0 {
 		return nil, nil
 	}

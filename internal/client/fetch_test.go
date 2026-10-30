@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"runtime"
 	"slices"
@@ -1469,8 +1470,8 @@ func Test_StreamMessagesByUIDs_When_ServerRepeatsAUID_Then_CallbackRunsOnce(t *t
 }
 
 // Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageStillDelivered
-// asserts that a FETCH response without a body does not hide the later response
-// that carries it.
+// asserts that a FETCH response without a body never reaches the callback, and
+// that the later response that carries the body does.
 func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageStillDelivered(t *testing.T) {
 	t.Parallel()
 
@@ -1488,10 +1489,12 @@ func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageS
 	}))
 	c := newClientWithFake(t, srv)
 
-	withBody := make(map[uint32]int)
+	calls := make(map[uint32]int)
+	withoutBody := 0
 	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
-		if msg.m.GetBody(fullBodyPeekSection) != nil {
-			withBody[msg.m.Uid]++
+		calls[msg.m.Uid]++
+		if msg.m.GetBody(fullBodyPeekSection) == nil {
+			withoutBody++
 		}
 		return nil
 	})
@@ -1500,9 +1503,48 @@ func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageS
 	}
 
 	for _, uid := range []uint32{1, 2, 3} {
-		if got := withBody[uid]; got != 1 {
-			t.Errorf("UID %d reached the callback with its body %d times, want 1", uid, got)
+		if got := calls[uid]; got != 1 {
+			t.Errorf("UID %d reached the callback %d times, want 1", uid, got)
 		}
+	}
+	if withoutBody != 0 {
+		t.Errorf("callback got %d messages without a body, want 0", withoutBody)
+	}
+}
+
+// Test_StreamMessagesByUIDs_When_UIDOnlyGetsBodylessResponses_Then_CallbackSkipsItAndStreamSucceeds
+// asserts that a UID whose body never arrives is not a stream error and never
+// reaches the callback.
+func Test_StreamMessagesByUIDs_When_UIDOnlyGetsBodylessResponses_Then_CallbackSkipsItAndStreamSucceeds(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		writeUIDMessage(conn, 1)
+		writeLine(conn, `* 2 FETCH (UID 2 FLAGS (\Seen))`)
+		writeUIDMessage(conn, 3)
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	var got []uint32
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want success", err)
+	}
+
+	if want := []uint32{1, 3}; !slices.Equal(got, want) {
+		t.Errorf("callback got UIDs %v, want %v", got, want)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1: a missing body is no reason to fetch again", got)
 	}
 }
 
@@ -2843,6 +2885,571 @@ func Test_bodyFetchHandler_Handle(t *testing.T) {
 			}
 			if tt.want != delivered && len(messages) != 0 {
 				t.Errorf("the handler sent %d messages, want none", len(messages))
+			}
+		})
+	}
+}
+
+// uidSearchLog records the UIDs and the argument of each UID SEARCH, one entry per command.
+type uidSearchLog struct {
+	args     []string
+	requests [][]uint32
+	mu       sync.Mutex
+}
+
+func (l *uidSearchLog) record(arg string, uids []uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.args = append(l.args, arg)
+	l.requests = append(l.requests, uids)
+}
+
+func (l *uidSearchLog) allArgs() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.args)
+}
+
+func (l *uidSearchLog) allRequests() [][]uint32 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.requests)
+}
+
+func isUIDSearch(cmd command) bool {
+	return cmd.verb == "UID" && strings.HasPrefix(strings.ToUpper(cmd.arg), "SEARCH")
+}
+
+// searchedUIDs expands the UID set of a "SEARCH UID <set>" command.
+func searchedUIDs(cmd command) []uint32 {
+	fields := strings.Fields(cmd.arg)
+	if len(fields) != 3 || !strings.EqualFold(fields[1], "UID") {
+		return nil
+	}
+	set, err := imap.ParseSeqSet(fields[2])
+	if err != nil {
+		return nil
+	}
+	var uids []uint32
+	for _, r := range set.Set {
+		for uid := r.Start; uid <= r.Stop; uid++ {
+			uids = append(uids, uid)
+		}
+	}
+	return uids
+}
+
+// holding picks, from the requested UIDs, those that the server holds.
+func holding(held ...uint32) func(requested []uint32) []uint32 {
+	return func(requested []uint32) []uint32 {
+		var hits []uint32
+		for _, uid := range requested {
+			if slices.Contains(held, uid) {
+				hits = append(hits, uid)
+			}
+		}
+		return hits
+	}
+}
+
+// answerUIDSearch is an interceptHandler hook that logs each UID SEARCH, answers it with the UIDs that reply picks for the requested set, then sends the tagged OK.
+func answerUIDSearch(log *uidSearchLog, reply func(requested []uint32) []uint32) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDSearch(cmd) {
+			return false, true
+		}
+		requested := searchedUIDs(cmd)
+		log.record(cmd.arg, requested)
+		line := "* SEARCH"
+		for _, uid := range reply(requested) {
+			line += " " + strconv.FormatUint(uint64(uid), 10)
+		}
+		writeLine(conn, "%s", line)
+		writeLine(conn, "%s OK UID SEARCH completed", cmd.tag)
+		return true, true
+	}
+}
+
+func Test_ExistingUIDs_When_ServerAnswers_Then_ResultIsTheHeldSubsetOfTheInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		reply   func(requested []uint32) []uint32
+		name    string
+		wantArg string
+		asked   []uint32
+		want    []uint32
+	}{
+		{name: "the server holds some UIDs", asked: []uint32{5, 3, 1, 4}, reply: holding(1, 4, 5, 9), wantArg: "SEARCH UID 1,3:5", want: []uint32{1, 4, 5}},
+		{name: "the server holds none", asked: []uint32{7, 8}, reply: holding(), wantArg: "SEARCH UID 7:8"},
+		{name: "the server holds all", asked: []uint32{2, 1, 3}, reply: holding(1, 2, 3), wantArg: "SEARCH UID 1:3", want: []uint32{1, 2, 3}},
+		{name: "the input repeats a UID", asked: []uint32{2, 2, 1, 1}, reply: holding(1, 2), wantArg: "SEARCH UID 1:2", want: []uint32{1, 2}},
+		{name: "the input holds UID 0", asked: []uint32{0, 3, 0}, reply: holding(3), wantArg: "SEARCH UID 3", want: []uint32{3}},
+		{
+			name:  "the reply names UIDs nobody asked for and repeats others",
+			asked: []uint32{1, 2, 3},
+			reply: func([]uint32) []uint32 {
+				return []uint32{3, 3, 9, 1, 1, 0, math.MaxUint32, 3}
+			},
+			wantArg: "SEARCH UID 1:3",
+			want:    []uint32{1, 3},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			searches := new(uidSearchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, tt.reply)))
+			c := newClientWithFake(t, srv)
+			input := slices.Clone(tt.asked)
+
+			got, err := c.ExistingUIDs(t.Context(), "INBOX", 0, tt.asked)
+			if err != nil {
+				t.Fatalf("ExistingUIDs: %v", err)
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ExistingUIDs = %v, want %v", got, tt.want)
+			}
+			if len(got) > len(tt.asked) {
+				t.Errorf("ExistingUIDs returned %d UIDs for %d asked", len(got), len(tt.asked))
+			}
+			if !slices.Equal(tt.asked, input) {
+				t.Errorf("ExistingUIDs changed its input to %v, was %v", tt.asked, input)
+			}
+			assertStrings(t, "UID SEARCH arguments", searches.allArgs(), tt.wantArg)
+			for _, verb := range []string{"FETCH", "UID FETCH", "STORE", "UID STORE"} {
+				if n := srv.callCount(verb); n != 0 {
+					t.Errorf("server saw %d %s commands, want 0: the check reads no message", n, verb)
+				}
+			}
+		})
+	}
+}
+
+func assertStrings(t *testing.T, what string, got []string, want ...string) {
+	t.Helper()
+
+	if !slices.Equal(got, want) {
+		t.Errorf("%s = %q, want %q", what, got, want)
+	}
+}
+
+func Test_ExistingUIDs_When_NothingIsAsked_Then_SendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		asked []uint32
+	}{
+		{name: "nil input", asked: nil},
+		{name: "empty input", asked: []uint32{}},
+		{name: "only UID 0", asked: []uint32{0}},
+		{name: "UID 0 twice", asked: []uint32{0, 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			searches := new(uidSearchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, holding(0, 1))))
+			c := newClientWithFake(t, srv)
+
+			got, err := c.ExistingUIDs(t.Context(), "INBOX", 5, tt.asked)
+
+			if err != nil || got != nil {
+				t.Errorf("ExistingUIDs = %v, %v, want nil, nil", got, err)
+			}
+			for _, verb := range []string{"EXAMINE", "UID SEARCH", "LOGIN"} {
+				want := 0
+				if verb == "LOGIN" {
+					want = 1
+				}
+				if n := srv.callCount(verb); n != want {
+					t.Errorf("server saw %d %s commands, want %d", n, verb, want)
+				}
+			}
+		})
+	}
+}
+
+func Test_ExistingUIDs_When_MoreThanOneBatchIsAsked_Then_EachCommandCarriesAtMost500UIDs(t *testing.T) {
+	t.Parallel()
+
+	searches := new(uidSearchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, requestedAsSent)))
+	c := newClientWithFake(t, srv)
+	const total = 2*uidFetchBatchSize + 1
+	asked := make([]uint32, total)
+	for i := range asked {
+		asked[i] = uint32(total - i)
+	}
+
+	got, err := c.ExistingUIDs(t.Context(), "INBOX", 0, asked)
+	if err != nil {
+		t.Fatalf("ExistingUIDs: %v", err)
+	}
+
+	want := make([]uint32, total)
+	for i := range want {
+		want[i] = uint32(i + 1)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ExistingUIDs returned %d UIDs, want the %d asked ones in ascending order", len(got), total)
+	}
+	assertStrings(t, "UID SEARCH arguments", searches.allArgs(), "SEARCH UID 1:500", "SEARCH UID 501:1000", "SEARCH UID 1001")
+	for i, request := range searches.allRequests() {
+		if len(request) > uidFetchBatchSize {
+			t.Errorf("UID SEARCH #%d carried %d UIDs, want at most %d", i+1, len(request), uidFetchBatchSize)
+		}
+	}
+	if n := srv.callCount("EXAMINE"); n != 1 {
+		t.Errorf("EXAMINE count = %d, want 1 for all batches", n)
+	}
+}
+
+func Test_ExistingUIDs_When_SecondBatchFails_Then_ReturnsNoUIDsAndTheError(t *testing.T) {
+	t.Parallel()
+
+	searches := new(uidSearchLog)
+	srv := newFakeServer(t)
+	var seen atomic.Int32
+	refuseSecond := func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDSearch(cmd) || seen.Add(1) != 2 {
+			return false, true
+		}
+		writeLine(conn, "%s NO [CANNOT] search refused", cmd.tag)
+		return true, true
+	}
+	srv.addConnHandler(interceptHandler(srv, chainHooks(refuseSecond, answerUIDSearch(searches, requestedAsSent))))
+	c := newClientWithFake(t, srv)
+	asked := make([]uint32, 2*uidFetchBatchSize+1)
+	for i := range asked {
+		asked[i] = uint32(i + 1)
+	}
+
+	got, err := c.ExistingUIDs(t.Context(), "INBOX", 0, asked)
+
+	if err == nil || !strings.Contains(err.Error(), "search refused") {
+		t.Fatalf("ExistingUIDs error = %v, want the refusal", err)
+	}
+	if got != nil {
+		t.Errorf("ExistingUIDs = %d UIDs, want none: the first batch alone proves nothing about the rest", len(got))
+	}
+	if n := srv.callCount("UID SEARCH"); n != 2 {
+		t.Errorf("UID SEARCH count = %d, want 2: the call stops at the first failed batch", n)
+	}
+}
+
+func Test_ExistingUIDs_When_FolderIsAlreadySelected_Then_SendsNoSecondExamine(t *testing.T) {
+	t.Parallel()
+
+	searches := new(uidSearchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, holding(1, 2))))
+	c := newClientWithFake(t, srv)
+
+	for range 2 {
+		if _, err := c.ExistingUIDs(t.Context(), "INBOX", 0, []uint32{1, 2}); err != nil {
+			t.Fatalf("ExistingUIDs: %v", err)
+		}
+	}
+
+	assertStrings(t, "EXAMINE names", srv.capturedNames("EXAMINE"), "INBOX")
+	if n := srv.callCount("UID SEARCH"); n != 2 {
+		t.Errorf("UID SEARCH count = %d, want 2", n)
+	}
+}
+
+func Test_ExistingUIDs_When_UIDValidityDiffers_Then_SendsNoSearch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		wantErr      string
+		server       uint32
+		planned      uint32
+		keepSelected bool
+	}{
+		{name: "another value after a fresh EXAMINE", server: 6, planned: 5, wantErr: "UIDVALIDITY 5, now 6"},
+		{name: "another value on a kept selection", server: 6, planned: 5, keepSelected: true, wantErr: "UIDVALIDITY 5, now 6"},
+		{name: "no value after a fresh EXAMINE", server: 0, planned: 5, wantErr: "(UIDVALIDITY 5, now none)"},
+		{name: "no value on a kept selection", server: 0, planned: 5, keepSelected: true, wantErr: "(UIDVALIDITY 5, now none)"},
+		{name: "plan holds none", server: 7, planned: 0},
+		{name: "values match", server: 7, planned: 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			searches := new(uidSearchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(tt.server), answerUIDSearch(searches, holding(1, 2)))))
+			c := newClientWithFake(t, srv)
+			priming := 0
+			if tt.keepSelected {
+				if _, err := c.ExistingUIDs(t.Context(), "INBOX", 0, []uint32{1}); err != nil {
+					t.Fatalf("priming ExistingUIDs: %v", err)
+				}
+				priming = 1
+			}
+
+			got, err := c.ExistingUIDs(t.Context(), "INBOX", tt.planned, []uint32{1, 2})
+
+			if tt.wantErr == "" {
+				if err != nil || !slices.Equal(got, []uint32{1, 2}) {
+					t.Fatalf("ExistingUIDs = %v, %v, want [1 2], nil", got, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrUIDValidityChanged) {
+				t.Fatalf("ExistingUIDs error = %v, want ErrUIDValidityChanged", err)
+			}
+			for _, want := range []string{"folder INBOX: ", tt.wantErr} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			if got := classifyError(err); got != ClassUnknown {
+				t.Errorf("classifyError(err) = %s, want %s", got, ClassUnknown)
+			}
+			if got != nil {
+				t.Errorf("ExistingUIDs = %v, want none", got)
+			}
+			if n := srv.callCount("UID SEARCH"); n != priming {
+				t.Errorf("UID SEARCH count = %d, want %d: the mismatch sends no search", n, priming)
+			}
+			if n := srv.callCount("EXAMINE"); n != 1 {
+				t.Errorf("EXAMINE count = %d, want 1", n)
+			}
+			if n := srv.callCount("LOGIN"); n != 1 {
+				t.Errorf("LOGIN count = %d, want 1: a mismatch is no reason to reconnect", n)
+			}
+		})
+	}
+}
+
+func Test_ExistingUIDs_When_ServerRefusesTheSearch_Then_ReturnsTheLabeledErrorWithoutReconnect(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDSearch(cmd) {
+			return false, true
+		}
+		writeLine(conn, "%s NO [CANNOT] search refused", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+	c.prefix = "src"
+
+	got, err := c.ExistingUIDs(t.Context(), "Work", 0, []uint32{1})
+
+	if err == nil {
+		t.Fatal("ExistingUIDs returned nil, want the refusal")
+	}
+	for _, want := range []string{"[src] check UIDs in Work: ", "search refused"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	if got != nil {
+		t.Errorf("ExistingUIDs = %v, want none", got)
+	}
+	if n := srv.callCount("LOGIN"); n != 1 {
+		t.Errorf("LOGIN count = %d, want 1: a refusal is no reason to reconnect", n)
+	}
+	if n := srv.callCount("UID SEARCH"); n != 1 {
+		t.Errorf("UID SEARCH count = %d, want 1", n)
+	}
+}
+
+func Test_ExistingUIDs_When_SessionEndsDuringTheSearch_Then_ReconnectsSelectsAgainAndSearchesAgain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		hook func(net.Conn, *bufio.Reader, command) (handled, keep bool)
+		name string
+	}{
+		{name: "the connection drops", hook: dropThenHold(isUIDSearch)},
+		{name: "the server sends BYE", hook: byeOn(isUIDSearch)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			searches := new(uidSearchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, tt.hook))
+			srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, holding(1, 3))))
+			c := newWatchedClient(t, srv, 0)
+
+			got, err := awaitCallUIDs(t, func() ([]uint32, error) {
+				return c.ExistingUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3})
+			})
+
+			if err != nil {
+				t.Fatalf("ExistingUIDs: %v, want success after the reconnect", err)
+			}
+			if want := []uint32{1, 3}; !slices.Equal(got, want) {
+				t.Errorf("ExistingUIDs = %v, want %v", got, want)
+			}
+			for verb, want := range map[string]int{"LOGIN": 2, "EXAMINE": 2, "UID SEARCH": 2} {
+				if n := srv.callCount(verb); n != want {
+					t.Errorf("%s count = %d, want %d", verb, n, want)
+				}
+			}
+		})
+	}
+}
+
+// awaitCallUIDs is awaitCall for a call that returns UIDs.
+func awaitCallUIDs(t *testing.T, call func() ([]uint32, error)) ([]uint32, error) {
+	t.Helper()
+
+	var got []uint32
+	err := awaitCall(t, "ExistingUIDs", func() error {
+		var err error
+		got, err = call()
+		return err
+	})
+	return got, err
+}
+
+func Test_ExistingUIDs_When_ContextEnded_Then_ReturnsItsErrorAndSendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDSearch(new(uidSearchLog), holding(1))))
+	c := newClientWithFake(t, srv)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	got, err := c.ExistingUIDs(ctx, "INBOX", 0, []uint32{1})
+
+	if !errors.Is(err, context.Canceled) || got != nil {
+		t.Errorf("ExistingUIDs = %v, %v, want nil, context.Canceled", got, err)
+	}
+	for _, verb := range []string{"EXAMINE", "UID SEARCH"} {
+		if n := srv.callCount(verb); n != 0 {
+			t.Errorf("server saw %d %s commands, want 0", n, verb)
+		}
+	}
+}
+
+func Test_ExistingUIDs_When_ContextEndsDuringTheSearch_Then_ReturnsItsError(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(isUIDSearch)
+	srv.addConnHandler(interceptHandler(srv, st.intercept))
+	c := newClientWithFake(t, srv)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	type result struct {
+		err error
+		got []uint32
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := c.ExistingUIDs(ctx, "INBOX", 0, []uint32{1})
+		done <- result{got: got, err: err}
+	}()
+
+	awaitSignal(t, st.reached, "the server to receive UID SEARCH")
+	cancel()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, context.Canceled) || r.got != nil {
+			t.Errorf("ExistingUIDs = %v, %v, want nil, context.Canceled", r.got, r.err)
+		}
+	case <-timer.C:
+		t.Fatal("ExistingUIDs still blocked 5s after the cancel")
+	}
+	if n := srv.callCount("LOGIN"); n != 1 {
+		t.Errorf("LOGIN count = %d, want 1: a canceled client must not reconnect", n)
+	}
+}
+
+func Test_uidSearchIDs_When_SessionHasNoSelection_Then_ReturnsErrNoMailboxSelectedAndSendsNothing(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newClientWithFake(t, srv)
+	uids := new(imap.SeqSet)
+	uids.AddNum(1)
+
+	got, err := uidSearchIDs(c.c.Load(), uids)
+
+	if !errors.Is(err, imapclient.ErrNoMailboxSelected) {
+		t.Fatalf("error = %v, want imapclient.ErrNoMailboxSelected", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError = %v, want %v", got, ClassTransient)
+	}
+	if got != nil {
+		t.Errorf("uidSearchIDs = %v, want none", got)
+	}
+	if n := srv.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("UID SEARCH count = %d, want 0", n)
+	}
+}
+
+// searchedContext reports cancellation through Err once the server has seen n UID SEARCH commands. Its Done channel stays nil, so nothing cancels the client.
+type searchedContext struct {
+	context.Context
+	srv *fakeServer
+	n   int
+}
+
+func (c searchedContext) Done() <-chan struct{} { return nil }
+
+func (c searchedContext) Err() error {
+	if c.srv.callCount("UID SEARCH") >= c.n {
+		return context.Canceled
+	}
+	return nil
+}
+
+func Test_ExistingUIDs_When_ContextEndsAfterAReply_Then_ReturnsItsErrorAndSendsNoMoreSearch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		asked        int
+		wantSearches int
+	}{
+		{name: "after the only batch", asked: 3, wantSearches: 1},
+		{name: "between two batches", asked: uidFetchBatchSize + 1, wantSearches: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, answerUIDSearch(new(uidSearchLog), requestedAsSent)))
+			c := newClientWithFake(t, srv)
+			asked := make([]uint32, tt.asked)
+			for i := range asked {
+				asked[i] = uint32(i + 1)
+			}
+
+			got, err := c.ExistingUIDs(searchedContext{Context: t.Context(), srv: srv, n: 1}, "INBOX", 0, asked)
+
+			if !errors.Is(err, context.Canceled) || got != nil {
+				t.Errorf("ExistingUIDs = %v, %v, want nil, context.Canceled", got, err)
+			}
+			if n := srv.callCount("UID SEARCH"); n != tt.wantSearches {
+				t.Errorf("UID SEARCH count = %d, want %d", n, tt.wantSearches)
 			}
 		})
 	}

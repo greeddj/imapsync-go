@@ -620,7 +620,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		go func(idx int, p FolderSyncPlan, w *syncWorker, tr *progress.Tracker) {
 			defer wg.Done()
 			defer func() { free <- w }()
-			synced, errs := runFolderSync(ctx, w, p, tr, idx, len(activePlans), syncPW, verbose)
+			synced, errs, _ := runFolderSync(ctx, w, p, tr, idx, len(activePlans), syncPW, verbose)
 			totalSynced.Add(int64(synced))
 			totalErrors.Add(int64(errs))
 		}(i, plan, w, trackers[i])

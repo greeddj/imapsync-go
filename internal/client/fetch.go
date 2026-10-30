@@ -353,7 +353,106 @@ func uidFetchBodies(cli *imapclient.Client, uids *imap.SeqSet, items []imap.Fetc
 	return status.Err()
 }
 
-// StreamMessagesByUIDs reads at most one body ahead of onMessage, which must not call c. Another UIDVALIDITY, or none, fetches nothing and returns ErrUIDValidityChanged; 0 skips the check.
+// selectChecked selects folder when the session has not selected it, then compares the UIDVALIDITY of the session with uidValidity. 0 skips the comparison.
+func (c *Client) selectChecked(cli *imapclient.Client, folder string, uidValidity uint32) error {
+	// A retry after a reconnect runs on a fresh session, which has no
+	// selection, so selectIfNeeded selects the folder again.
+	status, err := c.selectIfNeeded(cli, folder)
+	if err != nil {
+		return fmt.Errorf("[%s] select folder %s: %w", c.prefix, folder, err)
+	}
+	// A nil status means the folder stayed selected and no EXAMINE ran; the session still holds the value from its EXAMINE.
+	if status == nil {
+		status = cli.Mailbox()
+	}
+	if status != nil {
+		if err := CheckUIDValidity(uidValidity, status.UidValidity); err != nil {
+			return fmt.Errorf("[%s] folder %s: %w", c.prefix, folder, err)
+		}
+	}
+	return nil
+}
+
+// uidSearchIDs runs UID SEARCH UID with no charset, because a server without UTF-8 support would refuse one. Like uidFetchBodies, it sends nothing outside the selected state.
+func uidSearchIDs(cli *imapclient.Client, uids *imap.SeqSet) ([]uint32, error) {
+	if cli.State() != imap.SelectedState {
+		return nil, imapclient.ErrNoMailboxSelected
+	}
+	res := new(responses.Search)
+	status, err := cli.Execute(&commands.Uid{Cmd: &commands.Search{Criteria: &imap.SearchCriteria{Uid: uids}}}, res)
+	if err != nil {
+		return nil, err
+	}
+	if err := status.Err(); err != nil {
+		return nil, err
+	}
+	return res.Ids, nil
+}
+
+// ExistingUIDs returns the UIDs of uids that folder still holds, ascending, unique and never more than asked. It reads no body. A UIDVALIDITY mismatch returns ErrUIDValidityChanged; 0 skips.
+func (c *Client) ExistingUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32) ([]uint32, error) {
+	stop := c.withCancel(ctx)
+	defer stop()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// UID 0 would go out as "*", which selects the largest UID.
+	asked := slices.DeleteFunc(slices.Clone(uids), func(uid uint32) bool { return uid == 0 })
+	slices.Sort(asked)
+	asked = slices.Compact(asked)
+	if len(asked) == 0 {
+		return nil, nil
+	}
+
+	held := make([]uint32, 0, len(asked))
+	hits := make([]bool, min(len(asked), uidFetchBatchSize))
+	for start := 0; start < len(asked); start += uidFetchBatchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		chunk := asked[start:min(start+uidFetchBatchSize, len(asked))]
+		found := hits[:len(chunk)]
+		err := c.safeCall(func(cli *imapclient.Client) error {
+			clear(found)
+			if err := c.selectChecked(cli, folder, uidValidity); err != nil {
+				return err
+			}
+			set := new(imap.SeqSet)
+			set.AddNum(chunk...)
+			named, err := uidSearchIDs(cli, set)
+			if err != nil {
+				return fmt.Errorf("[%s] check UIDs in %s: %w", c.prefix, folder, err)
+			}
+			// A server can name UIDs that nobody asked for, and repeat them, so only the index in chunk counts.
+			for _, uid := range named {
+				if i, ok := slices.BinarySearch(chunk, uid); ok {
+					found[i] = true
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		for i, uid := range chunk {
+			if found[i] {
+				held = append(held, uid)
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return held, nil
+}
+
+// StreamMessagesByUIDs reads at most one body ahead of onMessage, which must not call c and gets each UID once, only with BODY[]. A UIDVALIDITY mismatch returns ErrUIDValidityChanged; 0 skips.
 func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -396,20 +495,8 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 			if uidSet.Empty() {
 				return nil
 			}
-			// A retry after a reconnect runs on a fresh session, which has no
-			// selection, so selectIfNeeded selects the folder again.
-			status, err := c.selectIfNeeded(cli, folder)
-			if err != nil {
-				return fmt.Errorf("[%s] select folder %s: %w", c.prefix, folder, err)
-			}
-			// A nil status means the folder stayed selected and no EXAMINE ran; the session still holds the value from its EXAMINE.
-			if status == nil {
-				status = cli.Mailbox()
-			}
-			if status != nil {
-				if err := CheckUIDValidity(uidValidity, status.UidValidity); err != nil {
-					return fmt.Errorf("[%s] folder %s: %w", c.prefix, folder, err)
-				}
+			if err := c.selectChecked(cli, folder, uidValidity); err != nil {
+				return err
 			}
 			// No buffer: go-imap holds each body fully in memory, so every slot would keep one more message per worker.
 			messages := make(chan *imap.Message)
@@ -428,17 +515,16 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 				if !found || seen[i] {
 					continue
 				}
-				// Only a response with the body can become an APPEND, so only it
-				// marks the UID. Read before onMessage, which may consume the body.
-				hasBody := msg.GetBody(fullBodyPeekSection) != nil
+				// A flag update has no body. Skipping it leaves the UID unseen, so the full response is still delivered and a retry still fetches it.
+				if msg.GetBody(fullBodyPeekSection) == nil {
+					continue
+				}
 				// onMessage is our own work, usually an APPEND. At a batch
 				// tail the source is done and silent, so that time must not count.
 				w.end()
 				e := onMessage(Message{m: msg})
 				w.begin()
-				if hasBody {
-					seen[i] = true
-				}
+				seen[i] = true
 				if e != nil {
 					cbErr = e
 				}

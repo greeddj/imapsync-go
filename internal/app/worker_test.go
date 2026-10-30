@@ -58,7 +58,7 @@ func Test_runFolderSync_successCounter(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
 
 	if synced != 2 {
 		t.Errorf("synced=%d, want 2", synced)
@@ -105,7 +105,7 @@ func Test_runFolderSync_appendErrorIncrementsErrorsCounter(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
 
 	if synced != 0 {
 		t.Errorf("synced=%d, want 0", synced)
@@ -142,7 +142,7 @@ func Test_runFolderSync_canceledContext_returnsEarly(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors := runFolderSync(ctx, w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(ctx, w, plan, tr, 0, 1, pw, false)
 
 	if synced != 0 || errors != 0 {
 		t.Errorf("canceled: synced=%d, errors=%d, want (0, 0)", synced, errors)
@@ -240,7 +240,7 @@ func Test_runFolderSync_verboseSuccess(t *testing.T) {
 	tr := progress.NewTracker("test", 10)
 
 	// verbose=true exercises pw.Log("Synced %d/%d...") on success path.
-	synced, errors := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, true)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, true)
 	if synced != 1 {
 		t.Errorf("synced=%d, want 1", synced)
 	}
@@ -249,9 +249,8 @@ func Test_runFolderSync_verboseSuccess(t *testing.T) {
 	}
 }
 
-// Test_runFolderSync_streamError asserts that a non-transient error from
-// StreamMessagesByUIDs (src server returns BAD for UID FETCH) is surfaced as
-// a stream-error: errors is incremented and the tracker is marked as errored.
+// Test_runFolderSync_streamError asserts that a BAD reply to UID FETCH leaves
+// the planned UID undelivered, so it counts as one error.
 func Test_runFolderSync_streamError(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	dstSrv := newFakeServer(t)
@@ -276,13 +275,16 @@ func Test_runFolderSync_streamError(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
 	if synced != 0 {
 		t.Errorf("synced=%d, want 0", synced)
 	}
-	// The stream error increments errors by 1 in the post-loop check.
+	// The stream error itself counts nothing; the planned UID that it left undelivered counts one.
 	if errors != 1 {
-		t.Errorf("errors=%d, want 1 (from stream error)", errors)
+		t.Errorf("errors=%d, want 1 (the undelivered UID)", errors)
+	}
+	if got := srcSrv.callCount("UID SEARCH"); got != 1 {
+		t.Errorf("UID SEARCH count=%d, want 1", got)
 	}
 	if !tr.IsErrored() {
 		t.Error("tracker not marked as errored after stream error")
@@ -461,6 +463,14 @@ func badUIDFetchHandler(srv *fakeServer) func(net.Conn) {
 				_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
 				_, _ = fmt.Fprintf(conn, "%s OK [READ-ONLY] %s completed\r\n", tag, verb)
 			case "UID":
+				if strings.HasPrefix(strings.ToUpper(parts[2]), "SEARCH") {
+					// The message is still on the source, so the check calls it not delivered.
+					srv.mu.Lock()
+					srv.counts["UID SEARCH"]++
+					srv.mu.Unlock()
+					_, _ = fmt.Fprintf(conn, "* SEARCH 1\r\n%s OK UID SEARCH completed\r\n", tag)
+					continue
+				}
 				srv.mu.Lock()
 				srv.counts["UID FETCH"]++
 				srv.mu.Unlock()
@@ -620,7 +630,7 @@ func Test_runFolderSync_When_NamesCarryControlCharacters_Then_LogsAndTrackerShow
 			tr := progress.NewTracker("test", 10)
 			pw.AppendTracker(tr)
 
-			synced, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, true)
+			synced, _, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, true)
 			pw.Stop()
 			pw.WaitForRenderDone()
 
@@ -782,7 +792,7 @@ func Test_runFolderSync_When_CanceledMidStream_Then_CancelLineShowsEscapes(t *te
 	}
 	tr := progress.NewTracker("test", 10)
 
-	synced, errs := runFolderSync(ctx, w, plan, tr, 0, 1, progress.NewWriter(1, true), false)
+	synced, errs, _ := runFolderSync(ctx, w, plan, tr, 0, 1, progress.NewWriter(1, true), false)
 
 	if synced != 0 || errs != 0 {
 		t.Errorf("synced, errors = %d, %d, want 0, 0", synced, errs)
@@ -823,7 +833,7 @@ func Test_runFolderSync_When_StreamFailsWithHostileReply_Then_LogAndTrackerShowE
 	tr := progress.NewTracker("test", 10)
 	pw.AppendTracker(tr)
 
-	synced, errs := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
+	synced, errs, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
 	pw.Stop()
 	pw.WaitForRenderDone()
 
@@ -838,7 +848,7 @@ func Test_runFolderSync_When_StreamFailsWithHostileReply_Then_LogAndTrackerShowE
 	}
 }
 
-func Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsOneErrorAndAppendsNothing(t *testing.T) {
+func Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsAnErrorForEachPlannedMessageAndAppendsNothing(t *testing.T) {
 	t.Parallel()
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x", "b@x")})
@@ -863,12 +873,12 @@ func Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsOneErrorAndAppe
 	tr := progress.NewTracker("test", 10)
 	pw.AppendTracker(tr)
 
-	synced, errs := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
+	synced, errs, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
 	pw.Stop()
 	pw.WaitForRenderDone()
 
-	if synced != 0 || errs != 1 {
-		t.Errorf("synced, errors = %d, %d, want 0, 1", synced, errs)
+	if synced != 0 || errs != 2 {
+		t.Errorf("synced, errors = %d, %d, want 0, 2: one error for each planned message", synced, errs)
 	}
 	if !tr.IsErrored() {
 		t.Error("tracker not marked as errored after the mismatch")
@@ -876,8 +886,10 @@ func Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsOneErrorAndAppe
 	if got := dst.callCount("APPEND"); got != 0 {
 		t.Errorf("destination saw %d APPEND commands, want 0", got)
 	}
-	if got := src.callCount("UID FETCH"); got != 0 {
-		t.Errorf("source saw %d UID FETCH commands, want 0", got)
+	for _, verb := range []string{"UID FETCH", "UID SEARCH"} {
+		if got := src.callCount(verb); got != 0 {
+			t.Errorf("source saw %d %s commands, want 0", got, verb)
+		}
 	}
 	assertContainsAll(t, sb.String(),
 		"Stream error for folder INBOX: ", "source folder changed after the sync plan, run sync again (UIDVALIDITY 1, now 2)")
@@ -959,6 +971,7 @@ type standbyRun struct {
 	log    string
 	synced int
 	errs   int
+	gone   int
 }
 
 // runStandbyPlan runs the plan on one worker and returns what the worker counted and logged.
@@ -976,10 +989,10 @@ func runStandbyPlan(ctx context.Context, t *testing.T, src, dst *fakeServer, pla
 	tr := progress.NewTracker("test", 10)
 	pw.AppendTracker(tr)
 
-	synced, errs := runFolderSync(ctx, w, plan, tr, 0, 1, pw, verbose)
+	synced, errs, gone := runFolderSync(ctx, w, plan, tr, 0, 1, pw, verbose)
 	pw.Stop()
 	pw.WaitForRenderDone()
-	return standbyRun{tr: tr, log: sb.String(), synced: synced, errs: errs}
+	return standbyRun{tr: tr, log: sb.String(), synced: synced, errs: errs, gone: gone}
 }
 
 func Test_runFolderSync_When_PlannedMessageHasEmptyBodyAndAStandby_Then_CopiesTheStandbyOnce(t *testing.T) {
@@ -1028,6 +1041,7 @@ func Test_runFolderSync_When_PlannedBodyIsMissingAndAStandby_Then_CopiesTheStand
 	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
 		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
 	}
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "1")
 }
 
 func Test_runFolderSync_When_BodylessResponseComesBeforeTheFullOne_Then_CopiesThePlannedMessageAndNoStandby(t *testing.T) {
@@ -1047,6 +1061,9 @@ func Test_runFolderSync_When_BodylessResponseComesBeforeTheFullOne_Then_CopiesTh
 		t.Errorf("dst X bodies = %q, want the copy of A", bodies)
 	}
 	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: the full response delivered the planned message", n)
+	}
 }
 
 func Test_runFolderSync_When_FirstStandbyIsAlsoEmpty_Then_TheNextSourceIsTried(t *testing.T) {
@@ -1180,8 +1197,11 @@ func Test_runFolderSync_When_MainStreamFailsAfterTheRefusal_Then_TheStandbyStill
 
 	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
 
-	if got.synced != 1 || got.errs != 1 {
-		t.Errorf("synced, errors = %d, %d, want 1, 1: the stream error is the only error", got.synced, got.errs)
+	if got.synced != 1 || got.errs != 0 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 0, 0: the stream error counts nothing, because the source delivered the planned message", got.synced, got.errs, got.gone)
+	}
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: every planned message was delivered", n)
 	}
 	assertContainsAll(t, got.log, "Stream error for folder A: ", "fetch cut short")
 	assertContainsNone(t, got.log, "Stream error for folder B")
@@ -1527,4 +1547,297 @@ func Test_runFolderSync_When_StandbyCopyHasOtherInternalDate_Then_TheAppendCarri
 	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
 		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
 	}
+}
+
+// copyPlan is the plan of folder A to X for the UIDs 1 to n.
+func copyPlan(n int) FolderSyncPlan {
+	plan := FolderSyncPlan{
+		SourceFolder:            "A",
+		DestinationFolder:       "X",
+		NewMessages:             n,
+		SrcUIDValidity:          1,
+		DestinationFolderExists: true,
+	}
+	for uid := 1; uid <= n; uid++ {
+		plan.SrcUIDs = append(plan.SrcUIDs, uint32(uid))
+	}
+	return plan
+}
+
+func Test_runFolderSync_When_PlannedUIDsEndDifferently_Then_EachIsSyncedFailedOrGoneOnce(t *testing.T) {
+	t.Parallel()
+
+	const (
+		goneLine     = "Source folder A no longer holds "
+		searchRefuse = "NO [CANNOT] search refused"
+	)
+	bodyOfB := subjectBody("m1@x", "from B")
+	manyIDs := make([]string, clientBatchSize+1)
+	firstBatchBodies := make([]string, clientBatchSize)
+	for i := range manyIDs {
+		manyIDs[i] = fmt.Sprintf("n%d@x", i+1)
+		if i < clientBatchSize {
+			firstBatchBodies[i] = imapFullBody(manyIDs[i])
+		}
+	}
+	tests := []struct {
+		arrange      func(src *fakeServer)
+		folders      map[string][]fakeMsg
+		name         string
+		wantBodies   []string
+		wantSearches []string
+		wantLog      []string
+		plan         FolderSyncPlan
+		wantSynced   int
+		wantErrs     int
+		wantGone     int
+		wantGoneLine bool
+	}{
+		{
+			name:       "every message is delivered",
+			folders:    map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")},
+			plan:       copyPlan(2),
+			wantSynced: 2,
+			wantBodies: []string{imapFullBody("m1@x"), imapFullBody("m2@x")},
+		},
+		{
+			name:       "a response without a body comes before the full one",
+			folders:    map[string][]fakeMsg{"A": fakeMsgs("m1@x")},
+			arrange:    func(src *fakeServer) { src.omitBodyFirstIn("A", "m1@x") },
+			plan:       copyPlan(1),
+			wantSynced: 1,
+			wantBodies: []string{imapFullBody("m1@x")},
+		},
+		{
+			name:         "the source leaves a held message out of the UID FETCH",
+			folders:      map[string][]fakeMsg{"A": fakeMsgs("m1@x")},
+			arrange:      func(src *fakeServer) { src.omitInUIDFetch("A", "m1@x") },
+			plan:         copyPlan(1),
+			wantErrs:     1,
+			wantSearches: []string{"1"},
+		},
+		{
+			name:         "the response of a held message has no BODY[]",
+			folders:      map[string][]fakeMsg{"A": fakeMsgs("m1@x")},
+			arrange:      func(src *fakeServer) { src.omitBodyIn("A", "m1@x") },
+			plan:         copyPlan(1),
+			wantErrs:     1,
+			wantSearches: []string{"1"},
+		},
+		{
+			name:         "the message left the source after the plan",
+			folders:      map[string][]fakeMsg{"A": fakeMsgs("m1@x")},
+			arrange:      func(src *fakeServer) { src.removeMessage("A", "m1@x") },
+			plan:         copyPlan(1),
+			wantGone:     1,
+			wantSearches: []string{"1"},
+			wantGoneLine: true,
+		},
+		{
+			name:         "a held message that the source leaves out has a usable standby",
+			folders:      map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)},
+			arrange:      func(src *fakeServer) { src.omitInUIDFetch("A", "m1@x") },
+			plan:         standbyPlan("B"),
+			wantSynced:   1,
+			wantBodies:   []string{bodyOfB},
+			wantSearches: []string{"1"},
+		},
+		{
+			name:         "a gone message has a usable standby",
+			folders:      map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)},
+			arrange:      func(src *fakeServer) { src.removeMessage("A", "m1@x") },
+			plan:         standbyPlan("B"),
+			wantSynced:   1,
+			wantBodies:   []string{bodyOfB},
+			wantSearches: []string{"1"},
+		},
+		{
+			name:    "a gone message has an empty standby",
+			folders: map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder("")},
+			arrange: func(src *fakeServer) {
+				src.removeMessage("A", "m1@x")
+				src.answerBodyIn("B", "m1@x", "NIL")
+			},
+			plan:         standbyPlan("B"),
+			wantGone:     1,
+			wantSearches: []string{"1"},
+			wantGoneLine: true,
+		},
+		{
+			name:    "a held message that the source leaves out has an empty standby",
+			folders: map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder("")},
+			arrange: func(src *fakeServer) {
+				src.omitInUIDFetch("A", "m1@x")
+				src.answerBodyIn("B", "m1@x", "NIL")
+			},
+			plan:         standbyPlan("B"),
+			wantErrs:     1,
+			wantSearches: []string{"1"},
+		},
+		{
+			name:    "the source refuses the check",
+			folders: map[string][]fakeMsg{"A": fakeMsgs("m1@x")},
+			arrange: func(src *fakeServer) {
+				src.omitInUIDFetch("A", "m1@x")
+				src.refuseUIDSearchWith("A", searchRefuse)
+			},
+			plan:         copyPlan(1),
+			wantErrs:     1,
+			wantSearches: []string{"1"},
+		},
+		{
+			name:     "the UIDVALIDITY changed before the copy",
+			folders:  map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")},
+			arrange:  func(src *fakeServer) { src.setUIDValidity("A", 2) },
+			plan:     copyPlan(2),
+			wantErrs: 2,
+		},
+		{
+			name:       "the source ends the UID FETCH with a tagged NO after every body",
+			folders:    map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")},
+			arrange:    func(src *fakeServer) { src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short") },
+			plan:       copyPlan(2),
+			wantSynced: 2,
+			wantBodies: []string{imapFullBody("m1@x"), imapFullBody("m2@x")},
+			wantLog:    []string{"Stream error for folder A: ", "fetch cut short"},
+		},
+		{
+			name:    "one message is delivered, one is gone and one is held",
+			folders: map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x", "m3@x")},
+			arrange: func(src *fakeServer) {
+				src.removeMessage("A", "m2@x")
+				src.omitInUIDFetch("A", "m3@x")
+			},
+			plan:         copyPlan(3),
+			wantSynced:   1,
+			wantErrs:     1,
+			wantGone:     1,
+			wantBodies:   []string{imapFullBody("m1@x")},
+			wantSearches: []string{"2:3"},
+			wantGoneLine: true,
+		},
+		{
+			name:    "the second batch fails before it delivers anything",
+			folders: map[string][]fakeMsg{"A": fakeMsgs(manyIDs...)},
+			arrange: func(src *fakeServer) {
+				var fetches atomic.Int32
+				src.onCommand("UID", func() {
+					if fetches.Add(1) == 2 {
+						src.omitInUIDFetch("A", manyIDs[clientBatchSize])
+						src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short")
+					}
+				})
+			},
+			plan:         copyPlan(clientBatchSize + 1),
+			wantSynced:   clientBatchSize,
+			wantErrs:     1,
+			wantBodies:   firstBatchBodies,
+			wantSearches: []string{strconv.Itoa(clientBatchSize + 1)},
+			wantLog:      []string{"Stream error for folder A: ", "fetch cut short"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.folders)
+			if tt.arrange != nil {
+				tt.arrange(src)
+			}
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+			got := runStandbyPlan(t.Context(), t, src, dst, tt.plan, false)
+
+			if got.synced != tt.wantSynced || got.errs != tt.wantErrs || got.gone != tt.wantGone {
+				t.Errorf("synced, errors, gone = %d, %d, %d, want %d, %d, %d", got.synced, got.errs, got.gone, tt.wantSynced, tt.wantErrs, tt.wantGone)
+			}
+			if sum := got.synced + got.errs + got.gone; sum != tt.plan.NewMessages {
+				t.Errorf("synced + errors + gone = %d, want the %d planned messages", sum, tt.plan.NewMessages)
+			}
+			if !got.tr.IsDone() || got.tr.IsErrored() != (tt.wantErrs > 0) {
+				t.Errorf("tracker done = %t, errored = %t, want done and errored = %t", got.tr.IsDone(), got.tr.IsErrored(), tt.wantErrs > 0)
+			}
+			if bodies := dst.folderBodies("X"); !slices.Equal(bodies, tt.wantBodies) {
+				t.Errorf("dst X holds %d bodies, want %d, and the same ones in the same order", len(bodies), len(tt.wantBodies))
+			}
+			if n := dst.callCount("APPEND"); n != tt.wantSynced {
+				t.Errorf("destination saw %d APPEND commands, want %d", n, tt.wantSynced)
+			}
+			assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), tt.wantSearches...)
+			assertContainsAll(t, got.log, tt.wantLog...)
+			wantLines := 0
+			if tt.wantGoneLine {
+				wantLines = 1
+			}
+			if n := strings.Count(got.log, goneLine); n != wantLines {
+				t.Errorf("log holds the gone line %d times, want %d\nlog: %s", n, wantLines, got.log)
+			}
+			if tt.wantGoneLine {
+				assertContainsAll(t, got.log, fmt.Sprintf("Source folder A no longer holds %d of the %d planned messages for X, so they are not copied", tt.wantGone, tt.plan.NewMessages))
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+// clientBatchSize is the largest UID set that the client sends in one command.
+const clientBatchSize = 500
+
+func Test_runFolderSync_When_ContextEndsDuringTheCheck_Then_ReturnsCanceledWithoutGoneLine(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x")})
+	src.omitInUIDFetch("A", "m1@x")
+	var commands atomic.Int32
+	// The first UID command is the FETCH that leaves the message out, the second is the check.
+	src.onCommand("UID", func() {
+		if commands.Add(1) == 2 {
+			cancel()
+		}
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(ctx, t, src, dst, copyPlan(1), false)
+
+	if got.synced != 0 || got.errs != 0 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 0, 0", got.synced, got.errs, got.gone)
+	}
+	if want := "1/1 Canceled A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+	assertContainsNone(t, got.log, "no longer holds")
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "1")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_GoneNamesCarryControlCharacters_Then_TheGoneLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: fakeMsgs("m1@x", "m2@x")})
+	src.removeMessage(hostileWireName, "m2@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: nil})
+	plan := copyPlan(2)
+	plan.SourceFolder, plan.DestinationFolder = hostileName, hostileName
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+	if got.synced != 1 || got.errs != 0 || got.gone != 1 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 0, 1", got.synced, got.errs, got.gone)
+	}
+	want := "Source folder " + hostileShownName + " no longer holds 1 of the 2 planned messages for " + hostileShownName + ", so they are not copied"
+	assertContainsAll(t, got.log, want)
+	assertContainsNone(t, got.log, hostileName, "\u202e", "\x1b[2J")
+	for _, line := range strings.Split(got.log, "\n") {
+		// The writer puts its own erase-line sequence before each log line.
+		if _, text, found := strings.Cut(line, "Source folder"); found {
+			assertAllGraphic(t, "log line", "Source folder"+text)
+		}
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), hostileWireName)
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2")
+	assertIDs(t, "dst APPENDs", dst.appended(hostileWireName), "m1@x")
 }

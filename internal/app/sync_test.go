@@ -10443,7 +10443,7 @@ func TestRunSync_When_TheLastSharedMappingFailsItsScan_Then_EarlierPlansStillCop
 	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "X")
 }
 
-func TestRunSync_When_TheFirstSharedMappingFailsAtCopyTime_Then_TheNextRunCopiesTheSharedMessageOnce(t *testing.T) {
+func TestRunSync_When_TheFirstSharedMappingFailsAtCopyTime_Then_TheStandbyCopiesTheSharedMessageAndTheNextRunCopiesTheRest(t *testing.T) {
 	t.Parallel()
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x"), "B": fakeMsgs("m1@x", "m3@x")})
@@ -10461,10 +10461,10 @@ func TestRunSync_When_TheFirstSharedMappingFailsAtCopyTime_Then_TheNextRunCopies
 	assertContainsAll(t, out.String(),
 		"• A → X will copy 2 messages",
 		"• B → X will copy 1 messages",
-		"1 messages uploaded, 1 errors occurred",
+		"2 messages uploaded, 1 errors occurred",
 		"source folder changed after the sync plan, run sync again",
 	)
-	assertIDs(t, "dst X after the first run", dst.folderMsgIDs("X"), "m3@x")
+	assertIDs(t, "dst X after the first run", dst.folderMsgIDs("X"), "m1@x", "m3@x")
 
 	second := runSyncOnce(t, cfg)
 
@@ -10493,7 +10493,7 @@ func TestRunSync_When_CreateReportsExistingEmptyFolderAndSourceIsRebuilt_Then_Th
 	if !errors.Is(err, ErrSilentExit) {
 		t.Fatalf("first runSync error = %v, want ErrSilentExit", err)
 	}
-	assertContainsAll(t, out.String(), "0 messages uploaded, 1 errors occurred", "source folder changed after the sync plan, run sync again")
+	assertContainsAll(t, out.String(), "0 messages uploaded, 3 errors occurred", "source folder changed after the sync plan, run sync again")
 	assertContainsNone(t, out.String(), "Sync completed successfully", "All folders already synced!")
 	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"))
 	if n := dst.callCount("APPEND"); n != 0 {
@@ -10529,7 +10529,7 @@ func TestRunSync_When_OneOfTwoSourceFoldersIsRebuiltAfterThePlan_Then_OnlyThatFo
 	if !errors.Is(err, ErrSilentExit) {
 		t.Fatalf("first runSync error = %v, want ErrSilentExit", err)
 	}
-	assertContainsAll(t, out.String(), "2 messages uploaded, 1 errors occurred, 0 folders failed")
+	assertContainsAll(t, out.String(), "2 messages uploaded, 2 errors occurred, 0 folders failed")
 	assertIDs(t, "dst Other", dst.folderMsgIDs("Other"), "o1@x", "o2@x")
 	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"))
 	if n := strings.Count(out.String(), "source folder changed after the sync plan"); n != 1 {
@@ -13618,4 +13618,114 @@ func TestRunSync_When_SourceFlagListHoldsCommandText_Then_DestinationGetsOnlyVal
 	}
 	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "w1@x")
 	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceSendsABodylessResponseBeforeEachFullOne_Then_RunSucceedsWithoutErrors(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	src.omitBodyFirstIn("INBOX", "m1@x")
+	src.omitBodyFirstIn("INBOX", "m2@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertContainsAll(t, out.String(), "Sync completed successfully")
+	assertContainsNone(t, out.String(), "errors occurred", "no longer holds")
+	assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), "m1@x", "m2@x")
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: every message arrived", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceLeavesAHeldMessageOutOfUIDFetch_Then_EveryRunFailsAndTheDestinationNeverGetsIt(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("good@x", "held@x")})
+	src.omitInUIDFetch("INBOX", "held@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+
+	for run, wantPlanned := range []int{2, 1} {
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+
+		err := runSync(e2eContext(t), cfg, opts)
+
+		if !errors.Is(err, ErrSilentExit) {
+			t.Fatalf("run %d error = %v, want ErrSilentExit", run+1, err)
+		}
+		assertContainsAll(t, out.String(),
+			fmt.Sprintf("INBOX → INBOX will copy %d messages", wantPlanned),
+			fmt.Sprintf("%d messages uploaded, 1 errors occurred, 0 folders failed", wantPlanned-1),
+			"Sync completed with errors",
+		)
+		assertContainsNone(t, out.String(), "Sync completed successfully", "no longer holds")
+		assertIDs(t, fmt.Sprintf("dst INBOX after run %d", run+1), dst.folderMsgIDs("INBOX"), "good@x")
+	}
+
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2", "2")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands over both runs, want 1", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_PlannedMessageLeavesTheSourceBeforeTheCopy_Then_RunSucceedsAndNamesTheGoneMessage(t *testing.T) {
+	t.Parallel()
+
+	const goneLine = "  ℹ️  Source folder INBOX no longer holds 1 of the 2 planned messages for INBOX, so they are not copied"
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "after the prompt"},
+		{name: "with --quiet and --confirm", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			if tt.quiet {
+				opts.quiet, opts.autoConfirm = true, true
+				var once sync.Once
+				src.onCommand("UID", func() { once.Do(func() { src.removeMessage("INBOX", "m2@x") }) })
+			} else {
+				opts.in = &hookReader{r: strings.NewReader("y\n"), hook: func() { src.removeMessage("INBOX", "m2@x") }}
+			}
+
+			if err := runSync(e2eContext(t), cfg, opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertContainsAll(t, out.String(), "Sync completed successfully")
+			assertContainsNone(t, out.String(), "errors occurred")
+			if tt.quiet {
+				assertContainsNone(t, out.String(), "no longer holds")
+			} else if n := strings.Count(out.String(), goneLine); n != 1 {
+				t.Errorf("output holds the gone line %d times, want 1\noutput: %q", n, out.String())
+			}
+			assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), "m1@x")
+			assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2")
+			if n := dst.callCount("CREATE"); n != 0 {
+				t.Errorf("destination saw %d CREATE commands, want 0: the folder is listed, so no check after CREATE runs", n)
+			}
+
+			assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
+			assertReadOnly(t, "source", src)
+		})
+	}
 }
