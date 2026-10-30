@@ -13421,3 +13421,128 @@ func Test_copyRuleOf_When_DestinationAdvertisesGmailExtension_Then_ChoosesTheOne
 		t.Errorf("copyRuleOf(plain) = %d, want %d", got, copyByCount)
 	}
 }
+
+func TestRunSync_When_SourceMessagesHaveFlags_Then_EachCopyKeepsTheFlagsOfItsSource(t *testing.T) {
+	t.Parallel()
+
+	rows := []struct {
+		id         string
+		sourceList string
+		wantList   string
+		wantStored string
+	}{
+		{id: "m1@x", sourceList: ``, wantList: ``, wantStored: ``},
+		{id: "m2@x", sourceList: `\Seen`, wantList: `(\Seen)`, wantStored: `\Seen`},
+		{id: "m3@x", sourceList: `\Flagged $Forwarded`, wantList: `(\Flagged $Forwarded)`, wantStored: `\Flagged $Forwarded`},
+		{id: "m4@x", sourceList: `\Seen \Answered \Recent \Deleted NonJunk`, wantList: `(\Seen \Answered NonJunk)`, wantStored: `\Seen \Answered NonJunk`},
+		{id: "m5@x", sourceList: `\Draft \FLAGGED`, wantList: `(\Draft \FLAGGED)`, wantStored: `\Draft \FLAGGED`},
+	}
+	msgs := make([]fakeMsg, len(rows))
+	ids := make([]string, len(rows))
+	wantLists := make([]string, len(rows))
+	for i, row := range rows {
+		msgs[i] = fakeMsg{msgID: row.id, flags: row.sourceList}
+		ids[i] = row.id
+		wantLists[i] = row.wantList
+	}
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": msgs})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), ids...)
+	assertIDs(t, "dst APPEND flag lists", dst.appendedFlagLists("INBOX"), wantLists...)
+	for _, row := range rows {
+		if got := dst.flagsOf("INBOX", row.id); got != row.wantStored {
+			t.Errorf("flags of %s on the destination = %q, want %q", row.id, got, row.wantStored)
+		}
+		if got := src.flagsOf("INBOX", row.id); got != row.sourceList {
+			t.Errorf("flags of %s on the source = %q, want them unchanged %q", row.id, got, row.sourceList)
+		}
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceFlagsChangeAfterTheCopy_Then_ALaterRunLeavesTheDestinationFlags(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": {
+		{msgID: "m1@x", flags: `\Seen`},
+		{msgID: "m2@x", flags: `\Flagged $Forwarded`},
+		{msgID: "m3@x"},
+	}})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	first := e2eOptions(&syncBuffer{}, "")
+	first.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, first); err != nil {
+		t.Fatalf("first runSync: %v", err)
+	}
+	appends := dst.callCount("APPEND")
+	wantFlags := []string{`\Seen`, `\Flagged $Forwarded`, ``}
+	for i, id := range []string{"m1@x", "m2@x", "m3@x"} {
+		if got := dst.flagsOf("INBOX", id); got != wantFlags[i] {
+			t.Fatalf("flags of %s on the destination after the first run = %q, want %q", id, got, wantFlags[i])
+		}
+	}
+
+	src.setFlagsIn("INBOX", "m1@x", `\Flagged`)
+	src.setFlagsIn("INBOX", "m2@x", ``)
+	src.setFlagsIn("INBOX", "m3@x", `\Seen \Answered`)
+	out := &syncBuffer{}
+	second := e2eOptions(out, "")
+	second.autoConfirm = true
+	if err := runSync(e2eContext(t), cfg, second); err != nil {
+		t.Fatalf("second runSync: %v", err)
+	}
+
+	assertContainsAll(t, out.String(), "All folders already synced!")
+	if n := dst.callCount("APPEND"); n != appends {
+		t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+	}
+	for _, verb := range []string{"STORE", "UID STORE"} {
+		if n := dst.callCount(verb); n != 0 {
+			t.Errorf("destination saw %d %s commands, want 0", n, verb)
+		}
+	}
+	for i, id := range []string{"m1@x", "m2@x", "m3@x"} {
+		if got := dst.flagsOf("INBOX", id); got != wantFlags[i] {
+			t.Errorf("flags of %s on the destination after the second run = %q, want them unchanged %q", id, got, wantFlags[i])
+		}
+	}
+}
+
+func TestRunSync_When_SourceFlagListHoldsCommandText_Then_DestinationGetsOnlyValidFlagsAndNoOtherCommand(t *testing.T) {
+	t.Parallel()
+
+	const injected = "x)\r\nA1 DELETE \"Work\""
+	hostile := fmt.Sprintf("\\Flagged {%d}\r\n%s y[a) {5}]", len(injected), injected)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": {{msgID: "m1@x", flags: hostile}}})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("w1@x")})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	opts := e2eOptions(&syncBuffer{}, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v", err)
+	}
+
+	assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), "m1@x")
+	assertIDs(t, "dst APPEND flag lists", dst.appendedFlagLists("INBOX"), `(\Flagged)`)
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	if n := dst.callCount("DELETE"); n != 0 {
+		t.Errorf("destination saw %d DELETE commands, want 0", n)
+	}
+	if !dst.hasFolder("Work") {
+		t.Error("destination folder Work is gone")
+	}
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "w1@x")
+	assertReadOnly(t, "source", src)
+}

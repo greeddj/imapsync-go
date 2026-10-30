@@ -1482,3 +1482,26 @@ func Test_runFolderSync_When_ContextEndsDuringTheStandbyAppend_Then_ReturnsCance
 		t.Errorf("destination saw %d APPEND commands, want 1: the standby of B", n)
 	}
 }
+
+func Test_runFolderSync_When_StandbyCopyHasOtherFlags_Then_TheAppendCarriesTheStandbyFlags(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	inA := fakeMsgs("m1@x")
+	inA[0].flags = `\Flagged`
+	inB := standbyFolder(bodyOfB)
+	inB[1].flags = `\Seen $Forwarded`
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": inA, "B": inB})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 1, 0", got.synced, got.errs)
+	}
+	assertIDs(t, "dst APPEND flag lists", dst.appendedFlagLists("X"), `(\Seen $Forwarded)`)
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+	}
+}

@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -30,6 +32,48 @@ func sessionEnded(cli *imapclient.Client) bool {
 	default:
 		return false
 	}
+}
+
+// A flag is written raw into the command line, so a flag that is not an atom could inject commands into the destination session.
+func validFlag(flag string) bool {
+	atom := strings.TrimPrefix(flag, `\`)
+	if atom == "" {
+		return false
+	}
+	for i := 0; i < len(atom); i++ {
+		switch b := atom[i]; {
+		case b < 0x21 || b > 0x7e:
+			return false
+		case strings.IndexByte(`(){%*"\]`, b) >= 0:
+			return false
+		}
+	}
+	return true
+}
+
+// APPEND cannot set \Recent, and \Deleted would let an EXPUNGE on the destination remove the copy.
+func carriedFlag(flag string) bool {
+	return validFlag(flag) && !strings.EqualFold(flag, `\Recent`) && !strings.EqualFold(flag, `\Deleted`)
+}
+
+// appendFlags returns flags itself when it drops nothing, and nil when no flag remains, so go-imap sends no flag list.
+func appendFlags(flags []string) []string {
+	if len(flags) == 0 {
+		return nil
+	}
+	if slices.ContainsFunc(flags, func(flag string) bool { return !carriedFlag(flag) }) {
+		kept := make([]string, 0, len(flags))
+		for _, flag := range flags {
+			if carriedFlag(flag) {
+				kept = append(kept, flag)
+			}
+		}
+		if len(kept) == 0 {
+			return nil
+		}
+		return kept
+	}
+	return flags
 }
 
 // AppendMessage streams the body with no copy, so only a failure before go-imap
@@ -77,7 +121,7 @@ func (c *Client) AppendMessage(ctx context.Context, folder string, msg Message) 
 	if env := msg.m.Envelope; env != nil {
 		date = env.Date
 	}
-	flags := []string{imap.SeenFlag}
+	flags := appendFlags(msg.m.Flags)
 	literal := &readTracker{Literal: body}
 	send := func(cli *imapclient.Client) error { return cli.Append(folder, flags, date, literal) }
 

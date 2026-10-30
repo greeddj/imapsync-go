@@ -567,12 +567,14 @@ type fakeMsg struct {
 	msgID      string
 	body       string
 	envelopeID string
+	flags      string // raw text between the parentheses of FLAGS
 }
 
 type storedMsg struct {
 	msgID      string
 	body       string
 	envelopeID string
+	flags      string
 	uid        uint32
 }
 
@@ -589,8 +591,9 @@ type folderUID struct {
 }
 
 type appendRecord struct {
-	folder string
-	msgID  string
+	folder   string
+	msgID    string
+	flagList string // the flag list of the APPEND with its parentheses, or "" when the APPEND has none
 }
 
 // mailStore is the mailbox state behind a store-backed fakeServer; the server's
@@ -642,7 +645,7 @@ func newStoreServer(t *testing.T, delimiter string, folders map[string][]fakeMsg
 			if body == "" {
 				body = imapFullBody(m.msgID)
 			}
-			st.addStored(name, storedMsg{msgID: m.msgID, body: body, envelopeID: m.envelopeID})
+			st.addStored(name, storedMsg{msgID: m.msgID, body: body, envelopeID: m.envelopeID, flags: m.flags})
 		}
 	}
 	return listenFakeServer(t, st)
@@ -689,8 +692,8 @@ func (st *mailStore) uidValidityOf(key string) uint32 {
 	return 1
 }
 
-func (st *mailStore) add(folder, msgID, body string) {
-	st.addStored(folder, storedMsg{msgID: msgID, body: body})
+func (st *mailStore) add(folder, msgID, body, flags string) {
+	st.addStored(folder, storedMsg{msgID: msgID, body: body, flags: flags})
 }
 
 func (st *mailStore) addStored(folder string, m storedMsg) {
@@ -1015,6 +1018,43 @@ func (s *fakeServer) appended(folder string) []string {
 	return ids
 }
 
+// appendedFlagLists returns the flag list of each APPEND to folder in arrival order, with parentheses. An APPEND with no list gives "", so `()` differs from it.
+func (s *fakeServer) appendedFlagLists(folder string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var lists []string
+	for _, rec := range s.store.appends {
+		if rec.folder == folder {
+			lists = append(lists, rec.flagList)
+		}
+	}
+	return lists
+}
+
+// flagsOf returns the raw flags stored for the first message of folder with msgID, or "" when there is none.
+func (s *fakeServer) flagsOf(folder, msgID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.store.folders[folder] {
+		if m.msgID == msgID {
+			return m.flags
+		}
+	}
+	return ""
+}
+
+// setFlagsIn sets the raw text between the parentheses of FLAGS for every message of folder with msgID.
+func (s *fakeServer) setFlagsIn(folder, msgID, flags string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msgs := s.store.folders[folder]
+	for i := range msgs {
+		if msgs[i].msgID == msgID {
+			msgs[i].flags = flags
+		}
+	}
+}
+
 // folderMsgIDs returns the Message-Ids stored in folder in UID order, or nil
 // when the folder does not exist.
 func (s *fakeServer) folderMsgIDs(folder string) []string {
@@ -1296,6 +1336,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	wantHeader := strings.Contains(upper, "HEADER.FIELDS")
 	wantEnvelope := strings.Contains(upper, "ENVELOPE")
 	wantBody := strings.Contains(upper, "BODY.PEEK[]") || strings.Contains(upper, "BODY[]")
+	wantFlags := hasToken(upper, "FLAGS")
 
 	for i, m := range msgs {
 		id := uint32(i + 1)
@@ -1318,6 +1359,9 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 		if wantHeader {
 			hdr := imapMsgIDHeader(m.msgID)
 			parts = append(parts, fmt.Sprintf("BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {%d}\r\n%s", len(hdr), hdr))
+		}
+		if wantFlags {
+			parts = append(parts, "FLAGS ("+m.flags+")")
 		}
 		key := folderMsg{selected, m.msgID}
 		if wantBody && omitFirst[key] {
@@ -1365,8 +1409,9 @@ func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {
 // replying NO before the continuation races go-imap's literal writer. It
 // reports false when the connection died mid-literal.
 func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg string) bool {
-	name, _ := parseMailboxArg(arg)
+	name, rest := parseMailboxArg(arg)
 	size := parseLiteralSize(arg)
+	flagList, flags := parseAppendFlags(rest)
 
 	rw.line("+ Ready for literal data")
 	lit := make([]byte, size)
@@ -1399,11 +1444,24 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	}
 	dropped := s.store.onePerID && msgID != "" && slices.ContainsFunc(s.store.folders[key], func(m storedMsg) bool { return m.msgID == msgID })
 	if !dropped {
-		s.store.add(key, msgID, string(lit))
+		s.store.add(key, msgID, string(lit), flags)
 	}
-	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID})
+	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID, flagList: flagList})
 	rw.line("%s OK APPEND completed", tag)
 	return true
+}
+
+// parseAppendFlags reads the optional flag list after the mailbox name of an APPEND. flagList keeps the parentheses, and flags is the text between them. Both are "" for no list.
+func parseAppendFlags(rest string) (flagList, flags string) {
+	rest = strings.TrimLeft(rest, " ")
+	if !strings.HasPrefix(rest, "(") {
+		return "", ""
+	}
+	end := strings.IndexByte(rest, ')')
+	if end < 0 {
+		return "", ""
+	}
+	return rest[:end+1], rest[1:end]
 }
 
 // parseMailboxArg reads a quoted or atom mailbox name from the start of arg

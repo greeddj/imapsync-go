@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"slices"
@@ -1118,6 +1119,7 @@ func Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectApp
 	dated := func() Message {
 		msg := buildTestIMAPMessage()
 		msg.m.Envelope.Date = time.Date(2026, 10, 25, 9, 8, 7, 0, time.UTC)
+		msg.m.Flags = []string{`\Flagged`, "$Forwarded", `\Recent`}
 		return msg
 	}
 
@@ -1150,9 +1152,14 @@ func Test_AppendMessage_When_RetriedAfterEarlyFailure_Then_WireMatchesADirectApp
 		t.Errorf("APPEND count = %d, want 1", got)
 	}
 	got := awaitAppend(t, retryOut)
-	for _, part := range []string{`(\Seen)`, "25-Oct-2026 09:08:07 +0000"} {
+	for _, part := range []string{`(\Flagged $Forwarded)`, "25-Oct-2026 09:08:07 +0000"} {
 		if !strings.Contains(want.arg, part) {
 			t.Errorf("direct APPEND arguments %q do not contain %q", want.arg, part)
+		}
+	}
+	for _, part := range []string{`\Seen`, `\Recent`} {
+		if strings.Contains(want.arg, part) {
+			t.Errorf("direct APPEND arguments %q contain %q", want.arg, part)
 		}
 	}
 	if got.arg != want.arg {
@@ -1364,5 +1371,309 @@ func Test_AppendMessage_When_BodyHasOneByte_Then_Appends(t *testing.T) {
 	}
 	if got := string(awaitAppend(t, appends).literal); got != "x" {
 		t.Errorf("literal = %q, want %q", got, "x")
+	}
+}
+
+func Test_validFlag(t *testing.T) {
+	t.Parallel()
+
+	const punctuation = "!#$&'+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[^_`abcdefghijklmnopqrstuvwxyz|}~"
+	tests := []struct {
+		name string
+		flag string
+		want bool
+	}{
+		{name: "Seen", flag: `\Seen`, want: true},
+		{name: "Flagged in capitals", flag: `\FLAGGED`, want: true},
+		{name: "Answered", flag: `\Answered`, want: true},
+		{name: "Draft", flag: `\Draft`, want: true},
+		{name: "Recent", flag: `\Recent`, want: true},
+		{name: "Deleted", flag: `\Deleted`, want: true},
+		{name: "extension flag", flag: `\X-Ext`, want: true},
+		{name: "keyword with a dollar sign", flag: "$Forwarded", want: true},
+		{name: "keyword with a digit", flag: "$MailFlagBit0", want: true},
+		{name: "plain keyword", flag: "NonJunk", want: true},
+		{name: "open bracket", flag: "[x", want: true},
+		{name: "every other allowed punctuation character", flag: punctuation, want: true},
+		{name: "the same characters after a backslash", flag: `\` + punctuation, want: true},
+		{name: "empty", flag: ""},
+		{name: "backslash only", flag: `\`},
+		{name: "two backslashes", flag: `\\Seen`},
+		{name: "backslash and star", flag: `\*`},
+		{name: "star", flag: "*"},
+		{name: "percent", flag: "%"},
+		{name: "space", flag: "a b"},
+		{name: "close parenthesis", flag: "x)"},
+		{name: "open parenthesis", flag: "(x"},
+		{name: "literal marker", flag: "{5}"},
+		{name: "quote", flag: `a"b`},
+		{name: "backslash inside", flag: `a\b`},
+		{name: "close bracket", flag: "a]"},
+		{name: "injected command", flag: "x\r\nA1 DELETE INBOX"},
+		{name: "NUL", flag: "\x00"},
+		{name: "control byte before a letter", flag: "\x01a"},
+		{name: "DEL", flag: "\x7f"},
+		{name: "non-ASCII keyword", flag: "caf\u00e9"},
+		{name: "lone high byte", flag: "\xff"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := validFlag(tt.flag); got != tt.want {
+				t.Errorf("validFlag(%q) = %t, want %t", tt.flag, got, tt.want)
+			}
+		})
+	}
+
+	t.Run("every single byte, with and without a backslash", func(t *testing.T) {
+		t.Parallel()
+
+		for b := range 256 {
+			want := strings.IndexByte(punctuation, byte(b)) >= 0
+			if got := validFlag(string([]byte{byte(b)})); got != want {
+				t.Errorf("validFlag(%#x) = %t, want %t", b, got, want)
+			}
+			if got := validFlag(`\` + string([]byte{byte(b)})); got != want {
+				t.Errorf("validFlag(backslash and %#x) = %t, want %t", b, got, want)
+			}
+		}
+	})
+}
+
+func Test_appendFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{name: "nil", in: nil, want: nil},
+		{name: "empty", in: []string{}, want: nil},
+		{name: "order and spelling are kept", in: []string{`\Seen`, `\FLAGGED`, "$Forwarded", "NonJunk"}, want: []string{`\Seen`, `\FLAGGED`, "$Forwarded", "NonJunk"}},
+		{name: "Recent and Deleted in any letter case are dropped", in: []string{`\Recent`, `\Seen`, `\RECENT`, `\Flagged`, `\recent`, `\Deleted`, "$a", `\DELETED`}, want: []string{`\Seen`, `\Flagged`, "$a"}},
+		{name: "only Recent and Deleted", in: []string{`\Recent`, `\Deleted`}, want: nil},
+		{name: "invalid entries are dropped", in: []string{`\Seen`, "a b", "x)", "", `\`, "$ok", "{5}"}, want: []string{`\Seen`, "$ok"}},
+		{name: "only invalid entries", in: []string{"x)\r\nA1 DELETE INBOX", `"q"`}, want: nil},
+		{name: "duplicates and letter case are kept", in: []string{"$a", "$A", "$a"}, want: []string{"$a", "$A", "$a"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			before := slices.Clone(tt.in)
+
+			got := appendFlags(tt.in)
+
+			if !slices.Equal(got, tt.want) || (got == nil) != (tt.want == nil) {
+				t.Errorf("appendFlags(%q) = %#v, want %#v", before, got, tt.want)
+			}
+			if !slices.Equal(tt.in, before) || (tt.in == nil) != (before == nil) {
+				t.Errorf("input after the call = %#v, want it unchanged %#v", tt.in, before)
+			}
+		})
+	}
+
+	t.Run("a list that drops nothing is returned as it is", func(t *testing.T) {
+		t.Parallel()
+
+		in := []string{`\Seen`, "$Forwarded"}
+		got := appendFlags(in)
+		if len(got) != len(in) || &got[0] != &in[0] {
+			t.Errorf("appendFlags(%q) = %q, want the same backing array", in, got)
+		}
+	})
+
+	t.Run("a list that drops something is a new slice", func(t *testing.T) {
+		t.Parallel()
+
+		in := []string{`\Seen`, `\Recent`, "$Forwarded"}
+		got := appendFlags(in)
+		if len(got) != 2 || &got[0] == &in[0] {
+			t.Errorf("appendFlags(%q) = %q, want a new slice of two flags", in, got)
+		}
+	})
+}
+
+// Not parallel: AllocsPerRun counts allocations of the whole process.
+func Test_appendFlags_When_NothingIsDropped_Then_AllocatesNothing(t *testing.T) {
+	valid := []string{`\Seen`, `\Flagged`, "$Forwarded", "NonJunk"}
+
+	tests := []struct {
+		call func()
+		name string
+	}{
+		{name: "a valid list", call: func() { _ = appendFlags(valid) }},
+		{name: "nil", call: func() { _ = appendFlags(nil) }},
+		{name: "validFlag", call: func() { _ = validFlag("$Forwarded") }},
+		{name: "validFlag on a rejected flag", call: func() { _ = validFlag("a b") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := testing.AllocsPerRun(100, tt.call); got != 0 {
+				t.Errorf("allocations per call = %v, want 0", got)
+			}
+		})
+	}
+}
+
+func FuzzAppendFlags(f *testing.F) {
+	const sep = "\n"
+	for _, seed := range []string{
+		"",
+		`\Seen` + sep + `\FLAGGED` + sep + "$Forwarded" + sep + "NonJunk",
+		`\Recent` + sep + `\Seen` + sep + `\DELETED`,
+		`\Recent` + sep + `\Deleted`,
+		`\Seen` + sep + "a b" + sep + "x)" + sep + "" + sep + `\`,
+		"[x" + sep + "a]" + sep + `a"b` + sep + `a\b` + sep + "{5}",
+		"caf\u00e9" + sep + "\x00" + sep + "\x7f",
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, joined string) {
+		in := strings.Split(joined, sep)
+		before := slices.Clone(in)
+
+		out := appendFlags(in)
+
+		if !slices.Equal(in, before) {
+			t.Fatalf("input changed from %q to %q", before, in)
+		}
+		if out != nil && len(out) == 0 {
+			t.Fatalf("output is empty but not nil: %#v", out)
+		}
+		next := 0
+		for _, flag := range out {
+			if !validFlag(flag) || strings.EqualFold(flag, `\Recent`) || strings.EqualFold(flag, `\Deleted`) {
+				t.Errorf("output flag %q is not allowed", flag)
+			}
+			found := slices.Index(in[next:], flag)
+			if found < 0 {
+				t.Fatalf("output %q is not an in-order subsequence of %q", out, in)
+			}
+			next += found + 1
+		}
+		allowed := 0
+		for _, flag := range in {
+			if validFlag(flag) && !strings.EqualFold(flag, `\Recent`) && !strings.EqualFold(flag, `\Deleted`) {
+				allowed++
+			}
+		}
+		if len(out) != allowed {
+			t.Errorf("output %q holds %d flags, want the %d allowed flags of %q (every dropped flag fails a check)", out, len(out), allowed, in)
+		}
+	})
+}
+
+func messageWithFlags(flags []string) Message {
+	msg := buildTestIMAPMessage()
+	msg.m.Flags = flags
+	return msg
+}
+
+// seenVerbs returns the sorted command verbs that srv received.
+func seenVerbs(srv *fakeServer) []string {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	verbs := make([]string, 0, len(srv.counts))
+	for verb, n := range srv.counts {
+		if n > 0 {
+			verbs = append(verbs, verb)
+		}
+	}
+	slices.Sort(verbs)
+	return verbs
+}
+
+func Test_AppendMessage_When_SourceHasFlags_Then_AppendCarriesThemWithoutRecentOrDeleted(t *testing.T) {
+	t.Parallel()
+
+	appends := make(chan capturedAppend, 1)
+	srv := newFakeServer(t)
+	srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", appends))
+	c := newClientWithFake(t, srv)
+	msg := messageWithFlags([]string{`\Seen`, `\FLAGGED`, `\Recent`, "$Forwarded", `\deleted`, "NonJunk"})
+
+	err := awaitCall(t, "AppendMessage", func() error { return c.AppendMessage(t.Context(), "INBOX", msg) })
+
+	if err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	want := fmt.Sprintf(`INBOX (\Seen \FLAGGED $Forwarded NonJunk) {%d}`, len(testMessageBody(t)))
+	if got := awaitAppend(t, appends).arg; got != want {
+		t.Errorf("APPEND arguments = %q, want %q", got, want)
+	}
+	if want := []string{`\Seen`, `\FLAGGED`, `\Recent`, "$Forwarded", `\deleted`, "NonJunk"}; !slices.Equal(msg.m.Flags, want) {
+		t.Errorf("flags of the message = %q, want them unchanged %q", msg.m.Flags, want)
+	}
+}
+
+func Test_AppendMessage_When_NoFlagRemains_Then_AppendHasNoFlagList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		flags []string
+	}{
+		{name: "nil", flags: nil},
+		{name: "empty", flags: []string{}},
+		{name: "only Recent and Deleted", flags: []string{`\Recent`, `\Deleted`}},
+		{name: "only invalid flags", flags: []string{"a b", "x)"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			appends := make(chan capturedAppend, 1)
+			srv := newFakeServer(t)
+			srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", appends))
+			c := newClientWithFake(t, srv)
+
+			err := awaitCall(t, "AppendMessage", func() error {
+				return c.AppendMessage(t.Context(), "INBOX", messageWithFlags(tt.flags))
+			})
+
+			if err != nil {
+				t.Fatalf("AppendMessage: %v", err)
+			}
+			want := fmt.Sprintf("INBOX {%d}", len(testMessageBody(t)))
+			if got := awaitAppend(t, appends).arg; got != want {
+				t.Errorf("APPEND arguments = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func Test_AppendMessage_When_FlagWouldBreakTheCommandLine_Then_DropsItAndSendsOneCleanAppend(t *testing.T) {
+	t.Parallel()
+
+	appends := make(chan capturedAppend, 2)
+	srv := newFakeServer(t)
+	srv.addConnHandler(appendCaptureHandler(srv, "OK APPEND completed", appends))
+	c := newClientWithFake(t, srv)
+	msg := messageWithFlags([]string{`\Flagged`, "x)\r\nA1 DELETE INBOX", "y[a) {5}]", `"q"`})
+
+	err := awaitCall(t, "AppendMessage", func() error { return c.AppendMessage(t.Context(), "INBOX", msg) })
+
+	if err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	got := awaitAppend(t, appends)
+	if want := fmt.Sprintf(`INBOX (\Flagged) {%d}`, len(testMessageBody(t))); got.arg != want {
+		t.Errorf("APPEND arguments = %q, want %q", got.arg, want)
+	}
+	if string(got.literal) != testMessageBody(t) {
+		t.Errorf("literal = %q, want the message body %q", got.literal, testMessageBody(t))
+	}
+	if n := srv.callCount("APPEND"); n != 1 {
+		t.Errorf("APPEND count = %d, want 1", n)
+	}
+	if n := srv.callCount("DELETE"); n != 0 {
+		t.Errorf("DELETE count = %d, want 0", n)
+	}
+	if verbs := seenVerbs(srv); !slices.Equal(verbs, []string{"APPEND", "LOGIN"}) {
+		t.Errorf("the server saw the commands %q, want only LOGIN and APPEND", verbs)
 	}
 }

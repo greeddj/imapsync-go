@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/responses"
 )
 
 func TestParseMessageID(t *testing.T) {
@@ -1165,8 +1167,13 @@ func requestedUIDs(cmd command) []uint32 {
 
 // writeUIDMessage sends one FETCH response that carries the full body of uid.
 func writeUIDMessage(conn net.Conn, uid uint32) {
+	writeUIDMessageWithItems(conn, uid, "")
+}
+
+// writeUIDMessageWithItems is writeUIDMessage with extra fetch items, such as " FLAGS (\Seen)" with a leading space, between the UID and the body.
+func writeUIDMessageWithItems(conn net.Conn, uid uint32, extra string) {
 	body := "Subject: uid " + strconv.FormatUint(uint64(uid), 10) + "\r\n\r\nbody\r\n"
-	writeLine(conn, "* %d FETCH (UID %d BODY[] {%d}\r\n%s)", uid, uid, len(body), body)
+	writeLine(conn, "* %d FETCH (UID %d%s BODY[] {%d}\r\n%s)", uid, uid, extra, len(body), body)
 }
 
 // answerUIDFetch is an interceptHandler hook that answers each UID FETCH with the
@@ -2532,5 +2539,223 @@ func Test_StreamMessagesByUIDs_When_UIDValidityChangesOnRetryInsideFirstBatch_Th
 	}
 	if n := srv.callCount("EXAMINE"); n != 2 {
 		t.Errorf("EXAMINE count = %d, want 2", n)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_ResponseCarriesFlags_Then_MessageKeepsTheServerSpelling(t *testing.T) {
+	t.Parallel()
+
+	args := make(chan string, 1)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		args <- cmd.arg
+		writeUIDMessageWithItems(conn, 1, ` FLAGS (\Seen \FLAGGED $Forwarded NonJunk $MailFlagBit0)`)
+		writeUIDMessageWithItems(conn, 2, "")
+		writeUIDMessageWithItems(conn, 3, ` FLAGS ()`)
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	got := make(map[uint32][]string)
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+		got[msg.UID()] = msg.m.Flags
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	arg := <-args
+	if !strings.Contains(arg, "FLAGS") || !strings.Contains(arg, "BODY.PEEK[]") {
+		t.Errorf("UID FETCH arguments = %q, want FLAGS and BODY.PEEK[]", arg)
+	}
+	if strings.Contains(strings.ReplaceAll(arg, "BODY.PEEK[]", ""), "BODY[") {
+		t.Errorf("UID FETCH arguments = %q, want no BODY[] without PEEK", arg)
+	}
+	if want := []string{`\Seen`, `\FLAGGED`, "$Forwarded", "NonJunk", "$MailFlagBit0"}; !slices.Equal(got[1], want) {
+		t.Errorf("flags of UID 1 = %q, want the spelling of the server %q", got[1], want)
+	}
+	if flags, ok := got[2]; !ok || flags != nil {
+		t.Errorf("flags of UID 2 = %#v, want nil for a response without FLAGS", flags)
+	}
+	if flags := got[3]; flags == nil || len(flags) != 0 {
+		t.Errorf("flags of UID 3 = %#v, want an empty slice for FLAGS ()", flags)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_UnilateralOrUnrequestedFetchArrives_Then_CallbackSkipsIt(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		writeLine(conn, `* 7 FETCH (FLAGS (\Seen))`)
+		writeUIDMessageWithItems(conn, 1, ` FLAGS (\Flagged)`)
+		writeUIDMessageWithItems(conn, 99, ` FLAGS (\Draft)`)
+		writeLine(conn, `* 8 FETCH (UID 0 FLAGS (\Draft))`)
+		writeUIDMessageWithItems(conn, 2, ` FLAGS (\Answered)`)
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	flags := make(map[uint32][]string)
+	calls := 0
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2}, func(msg Message) error {
+		calls++
+		flags[msg.UID()] = msg.m.Flags
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v, want nil", err)
+	}
+
+	if calls != 2 || !slices.Equal(flags[1], []string{`\Flagged`}) || !slices.Equal(flags[2], []string{`\Answered`}) {
+		t.Errorf("callback ran %d times with flags %v, want UID 1 and UID 2 once each", calls, flags)
+	}
+}
+
+func Test_uidFetchBodies_When_SessionHasNoSelection_Then_ReturnsErrNoMailboxSelectedAndClosesTheChannel(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newClientWithFake(t, srv)
+	messages := make(chan *imap.Message)
+	uids := new(imap.SeqSet)
+	uids.AddNum(1)
+
+	err := uidFetchBodies(c.c.Load(), uids, []imap.FetchItem{imap.FetchFlags}, messages)
+
+	if !errors.Is(err, imapclient.ErrNoMailboxSelected) {
+		t.Fatalf("error = %v, want imapclient.ErrNoMailboxSelected", err)
+	}
+	if got := classifyError(err); got != ClassTransient {
+		t.Errorf("classifyError = %v, want %v", got, ClassTransient)
+	}
+	select {
+	case msg, ok := <-messages:
+		if ok {
+			t.Errorf("received %v, want a closed channel", msg)
+		}
+	default:
+		t.Error("the message channel is still open")
+	}
+	for range messages {
+		t.Error("the closed channel delivered a message")
+	}
+	if got := srv.callCount("UID FETCH"); got != 0 {
+		t.Errorf("UID FETCH count = %d, want 0", got)
+	}
+}
+
+func Test_bodyFetchHandler_Handle(t *testing.T) {
+	t.Parallel()
+
+	type outcome int
+	const (
+		delivered outcome = iota
+		unhandled
+		failed
+	)
+	fetch := func(items ...any) *imap.DataResp {
+		return &imap.DataResp{Fields: []any{"1", "FETCH", items}}
+	}
+	tests := []struct {
+		resp      imap.Resp
+		name      string
+		wantFlags []string
+		want      outcome
+	}{
+		{name: "a response that is not FETCH", resp: &imap.DataResp{Fields: []any{"1", "EXISTS"}}, want: unhandled},
+		{name: "a status response", resp: &imap.StatusResp{Type: imap.StatusRespOk}, want: unhandled},
+		{name: "FETCH whose sequence number is not a number", resp: &imap.DataResp{Fields: []any{"FETCH", "x", []any{"UID", "5"}}}, want: failed},
+		{name: "FETCH with no item list", resp: &imap.DataResp{Fields: []any{"1", "FETCH"}}, want: failed},
+		{name: "FETCH whose item list is not a list", resp: &imap.DataResp{Fields: []any{"1", "FETCH", "UID"}}, want: failed},
+		{name: "an item list that go-imap cannot parse", resp: fetch(uint32(1), "x"), want: failed},
+		{name: "a response with no UID", resp: fetch("FLAGS", []any{`\Seen`}), want: unhandled},
+		{name: "a response with UID 0", resp: fetch("UID", "0", "FLAGS", []any{`\Seen`}), want: unhandled},
+		{name: "a UID that was not requested", resp: fetch("UID", "6", "FLAGS", []any{`\Seen`}), want: unhandled},
+		{
+			name:      "flags keep the spelling of the server",
+			resp:      fetch("UID", "5", "FLAGS", []any{`\Seen`, `\FLAGGED`, "$Forwarded", "NonJunk"}),
+			want:      delivered,
+			wantFlags: []string{`\Seen`, `\FLAGGED`, "$Forwarded", "NonJunk"},
+		},
+		{
+			name:      "the item key is lower case and the values are raw strings",
+			resp:      fetch(imap.RawString("uid"), "5", imap.RawString("flags"), []any{imap.RawString("$A"), "$B"}),
+			want:      delivered,
+			wantFlags: []string{"$A", "$B"},
+		},
+		{
+			name:      "the last of two FLAGS items decides, and the first list is longer",
+			resp:      fetch("FLAGS", []any{`\A`, `\B`, "$Long"}, "UID", "5", "FLAGS", []any{"$Last"}),
+			want:      delivered,
+			wantFlags: []string{"$Last"},
+		},
+		{
+			name:      "the last of two FLAGS items decides, and the first list is shorter",
+			resp:      fetch("FLAGS", []any{"$X"}, "UID", "5", "FLAGS", []any{"$Y", "$Z"}),
+			want:      delivered,
+			wantFlags: []string{"$Y", "$Z"},
+		},
+		{
+			name:      "a literal item keeps the text that go-imap parsed",
+			resp:      fetch("UID", "5", "FLAGS", []any{"$Atom", bytes.NewBufferString("LitFlag"), "$Next"}),
+			want:      delivered,
+			wantFlags: []string{"$Atom", "litflag", "$Next"},
+		},
+		{
+			name:      "a NIL item keeps the text that go-imap parsed",
+			resp:      fetch("UID", "5", "FLAGS", []any{"$Atom", nil}),
+			want:      delivered,
+			wantFlags: []string{"$Atom", ""},
+		},
+		{name: "an empty flag list", resp: fetch("UID", "5", "FLAGS", []any{}), want: delivered, wantFlags: []string{}},
+		{name: "a response with no FLAGS item", resp: fetch("UID", "5"), want: delivered},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			uids := new(imap.SeqSet)
+			uids.AddNum(5)
+			messages := make(chan *imap.Message, 1)
+			h := &bodyFetchHandler{messages: messages, uids: uids}
+
+			err := h.Handle(tt.resp)
+
+			switch tt.want {
+			case unhandled:
+				if !errors.Is(err, responses.ErrUnhandled) {
+					t.Errorf("error = %v, want responses.ErrUnhandled", err)
+				}
+			case failed:
+				if err == nil || errors.Is(err, responses.ErrUnhandled) {
+					t.Errorf("error = %v, want a failure that is not ErrUnhandled", err)
+				}
+			case delivered:
+				if err != nil {
+					t.Fatalf("Handle: %v", err)
+				}
+				msg := <-messages
+				if msg.Uid != 5 {
+					t.Errorf("UID = %d, want 5", msg.Uid)
+				}
+				if !slices.Equal(msg.Flags, tt.wantFlags) || (msg.Flags == nil) != (tt.wantFlags == nil) {
+					t.Errorf("flags = %#v, want %#v", msg.Flags, tt.wantFlags)
+				}
+			}
+			if tt.want != delivered && len(messages) != 0 {
+				t.Errorf("the handler sent %d messages, want none", len(messages))
+			}
+		})
 	}
 }

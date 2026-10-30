@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/mail"
 	"slices"
+	"strings"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/commands"
+	"github.com/emersion/go-imap/responses"
 	"github.com/greeddj/imapsync-go/internal/termsafe"
 )
 
@@ -268,6 +272,87 @@ func trimAngleBrackets(id string) string {
 	return id
 }
 
+var errFetchNotEnoughFields = errors.New("fetch response has no message data")
+
+// bodyFetchHandler is responses.Fetch for a UID FETCH that keeps the flag spelling of the server. Like responses.Fetch, it sends each message on the reader goroutine.
+type bodyFetchHandler struct {
+	messages chan<- *imap.Message
+	uids     *imap.SeqSet
+}
+
+func (h *bodyFetchHandler) Handle(resp imap.Resp) error {
+	name, fields, ok := imap.ParseNamedResp(resp)
+	if !ok || name != "FETCH" {
+		return responses.ErrUnhandled
+	}
+	if len(fields) < 2 {
+		return errFetchNotEnoughFields
+	}
+	seqNum, err := imap.ParseNumber(fields[0])
+	if err != nil {
+		return err
+	}
+	list, ok := fields[1].([]any)
+	if !ok {
+		return errFetchNotEnoughFields
+	}
+	msg := &imap.Message{SeqNum: seqNum}
+	if err := msg.Parse(list); err != nil {
+		return err
+	}
+	// A response with no UID, or with a UID that was not requested, is unilateral data.
+	if msg.Uid == 0 || !h.uids.Contains(msg.Uid) {
+		return responses.ErrUnhandled
+	}
+	restoreFlagSpelling(msg, list)
+	h.messages <- msg
+	return nil
+}
+
+// go-imap lower-cases keywords, and the copy must keep the spelling of the source. A literal or NIL item keeps the parsed value.
+func restoreFlagSpelling(msg *imap.Message, list []any) {
+	var raw []any
+	for i := 0; i+1 < len(list); i += 2 {
+		if key, ok := atomText(list[i]); ok && strings.EqualFold(key, string(imap.FetchFlags)) {
+			raw, _ = list[i+1].([]any)
+		}
+	}
+	for i, field := range raw[:min(len(raw), len(msg.Flags))] {
+		if text, ok := atomText(field); ok {
+			msg.Flags[i] = text
+		}
+	}
+}
+
+// atomText returns the text of an atom or a quoted string, which go-imap reads as a string.
+func atomText(field any) (string, bool) {
+	switch f := field.(type) {
+	case string:
+		return f, true
+	case imap.RawString:
+		return string(f), true
+	default:
+		return "", false
+	}
+}
+
+// uidFetchBodies is UidFetch with bodyFetchHandler. Like go-imap, it closes messages only after Execute returns and sends no command outside the selected state.
+func uidFetchBodies(cli *imapclient.Client, uids *imap.SeqSet, items []imap.FetchItem, messages chan<- *imap.Message) error {
+	defer close(messages)
+
+	if cli.State() != imap.SelectedState {
+		return imapclient.ErrNoMailboxSelected
+	}
+	status, err := cli.Execute(
+		&commands.Uid{Cmd: &commands.Fetch{SeqSet: uids, Items: items}},
+		&bodyFetchHandler{messages: messages, uids: uids},
+	)
+	if err != nil {
+		return err
+	}
+	return status.Err()
+}
+
 // StreamMessagesByUIDs reads at most one body ahead of onMessage, which must not call c. Another UIDVALIDITY, or none, fetches nothing and returns ErrUIDValidityChanged; 0 skips the check.
 func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
@@ -329,8 +414,8 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 			// No buffer: go-imap holds each body fully in memory, so every slot would keep one more message per worker.
 			messages := make(chan *imap.Message)
 			batchDone := make(chan error, 1)
-			items := []imap.FetchItem{imap.FetchEnvelope, fullBodyPeekSection.FetchItem()}
-			go func() { batchDone <- cli.UidFetch(uidSet, items, messages) }()
+			items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, fullBodyPeekSection.FetchItem()}
+			go func() { batchDone <- uidFetchBodies(cli, uidSet, items, messages) }()
 
 			w := c.idle.Load()
 			for msg := range messages {
