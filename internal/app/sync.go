@@ -1438,9 +1438,6 @@ func printCaseVariantDestinations(out io.Writer, mappings []config.DirectoryMapp
 			}
 			group = []string{first}
 		}
-		if slices.Contains(group, m.Destination) {
-			continue
-		}
 		if variants == nil {
 			variants = make(map[string][]string)
 		}
@@ -1450,7 +1447,11 @@ func printCaseVariantDestinations(out io.Writer, mappings []config.DirectoryMapp
 	if len(variants) == 0 {
 		return
 	}
-	unlisted := func(name string) bool { return !slices.Contains(listed, name) }
+	// MailboxNames returns names sorted in byte order, so a binary search keeps this lookup logarithmic on a server-controlled LIST.
+	unlisted := func(name string) bool {
+		_, found := slices.BinarySearch(listed, name)
+		return !found
+	}
 	printed := false
 	for _, key := range slices.Sorted(maps.Keys(variants)) {
 		names := variants[key]
@@ -1458,6 +1459,7 @@ func printCaseVariantDestinations(out io.Writer, mappings []config.DirectoryMapp
 			continue
 		}
 		slices.Sort(names)
+		names = slices.Compact(names)
 		for i, name := range names {
 			names[i] = termsafe.Escape(name)
 		}

@@ -5809,6 +5809,18 @@ func Test_printCaseVariantDestinations(t *testing.T) {
 			want: caseVariantLine("ARCHIVE", "Archive", "archive") + "\n",
 		},
 		{
+			name:     "a later spelling repeats exactly",
+			mappings: []config.DirectoryMapping{mapping("A", "archive"), mapping("B", "ARCHIVE"), mapping("C", "ARCHIVE")},
+			want:     caseVariantLine("ARCHIVE", "archive") + "\n",
+		},
+		{
+			name: "every distinct spelling is listed despite a repeat",
+			mappings: []config.DirectoryMapping{
+				mapping("A", "archive"), mapping("B", "ARCHIVE"), mapping("C", "ARCHIVE"), mapping("D", "Archive"),
+			},
+			listed: []string{"ARCHIVE", "Archive", "archive"},
+		},
+		{
 			name: "two groups in reverse key order",
 			mappings: []config.DirectoryMapping{
 				mapping("B", "beta"), mapping("C", "Beta"), mapping("D", "alpha"), mapping("E", "Alpha"),
@@ -5848,6 +5860,82 @@ func Test_printCaseVariantDestinations(t *testing.T) {
 				t.Errorf("output = %q, want %q", got, tt.want)
 			}
 			assertContainsNone(t, out.String(), "\x1b", "\r", "\u202e")
+		})
+	}
+}
+
+func firstOutputDifference(got, want string) string {
+	i := 0
+	for i < min(len(got), len(want)) && got[i] == want[i] {
+		i++
+	}
+	window := func(s string) string { return s[max(i-20, 0):min(i+40, len(s))] }
+	return fmt.Sprintf("length %d, want %d; first difference at byte %d: got %q, want %q",
+		len(got), len(want), i, window(got), window(want))
+}
+
+func Test_printCaseVariantDestinations_When_GroupHoldsEveryLetterCaseVariant_Then_ListsEachNameOnce(t *testing.T) {
+	t.Parallel()
+
+	const base = "abcdefghijklmn"
+	variants := make([]string, 0, 1<<len(base))
+	for mask := range 1 << len(base) {
+		name := []byte(base)
+		for i := range name {
+			if mask&(1<<i) != 0 {
+				name[i] -= 'a' - 'A'
+			}
+		}
+		variants = append(variants, string(name))
+	}
+	sorted := slices.Clone(variants)
+	slices.Sort(sorted)
+
+	mappings := make([]config.DirectoryMapping, 0, len(sorted)+3)
+	for _, name := range slices.Backward(sorted) {
+		mappings = append(mappings, mapping("src/"+strconv.Itoa(len(mappings)), name))
+	}
+	for _, name := range []string{mappings[0].Destination, sorted[len(sorted)/2], sorted[0]} {
+		mappings = append(mappings, mapping("src/"+strconv.Itoa(len(mappings)), name))
+	}
+
+	unrelated := []string{"INBOX", "Sent", "zzz"}
+	listedMissingOne := append(slices.DeleteFunc(slices.Clone(variants), func(v string) bool { return v == base }), unrelated...)
+	listedAll := append(slices.Clone(variants), unrelated...)
+	slices.Sort(listedMissingOne)
+	slices.Sort(listedAll)
+	tests := []struct {
+		name   string
+		want   string
+		listed []string
+	}{
+		{
+			name:   "one variant is not listed",
+			listed: listedMissingOne,
+			want:   caseVariantLine(sorted...) + "\n",
+		},
+		{
+			name:   "every variant is listed",
+			listed: listedAll,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			wantMappings, wantListed := slices.Clone(mappings), slices.Clone(tt.listed)
+			var out strings.Builder
+			printCaseVariantDestinations(&out, mappings, tt.listed)
+
+			if got := out.String(); got != tt.want {
+				t.Errorf("output differs: %s", firstOutputDifference(got, tt.want))
+			}
+			if !slices.Equal(mappings, wantMappings) {
+				t.Error("the call changed the mappings of the caller")
+			}
+			if !slices.Equal(tt.listed, wantListed) {
+				t.Error("the call changed the listed names of the caller")
+			}
 		})
 	}
 }
