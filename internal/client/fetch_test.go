@@ -14,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -913,6 +915,56 @@ func Test_StreamMessagesByUIDs_When_MessagesAreDelivered_Then_UIDIsTheRequestedO
 	}
 }
 
+// Test_StreamMessagesByUIDs_When_CallbackBlocks_Then_AtMostOneBodyIsReadAhead asserts
+// the memory bound of the body stream: while onMessage holds one body, go-imap
+// reads one more and waits. Each further read holds one more body.
+func Test_StreamMessagesByUIDs_When_CallbackBlocks_Then_AtMostOneBodyIsReadAhead(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		const messages = 16
+
+		var read atomic.Int32
+		srv := newPipeServer()
+		c := newPipeClient(t, interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+			if !isUIDFetch(cmd) {
+				return false, true
+			}
+			for _, uid := range requestedUIDs(cmd) {
+				writeUIDMessage(conn, uid)
+				// net.Pipe has no buffer, so a returned write means the client read the whole response.
+				read.Add(1)
+			}
+			writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+			return true, true
+		}))
+
+		uids := make([]uint32, messages)
+		for i := range uids {
+			uids[i] = uint32(i + 1)
+		}
+		var seen []int32
+		err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(Message) error {
+			synctest.Wait()
+			seen = append(seen, read.Load())
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("StreamMessagesByUIDs: %v", err)
+		}
+
+		if len(seen) != messages {
+			t.Fatalf("callback ran %d times, want %d", len(seen), messages)
+		}
+		for i, got := range seen {
+			k := i + 1
+			if want := int32(min(k+1, messages)); got != want {
+				t.Errorf("callback %d saw %d responses read, want %d: the body in onMessage plus at most one read ahead", k, got, want)
+			}
+		}
+	})
+}
+
 // Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip asserts
 // that time spent in onMessage, our own work, is never counted as server silence.
 func Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip(t *testing.T) {
@@ -924,9 +976,9 @@ func Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip(t *t
 	}{
 		// The server has sent the tagged OK and is silent while the callback runs.
 		{name: "at the batch tail", messages: 1},
-		// More messages than the channel and go-imap's reader can hold, so the
-		// reader stops consuming while the first callback runs.
-		{name: "in the middle of a batch", messages: messageChanBuffer + 10},
+		// More messages than the body stream holds, so the reader stops
+		// consuming while the first callback runs.
+		{name: "in the middle of a batch", messages: 20},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

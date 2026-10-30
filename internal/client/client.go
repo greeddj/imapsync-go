@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	// messageChanBuffer is the buffer size for message fetching channels.
+	// messageChanBuffer lets the scans that fetch no body read ahead. A body stream must not use it: each slot would hold one full message.
 	messageChanBuffer = 10
 	// initialBackoff is the initial delay before reconnect attempts.
 	initialBackoff = 2 * time.Second

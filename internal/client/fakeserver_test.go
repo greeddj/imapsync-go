@@ -334,6 +334,44 @@ func newDisconnectedClient(t *testing.T, srv *fakeServer) *Client {
 	return c
 }
 
+// newPipeServer returns a fakeServer with no listener. A loopback socket read is
+// not durably blocking, so synctest.Wait would never return.
+func newPipeServer() *fakeServer {
+	return &fakeServer{
+		counts: make(map[string]int),
+		names:  make(map[string][]string),
+	}
+}
+
+// newPipeClient connects a Client to handler over net.Pipe. Call it inside
+// synctest.Test only: a pipe blocks durably, so synctest.Wait sees every stalled goroutine.
+func newPipeClient(t *testing.T, handler func(net.Conn)) *Client {
+	t.Helper()
+
+	c := &Client{
+		username:    "user",
+		password:    "pass",
+		backoff:     initialBackoff,
+		dialTimeout: 5 * time.Second,
+		folderLocks: make(map[string]*sync.Mutex),
+		cancelCh:    make(chan struct{}),
+	}
+	c.dialFn = func(context.Context, string) (net.Conn, error) {
+		local, peer := net.Pipe()
+		go handler(peer)
+		return local, nil
+	}
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("newPipeClient connectAndLogin: %v", err)
+	}
+
+	t.Cleanup(func() {
+		c.Cancel()
+		_ = c.Logout()
+	})
+	return c
+}
+
 // command is one parsed IMAP command line as seen by a scripted handler. arg
 // is everything after the verb.
 type command struct {

@@ -268,7 +268,7 @@ func trimAngleBrackets(id string) string {
 	return id
 }
 
-// StreamMessagesByUIDs streams bodies, so no mailbox sits in memory. A session with another UIDVALIDITY, or none, gets no FETCH, and the stream returns ErrUIDValidityChanged; 0 skips the check.
+// StreamMessagesByUIDs reads at most one body ahead of onMessage, which must not call c. Another UIDVALIDITY, or none, fetches nothing and returns ErrUIDValidityChanged; 0 skips the check.
 func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -326,7 +326,8 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 					return fmt.Errorf("[%s] folder %s: %w", c.prefix, folder, err)
 				}
 			}
-			messages := make(chan *imap.Message, messageChanBuffer)
+			// No buffer: go-imap holds each body fully in memory, so every slot would keep one more message per worker.
+			messages := make(chan *imap.Message)
 			batchDone := make(chan error, 1)
 			items := []imap.FetchItem{imap.FetchEnvelope, fullBodyPeekSection.FetchItem()}
 			go func() { batchDone <- cli.UidFetch(uidSet, items, messages) }()
