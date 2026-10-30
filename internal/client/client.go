@@ -273,7 +273,6 @@ func (c *Client) detectOneCopyPerID(ctx context.Context) error {
 	return nil
 }
 
-// hasCapability reports whether caps lists name in any letter case. A nil map lists nothing.
 func hasCapability(caps map[string]bool, name string) bool {
 	for key, ok := range caps {
 		if ok && strings.EqualFold(key, name) {
