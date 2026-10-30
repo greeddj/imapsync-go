@@ -150,6 +150,18 @@
   - `Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmpty` - go-imap keeps no quoted string, so a quoted body that is not empty also reads as empty and gives `ErrEmptyBody`;
   - `Test_AppendMessage_When_BodyIsEmptyAndSessionIsGone_Then_SendsNoDialLoginOrAppend` - the refusal comes before the reconnect, so a Client with no session sends no dial, LOGIN or APPEND. This holds after a give-up, after a BYE and after a hang-up while idle;
   - `Test_AppendMessage_When_BodyHasOneByte_Then_Appends` - a body of one byte passes the guard and reaches the server.
+
+  The capability read has these tests:
+  - `Test_New_When_ServerAdvertisesGmailExtensionAfterLogin_Then_KeepsOneCopyPerMessageID` - when the CAPABILITY reply lists `X-GM-EXT-1`, `KeepsOneCopyPerMessageID` is true and `New` sends one CAPABILITY. This holds also when LOGIN OK carried a list;
+  - `Test_New_When_ServerSpellsTheGmailExtensionInAnotherLetterCase_Then_KeepsOneCopyPerMessageID` - the spellings `x-gm-ext-1` and `X-Gm-Ext-1` count as the capability, in the CAPABILITY reply and in LOGIN OK;
+  - `Test_New_When_ServerDoesNotAdvertiseGmailExtensionAfterLogin_Then_ReportsFalse` - the flag is false when the capability is in no list, only in the greeting, or only in LOGIN OK. The CAPABILITY reply after LOGIN decides;
+  - `Test_New_When_CapabilityIsRefused_Then_FailsAndNamesTheLabel` - a refused CAPABILITY fails `New` with `failed to read server capabilities` and `[label] capability`. `New` returns no client and logs out;
+  - `Test_New_When_ConnectionDropsDuringCapabilityCheck_Then_ReconnectsAndReadsTheNewSession` - a dropped connection gets one reconnect, and the CAPABILITY reply of the new session decides;
+  - `Test_New_When_ContextEndsDuringCapabilityCheck_Then_ReturnsCanceled` - a context that ends while CAPABILITY waits returns `context.Canceled` and no client, and `New` sends no second LOGIN;
+  - `Test_detectOneCopyPerID_When_ContextAlreadyEnded_Then_SendsNoCommand` - a context that ended before the call gives the context error and sends no CAPABILITY;
+  - `Test_detectOneCopyPerID_When_ContextEndsAfterTheReply_Then_ReturnsErrorAndStoresNothing` - a context that ends after the reply gives the context error, and the flag stays false;
+  - `Test_hasCapability` - the name matches in any letter case among other names. A nil map, an empty map, a longer, shorter or other name, a look-alike letter and a false value do not match;
+  - `Test_hasCapability_When_Called_Then_AllocatesNothing` - a match and a miss cost no allocation.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (count of copies for each Message-Id), subfolder expansion, delimiter reconciliation, worker pool dispatch.
@@ -261,9 +273,26 @@
   - `TestRunSync_When_NoSelectDestinationReceivesDuplicateMessageIds_Then_FailureCountsEveryMessage` - the failure of a `\Noselect` destination counts each source message, also the messages that share a Message-Id.
 
   The note of extra copies has these tests:
-  - `TestRunSync_When_DestinationKeepsOneCopyPerMessageId_Then_EveryRunNotesTheExtraCopies` - a destination that keeps one message for each Message-Id gets the note on each later run. The first run prints none;
+  - `TestRunSync_When_DestinationKeepsOneCopyPerMessageId_Then_EveryRunNotesTheExtraCopies` - a destination that keeps one message for each Message-Id but does not advertise X-GM-EXT-1 gets the note on each later run. The first run prints none. The fake server has `keepOnePerMessageID` and no `advertiseGmailExtension`;
   - `TestRunSync_When_DestinationHoldsOneOfThreeCopies_Then_QuietRunPrintsNoNote` - with `--quiet`, the run prints no note and no preview;
   - `TestRunSync_When_VerbosePreviewHasCopiesTheDestinationHolds_Then_NoteComesBeforeTheUIDList` - with `--verbose`, the note comes after the "will copy" line and before the UID list.
+
+  The one-copy rule has these tests:
+  - `Test_copyRule_sourceCopies` - the count rule keeps each group. The one-copy rule cuts a group to its first copy, which has the lowest UID. Neither call allocates;
+  - `Test_maybeDiff_When_DestinationKeepsOneCopyPerMessageID_Then_PlansTheLowestUIDOnce` - the plan holds the lowest UID of each Message-Id, and none when the destination holds the Message-Id. `RepeatedCopies` counts the cut copies, `ExtraCopies` stays 0, the plan stores the rule, and `NewSize` and the totals count the planned copies only;
+  - `Test_maybeDiff_When_DestinationCountsByCopies_Then_NothingIsLeftOut` - the count rule plans every copy, and `RepeatedCopies` stays 0;
+  - `Test_maybeDiff_When_OneCopyDestinationIsShared_Then_LaterMappingsGetStandbysNotPlans` - on a shared destination, the first mapping that lists the Message-Id plans one copy. The later mappings plan none, and their copies become standbys. The last mapping releases the reservations;
+  - `Test_maybeDiff_When_DestinationKeepsOneCopyAndCountsVary_Then_PlanAndRecheckPickTheSameMessages` - for each pair of source and destination counts, `maybeDiff` and `rediffPlan` choose the same UID, the same size and the same `RepeatedCopies`;
+  - `Test_rediffPlan_When_PlanKeepsOneCopyPerMessageID_Then_TheRecheckAppliesTheSameRule` - the check after CREATE reads `plan.copyRule`. It sets `NewSize`, `RepeatedCopies` and `ExtraCopies` again, counts `held` and `gone`, and leaves the input slice unchanged;
+  - `Test_rediffPlan_When_OneCopyRuleAndPlanVary_Then_ResultIsASubsetOfThePlan` - for random counts and plans, the check never adds a UID and keeps at most one UID of each Message-Id. `NewSize`, `RepeatedCopies`, `held` and `gone` follow the kept UIDs;
+  - `TestRunSync_When_GmailDestinationGetsRepeatedMessageIds_Then_OneCopyArrivesAndTheNextRunCopiesNothing` - three source copies of one Message-Id give a plan of one message and the repeated-copies line with 2. The copy with the lowest UID arrives, the preview has no extra-copies line, and a second run copies nothing;
+  - `TestRunSync_When_GmailDestinationHoldsTheMessageId_Then_NoCopyOfItIsPlanned` - a destination that holds the Message-Id gets none of its copies, only the other messages. The preview shows neither note;
+  - `TestRunSync_When_TwoMappingsShareAGmailDestination_Then_TheSharedMessageArrivesOnce` - the shared message arrives one time, with one worker and with two workers. This holds also when every copy in the folder of the first mapping has an empty body. Then the copy of the second mapping arrives. A second run copies nothing;
+  - `TestRunSync_When_HiddenGmailDestinationHoldsTheMessageId_Then_TheRecheckAppliesTheOneCopyRule` - for a folder that CREATE reports as existing, the check after CREATE drops the planned copy whose Message-Id the folder holds. This holds also when the held copy has the size of another source copy. The run prints the "already exists and holds" line;
+  - `TestRunSync_When_GmailDestinationRunsQuiet_Then_PrintsNoRepeatedCopiesLine` - with `--quiet`, the run prints no preview and no repeated-copies line;
+  - `TestRunSync_When_VerbosePreviewHasRepeatedCopies_Then_LineComesBeforeTheUIDList` - with `--verbose`, the repeated-copies line comes after the "will copy" line and before the UID list;
+  - `TestRunSync_When_OnlyTheSourceAdvertisesGmailExtension_Then_CopyByCountStays` - a source that advertises the capability does not change the plan. All three copies are planned, and the preview has no repeated-copies line;
+  - `TestRunSync_When_DestinationAdvertisesGmailExtension_Then_VerboseRunNamesTheOneCopyRule` - with `--verbose`, the run prints the rule line one time, after the server delimiters and before the next section. It prints no line without `--verbose`, with `--quiet`, or when only the source advertises the capability.
 
   The shared destinations have these tests:
   - `Test_maybeDiff_When_PlansShareADestination_Then_LaterPlansCopyOnlyTheExcess` - a later plan copies only the copies that the earlier plans and the destination do not cover;
@@ -301,6 +330,17 @@
   - `Test_runFolderSync_When_NamesCarryControlCharacters_Then_TheStandbyLineShowsEscapes` - the verbose standby line escapes the names and the Message-Id;
   - `TestRunSync_When_TheFirstSharedMappingHasAnEmptyBody_Then_TheLaterMappingsCopyArrivesInTheSameRun` and `TestRunSync_When_SharedDestinationIsRecheckedAndTheReservedCopyHasAnEmptyBody_Then_TheStandbyArrives` - the standby copy arrives in the same run, also after the check of an existing destination;
   - `TestRunSync_When_EverySharedCopyHasAnEmptyBody_Then_EachRunFailsAndNothingEmptyIsAppended` - when every copy has an empty body, each run counts one error and the destination never gets an empty message;
+  - `Test_maybeDiff_When_OneCopyPlanHasNoSharedDestination_Then_CutCopiesOfItsOwnFolderAreStandbys` - the copies that the rule cuts from the folder of the plan become standbys of the planned copy, in UID order. A single copy, or a Message-Id that the destination holds, gives none;
+  - `Test_maybeDiff_When_ThreeOneCopyMappingsShareADestination_Then_OnlyTheFirstPlansAndTheOthersAreStandbys` - of three mappings with one destination, only the first mapping that lists the Message-Id plans a copy. The copies of the other mappings become standbys, in mapping order. A destination that holds the Message-Id, also with a copy that has no UID, gives no plan and no standby;
+  - `Test_maybeDiff_When_PlanCountsByCopiesAndHasNoSharedDestination_Then_PlanHasNoStandbys` - a plan that copies by count plans every copy and has no standbys;
+  - `Test_maybeDiff_When_OneCopyMappingsShareASourceFolder_Then_TheFolderStandsByOnlyAsItsOwnPlan` - two mappings with one source folder and one destination add no second standby for that folder;
+  - `TestFolderSyncPlan_mergeStandbys` - the standbys of the folder of the plan come first, then the shared ones, sorted by planned UID, source and UID. `standbysOf` gives the copies of one source in UID order. The call never writes to the shared slices, and a call that merges nothing, or takes the shared slices as they are, costs no allocation;
+  - `Test_standbysFor_When_ManyCopiesOfOneSourceStandByForOnePlannedUID_Then_UIDsAscend` - copies of one source that arrive in random order come out in ascending UID order for each planned UID;
+  - `Test_buildSyncPlan_When_OneCopyDestinationHasCutCopies_Then_PlansCarryOwnStandbysBeforeLaterMappings` - each plan lists the standbys of its own folder before those of later mappings. This holds for one mapping and for three mappings with one destination, also when a source scan or a destination scan is slow;
+  - `Test_runFolderSync_When_PlannedCopyIsEmptyAndItsOwnFolderHoldsAnotherCopy_Then_CopiesItWithoutASecondExamine` - when the planned copy is empty, the worker first copies the standby from the same folder. This needs one EXAMINE of that folder. The worker goes to a later source only when that standby is also empty;
+  - `TestRunSync_When_LowestGmailCopyHasAnEmptyBody_Then_AHigherCopyOfTheMessageIdArrivesInTheSameRun` - when the lowest copy has no body, a higher copy of the same folder arrives in the same run. This holds also for a destination folder that LIST hides. The preview and the totals do not change, and a second run copies nothing;
+  - `TestRunSync_When_FirstMappingOfAGmailDestinationHasAnEmptyBody_Then_AnotherCopyOfTheMessageIdArrivesInTheSameRun` - with a shared destination, another copy of the Message-Id arrives in the same run. The worker tries a copy of the same folder first, then a copy of a later mapping. This holds with one worker and with two workers, also for a destination folder that LIST hides;
+  - `TestRunSync_When_EveryCopyOfAGmailMessageIdHasAnEmptyBody_Then_EachRunCountsOneErrorAndAppendsNothing` - when every copy of the Message-Id has an empty body, each run counts one error, ends with `ErrSilentExit`, and sends no APPEND;
   - `TestRunSync_When_SourceReturnsEmptyBody_Then_MessageFailsOnEachRun` and `TestRunSync_When_SourceBodyStaysEmpty_Then_EveryRunFailsLoudAndTheDestinationNeverGrows` - a message with an empty body fails on each run with exit code 1. The destination never gets an empty message.
 
   The UIDVALIDITY of a source folder has these tests:
@@ -329,7 +369,8 @@
   - `TestRunSync_When_ExplicitChildDestinationEqualsRenamedSiblingDestination_Then_BothFailAsAClash` - a typed destination that equals a renamed destination gives a clash, and both folders fail.
 
   The case-variant warning has these tests:
-  - `Test_printCaseVariantDestinations` - the groups, their order, the escapes and the rule that a group with every name listed gets no line;
+  - `Test_printCaseVariantDestinations` - the groups, their order, the escapes and the rule that a group with every name listed gets no line. The cases include an exact repeat of a spelling, and a group that the LIST lists in full although one spelling repeats;
+  - `Test_printCaseVariantDestinations_When_GroupHoldsEveryLetterCaseVariant_Then_ListsEachNameOnce` - a group of all 16384 letter-case spellings of one name, in reverse order and with three repeats. The line names each spelling one time, in byte order, when the LIST misses one spelling. The line does not show when the LIST holds every spelling. The call changes neither the mappings nor the LIST;
   - `TestRunSync_When_DestinationsDifferOnlyInLetterCase_Then_WarningShowsAndEachFolderCopies` - the warning shows before the prompt, also with `--quiet`, and each folder gets its messages.
 - **`internal/progress`** - interface compliance against the contract `internal/client` expects.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
@@ -346,7 +387,7 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 
 ### Deliberate exclusions in `internal/client`
 
-- **`client.New`** - the `Test_New_*` tests cover CRAM-MD5, dial failure, LIST refusal, cancel during LOGIN and shared limiters. Only `internal/app` tests cover two branches: the `tls.Dialer` path and the default dial timeout. The `tls.Dialer` test uses a plaintext server, so a handshake error is expected. The standard library handles a successful TLS handshake, so no test covers it.
+- **`client.New`** - the `Test_New_*` tests cover CRAM-MD5, dial failure, LIST refusal, CAPABILITY refusal, cancel during LOGIN, cancel during the CAPABILITY read and shared limiters. Only `internal/app` tests cover two branches: the `tls.Dialer` path and the default dial timeout. The `tls.Dialer` test uses a plaintext server, so a handshake error is expected. The standard library handles a successful TLS handshake, so no test covers it.
 - **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
 - **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:

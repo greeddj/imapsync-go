@@ -372,6 +372,10 @@ in the destination folder. If the source folder holds more copies, the command
 copies the difference. The command never deletes a copy on the destination.
 This is fast, and a new run after a partial sync is safe.
 
+A destination server that advertises `X-GM-EXT-1` is the exception. It gets at
+most one copy of each `Message-Id` in each folder. The bullet about
+`X-GM-EXT-1` below describes this rule.
+
 These limitations apply:
 
 - **Messages without a `Message-Id` are skipped.** Drafts, some bulk mail and
@@ -385,12 +389,23 @@ These limitations apply:
   them. If you suspect this, do the sync in a single pass and avoid re-running
   it against the same destination.
 - **Messages that share a `Message-Id` are copied by count.**
+  - A destination server that advertises `X-GM-EXT-1` is the exception. The next bullet describes it.
   - The command matches each destination copy to a source copy with the same size. Among equal sizes, the lowest UID goes first.
   - A destination copy that matches no size takes the lowest free UID.
   - The sizes only choose which source copies stay in the plan. The count never depends on the sizes.
   - If the destination changes the size of a message on upload, the match uses UID order only. The count stays correct. But the command can copy a message that the destination already has and leave out a different message.
   - Releases v1.2.1 and earlier copied only one message for each `Message-Id`. After an upgrade from such a release, the command matches the destination copy to its source copy by size. Then it copies the other copies. When the sizes stay the same, the upgrade is safe.
-- **Some servers keep one message for each `Message-Id`, for example Gmail.** Such a server accepts the upload of a second copy, but it drops the copy. So the extra copies upload again on each run, and each run reports success. Under the `will copy` line of the plan, the command prints the line `N of these messages have a Message-Id that the destination folder already holds`. N is the number of planned copies whose `Message-Id` the destination folder already holds. The `-q` option hides this line.
+- **A destination server that advertises `X-GM-EXT-1` gets at most one copy of each `Message-Id` in each folder.** Gmail advertises it.
+  - After the login, the command asks the destination server for its capabilities. The command finds `X-GM-EXT-1` in any letter case. The capabilities of the source server do not change the plan.
+  - Each destination folder gets at most one copy of each `Message-Id`. The plan takes the copy with the lowest UID. If the destination folder already holds the `Message-Id`, the plan takes no copy.
+  - The check after CREATE uses the same rule.
+  - Under the `will copy` line of the plan, the command prints the line `N repeated copies of these messages are left out: the destination server keeps one message for each Message-Id`. N is the number of source copies in the same folder that the plan leaves out.
+    - The line counts only planned messages. It shows only when N is more than 0. The `-q` option hides it.
+    - With `-V`, the line comes before the list of UIDs.
+    - Under this rule, the line `N of these messages have a Message-Id that the destination folder already holds` does not show.
+  - If the planned copy has an empty body or no body, the command tries the other copies in the same source folder first. Then it tries the copies from later mappings of the same destination folder.
+  - With `-V` and without `-q`, the command prints one more line after the server delimiters: `[label] The destination server advertises X-GM-EXT-1, so each destination folder gets at most one copy of each Message-Id`. `label` is the label of the destination server.
+- **Some servers keep one message for each `Message-Id` but do not advertise `X-GM-EXT-1`.** Such a server accepts the upload of a second copy, but it drops the copy. So the extra copies upload again on each run, and each run reports success. Under the `will copy` line of the plan, the command prints the line `N of these messages have a Message-Id that the destination folder already holds`. N is the number of planned copies whose `Message-Id` the destination folder already holds. The `-q` option hides this line.
 - **Destination folders can differ only in letter case.** For example, a `map` can name `Archive` and `archive`. A server that ignores letter case, for example Exchange, treats these names as one folder. Then a message that the two source folders share is copied more than once. Before the scan, the command prints the line `Destination folders NAMES differ only in letter case. If the destination server ignores letter case, a message that their source folders share is copied more than once.` The line shows also with `-q`. It does not show when the destination server already lists every one of these names.
 - **A folder fails when the server changes its UIDVALIDITY or does not send it.** UIDVALIDITY is a number that the server sends for a folder. If it changes, the old UIDs can point to other messages. The plan holds this number for each source folder.
   - The command checks the number before each fetch of message bodies. It also checks the number when it reads the source folder again after CREATE.
@@ -402,8 +417,9 @@ These limitations apply:
 - **A message can come without a UID.** A destination copy without a UID counts as one copy. A source message that has a `Message-Id` but no UID makes the source folder fail. The folder shows in the list `Folders that cannot be synced`. The other folders still copy.
 - **Two or more mappings can copy into one destination folder.**
   - For each `Message-Id`, the folder ends with the largest count of copies. This is the count that the folder already holds, or the count that one source folder holds. It is not the sum of the counts.
+  - A destination server that advertises `X-GM-EXT-1` is the exception. The folder gets at most one copy of each `Message-Id`. The first mapping in the mapping order that lists the `Message-Id` copies it. The later mappings copy none.
   - The command creates the folder one time.
-  - The first mapping can have a copy with an empty body or no body. Then the command copies the copy of a later mapping in the same run.
+  - The first mapping can have a copy with an empty body or no body. Then the command copies the copy of a later mapping in the same run. With `X-GM-EXT-1`, the command first tries the other copies in the same source folder.
 - **A message with an empty body, or with no body, fails on each run when no other copy can replace it.** The command never uploads an empty message. An empty message has no `Message-Id`, so each later run would add one more. The command counts one error for the message, and the run ends with exit code 1. With `-V`, the command shows the reason: `source returned an empty body` or `message has no body`. The message fails again on each run until the source sends a body.
 
 When CREATE answers that the destination folder already exists, the folder was not in the list of the destination server. The plan has no diff against this folder, so the command reads the folder again after your answer.
@@ -432,7 +448,7 @@ At all other steps, Ctrl+C stops the program at once.
 
 These limits apply to the connection steps, to the commands and to the exit of the program:
 
-- During the greeting, the login and the mailbox list, Ctrl+C stops the program at once.
+- During the greeting, the login, the mailbox list and the read of the server capabilities, Ctrl+C stops the program at once.
 - If a server accepts a connection but sends no greeting, the connection attempt fails after 30 seconds.
 - If no data moves for 5 minutes during the login, the connection attempt fails.
 - During a command, the program watches for data in both directions. If no data moves for 5 minutes, the program closes the connection and connects again. Then it sends the command one more time.

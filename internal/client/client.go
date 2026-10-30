@@ -170,8 +170,8 @@ func newDialer(timeout time.Duration) *net.Dialer {
 	return &net.Dialer{Timeout: timeout, KeepAlive: tcpKeepAlivePeriod}
 }
 
-// New logs in to the IMAP server. ctx bounds the dial, greeting, login and first
-// mailbox list. Afterwards reconnects stop on Cancel, so callers need not keep
+// New logs in. ctx bounds the dial, greeting, login, first mailbox list and
+// CAPABILITY read. Later reconnects stop on Cancel, so callers need not keep
 // ctx alive.
 func New(ctx context.Context, addr, username, password string, opts Options) (*Client, error) {
 	if !supportedAuth(opts.Auth) {
