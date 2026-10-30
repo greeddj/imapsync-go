@@ -806,6 +806,13 @@ func (s *fakeServer) removeMessage(folder, msgID string) {
 	s.store.folders[folder] = slices.DeleteFunc(s.store.folders[folder], func(m storedMsg) bool { return m.msgID == msgID })
 }
 
+// removeMessageAt deletes the message with uid and leaves every other message and UID as it is, also the copies that share its Message-Id.
+func (s *fakeServer) removeMessageAt(folder string, uid uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.folders[folder] = slices.DeleteFunc(s.store.folders[folder], func(m storedMsg) bool { return m.uid == uid })
+}
+
 // answerBody makes every FETCH of msgID send value as the BODY[] item, for example NIL or {0}. The header, ENVELOPE and size items stay as they are.
 func (s *fakeServer) answerBody(msgID, value string) {
 	s.mu.Lock()

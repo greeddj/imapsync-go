@@ -913,6 +913,37 @@ func capabilityAs(capabilities string) func(net.Conn, *bufio.Reader, command) (h
 	}
 }
 
+// authenticateAs is an interceptHandler hook that runs a CRAM-MD5 exchange, accepts any answer and ends with OK and the response code text. Empty leaves the code out.
+func authenticateAs(code string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "AUTHENTICATE" {
+			return false, true
+		}
+		writeLine(conn, "+ %s", base64.StdEncoding.EncodeToString([]byte(cramMD5Challenge)))
+		if _, err := rd.ReadString('\n'); err != nil {
+			return true, false
+		}
+		if code == "" {
+			writeLine(conn, "%s OK AUTHENTICATE completed", cmd.tag)
+		} else {
+			writeLine(conn, "%s OK %s AUTHENTICATE completed", cmd.tag, code)
+		}
+		return true, true
+	}
+}
+
+// untaggedCapabilityBeforeLogin is an interceptHandler hook that sends an untagged CAPABILITY list ahead of the tagged OK of LOGIN, with no response code.
+func untaggedCapabilityBeforeLogin(capabilities string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "LOGIN" {
+			return false, true
+		}
+		writeLine(conn, "* CAPABILITY %s", capabilities)
+		writeLine(conn, "%s OK LOGIN completed", cmd.tag)
+		return true, true
+	}
+}
+
 // statusMessagesAndUIDValidity is the event statusAs counts for a STATUS that asks for both items.
 const statusMessagesAndUIDValidity = "STATUS MESSAGES UIDVALIDITY"
 

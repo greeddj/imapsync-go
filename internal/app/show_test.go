@@ -745,3 +745,51 @@ func TestRunShow_When_FolderNameHoldsLatin1Byte_Then_TableLeavesItOutAndWarnsWit
 		})
 	}
 }
+
+func TestRunShow_When_ServerRefusesCapability_Then_NamesTheFailingAccount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		wantConnect    string
+		wantCapability string
+		refuseSource   bool
+	}{
+		{name: "source", refuseSource: true, wantConnect: "[alpha] connect", wantCapability: "[alpha] capability"},
+		{name: "destination", wantConnect: "[beta] connect", wantCapability: "[beta] capability"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("b@x")})
+			refusing := dst
+			if tt.refuseSource {
+				refusing = src
+			}
+			refusing.addConnHandler(scriptedHandler(refusing, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+				if verb == "CAPABILITY" {
+					return "NO [CANNOT] capability refused", true
+				}
+				return "", false
+			}))
+			cfg := e2eConfig(src, dst, 1)
+			cfg.Src.Label, cfg.Dst.Label = "alpha", "beta"
+
+			err := runShow(e2eContext(t), cfg, e2eShowOptions(&syncBuffer{}, true))
+
+			if err == nil {
+				t.Fatal("runShow error = nil, want the capability failure")
+			}
+			for _, want := range []string{tt.wantConnect, "failed to read server capabilities", tt.wantCapability, "capability refused"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), e2ePassword) {
+				t.Errorf("error %q leaks the password", err)
+			}
+		})
+	}
+}

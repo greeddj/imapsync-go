@@ -10850,6 +10850,14 @@ func resolveStandbys(t *testing.T, sources []standbySource, copies []standbyCopy
 	return views
 }
 
+// mergedStandbys reads the standbys of a slot through the merge that buildSyncPlan applies. It merges into a copy of plan.
+func mergedStandbys(t *testing.T, plan FolderSyncPlan, shared *sharedDestinations, slot int) []standbyView {
+	t.Helper()
+
+	plan.mergeStandbys(shared.standbysFor(slot))
+	return resolveStandbys(t, plan.standbySources, plan.standbys)
+}
+
 func Test_maybeDiff_When_SharedDestinationHasStandbyCopies_Then_EachPlannedCopyGetsThemInMapOrder(t *testing.T) {
 	t.Parallel()
 
@@ -11575,9 +11583,7 @@ func Test_maybeDiff_When_OneCopyDestinationIsShared_Then_LaterMappingsGetStandby
 				if plans[i].RepeatedCopies != tt.wantRepeated[i] {
 					t.Errorf("slot %d: RepeatedCopies = %d, want %d", i, plans[i].RepeatedCopies, tt.wantRepeated[i])
 				}
-				plan := plans[i]
-				plan.mergeStandbys(shared.standbysFor(i))
-				if got := resolveStandbys(t, plan.standbySources, plan.standbys); !slices.Equal(got, tt.wantStandbys[i]) {
+				if got := mergedStandbys(t, plans[i], shared, i); !slices.Equal(got, tt.wantStandbys[i]) {
 					t.Errorf("slot %d: standbys = %+v, want %+v", i, got, tt.wantStandbys[i])
 				}
 			}
@@ -12239,7 +12245,7 @@ func TestRunSync_When_LowestGmailCopyHasAnEmptyBody_Then_AHigherCopyOfTheMessage
 				"Total new messages to sync: 1",
 				"Sync completed successfully",
 			)
-			assertContainsNone(t, first, "errors occurred", "empty body")
+			assertContainsNone(t, first, "errors occurred", "empty body", extraCopiesMarker)
 			if got := dst.folderBodies("Scans"); !slices.Equal(got, wantBodies) {
 				t.Errorf("dst Scans bodies = %q, want %q", got, wantBodies)
 			}
@@ -12277,6 +12283,7 @@ func TestRunSync_When_FirstMappingOfAGmailDestinationHasAnEmptyBody_Then_Another
 		emptiedB     []uint32
 		wantRepeated int
 		hidden       bool
+		listed       bool
 	}{
 		{
 			name:         "the lowest copy of the first mapping is empty and it holds a second copy",
@@ -12304,6 +12311,47 @@ func TestRunSync_When_FirstMappingOfAGmailDestinationHasAnEmptyBody_Then_Another
 			wantRepeated: 1,
 			hidden:       true,
 		},
+		{
+			name:     "the only copy of the first mapping is empty and the lowest copy of the second is usable",
+			fromA:    []string{subjectBody(id, "a1")},
+			fromB:    []string{subjectBody(id, "b1"), subjectBody(id, "b2")},
+			emptiedA: []uint32{1},
+			wantBody: subjectBody(id, "b1"),
+		},
+		{
+			name:     "the only copy of the first mapping is empty, the lowest copy of the second is usable and the destination folder is listed",
+			fromA:    []string{subjectBody(id, "a1")},
+			fromB:    []string{subjectBody(id, "b1"), subjectBody(id, "b2")},
+			emptiedA: []uint32{1},
+			wantBody: subjectBody(id, "b1"),
+			listed:   true,
+		},
+		{
+			name:     "the only copy of the first mapping is empty, the lowest copy of the second is usable and the destination folder is hidden from LIST",
+			fromA:    []string{subjectBody(id, "a1")},
+			fromB:    []string{subjectBody(id, "b1"), subjectBody(id, "b2")},
+			emptiedA: []uint32{1},
+			wantBody: subjectBody(id, "b1"),
+			hidden:   true,
+		},
+		{
+			name:     "the only copy of the first mapping is empty, the lowest copy of the second is empty too and the destination folder is listed",
+			fromA:    []string{subjectBody(id, "a1")},
+			fromB:    []string{subjectBody(id, "b1"), subjectBody(id, "b2")},
+			emptiedA: []uint32{1},
+			emptiedB: []uint32{1},
+			wantBody: subjectBody(id, "b2"),
+			listed:   true,
+		},
+		{
+			name:     "the only copy of the first mapping is empty, the lowest copy of the second is empty too and the destination folder is hidden from LIST",
+			fromA:    []string{subjectBody(id, "a1")},
+			fromB:    []string{subjectBody(id, "b1"), subjectBody(id, "b2")},
+			emptiedA: []uint32{1},
+			emptiedB: []uint32{1},
+			wantBody: subjectBody(id, "b2"),
+			hidden:   true,
+		},
 	}
 	for _, tt := range tests {
 		for _, workers := range []int{1, 2} {
@@ -12318,6 +12366,9 @@ func TestRunSync_When_FirstMappingOfAGmailDestinationHasAnEmptyBody_Then_Another
 					src.answerBodyAt("B", uid, "NIL")
 				}
 				dstFolders := map[string][]fakeMsg{"INBOX": nil}
+				if tt.listed {
+					dstFolders["X"] = nil
+				}
 				var wantBodies []string
 				if tt.hidden {
 					dstFolders["X"] = fakeMsgs("other@x")
@@ -12337,7 +12388,7 @@ func TestRunSync_When_FirstMappingOfAGmailDestinationHasAnEmptyBody_Then_Another
 					want += repeatedCopiesLine(tt.wantRepeated)
 				}
 				assertContainsAll(t, first, want, "Total new messages to sync: 1", "Sync completed successfully")
-				assertContainsNone(t, first, "• B → X will copy", "errors occurred", "empty body")
+				assertContainsNone(t, first, "• B → X will copy", "errors occurred", "empty body", extraCopiesMarker)
 				if got := dst.folderBodies("X"); !slices.Equal(got, wantBodies) {
 					t.Errorf("dst X bodies = %q, want %q", got, wantBodies)
 				}
@@ -12449,13 +12500,15 @@ func Test_maybeDiff_When_ThreeOneCopyMappingsShareADestination_Then_OnlyTheFirst
 		name         string
 		refs         [][]uint32
 		wantUIDs     [][]uint32
+		wantRepeated []int
 		wantStandbys [][]standbyView
 		wantTotal    int64
 	}{
 		{
-			name:     "none of the copies is on the destination",
-			refs:     [][]uint32{{1, 2}, {10}, {20, 21, 22}},
-			wantUIDs: [][]uint32{{1}, nil, nil},
+			name:         "none of the copies is on the destination",
+			refs:         [][]uint32{{1, 2}, {10}, {20, 21, 22}},
+			wantUIDs:     [][]uint32{{1}, nil, nil},
+			wantRepeated: []int{1, 0, 0},
 			wantStandbys: [][]standbyView{
 				{
 					{planned: 1, folder: "A", uidValidity: 100, uid: 2},
@@ -12470,9 +12523,10 @@ func Test_maybeDiff_When_ThreeOneCopyMappingsShareADestination_Then_OnlyTheFirst
 			wantTotal: 1,
 		},
 		{
-			name:     "the first mapping lacks the id",
-			refs:     [][]uint32{nil, {10, 11}, {20}},
-			wantUIDs: [][]uint32{nil, {10}, nil},
+			name:         "the first mapping lacks the id",
+			refs:         [][]uint32{nil, {10, 11}, {20}},
+			wantUIDs:     [][]uint32{nil, {10}, nil},
+			wantRepeated: []int{0, 1, 0},
 			wantStandbys: [][]standbyView{
 				nil,
 				{{planned: 10, folder: "B", uidValidity: 101, uid: 11}, {planned: 10, folder: "C", uidValidity: 102, uid: 20}},
@@ -12485,6 +12539,7 @@ func Test_maybeDiff_When_ThreeOneCopyMappingsShareADestination_Then_OnlyTheFirst
 			dst:          map[string][]client.MessageRef{"m@x": msgRefs(900)},
 			refs:         [][]uint32{{1, 2}, {10, 11}, {20, 21, 22}},
 			wantUIDs:     [][]uint32{nil, nil, nil},
+			wantRepeated: []int{0, 0, 0},
 			wantStandbys: [][]standbyView{nil, nil, nil},
 		},
 		{
@@ -12492,6 +12547,7 @@ func Test_maybeDiff_When_ThreeOneCopyMappingsShareADestination_Then_OnlyTheFirst
 			dst:          map[string][]client.MessageRef{"m@x": msgRefs(0)},
 			refs:         [][]uint32{{1, 2}, {10, 11}, {20, 21, 22}},
 			wantUIDs:     [][]uint32{nil, nil, nil},
+			wantRepeated: []int{0, 0, 0},
 			wantStandbys: [][]standbyView{nil, nil, nil},
 		},
 	}
@@ -12518,9 +12574,13 @@ func Test_maybeDiff_When_ThreeOneCopyMappingsShareADestination_Then_OnlyTheFirst
 				if !slices.Equal(plans[i].SrcUIDs, tt.wantUIDs[i]) {
 					t.Errorf("slot %d: SrcUIDs = %v, want %v", i, plans[i].SrcUIDs, tt.wantUIDs[i])
 				}
-				plan := plans[i]
-				plan.mergeStandbys(shared.standbysFor(i))
-				if got := resolveStandbys(t, plan.standbySources, plan.standbys); !slices.Equal(got, tt.wantStandbys[i]) {
+				if plans[i].RepeatedCopies != tt.wantRepeated[i] || plans[i].ExtraCopies != 0 {
+					t.Errorf("slot %d: RepeatedCopies, ExtraCopies = %d, %d, want %d, 0", i, plans[i].RepeatedCopies, plans[i].ExtraCopies, tt.wantRepeated[i])
+				}
+				if len(tt.wantUIDs[i]) > 0 && plans[i].copyRule != copyOnePerMessageID {
+					t.Errorf("slot %d: copyRule = %d, want %d", i, plans[i].copyRule, copyOnePerMessageID)
+				}
+				if got := mergedStandbys(t, plans[i], shared, i); !slices.Equal(got, tt.wantStandbys[i]) {
 					t.Errorf("slot %d: standbys = %+v, want %+v", i, got, tt.wantStandbys[i])
 				}
 			}
@@ -12774,29 +12834,38 @@ func Test_buildSyncPlan_When_OneCopyDestinationHasCutCopies_Then_PlansCarryOwnSt
 func TestRunSync_When_EveryCopyOfAGmailMessageIdHasAnEmptyBody_Then_EachRunCountsOneErrorAndAppendsNothing(t *testing.T) {
 	t.Parallel()
 
-	const id = "scan@printer"
-	src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, subjectBody(id, "one"), subjectBody(id, "two"), subjectBody(id, "three"))})
-	src.answerBody(id, "NIL")
-	dst := newGmailDestination(t, map[string][]fakeMsg{})
-	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+	for _, verbose := range []bool{false, true} {
+		t.Run(fmt.Sprintf("verbose %t", verbose), func(t *testing.T) {
+			t.Parallel()
 
-	for run := 1; run <= 2; run++ {
-		out := &syncBuffer{}
-		opts := e2eOptions(out, "")
-		opts.autoConfirm = true
+			const id = "scan@printer"
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": sharedIDMsgs(id, subjectBody(id, "one"), subjectBody(id, "two"), subjectBody(id, "three"))})
+			src.answerBody(id, "NIL")
+			dst := newGmailDestination(t, map[string][]fakeMsg{})
+			cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
 
-		err := runSync(e2eContext(t), cfg, opts)
+			for run := 1; run <= 2; run++ {
+				out := &syncBuffer{}
+				opts := e2eOptions(out, "")
+				opts.autoConfirm, opts.verbose = true, verbose
 
-		if !errors.Is(err, ErrSilentExit) {
-			t.Fatalf("run %d error = %v, want ErrSilentExit", run, err)
-		}
-		assertContainsAll(t, out.String(), "Sync completed with errors. 0 messages uploaded, 1 errors occurred, 0 folders failed")
-		assertContainsNone(t, out.String(), "Sync completed successfully")
-		if n := dst.callCount("APPEND"); n != 0 {
-			t.Errorf("destination saw %d APPEND commands after run %d, want 0", n, run)
-		}
+				err := runSync(e2eContext(t), cfg, opts)
+
+				if !errors.Is(err, ErrSilentExit) {
+					t.Fatalf("run %d error = %v, want ErrSilentExit", run, err)
+				}
+				assertContainsAll(t, out.String(), "Sync completed with errors. 0 messages uploaded, 1 errors occurred, 0 folders failed")
+				assertContainsNone(t, out.String(), "Sync completed successfully")
+				if verbose {
+					assertContainsAll(t, out.String(), "source returned an empty body")
+				}
+				if n := dst.callCount("APPEND"); n != 0 {
+					t.Errorf("destination saw %d APPEND commands after run %d, want 0: an empty message must never reach it", n, run)
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
 	}
-	assertReadOnly(t, "source", src)
 }
 
 func Test_maybeDiff_When_OneCopyMappingsShareASourceFolder_Then_TheFolderStandsByOnlyAsItsOwnPlan(t *testing.T) {
@@ -12825,5 +12894,532 @@ func Test_maybeDiff_When_OneCopyMappingsShareASourceFolder_Then_TheFolderStandsB
 	}
 	if len(shared.reserved) != 0 {
 		t.Errorf("reserved = %v after the last slot, want none", shared.reserved)
+	}
+}
+
+func TestRunSync_When_MappingsGoToDifferentGmailFolders_Then_EachFolderGetsItsOwnCopy(t *testing.T) {
+	t.Parallel()
+
+	for _, workers := range []int{1, 2} {
+		t.Run(fmt.Sprintf("%d workers", workers), func(t *testing.T) {
+			t.Parallel()
+
+			const id = "m@x"
+			fromS1 := []string{subjectBody(id, "s1 first"), subjectBody(id, "s1 second")}
+			fromS2 := subjectBody(id, "s2")
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"S1": sharedIDMsgs(id, fromS1...), "S2": sharedIDMsgs(id, fromS2)})
+			dst := newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, workers, mapping("S1", "D1"), mapping("S2", "D2"))
+
+			first := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, first,
+				fmt.Sprintf("• S1 → D1 will copy 1 messages (≈ %d B)\n", len(fromS1[0]))+repeatedCopiesLine(1),
+				fmt.Sprintf("• S2 → D2 will copy 1 messages (≈ %d B)\n", len(fromS2)),
+				fmt.Sprintf("Total new messages to sync: 2 (≈ %d B)", totalSize(fromS1[0], fromS2)),
+				"Sync completed successfully",
+			)
+			if n := strings.Count(first, repeatedCopiesMarker); n != 1 {
+				t.Errorf("output holds %d repeated-copies lines, want 1: only S1 has a repeated copy\noutput: %q", n, first)
+			}
+			assertIDs(t, "dst APPENDs to D1", dst.appended("D1"), id)
+			assertIDs(t, "dst APPENDs to D2", dst.appended("D2"), id)
+			if got := dst.folderBodies("D1"); !slices.Equal(got, fromS1[:1]) {
+				t.Errorf("dst D1 bodies = %q, want the lowest copy of S1 %q", got, fromS1[:1])
+			}
+			if got := dst.folderBodies("D2"); !slices.Equal(got, []string{fromS2}) {
+				t.Errorf("dst D2 bodies = %q, want %q", got, []string{fromS2})
+			}
+
+			second := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != 2 {
+				t.Errorf("destination saw %d APPENDs over both runs, want 2", n)
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_GmailFolderHoldsRepeatedAndSingleMessageIds_Then_OnlyTheLowestCopyOfEachIdIsPlanned(t *testing.T) {
+	t.Parallel()
+
+	// The lowest copy of m@x is the largest and the lowest copy of n@x is the smallest, so a pick by size differs from a pick by UID.
+	m := []string{subjectBody("m@x", "the first copy has a long subject"), subjectBody("m@x", "b"), subjectBody("m@x", "cc")}
+	n := []string{subjectBody("n@x", "d"), subjectBody("n@x", "the second copy has a long subject")}
+	o := subjectBody("o@x", "o")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"Scans": slices.Concat(sharedIDMsgs("m@x", m...), sharedIDMsgs("n@x", n...), sharedIDMsgs("o@x", o)),
+	})
+	dst := newGmailDestination(t, map[string][]fakeMsg{})
+	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+	planned := []string{m[0], n[0], o}
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first,
+		fmt.Sprintf("• Scans → Scans will copy 3 messages (≈ %d B)\n", totalSize(planned...))+repeatedCopiesLine(3),
+		fmt.Sprintf("Total new messages to sync: 3 (≈ %d B)", totalSize(planned...)),
+		"Sync completed successfully",
+	)
+	assertContainsNone(t, first, extraCopiesMarker, "errors occurred", folderFailuresHeader, "Sync completed with errors")
+	assertIDs(t, "dst APPENDs", dst.appended("Scans"), "m@x", "n@x", "o@x")
+	if got := dst.folderBodies("Scans"); !slices.Equal(got, planned) {
+		t.Errorf("dst Scans bodies = %q, want the lowest copy of each Message-Id %q", got, planned)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "All folders already synced!")
+	if got := dst.callCount("APPEND"); got != 3 {
+		t.Errorf("destination saw %d APPENDs over both runs, want 3", got)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_GmailDestinationHoldsOneOfTwoMessageIds_Then_OnlyTheOtherIdIsPlanned(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                      string
+		destinationScanSendsNoUID bool
+	}{
+		{name: "the destination scan sends the UID of the held copy"},
+		{name: "the destination scan sends no UID for the held copy", destinationScanSendsNoUID: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := []string{subjectBody("m@x", "one"), subjectBody("m@x", "two"), subjectBody("m@x", "three")}
+			n := []string{subjectBody("n@x", "one"), subjectBody("n@x", "two")}
+			held := subjectBody("m@x", "held")
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": slices.Concat(sharedIDMsgs("m@x", m...), sharedIDMsgs("n@x", n...))})
+			dst := newGmailDestination(t, map[string][]fakeMsg{"Scans": sharedIDMsgs("m@x", held)})
+			if tt.destinationScanSendsNoUID {
+				dst.omitScanUIDIn("Scans")
+			}
+			cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+
+			first := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, first,
+				fmt.Sprintf("• Scans → Scans will copy 1 messages (≈ %d B)\n", len(n[0]))+repeatedCopiesLine(1),
+				"Sync completed successfully",
+			)
+			assertContainsNone(t, first, extraCopiesMarker)
+			assertIDs(t, "dst APPENDs", dst.appended("Scans"), "n@x")
+			if got, want := dst.folderBodies("Scans"), []string{held, n[0]}; !slices.Equal(got, want) {
+				t.Errorf("dst Scans bodies = %q, want the held copy and the lowest copy of n@x %q", got, want)
+			}
+
+			second := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if got := len(dst.appended("Scans")); got != 1 {
+				t.Errorf("destination saw %d APPENDs over both runs, want 1", got)
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func Test_maybeDiff_When_OneCopyDestinationHoldsTheIdAtTheFirstSlot_Then_NothingIsReserved(t *testing.T) {
+	t.Parallel()
+
+	mappings := []config.DirectoryMapping{mapping("A", "D"), mapping("B", "D")}
+	shared := newSharedDestinations(mappings)
+	plans := make([]FolderSyncPlan, len(mappings))
+	var totalNew atomic.Int64
+	var totalNewSize atomic.Uint64
+	srcMap := map[string][]client.MessageRef{"x@x": msgRefs(1, 2)}
+	s := &folderScan{srcMap: srcMap, dstMap: map[string][]client.MessageRef{"x@x": msgRefs(90)}, srcMessages: 2, dstExists: true}
+
+	diffBothSidesUnder(t, copyOnePerMessageID, s, 0, mappings, plans, &totalNew, &totalNewSize, shared)
+
+	if got := shared.reserved["D"]["x@x"]; len(got) != 0 {
+		t.Errorf("reserved copies of x@x after slot 0 = %v, want none: a plan that copies nothing reserves nothing", got)
+	}
+}
+
+func TestRunSync_When_ThreeMappingsShareAGmailDestination_Then_OneCopyArrivesAndTheNextRunCopiesNothing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		destination map[string][]fakeMsg
+		name        string
+		workers     int
+		wantAppends int
+	}{
+		{name: "one worker and a missing destination", workers: 1, destination: map[string][]fakeMsg{"INBOX": nil}, wantAppends: 1},
+		{name: "two workers and a missing destination", workers: 2, destination: map[string][]fakeMsg{"INBOX": nil}, wantAppends: 1},
+		{name: "two workers and a destination that holds the id", workers: 2, destination: map[string][]fakeMsg{"X": sharedIDMsgs("x@x", subjectBody("x@x", "held"))}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const id = "x@x"
+			fromA := []string{subjectBody(id, "a1"), subjectBody(id, "a2")}
+			fromB := []string{subjectBody(id, "b1")}
+			fromC := []string{subjectBody(id, "c1"), subjectBody(id, "c2"), subjectBody(id, "c3")}
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": sharedIDMsgs(id, fromA...), "B": sharedIDMsgs(id, fromB...), "C": sharedIDMsgs(id, fromC...)})
+			dst := newGmailDestination(t, tt.destination)
+			cfg := e2eConfig(src, dst, tt.workers, mapping("A", "X"), mapping("B", "X"), mapping("C", "X"))
+
+			first := runSyncOnce(t, cfg)
+
+			if tt.wantAppends == 0 {
+				assertContainsAll(t, first, "All folders already synced!")
+			} else {
+				assertContainsAll(t, first,
+					fmt.Sprintf("• A → X will copy 1 messages (≈ %d B)\n", len(fromA[0]))+repeatedCopiesLine(1),
+					"Total new messages to sync: 1",
+					"Sync completed successfully",
+				)
+			}
+			assertContainsNone(t, first, "• B → X will copy", "• C → X will copy", extraCopiesMarker, "errors occurred")
+			if n := dst.callCount("APPEND"); n != tt.wantAppends {
+				t.Errorf("destination saw %d APPENDs, want %d", n, tt.wantAppends)
+			}
+			if tt.wantAppends == 1 {
+				if got := dst.folderBodies("X"); !slices.Equal(got, fromA[:1]) {
+					t.Errorf("dst X bodies = %q, want the lowest copy of the first mapping %q", got, fromA[:1])
+				}
+			}
+
+			second := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != tt.wantAppends {
+				t.Errorf("destination saw %d APPENDs over both runs, want %d", n, tt.wantAppends)
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func Test_recheckExistingDestinations_When_OneCopyPlanLosesAHeldId_Then_KeptPlanCountsOnlyItsOwnRepeatedCopies(t *testing.T) {
+	t.Parallel()
+
+	m := []string{subjectBody("m@x", "m1"), subjectBody("m@x", "m22"), subjectBody("m@x", "m333")}
+	n := []string{subjectBody("n@x", "n1 is the lowest"), subjectBody("n@x", "n2")}
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": slices.Concat(sharedIDMsgs("m@x", m...), sharedIDMsgs("n@x", n...))})
+	// The held copy has the size of the third source copy, so a count rule would take the lowest UID as not held.
+	dst := newGmailDestination(t, map[string][]fakeMsg{"Work": sharedIDMsgs("m@x", m[2])})
+	srcC := newAppClient(t, src, "src")
+	dstC := newAppClient(t, dst, "dst")
+	plans := []FolderSyncPlan{{
+		SourceFolder:      "Work",
+		DestinationFolder: "Work",
+		SrcUIDs:           []uint32{1, 4},
+		NewMessages:       2,
+		NewSize:           uint64(len(m[0]) + len(n[0])),
+		RepeatedCopies:    3,
+		SrcUIDValidity:    1,
+		copyRule:          copyOnePerMessageID,
+	}}
+	out := &syncBuffer{}
+
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, srcC, dstC, plans, map[string]struct{}{"Work": {}})
+
+	if err != nil || failures != nil {
+		t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
+	}
+	if len(kept) != 1 {
+		t.Fatalf("kept = %+v, want one plan", kept)
+	}
+	got := kept[0]
+	if !slices.Equal(got.SrcUIDs, []uint32{4}) || got.NewMessages != 1 || got.NewSize != uint64(len(n[0])) {
+		t.Errorf("kept SrcUIDs, NewMessages, NewSize = %v, %d, %d, want [4], 1, %d", got.SrcUIDs, got.NewMessages, got.NewSize, len(n[0]))
+	}
+	if got.RepeatedCopies != 1 || got.ExtraCopies != 0 || got.copyRule != copyOnePerMessageID {
+		t.Errorf("kept RepeatedCopies, ExtraCopies, copyRule = %d, %d, %d, want 1, 0, %d", got.RepeatedCopies, got.ExtraCopies, got.copyRule, copyOnePerMessageID)
+	}
+	want := "  ℹ️  Destination folder Work already exists and holds 1 of the 2 planned messages from Work, so they are not copied\n"
+	if out.String() != want {
+		t.Errorf("output = %q, want %q", out.String(), want)
+	}
+}
+
+func TestRunSync_When_HiddenGmailDestinationHoldsOneOfTwoMessageIds_Then_OnlyTheOtherIdIsCopied(t *testing.T) {
+	t.Parallel()
+
+	m := []string{subjectBody("m@x", "m1"), subjectBody("m@x", "m22"), subjectBody("m@x", "m333")}
+	n := []string{subjectBody("n@x", "n1"), subjectBody("n@x", "n2")}
+	// The held copy has the size of the third source copy, so a count rule would take the lowest UID as not held.
+	held := m[2]
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": slices.Concat(sharedIDMsgs("m@x", m...), sharedIDMsgs("n@x", n...))})
+	dst := newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil, "Work": sharedIDMsgs("m@x", held)})
+	dst.hideFromList("Work")
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first,
+		fmt.Sprintf("• Work → Work will copy 2 messages (≈ %d B)\n", len(m[0])+len(n[0]))+repeatedCopiesLine(3),
+		"  ℹ️  Destination folder Work already exists and holds 1 of the 2 planned messages from Work, so they are not copied\n",
+		"Sync completed successfully",
+	)
+	assertContainsNone(t, first, extraCopiesMarker, "no longer holds")
+	assertIDs(t, "dst APPENDs", dst.appended("Work"), "n@x")
+	if got, want := dst.folderBodies("Work"), []string{held, n[0]}; !slices.Equal(got, want) {
+		t.Errorf("dst Work bodies = %q, want the held copy and the lowest copy of n@x %q", got, want)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "holds 2 of the 2 planned messages", "All folders already synced!")
+	if got := len(dst.appended("Work")); got != 1 {
+		t.Errorf("destination saw %d APPENDs over both runs, want 1", got)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_PlannedLowestGmailCopyLeavesTheSourceBeforeTheRecheck_Then_TheHigherCopyIsNotAddedUntilTheNextRun(t *testing.T) {
+	t.Parallel()
+
+	const (
+		heldLine = "  ℹ️  Destination folder Work already exists and holds 1 of the 2 planned messages from Work, so they are not copied\n"
+		goneLine = "  ℹ️  Source folder Work no longer holds 1 of the 2 planned messages for Work, so they are not copied\n"
+	)
+	m := []string{subjectBody("m@x", "m1"), subjectBody("m@x", "m22"), subjectBody("m@x", "m333")}
+	n := []string{subjectBody("n@x", "n1"), subjectBody("n@x", "n2")}
+	// The held copy has the size of the third source copy, so a count rule would take the lowest UID as not held.
+	held := m[2]
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": slices.Concat(sharedIDMsgs("m@x", m...), sharedIDMsgs("n@x", n...))})
+	dst := newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil, "Work": sharedIDMsgs("m@x", held)})
+	dst.hideFromList("Work")
+	var once sync.Once
+	dst.onCommand("CREATE", func() { once.Do(func() { src.removeMessageAt("Work", 4) }) })
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first,
+		fmt.Sprintf("• Work → Work will copy 2 messages (≈ %d B)\n", len(m[0])+len(n[0]))+repeatedCopiesLine(3),
+		heldLine, goneLine, "All folders already synced!",
+	)
+	assertContainsNone(t, first, "holds 2 of the 2", "Syncing messages")
+	assertIDs(t, "dst APPENDs after the first run", dst.appended("Work"))
+	if got := src.callCount("UID FETCH"); got != 0 {
+		t.Errorf("source saw %d UID FETCH commands, want 0: the recheck must not add the higher copy", got)
+	}
+	if got := dst.callCount("LOGIN"); got != 1 {
+		t.Errorf("destination saw %d LOGIN commands, want 1: no worker may connect", got)
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, fmt.Sprintf("• Work → Work will copy 2 messages (≈ %d B)\n", len(m[0])+len(n[1]))+repeatedCopiesLine(2), heldLine, "Sync completed successfully")
+	assertContainsNone(t, second, "no longer holds")
+	assertIDs(t, "dst APPENDs after the second run", dst.appended("Work"), "n@x")
+	if got, want := dst.folderBodies("Work"), []string{held, n[1]}; !slices.Equal(got, want) {
+		t.Errorf("dst Work bodies = %q, want the held copy and the remaining copy of n@x %q", got, want)
+	}
+}
+
+func TestRunSync_When_MirrorRunHasAGmailDestination_Then_EveryFolderAndSubfolderGetsOneCopyPerMessageId(t *testing.T) {
+	t.Parallel()
+
+	inbox := []string{subjectBody("i@x", "inbox one"), subjectBody("i@x", "inbox two")}
+	work := []string{subjectBody("w@x", "work one"), subjectBody("w@x", "work two"), subjectBody("w@x", "work three")}
+	sub := []string{subjectBody("k@x", "sub one"), subjectBody("k@x", "sub two")}
+	sent := []string{subjectBody("s@x", "sent one"), subjectBody("s@x", "sent two")}
+	single := imapFullBody("x@x")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":        sharedIDMsgs("i@x", inbox...),
+		"Work":         slices.Concat(sharedIDMsgs("w@x", work...), fakeMsgs("x@x")),
+		"Work/Sub":     sharedIDMsgs("k@x", sub...),
+		"[Gmail]/Sent": sharedIDMsgs("s@x", sent...),
+	})
+	src.markNoSelect("[Gmail]")
+	dst := newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil, "[Gmail]/Sent": nil})
+	dst.markNoSelect("[Gmail]")
+	cfg := e2eConfig(src, dst, 2)
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first,
+		fmt.Sprintf("• INBOX → INBOX will copy 1 messages (≈ %d B)\n", len(inbox[0]))+repeatedCopiesLine(1),
+		fmt.Sprintf("• Work → Work will copy 2 messages (≈ %d B)\n", len(work[0])+len(single))+repeatedCopiesLine(2),
+		fmt.Sprintf("• Work/Sub → Work/Sub will copy 1 messages (≈ %d B)\n", len(sub[0]))+repeatedCopiesLine(1),
+		fmt.Sprintf("• [Gmail]/Sent → [Gmail]/Sent will copy 1 messages (≈ %d B)\n", len(sent[0]))+repeatedCopiesLine(1),
+		"Total new messages to sync: 5",
+		"Sync completed successfully",
+	)
+	assertContainsNone(t, first, extraCopiesMarker, "errors occurred", "cannot be synced")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "i@x")
+	assertIDs(t, "dst Work", dst.folderMsgIDs("Work"), "w@x", "x@x")
+	assertIDs(t, "dst Work/Sub", dst.folderMsgIDs("Work/Sub"), "k@x")
+	assertIDs(t, "dst [Gmail]/Sent", dst.folderMsgIDs("[Gmail]/Sent"), "s@x")
+	for folder, want := range map[string]string{"INBOX": inbox[0], "Work/Sub": sub[0], "[Gmail]/Sent": sent[0]} {
+		if got := dst.folderBodies(folder); !slices.Equal(got, []string{want}) {
+			t.Errorf("dst %s bodies = %q, want the lowest source copy %q", folder, got, want)
+		}
+	}
+	for name, srv := range map[string]*fakeServer{"source": src, "destination": dst} {
+		if slices.Contains(srv.capturedNames("EXAMINE"), "[Gmail]") {
+			t.Errorf("%s opened [Gmail], a folder its LIST marks \\Noselect", name)
+		}
+	}
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "All folders already synced!")
+	if n := dst.callCount("APPEND"); n != 5 {
+		t.Errorf("destination saw %d APPENDs over both runs, want 5", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_ServerRefusesCapability_Then_RunFailsBeforeAnyScanAndNamesTheLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		wantStep     string
+		wantLabel    string
+		refuseSource bool
+	}{
+		{name: "source", refuseSource: true, wantStep: "source connection failed", wantLabel: "[src] capability"},
+		{name: "destination", wantStep: "destination connection failed", wantLabel: "[dst] capability"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			refusing := dst
+			if tt.refuseSource {
+				refusing = src
+			}
+			refusing.addConnHandler(scriptedHandler(refusing, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+				if verb == "CAPABILITY" {
+					return "NO [CANNOT] capability refused", true
+				}
+				return "", false
+			}))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+			if err == nil {
+				t.Fatalf("runSync error = nil, want the capability failure\noutput: %s", out.String())
+			}
+			for _, want := range []string{tt.wantStep, "failed to read server capabilities", tt.wantLabel, "capability refused"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			assertContainsNone(t, out.String(), "will copy", "Syncing messages")
+			for name, srv := range map[string]*fakeServer{"source": src, "destination": dst} {
+				for _, verb := range []string{"EXAMINE", "STATUS", "FETCH", "CREATE", "APPEND"} {
+					if n := srv.callCount(verb); n != 0 {
+						t.Errorf("%s saw %d %s commands, want 0: the run must fail before any scan or write", name, n, verb)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_GmailRunUsesTwoWorkers_Then_EachConnectionAsksForCapabilitiesOnce(t *testing.T) {
+	t.Parallel()
+
+	// The store server greeting lists its capabilities, so go-imap sends no CAPABILITY before LOGIN
+	// and the count per connection is the one check that New makes after LOGIN.
+	const folders = 6
+	srcFolders := make(map[string][]fakeMsg, folders)
+	mappings := make([]config.DirectoryMapping, 0, folders)
+	for i := range folders {
+		name := fmt.Sprintf("F%d", i)
+		srcFolders[name] = sharedIDMsgs(fmt.Sprintf("m%d@x", i), subjectBody(fmt.Sprintf("m%d@x", i), "one"), subjectBody(fmt.Sprintf("m%d@x", i), "two"))
+		mappings = append(mappings, mapping(name, name))
+	}
+	src := newStoreServer(t, "/", srcFolders)
+	dst := newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 2, mappings...)
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, "Total new messages to sync: 6", "Sync completed successfully")
+	const connections = 3
+	for name, srv := range map[string]*fakeServer{"source": src, "destination": dst} {
+		if n := srv.callCount("LOGIN"); n != connections {
+			t.Errorf("%s saw %d LOGIN commands, want %d: one planning client and two workers", name, n, connections)
+		}
+		if n := srv.callCount("CAPABILITY"); n != connections {
+			t.Errorf("%s saw %d CAPABILITY commands, want %d: one per connection and none per plan", name, n, connections)
+		}
+	}
+}
+
+func Test_copyRule_When_ZeroValue_Then_CopiesByCount(t *testing.T) {
+	t.Parallel()
+
+	var rule copyRule
+	three := []client.MessageRef{{UID: 1, Size: 10}, {UID: 2, Size: 20}, {UID: 3, Size: 30}}
+
+	if rule != copyByCount || (FolderSyncPlan{}).copyRule != copyByCount {
+		t.Errorf("zero copyRule = %d and zero plan rule = %d, want %d", rule, (FolderSyncPlan{}).copyRule, copyByCount)
+	}
+	if got := rule.sourceCopies(three); len(got) != 3 {
+		t.Errorf("sourceCopies of the zero rule returned %d refs, want 3", len(got))
+	}
+}
+
+func Test_rediffPlan_When_PlanHasNoCopyRule_Then_CountsByCopiesAndLeavesNothingOut(t *testing.T) {
+	t.Parallel()
+
+	x := []client.MessageRef{{UID: 1, Size: 10}, {UID: 2, Size: 20}, {UID: 3, Size: 30}}
+	plan := FolderSyncPlan{SourceFolder: "S", DestinationFolder: "D", SrcUIDs: []uint32{1, 2, 3}, NewMessages: 3, NewSize: 60, RepeatedCopies: 9}
+
+	tests := []struct {
+		name         string
+		dst          map[string][]client.MessageRef
+		wantUIDs     []uint32
+		wantExtra    int
+		wantHeld     int
+		wantSizeLeft uint64
+	}{
+		{name: "the destination holds none", dst: map[string][]client.MessageRef{}, wantUIDs: []uint32{1, 2, 3}, wantSizeLeft: 60},
+		{name: "the destination holds the copy of the lowest size", dst: map[string][]client.MessageRef{"x@x": {{UID: 90, Size: 10}}}, wantUIDs: []uint32{2, 3}, wantExtra: 2, wantHeld: 1, wantSizeLeft: 50},
+		{name: "the destination holds three copies", dst: map[string][]client.MessageRef{"x@x": msgRefs(90, 91, 92)}, wantHeld: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, drops := rediffPlan(plan, map[string][]client.MessageRef{"x@x": slices.Clone(x)}, tt.dst)
+
+			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) || got.NewSize != tt.wantSizeLeft {
+				t.Errorf("SrcUIDs, NewSize = %v, %d, want %v, %d", got.SrcUIDs, got.NewSize, tt.wantUIDs, tt.wantSizeLeft)
+			}
+			if got.RepeatedCopies != 0 || got.ExtraCopies != tt.wantExtra {
+				t.Errorf("RepeatedCopies, ExtraCopies = %d, %d, want 0, %d", got.RepeatedCopies, got.ExtraCopies, tt.wantExtra)
+			}
+			if drops.held != tt.wantHeld || drops.gone != 0 {
+				t.Errorf("drops = %+v, want held %d and gone 0", drops, tt.wantHeld)
+			}
+		})
+	}
+}
+
+func Test_copyRuleOf_When_DestinationAdvertisesGmailExtension_Then_ChoosesTheOneCopyRule(t *testing.T) {
+	t.Parallel()
+
+	gmail := newAppClient(t, newGmailDestination(t, map[string][]fakeMsg{"INBOX": nil}), "gmail")
+	plain := newAppClient(t, newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil}), "plain")
+
+	if got := copyRuleOf(gmail); got != copyOnePerMessageID {
+		t.Errorf("copyRuleOf(gmail) = %d, want %d", got, copyOnePerMessageID)
+	}
+	if got := copyRuleOf(plain); got != copyByCount {
+		t.Errorf("copyRuleOf(plain) = %d, want %d", got, copyByCount)
 	}
 }

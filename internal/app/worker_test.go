@@ -1379,3 +1379,106 @@ func Test_runFolderSync_When_PlannedCopyIsEmptyAndItsOwnFolderHoldsAnotherCopy_T
 		})
 	}
 }
+
+func Test_runFolderSync_When_OneStandbySourceHoldsSeveralCopies_Then_OnlyTheFirstUsableCopyIsAppended(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		emptyUIDs  []uint32
+		wantBodies []string
+		wantSynced int
+		wantErrs   int
+	}{
+		{name: "the first copy is usable", wantBodies: []string{"two"}, wantSynced: 1},
+		{name: "the first copy is empty", emptyUIDs: []uint32{2}, wantBodies: []string{"three"}, wantSynced: 1},
+		{name: "every copy is empty", emptyUIDs: []uint32{2, 3}, wantErrs: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bodies := map[string]string{"two": subjectBody("m1@x", "two"), "three": subjectBody("m1@x", "three")}
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": fakeMsgs("m1@x"),
+				"B": {{msgID: "other@x"}, {msgID: "m1@x", body: bodies["two"]}, {msgID: "m1@x", body: bodies["three"]}},
+			})
+			src.answerBodyIn("A", "m1@x", "NIL")
+			for _, uid := range tt.emptyUIDs {
+				src.answerBodyAt("B", uid, "NIL")
+			}
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+			plan := standbyPlan("B")
+			plan.standbys = append(plan.standbys, standbyCopy{planned: 1, uid: 3, source: 0})
+
+			got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+			if got.synced != tt.wantSynced || got.errs != tt.wantErrs {
+				t.Errorf("synced, errors = %d, %d, want %d, %d", got.synced, got.errs, tt.wantSynced, tt.wantErrs)
+			}
+			var want []string
+			for _, key := range tt.wantBodies {
+				want = append(want, bodies[key])
+			}
+			if got := dst.folderBodies("X"); !slices.Equal(got, want) {
+				t.Errorf("dst X bodies = %q, want %q: the message arrives once, from its first usable copy", got, want)
+			}
+			if n := dst.callCount("APPEND"); n != len(want) {
+				t.Errorf("destination saw %d APPEND commands, want %d", n, len(want))
+			}
+			assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+		})
+	}
+}
+
+func Test_runFolderSync_When_DestinationRefusesTheStandbyInVerboseMode_Then_LogsTheEscapedReason(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.refuseAppendWith("NO Quota \x1b[2J exceeded")
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B", "C"), true)
+
+	if got.synced != 0 || got.errs != 1 {
+		t.Errorf("synced, errors = %d, %d, want 0, 1", got.synced, got.errs)
+	}
+	assertContainsAll(t, got.log, "Failed to append message to X: [dst] source returned an empty body", `Quota \x1b[2J exceeded`)
+	assertContainsNone(t, got.log, "\x1b[2J")
+	if n := strings.Count(got.log, "Failed to append message to X: "); n != 2 {
+		t.Errorf("log holds %d failed-append lines, want 2: the refused body and the refused standby\nlog: %s", n, got.log)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+}
+
+func Test_runFolderSync_When_ContextEndsDuringTheStandbyAppend_Then_ReturnsCanceledWithoutCounting(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(subjectBody("m1@x", "from B")), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	// The handler reacts after it read the whole literal, so the cancel never lands before the continuation.
+	dst := newFakeServer(t)
+	dst.addConnHandler(scriptedHandler(dst, []string{"X"}, func(verb string, _ int) (string, bool) {
+		if verb == "APPEND" {
+			cancel()
+			return "", true
+		}
+		return "", false
+	}))
+
+	got := runStandbyPlan(ctx, t, src, dst, standbyPlan("B", "C"), false)
+
+	if got.synced != 0 || got.errs != 0 {
+		t.Errorf("synced, errors = %d, %d, want 0, 0: a failure after the cancel is not a message error", got.synced, got.errs)
+	}
+	if want := "1/1 Canceled A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1: the standby of B", n)
+	}
+}

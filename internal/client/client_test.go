@@ -1345,6 +1345,212 @@ func Test_detectOneCopyPerID_When_ContextEndsAfterTheReply_Then_ReturnsErrorAndS
 	}
 }
 
+func Test_New_When_LoginUsesCramMD5_Then_TheCapabilityReplyDecides(t *testing.T) {
+	t.Parallel()
+
+	const greeting = "* OK [CAPABILITY IMAP4rev1 AUTH=CRAM-MD5] fake ready"
+	tests := []struct {
+		name         string
+		authCode     string
+		capabilities string
+		want         bool
+	}{
+		{name: "AUTHENTICATE OK and the CAPABILITY reply list it", authCode: "[CAPABILITY IMAP4rev1 X-GM-EXT-1]", capabilities: "IMAP4rev1 X-GM-EXT-1", want: true},
+		{name: "AUTHENTICATE OK lists it and the CAPABILITY reply does not", authCode: "[CAPABILITY IMAP4rev1 X-GM-EXT-1]", capabilities: "IMAP4rev1", want: false},
+		{name: "AUTHENTICATE OK carries a list without it and the CAPABILITY reply lists it", authCode: "[CAPABILITY IMAP4rev1]", capabilities: "IMAP4rev1 X-GM-EXT-1", want: true},
+		{name: "AUTHENTICATE OK carries no list and the CAPABILITY reply lists it", capabilities: "IMAP4rev1 X-GM-EXT-1", want: true},
+		{name: "neither lists it", capabilities: "IMAP4rev1", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandlerGreeting(srv, greeting, chainHooks(authenticateAs(tt.authCode), capabilityAs(tt.capabilities))))
+
+			c := newReadyClient(t, srv, Options{Auth: "cram-md5"})
+
+			if got := c.KeepsOneCopyPerMessageID(); got != tt.want {
+				t.Errorf("KeepsOneCopyPerMessageID = %v, want %v: the CAPABILITY reply decides", got, tt.want)
+			}
+			for verb, want := range map[string]int{"AUTHENTICATE": 1, "LOGIN": 0, "CAPABILITY": 1} {
+				if got := srv.callCount(verb); got != want {
+					t.Errorf("%s count = %d, want %d", verb, got, want)
+				}
+			}
+		})
+	}
+}
+
+func Test_detectOneCopyPerID_When_ServerStaysSilentOnCapability_Then_WatchdogTripsAndTheRetryReadsTheNewSession(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	st := newStall(verbIs("CAPABILITY"))
+	firstEnded := make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, st.intercept), firstEnded))
+	srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs(""), capabilityAs("IMAP4rev1 X-GM-EXT-1"))))
+	c := newWatchedClient(t, srv, tripLimit)
+
+	err := awaitCall(t, "detectOneCopyPerID", func() error { return c.detectOneCopyPerID(t.Context()) })
+
+	if err != nil {
+		t.Fatalf("detectOneCopyPerID error = %v, want nil: the watchdog trip is transient and the retry succeeds", err)
+	}
+	if !c.KeepsOneCopyPerMessageID() {
+		t.Error("KeepsOneCopyPerMessageID = false, want true: the answer comes from the new session")
+	}
+	awaitSignal(t, firstEnded, "the watchdog to close the silent socket")
+	for verb, want := range map[string]int{"LOGIN": 2, "CAPABILITY": 2} {
+		if got := srv.callCount(verb); got != want {
+			t.Errorf("%s count = %d, want %d", verb, got, want)
+		}
+	}
+}
+
+func Test_Client_When_SessionIsReplacedAfterTheCheck_Then_KeepsTheValueAndAsksNothingMore(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs(""), capabilityAs("IMAP4rev1 X-GM-EXT-1"), byeOn(verbIs("EXAMINE")))))
+	// The new session advertises nothing, so a second check would turn the value off.
+	srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs("[CAPABILITY IMAP4rev1]"), capabilityAs("IMAP4rev1"))))
+	c := newReadyClient(t, srv, Options{})
+	if !c.KeepsOneCopyPerMessageID() {
+		t.Fatal("KeepsOneCopyPerMessageID = false after New, want true")
+	}
+	if got := srv.callCount("CAPABILITY"); got != 1 {
+		t.Fatalf("CAPABILITY count after New = %d, want 1", got)
+	}
+
+	_, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageMap error = %v, want nil after the reconnect", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Fatalf("LOGIN count = %d, want 2: the BYE must have caused a reconnect", got)
+	}
+	if !c.KeepsOneCopyPerMessageID() {
+		t.Error("KeepsOneCopyPerMessageID = false after the reconnect, want the value of New")
+	}
+	if got := srv.callCount("CAPABILITY"); got != 1 {
+		t.Errorf("CAPABILITY count = %d, want 1: the reconnect must not ask again", got)
+	}
+}
+
+func Test_New_When_ConnectionDropsDuringCapabilityCheckAndReloginIsRefusedPermanently_Then_FailsAndClosesEverySocket(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	firstEnded, secondEnded := make(chan struct{}), make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		return cmd.verb == "CAPABILITY", false
+	}), firstEnded))
+	srv.addConnHandler(endedSignal(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."), secondEnded))
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "dst", DialTimeout: 5 * time.Second})
+
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the reconnect failure")
+	}
+	if c != nil {
+		t.Error("New returned a client alongside the error")
+	}
+	for _, want := range []string{"failed to read server capabilities", "Authentication failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	if got := classifyError(err); got != ClassPermanent {
+		t.Errorf("classifyError(err) = %s, want %s", got, ClassPermanent)
+	}
+	awaitSignal(t, firstEnded, "the client to close the dropped session")
+	awaitSignal(t, secondEnded, "the client to close the refused session")
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2: the first session and one refused reconnect", got)
+	}
+}
+
+// Sequential - swaps the package-level sleepCtx var.
+func Test_New_When_ConnectionDropsDuringCapabilityCheckAndEveryReloginFailsTemporarily_Then_FailsWithTheLabel(t *testing.T) {
+	srv := newFakeServer(t)
+	firstEnded := make(chan struct{})
+	srv.addConnHandler(endedSignal(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		return cmd.verb == "CAPABILITY", false
+	}), firstEnded))
+	for range maxReconnectAttempts {
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	}
+	recordSleeps(t, srv)
+
+	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "dst", DialTimeout: 5 * time.Second})
+
+	if err == nil {
+		c.Cancel()
+		t.Fatal("New returned nil error, want the reconnect give-up")
+	}
+	if c != nil {
+		t.Error("New returned a client alongside the error")
+	}
+	for _, want := range []string{"failed to read server capabilities", "[dst] failed to reconnect after retries"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	awaitSignal(t, firstEnded, "the client to close the dropped session")
+	if got := srv.callCount("LOGIN"); got != 1+maxReconnectAttempts {
+		t.Errorf("LOGIN count = %d, want %d: the first session and every reconnect attempt", got, 1+maxReconnectAttempts)
+	}
+}
+
+func Test_New_When_UntaggedCapabilityComesBeforeLoginOK_Then_TheExplicitReplyDecides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		capabilities string
+		want         bool
+	}{
+		{name: "the CAPABILITY reply lacks the extension", capabilities: "IMAP4rev1", want: false},
+		{name: "the CAPABILITY reply lists the extension", capabilities: "IMAP4rev1 X-GM-EXT-1", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, chainHooks(untaggedCapabilityBeforeLogin("IMAP4rev1 X-GM-EXT-1"), capabilityAs(tt.capabilities))))
+
+			c := newReadyClient(t, srv, Options{})
+
+			if got := c.KeepsOneCopyPerMessageID(); got != tt.want {
+				t.Errorf("KeepsOneCopyPerMessageID = %v, want %v: go-imap drops the list that came before LOGIN OK", got, tt.want)
+			}
+			if got := srv.callCount("CAPABILITY"); got != 1 {
+				t.Errorf("CAPABILITY count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func Test_New_When_GreetingHasNoCapabilityList_Then_OneProbeComesBeforeLoginAndOneCheckAfterIt(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandlerGreeting(srv, "* OK fake ready", capabilityAs("IMAP4rev1 X-GM-EXT-1")))
+
+	c := newReadyClient(t, srv, Options{})
+
+	if !c.KeepsOneCopyPerMessageID() {
+		t.Error("KeepsOneCopyPerMessageID = false, want true")
+	}
+	if got := srv.callCount("CAPABILITY"); got != 2 {
+		t.Errorf("CAPABILITY count = %d, want 2: go-imap asks once before LOGIN, and New asks once after it", got)
+	}
+}
+
 func Test_hasCapability(t *testing.T) {
 	t.Parallel()
 
@@ -1364,6 +1570,9 @@ func Test_hasCapability(t *testing.T) {
 		{name: "shorter name", caps: map[string]bool{"X-GM-EXT": true}},
 		{name: "other version", caps: map[string]bool{"X-GM-EXT-2": true}},
 		{name: "extra leading letter", caps: map[string]bool{"XX-GM-EXT-1": true}},
+		{name: "extra trailing letter", caps: map[string]bool{"X-GM-EXT-1X": true}},
+		{name: "missing hyphen", caps: map[string]bool{"XGM-EXT-1": true}},
+		{name: "authentication mechanism with the name", caps: map[string]bool{"AUTH=X-GM-EXT-1": true}},
 		{name: "Cyrillic look-alike", caps: map[string]bool{"\u0425-GM-EXT-1": true}},
 		{name: "matching key with a false value", caps: map[string]bool{"X-GM-EXT-1": false}},
 		{name: "another name in another letter case", caps: map[string]bool{"UidPlus": true}, find: "UIDPLUS", want: true},
