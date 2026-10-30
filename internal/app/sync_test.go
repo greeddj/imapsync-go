@@ -12883,10 +12883,8 @@ func Test_maybeDiff_When_OneCopyMappingsShareASourceFolder_Then_TheFolderStandsB
 		diffBothSidesUnder(t, copyOnePerMessageID, s, i, mappings, plans, &totalNew, &totalNewSize, shared)
 	}
 
-	plan := plans[0]
-	plan.mergeStandbys(shared.standbysFor(0))
 	want := []standbyView{{planned: 1, folder: "S", uidValidity: 9, uid: 2}}
-	if got := resolveStandbys(t, plan.standbySources, plan.standbys); !slices.Equal(got, want) {
+	if got := mergedStandbys(t, plans[0], shared, 0); !slices.Equal(got, want) {
 		t.Errorf("standbys = %+v, want %+v: the second mapping adds nothing for its own folder", got, want)
 	}
 	if plans[1].SrcUIDs != nil || plans[1].standbys != nil {

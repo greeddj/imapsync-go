@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -767,6 +768,46 @@ func retainDialed(t *testing.T, c *Client) {
 		return conn, err
 	}
 	t.Cleanup(func() { runtime.KeepAlive(conns) })
+}
+
+// disableGC keeps the finalizer of an unreachable connection from closing a socket the code
+// under test leaked. The setting is process-wide, so the caller must be sequential.
+func disableGC(t *testing.T) {
+	t.Helper()
+
+	prev := debug.SetGCPercent(-1)
+	t.Cleanup(func() { debug.SetGCPercent(prev) })
+}
+
+// dropThenHold is an interceptHandler hook. On a match it half-closes like a dropped connection,
+// then reads until the client hangs up.
+func dropThenHold(match func(command) bool) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if !match(cmd) {
+			return false, true
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		_, _ = io.Copy(io.Discard, rd)
+		return true, false
+	}
+}
+
+// holdAfterLoginReply is an interceptHandler hook. It answers LOGIN with reply and LOGOUT with a plain OK.
+// Without a BYE, go-imap keeps the socket, so only the client closes it.
+func holdAfterLoginReply(reply string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		switch cmd.verb {
+		case "LOGIN":
+			writeLine(conn, "%s %s", cmd.tag, reply)
+		case "LOGOUT":
+			writeLine(conn, "%s OK LOGOUT completed", cmd.tag)
+		default:
+			return false, true
+		}
+		return true, true
+	}
 }
 
 // stall goes silent on the first command match accepts, so the client blocks

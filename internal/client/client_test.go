@@ -1413,7 +1413,7 @@ func Test_Client_When_SessionIsReplacedAfterTheCheck_Then_KeepsTheValueAndAsksNo
 
 	srv := newFakeServer(t)
 	srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs(""), capabilityAs("IMAP4rev1 X-GM-EXT-1"), byeOn(verbIs("EXAMINE")))))
-	// The new session advertises nothing, so a second check would turn the value off.
+	// The new session lacks X-GM-EXT-1, so a second check would turn the value off.
 	srv.addConnHandler(interceptHandler(srv, chainHooks(loginAs("[CAPABILITY IMAP4rev1]"), capabilityAs("IMAP4rev1"))))
 	c := newReadyClient(t, srv, Options{})
 	if !c.KeepsOneCopyPerMessageID() {
@@ -1439,15 +1439,14 @@ func Test_Client_When_SessionIsReplacedAfterTheCheck_Then_KeepsTheValueAndAsksNo
 	}
 }
 
+// Sequential - disableGC is process-wide.
 func Test_New_When_ConnectionDropsDuringCapabilityCheckAndReloginIsRefusedPermanently_Then_FailsAndClosesEverySocket(t *testing.T) {
-	t.Parallel()
+	disableGC(t)
 
 	srv := newFakeServer(t)
 	firstEnded, secondEnded := make(chan struct{}), make(chan struct{})
-	srv.addConnHandler(endedSignal(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
-		return cmd.verb == "CAPABILITY", false
-	}), firstEnded))
-	srv.addConnHandler(endedSignal(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."), secondEnded))
+	srv.addConnHandler(endedSignal(interceptHandler(srv, dropThenHold(verbIs("CAPABILITY"))), firstEnded))
+	srv.addConnHandler(endedSignal(interceptHandler(srv, holdAfterLoginReply("NO [AUTHENTICATIONFAILED] Authentication failed.")), secondEnded))
 
 	c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{Label: "dst", DialTimeout: 5 * time.Second})
 
@@ -1473,15 +1472,18 @@ func Test_New_When_ConnectionDropsDuringCapabilityCheckAndReloginIsRefusedPerman
 	}
 }
 
-// Sequential - swaps the package-level sleepCtx var.
+// Sequential - swaps the package-level sleepCtx var, and disableGC is process-wide.
 func Test_New_When_ConnectionDropsDuringCapabilityCheckAndEveryReloginFailsTemporarily_Then_FailsWithTheLabel(t *testing.T) {
+	disableGC(t)
+
 	srv := newFakeServer(t)
-	firstEnded := make(chan struct{})
-	srv.addConnHandler(endedSignal(interceptHandler(srv, func(_ net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
-		return cmd.verb == "CAPABILITY", false
-	}), firstEnded))
-	for range maxReconnectAttempts {
-		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+	ended := make([]chan struct{}, 1+maxReconnectAttempts)
+	for i := range ended {
+		ended[i] = make(chan struct{})
+	}
+	srv.addConnHandler(endedSignal(interceptHandler(srv, dropThenHold(verbIs("CAPABILITY"))), ended[0]))
+	for _, e := range ended[1:] {
+		srv.addConnHandler(endedSignal(interceptHandler(srv, holdAfterLoginReply(dovecotTempAuthFailure)), e))
 	}
 	recordSleeps(t, srv)
 
@@ -1499,7 +1501,9 @@ func Test_New_When_ConnectionDropsDuringCapabilityCheckAndEveryReloginFailsTempo
 			t.Errorf("error = %q, want it to contain %q", err, want)
 		}
 	}
-	awaitSignal(t, firstEnded, "the client to close the dropped session")
+	for i, e := range ended {
+		awaitSignal(t, e, fmt.Sprintf("the client to close session %d of %d", i+1, len(ended)))
+	}
 	if got := srv.callCount("LOGIN"); got != 1+maxReconnectAttempts {
 		t.Errorf("LOGIN count = %d, want %d: the first session and every reconnect attempt", got, 1+maxReconnectAttempts)
 	}
