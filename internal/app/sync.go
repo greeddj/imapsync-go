@@ -484,6 +484,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	}
 	// Folders whose plan may have no diff against the real folder: CREATE said it exists, or the destination LIST left out names, so an OK proves nothing.
 	existing := make(map[string]struct{})
+	var stop throttleStop
 
 	if len(foldersToCreate) > 0 {
 		if !quiet {
@@ -502,6 +503,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 
 		// Sorted, so a parent path is created before its children and the log
 		// order is stable.
+	createFolders:
 		for _, folder := range slices.Sorted(maps.Keys(foldersToCreate)) {
 			if err := ctx.Err(); err != nil {
 				creationPW.Stop()
@@ -516,6 +518,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				return ctx.Err()
 			case err != nil:
 				creationPW.Log("Failed to create folder %q: %s", folder, termsafe.Escape(err.Error()))
+				// A throttled reply limits the account, not this folder, so no more CREATE follows.
+				if stop.recordThrottled(sideDestination, err) {
+					break createFolders
+				}
 				refused[folder] = err
 			case created:
 				if verbose {
@@ -548,9 +554,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		}
 	}
 
-	if len(existing) > 0 {
+	if len(existing) > 0 && !stop.stopped() {
 		var newFailures []FolderFailure
-		activePlans, newFailures, err = recheckExistingDestinations(ctx, out, quiet, srcClient, dstClient, activePlans, existing)
+		activePlans, newFailures, err = recheckExistingDestinations(ctx, out, quiet, srcClient, dstClient, activePlans, existing, &stop)
 		if err != nil {
 			return err
 		}
@@ -558,6 +564,17 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			summary.Failures = append(summary.Failures, newFailures...)
 			printFolderFailures(out, newFailures)
 		}
+	}
+
+	if stop.stopped() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		planned := 0
+		for _, plan := range activePlans {
+			planned += plan.NewMessages
+		}
+		return endRunWithErrors(out, cfg, quiet, summary.Failures, stop.get(), 0, planned)
 	}
 
 	if len(activePlans) == 0 {
@@ -606,7 +623,6 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		wg          sync.WaitGroup
 		totalSynced atomic.Int64
 		totalErrors atomic.Int64
-		stop        throttleStop
 	)
 
 	// A stop ends the dispatch: the plans from firstUnstarted on never begin.
@@ -658,20 +674,24 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	totalErrorsN := int(totalErrors.Load())
 
 	if totalErrorsN > 0 || len(summary.Failures) > 0 || cause != nil {
-		if len(summary.Failures) > 0 && !quiet {
-			printFolderFailures(out, summary.Failures)
-		}
-		if cause != nil {
-			printThrottleStop(out, cfg, cause)
-		}
-		printSyncErrors(out, totalSyncedN, totalErrorsN, len(summary.Failures))
-		// Friendly summary already printed; signal non-zero exit without
-		// asking main to repeat the same information through stderr.
-		return ErrSilentExit
+		return endRunWithErrors(out, cfg, quiet, summary.Failures, cause, totalSyncedN, totalErrorsN)
 	}
 
 	_, _ = fmt.Fprintln(out, "✨ Sync completed successfully. ✨")
 	return nil
+}
+
+// endRunWithErrors ends a run that has errors, failed folders or a stop. Quiet mode lists the failed folders only once, because the caller printed them already.
+func endRunWithErrors(out io.Writer, cfg *config.Config, quiet bool, failures []FolderFailure, cause *throttleCause, synced, errs int) error {
+	if len(failures) > 0 && !quiet {
+		printFolderFailures(out, failures)
+	}
+	if cause != nil {
+		printThrottleStop(out, cfg, cause)
+	}
+	printSyncErrors(out, synced, errs, len(failures))
+	// The summary is printed already, so the exit code needs no second message from main.
+	return ErrSilentExit
 }
 
 // The caller has already printed the failed folders.
@@ -705,7 +725,7 @@ func splitRefusedDestinations(plans []FolderSyncPlan, refused map[string]error) 
 }
 
 // The prompt already showed the plans, so a plan only loses messages. Lines print after every check, so a cancel leaves no output.
-func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool, srcClient, dstClient *client.Client, plans []FolderSyncPlan, existing map[string]struct{}) ([]FolderSyncPlan, []FolderFailure, error) {
+func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool, srcClient, dstClient *client.Client, plans []FolderSyncPlan, existing map[string]struct{}, stop *throttleStop) ([]FolderSyncPlan, []FolderFailure, error) {
 	groupOf := make(map[string]int)
 	var groups [][]int
 	for i, plan := range plans {
@@ -730,9 +750,13 @@ func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool,
 		for slot, i := range indexes {
 			group[slot] = plans[i]
 		}
-		rechecked, err := recheckDestination(ctx, srcClient, dstClient, group)
+		rechecked, err := recheckDestination(ctx, srcClient, dstClient, group, stop)
 		if err != nil {
 			return nil, nil, err
+		}
+		// The run ends on the stop and counts every planned message as an error, so earlier groups report nothing.
+		if stop.stopped() {
+			return plans, nil, nil
 		}
 		for slot, i := range indexes {
 			results[i] = rechecked[slot]
@@ -776,8 +800,8 @@ type recheckResult struct {
 	drops recheckDrops
 }
 
-// The plans share one destination, in mapping order. An empty folder holds nothing to drop, so it needs no source scan. The error is only for an ended context.
-func recheckDestination(ctx context.Context, srcClient, dstClient *client.Client, plans []FolderSyncPlan) ([]recheckResult, error) {
+// The plans share one destination, in mapping order. A throttled reply sets the stop and returns no results. The error is only for an ended context.
+func recheckDestination(ctx context.Context, srcClient, dstClient *client.Client, plans []FolderSyncPlan, stop *throttleStop) ([]recheckResult, error) {
 	results := make([]recheckResult, len(plans))
 	for slot, plan := range plans {
 		results[slot].plan = plan
@@ -787,11 +811,15 @@ func recheckDestination(ctx context.Context, srcClient, dstClient *client.Client
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
+		if stop.recordThrottled(sideDestination, err) {
+			return nil, nil
+		}
 		for slot := range results {
 			results[slot].err = fmt.Errorf("%w: %w", errDestinationRecheck, err)
 		}
 		return results, nil
 	}
+	// An empty folder holds nothing to drop, so it needs no source scan.
 	if len(dstMap) == 0 {
 		for slot := range results {
 			results[slot].plan.DestinationFolderExists = true
@@ -807,6 +835,9 @@ func recheckDestination(ctx context.Context, srcClient, dstClient *client.Client
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
+			}
+			if stop.recordThrottled(sideSource, err) {
+				return nil, nil
 			}
 			results[slot].err = fmt.Errorf("%w: %w", errSourceScan, err)
 			continue

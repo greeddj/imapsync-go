@@ -7838,7 +7838,7 @@ func Test_recheckExistingDestinations_When_ContextAlreadyEnded_Then_SendsNoComma
 	existing := map[string]struct{}{"B": {}}
 	out := &syncBuffer{}
 
-	kept, failures, err := recheckExistingDestinations(ctx, out, false, srcC, dstC, plans, existing)
+	kept, failures, err := recheckExistingDestinations(ctx, out, false, srcC, dstC, plans, existing, &throttleStop{})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want context.Canceled", err)
@@ -7966,7 +7966,7 @@ func Test_recheckExistingDestinations_When_PlannedMessagesAreDropped_Then_EachCa
 			existing := map[string]struct{}{tt.names.dst: {}}
 			out := &syncBuffer{}
 
-			kept, failures, err := recheckExistingDestinations(t.Context(), out, tt.quiet, srcC, dstC, plans, existing)
+			kept, failures, err := recheckExistingDestinations(t.Context(), out, tt.quiet, srcC, dstC, plans, existing, &throttleStop{})
 
 			if err != nil {
 				t.Fatalf("error = %v, want nil", err)
@@ -8096,7 +8096,7 @@ func Test_recheckExistingDestinations_When_PlansShareADestination_Then_TheyAreCo
 			}
 			out := &syncBuffer{}
 
-			kept, failures, err := recheckExistingDestinations(t.Context(), out, tt.quiet, srcC, dstC, tt.plans, existing)
+			kept, failures, err := recheckExistingDestinations(t.Context(), out, tt.quiet, srcC, dstC, tt.plans, existing, &throttleStop{})
 
 			if err != nil || failures != nil {
 				t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
@@ -8139,7 +8139,7 @@ func Test_recheckExistingDestinations_When_PlansShareADestination_Then_TheDestin
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": {{msgID: id, body: bodyOfSize(id, 300)}}})
 	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("B", "D", 300, 2)}
 
-	_, _, err := recheckExistingDestinations(t.Context(), &syncBuffer{}, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+	_, _, err := recheckExistingDestinations(t.Context(), &syncBuffer{}, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}}, &throttleStop{})
 
 	if err != nil {
 		t.Fatalf("error = %v, want nil", err)
@@ -8191,7 +8191,7 @@ func Test_recheckExistingDestinations_When_OneSharedPlanCannotBeRescanned_Then_O
 			plans[1].SrcUIDValidity = 1
 			out := &syncBuffer{}
 
-			kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+			kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}}, &throttleStop{})
 
 			if err != nil {
 				t.Fatalf("error = %v, want nil", err)
@@ -8230,7 +8230,7 @@ func Test_recheckExistingDestinations_When_SharedDestinationCannotBeRead_Then_Ev
 	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("X", "E", 200, 1, 2), sharedPlan("B", "D", 300, 2)}
 	out := &syncBuffer{}
 
-	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}, "E": {}})
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}, "E": {}}, &throttleStop{})
 
 	if err != nil {
 		t.Fatalf("error = %v, want nil", err)
@@ -8260,7 +8260,7 @@ func Test_recheckExistingDestinations_When_SharedDestinationIsEmpty_Then_NoSourc
 	plans := []FolderSyncPlan{sharedPlan("A", "D", 100, 1), sharedPlan("B", "D", 100, 1)}
 	out := &syncBuffer{}
 
-	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}}, &throttleStop{})
 
 	if err != nil || failures != nil {
 		t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
@@ -8303,7 +8303,7 @@ func Test_recheckExistingDestinations_When_ContextEndsBetweenSharedSourceScans_T
 	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("B", "D", 300, 2)}
 	out := &syncBuffer{}
 
-	kept, failures, err := recheckExistingDestinations(ctx, out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+	kept, failures, err := recheckExistingDestinations(ctx, out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}}, &throttleStop{})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want context.Canceled", err)
@@ -14239,7 +14239,7 @@ func Test_recheckExistingDestinations_When_OneCopyPlanLosesAHeldId_Then_KeptPlan
 	}}
 	out := &syncBuffer{}
 
-	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, srcC, dstC, plans, map[string]struct{}{"Work": {}})
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, srcC, dstC, plans, map[string]struct{}{"Work": {}}, &throttleStop{})
 
 	if err != nil || failures != nil {
 		t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
@@ -15561,4 +15561,403 @@ func TestRunSync_When_LowestGmailCopyHasAnEmptyBody_Then_TheHigherCopyKeepsItsOw
 	}
 	assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
 	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_CreateGetsAThrottledReply_Then_RunStopsBeforeAnyWorker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "default output"},
+		{name: "quiet output", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x"), "B": fakeMsgs("b1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.refuseCreateOf("A", gmailThrottleReply)
+			cfg := e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A")
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+			for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+				if n := srv.callCount("LOGIN"); n != 1 {
+					t.Errorf("%s LOGIN count = %d, want 1: no worker connection after the stop", name, n)
+				}
+			}
+			for _, verb := range []string{"EXAMINE", "STATUS", "FETCH"} {
+				if n := dst.callCount(verb); n != 0 {
+					t.Errorf("dst saw %d %s commands, want 0: both folders are missing", n, verb)
+				}
+			}
+			if n := src.callCount("UID FETCH"); n != 0 {
+				t.Errorf("src saw %d UID FETCH commands, want 0", n)
+			}
+			got := out.String()
+			if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+				t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+			}
+			assertInOrder(t, got, destinationStopStart, "Account exceeded command or bandwidth limits. (Failure)", "0 messages uploaded, 3 errors occurred, 0 folders failed")
+			assertContainsNone(t, got, "Syncing messages", folderFailuresHeader, "Sync completed successfully", "Cancelled", "Canceled")
+			if tt.quiet {
+				assertContainsNone(t, got, "Failed to create folder")
+			} else {
+				assertContainsAll(t, got, `Failed to create folder "A"`)
+			}
+
+			dst.refuseCreateOf("A", "")
+			second := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, second, "Sync completed successfully")
+			assertContainsNone(t, second, "Sync stopped")
+			assertIDs(t, "dst A after the second run", dst.folderMsgIDs("A"), "a1@x", "a2@x")
+			assertIDs(t, "dst B after the second run", dst.folderMsgIDs("B"), "b1@x")
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_CreateIsRefusedAndThenThrottled_Then_OnlyTheRefusedFolderFails(t *testing.T) {
+	t.Parallel()
+
+	const failureLine = "• A → A: cannot create destination folder: [dst] failed to create mailbox A: Invalid folder name"
+	tests := []struct {
+		name       string
+		wantHeader int
+		quiet      bool
+	}{
+		{name: "default output", wantHeader: 2},
+		{name: "quiet output", wantHeader: 1, quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x"), "B": fakeMsgs("b1@x", "b2@x"), "C": fakeMsgs("c1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.refuseCreateOf("A", "NO [CANNOT] Invalid folder name")
+			dst.refuseCreateOf("B", gmailThrottleReply)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"), mapping("C", "C")), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A", "B")
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+			for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+				if n := srv.callCount("LOGIN"); n != 1 {
+					t.Errorf("%s LOGIN count = %d, want 1: no worker connection after the stop", name, n)
+				}
+			}
+			got := out.String()
+			if n := strings.Count(got, folderFailuresHeader); n != tt.wantHeader {
+				t.Errorf("output holds the failure header %d times, want %d\noutput: %q", n, tt.wantHeader, got)
+			}
+			if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+				t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+			}
+			if tt.quiet {
+				assertInOrder(t, got, folderFailuresHeader, failureLine, destinationStopStart, "0 messages uploaded, 3 errors occurred, 1 folders failed")
+			} else {
+				assertInOrder(t, got, folderFailuresHeader, failureLine, folderFailuresHeader, failureLine, destinationStopStart, "0 messages uploaded, 3 errors occurred, 1 folders failed")
+			}
+			assertContainsNone(t, got, "Syncing messages", "Sync completed successfully", "Cancelled", "Canceled")
+			assertContainsNone(t, got, "• B → B:", "• C → C:")
+		})
+	}
+}
+
+// hiddenRecheckServers returns two servers whose destination folders H1 and H2 are hidden from LIST and each hold one of the two messages of the same source folder.
+func hiddenRecheckServers(t *testing.T) (src, dst *fakeServer) {
+	t.Helper()
+	src = newStoreServer(t, "/", map[string][]fakeMsg{"H1": fakeMsgs("a1@x", "a2@x"), "H2": fakeMsgs("b1@x", "b2@x")})
+	dst = newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "H1": fakeMsgs("a1@x"), "H2": fakeMsgs("b1@x")})
+	dst.hideFromList("H1", "H2")
+	return src, dst
+}
+
+func TestRunSync_When_DestinationRecheckIsThrottled_Then_RunStopsBeforeAnyWorker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "default output"},
+		{name: "quiet output", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst := hiddenRecheckServers(t)
+			dst.refuseOpenWith("H1", gmailThrottleReply)
+			sourceCommands := func() int64 {
+				return int64(src.callCount("EXAMINE") + src.callCount("STATUS") + src.callCount("FETCH") + src.callCount("UID"))
+			}
+			// The planning scan is over when the first CREATE arrives.
+			var afterPlanning atomic.Int64
+			dst.onCommand("CREATE", func() { afterPlanning.Store(sourceCommands()) })
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("H1", "H1"), mapping("H2", "H2")), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "H1", "H2")
+			assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "H1")
+			for _, verb := range []string{"STATUS", "FETCH", "APPEND"} {
+				if n := dst.callCount(verb); n != 0 {
+					t.Errorf("dst saw %d %s commands, want 0", n, verb)
+				}
+			}
+			for _, folder := range []string{"H1", "H2"} {
+				if n := timesNamed(src.capturedNames("EXAMINE"), folder); n != 1 {
+					t.Errorf("src examined %s %d times, want 1: only the planning scan", folder, n)
+				}
+			}
+			if n := src.callCount("STATUS"); n != 0 {
+				t.Errorf("src saw %d STATUS commands, want 0", n)
+			}
+			if got, want := sourceCommands(), afterPlanning.Load(); got != want || want == 0 {
+				t.Errorf("src saw %d scan commands in the whole run and %d during planning, want the same non-zero count", got, want)
+			}
+			for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+				if n := srv.callCount("LOGIN"); n != 1 {
+					t.Errorf("%s LOGIN count = %d, want 1: no worker connection after the stop", name, n)
+				}
+			}
+			got := out.String()
+			if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+				t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+			}
+			assertInOrder(t, got, destinationStopStart, "Account exceeded command or bandwidth limits. (Failure)", "0 messages uploaded, 4 errors occurred, 0 folders failed")
+			assertContainsNone(t, got, "already exists and holds", "no longer holds", folderFailuresHeader, "Syncing messages", "Sync completed successfully", "Cancelled", "Canceled")
+			assertIDs(t, "dst H1", dst.folderMsgIDs("H1"), "a1@x")
+			assertIDs(t, "dst H2", dst.folderMsgIDs("H2"), "b1@x")
+		})
+	}
+}
+
+func TestRunSync_When_SourceRecheckIsThrottled_Then_RunStopsBeforeAnyWorker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "default output"},
+		{name: "quiet output", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst := hiddenRecheckServers(t)
+			// The recheck can reuse the selected session and send STATUS, so both commands get the reply.
+			dst.onCommand("CREATE", func() {
+				src.refuseOpenWith("H1", gmailThrottleReply)
+				src.refuseStatusWith("H1", gmailThrottleReply)
+			})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("H1", "H1"), mapping("H2", "H2")), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "H1")
+			if n := timesNamed(src.capturedNames("EXAMINE"), "H1"); n != 2 {
+				t.Errorf("src examined H1 %d times, want 2: the planning scan and the recheck", n)
+			}
+			if n := timesNamed(src.capturedNames("EXAMINE"), "H2"); n != 1 {
+				t.Errorf("src examined H2 %d times, want 1: only the planning scan", n)
+			}
+			if n := src.callCount("UID FETCH"); n != 0 {
+				t.Errorf("src saw %d UID FETCH commands, want 0", n)
+			}
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+			for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+				if n := srv.callCount("LOGIN"); n != 1 {
+					t.Errorf("%s LOGIN count = %d, want 1: no worker connection after the stop", name, n)
+				}
+			}
+			got := out.String()
+			if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+				t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+			}
+			assertInOrder(t, got,
+				"⛔ Sync stopped: the source server [src] reports a rate limit or a full quota: ",
+				"Account exceeded command or bandwidth limits. (Failure)",
+				"0 messages uploaded, 4 errors occurred, 0 folders failed")
+			assertContainsNone(t, got, "already exists and holds", "no longer holds", folderFailuresHeader, "Syncing messages", "Sync completed successfully", "Cancelled", "Canceled")
+		})
+	}
+}
+
+func Test_recheckExistingDestinations_When_DestinationScanIsThrottled_Then_ReturnsThePlansAndSendsNothingMore(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x"), "B": fakeMsgs("b1@x", "b2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": fakeMsgs("a1@x"), "E": fakeMsgs("b1@x")})
+	dst.refuseOpenWith("D", gmailThrottleReply)
+	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1, 2), sharedPlan("B", "E", 200, 1, 2)}
+	existing := map[string]struct{}{"D": {}, "E": {}}
+	out := &syncBuffer{}
+	var stop throttleStop
+
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, existing, &stop)
+
+	if err != nil || failures != nil {
+		t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("kept = %+v, want both input plans", kept)
+	}
+	for i, want := range []struct{ src, dst string }{{"A", "D"}, {"B", "E"}} {
+		got := kept[i]
+		if got.SourceFolder != want.src || got.DestinationFolder != want.dst || !slices.Equal(got.SrcUIDs, []uint32{1, 2}) || got.NewMessages != 2 || got.NewSize != 200 {
+			t.Errorf("kept[%d] = %+v, want the input plan %s → %s with UIDs 1 and 2", i, got, want.src, want.dst)
+		}
+	}
+	if out.String() != "" {
+		t.Errorf("output = %q, want empty", out.String())
+	}
+	cause := stop.get()
+	if cause == nil || cause.side != sideDestination {
+		t.Fatalf("stop = %+v, want the destination side", cause)
+	}
+	if !strings.Contains(cause.err.Error(), "Account exceeded command or bandwidth limits") {
+		t.Errorf("stop error = %v, want the throttle reply", cause.err)
+	}
+	assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "D")
+	for _, verb := range []string{"STATUS", "FETCH"} {
+		if n := dst.callCount(verb); n != 0 {
+			t.Errorf("dst saw %d %s commands, want 0", n, verb)
+		}
+	}
+	for _, verb := range []string{"EXAMINE", "STATUS", "FETCH"} {
+		if n := src.callCount(verb); n != 0 {
+			t.Errorf("src saw %d %s commands, want 0", n, verb)
+		}
+	}
+}
+
+func Test_recheckExistingDestinations_When_SharedSourceScanIsThrottled_Then_NoLaterSourceIsScanned(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x"), "B": fakeMsgs("b1@x")})
+	src.refuseOpenWith("A", gmailThrottleReply)
+	src.refuseStatusWith("A", gmailThrottleReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"S": fakeMsgs("a1@x")})
+	plans := []FolderSyncPlan{sharedPlan("A", "S", 200, 1, 2), sharedPlan("B", "S", 100, 1)}
+	out := &syncBuffer{}
+	var stop throttleStop
+
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"S": {}}, &stop)
+
+	if err != nil || failures != nil {
+		t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
+	}
+	if len(kept) != 2 || kept[0].SourceFolder != "A" || kept[1].SourceFolder != "B" {
+		t.Errorf("kept = %+v, want both input plans in order", kept)
+	}
+	if out.String() != "" {
+		t.Errorf("output = %q, want empty", out.String())
+	}
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource {
+		t.Fatalf("stop = %+v, want the source side", cause)
+	}
+	assertIDs(t, "src EXAMINE names", src.capturedNames("EXAMINE"), "A")
+	if n := src.callCount("STATUS"); n != 0 {
+		t.Errorf("src saw %d STATUS commands, want 0: B must not be scanned", n)
+	}
+	assertIDs(t, "dst EXAMINE names", dst.capturedNames("EXAMINE"), "S")
+}
+
+func TestRunSync_When_ContextEndsWithAThrottledReply_Then_ReturnsCanceledWithoutStopLine(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		build func(t *testing.T, cancel context.CancelFunc) (src, dst *fakeServer, mappings []config.DirectoryMapping)
+		name  string
+	}{
+		{
+			name: "the first CREATE gets the reply",
+			build: func(t *testing.T, cancel context.CancelFunc) (*fakeServer, *fakeServer, []config.DirectoryMapping) {
+				src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")})
+				dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+				dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+					if verb != "CREATE" {
+						return "", false
+					}
+					cancel()
+					return gmailThrottleReply, true
+				}))
+				return src, dst, []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")}
+			},
+		},
+		{
+			name: "the scan of the check after CREATE gets the reply",
+			build: func(t *testing.T, cancel context.CancelFunc) (*fakeServer, *fakeServer, []config.DirectoryMapping) {
+				src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x")})
+				dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x")})
+				dst.hideFromList("Work")
+				dst.refuseOpenWith("Work", gmailThrottleReply)
+				// Work is not cached, so the planning scan sends no EXAMINE and this one is the check's.
+				dst.onCommand("EXAMINE", cancel)
+				return src, dst, []config.DirectoryMapping{mapping("Work", "Work")}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(e2eContext(t))
+			t.Cleanup(cancel)
+			src, dst, mappings := tt.build(t, cancel)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(ctx, e2eConfig(src, dst, 1, mappings...), opts)
+
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled\noutput: %s", err, out.String())
+			}
+			assertContainsNone(t, out.String(), "Sync stopped", "Sync completed", "errors occurred")
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+		})
+	}
 }
