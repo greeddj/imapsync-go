@@ -219,7 +219,7 @@ func Test_AppendMessage_When_SourceBodyIsEmpty_Then_SendsNoAppend(t *testing.T) 
 				appendErr error
 			)
 			err := awaitCall(t, "StreamMessagesByUIDs", func() error {
-				return srcClient.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(msg Message) error {
+				return srcClient.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, nil, func(msg Message) error {
 					calls++
 					appendErr = dstClient.AppendMessage(t.Context(), "INBOX", msg)
 					return nil
@@ -1248,7 +1248,7 @@ func Test_AppendMessage_When_SourceBodyIsANonEmptyQuotedString_Then_RefusesAsEmp
 		appendErr error
 	)
 	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
-		return srcClient.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(msg Message) error {
+		return srcClient.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, nil, func(msg Message) error {
 			calls++
 			if lit := msg.m.GetBody(fullBodyPeekSection); lit != nil {
 				bodyLen = lit.Len()

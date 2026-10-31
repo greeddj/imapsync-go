@@ -61,6 +61,9 @@ var errMissingUID = errors.New("server sent no UID for a message")
 // ErrUIDValidityChanged marks a source folder that no longer reports the UIDVALIDITY its planned UIDs belong to.
 var ErrUIDValidityChanged = errors.New("source folder changed after the sync plan, run sync again")
 
+// errStreamStopped ends a StreamMessagesByUIDs attempt after a halt or an onMessage error. Its text matches no class, so safeCall returns it without a retry.
+var errStreamStopped = errors.New("stream stopped by the caller")
+
 // StreamError is the result of StreamMessagesByUIDs when a batch failed. First is the first failure and Stop, if set, the one that ended the stream.
 type StreamError struct {
 	First         error
@@ -75,7 +78,7 @@ func (e *StreamError) Error() string {
 	return e.First.Error() + " (" + strconv.Itoa(e.FailedBatches) + " batches failed)"
 }
 
-// Stop comes first, so a throttled stop sets the class even when an earlier failure has another class.
+// Stop comes first so classifyLeaves reads it before First. classifyError checks io.EOF and net.Error on the whole tree first, so callers pass Stop to IsThrottled.
 func (e *StreamError) Unwrap() []error {
 	if e.Stop == nil {
 		return []error{e.First}
@@ -175,6 +178,11 @@ func classifyMessage(msg string) ErrClass {
 	}
 
 	return ClassUnknown
+}
+
+// IsThrottled reports whether classifyError puts err in ClassThrottled, a rate limit or a full quota.
+func IsThrottled(err error) bool {
+	return classifyError(err) == ClassThrottled
 }
 
 // isRetryable reports whether reconnect-and-retry should be attempted for err.

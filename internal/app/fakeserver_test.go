@@ -481,7 +481,7 @@ func slowExamineHandler(srv *fakeServer, mailboxes []string, msgs map[string][]s
 //
 // mailboxes is the LIST response; uidBodies maps folder → []{ uid, body }.
 // appendReply, when non-empty, is used as the tagged reply for APPEND (e.g.
-// "NO Quota exceeded"). When empty, APPEND succeeds.
+// "NO [CANNOT] APPEND refused by policy"). When empty, APPEND succeeds.
 func uidFetchBodyHandler(srv *fakeServer, mailboxes []string, uidBodies map[string][]struct {
 	body string
 	uid  uint32
@@ -654,6 +654,7 @@ type mailStore struct {
 	dropOnOpen   string
 	appends      []appendRecord
 	loginRefusal int
+	dropAtAppend int
 	seenMutating int
 	bareInbox    bool
 	onePerID     bool
@@ -998,6 +999,13 @@ func (s *fakeServer) refuseLoginAt(n int) {
 	s.store.loginRefusal = n
 }
 
+// dropAtAppendAndRefuseLogin makes the nth APPEND over the life of the server read its literal and close the connection with no reply. Every LOGIN after that is refused.
+func (s *fakeServer) dropAtAppendAndRefuseLogin(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.dropAtAppend = n
+}
+
 func (s *fakeServer) refuseCreate() {
 	s.refuseCreateWith("NO CREATE refused by policy")
 }
@@ -1050,7 +1058,7 @@ func (s *fakeServer) takeDropOnOpen(name string) bool {
 }
 
 func (s *fakeServer) refuseAppend() {
-	s.refuseAppendWith("NO Quota exceeded")
+	s.refuseAppendWith("NO [CANNOT] APPEND refused by policy")
 }
 
 // refuseAppendWith makes every APPEND end with reply, which carries its own
@@ -1572,6 +1580,10 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.store.dropAtAppend > 0 && s.counts["APPEND"] == s.store.dropAtAppend {
+		s.store.loginReply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
+		return false
+	}
 	if s.store.appendReply != "" {
 		rw.line("%s %s", tag, s.store.appendReply)
 		return true

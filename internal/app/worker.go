@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -94,6 +95,66 @@ func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts
 	return pool, nil
 }
 
+// stopSide names the server whose throttled reply stopped the run.
+type stopSide uint8
+
+const (
+	sideSource stopSide = iota + 1
+	sideDestination
+)
+
+func (s stopSide) String() string {
+	if s == sideSource {
+		return "source"
+	}
+	return "destination"
+}
+
+// throttleCause is the first throttled reply of a run.
+type throttleCause struct {
+	err  error
+	side stopSide
+}
+
+// throttleStop is the stop of one run. The first throttled reply wins, and every worker reads it before a plan, a batch and an APPEND.
+type throttleStop struct {
+	cause atomic.Pointer[throttleCause]
+}
+
+func (s *throttleStop) record(side stopSide, err error) {
+	s.cause.CompareAndSwap(nil, &throttleCause{err: err, side: side})
+}
+
+// recordThrottled records err as the stop and reports true only when err is a throttled reply.
+func (s *throttleStop) recordThrottled(side stopSide, err error) bool {
+	if !client.IsThrottled(err) {
+		return false
+	}
+	s.record(side, err)
+	return true
+}
+
+func (s *throttleStop) get() *throttleCause { return s.cause.Load() }
+
+func (s *throttleStop) stopped() bool { return s.cause.Load() != nil }
+
+// halt is the halt hook of StreamMessagesByUIDs.
+func (s *throttleStop) halt() error {
+	if s.stopped() {
+		return errPlanStopped
+	}
+	return nil
+}
+
+func isPlanStopped(err error) bool { return errors.Is(err, errPlanStopped) }
+
+// markPlanStopped shows a plan that the run stopped before it copied anything.
+func markPlanStopped(tr *progress.Tracker, p FolderSyncPlan, planIdx, planCount int) {
+	tr.UpdateMessage(fmt.Sprintf("%d/%d Stopped %s → %s",
+		planIdx+1, planCount, termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)))
+	tr.MarkAsErrored()
+}
+
 // pendingCause says why a planned UID waits for a standby copy.
 type pendingCause uint8
 
@@ -103,8 +164,8 @@ const (
 	causeGone                             // the source no longer holds the message
 )
 
-// runFolderSync copies one plan on the worker. Each planned UID ends as exactly one of synced, errors or gone, unless the context ends. planIdx is zero-based.
-func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *progress.Tracker, planIdx, planCount int, pw *progress.Writer, verbose bool) (synced, errors, gone int) {
+// runFolderSync copies one plan. Each planned UID ends as synced, errors or gone, unless the context ends. After a stop, every UID not copied is an error. planIdx is zero-based.
+func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, stop *throttleStop, tr *progress.Tracker, planIdx, planCount int, pw *progress.Writer, verbose bool) (synced, errors, gone int) {
 	// Display only: the IMAP calls below keep the exact names from the plan.
 	srcShown, dstShown := termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)
 
@@ -112,6 +173,10 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		tr.UpdateMessage(fmt.Sprintf("%d/%d Canceled", planIdx+1, planCount))
 		tr.MarkAsErrored()
 		return 0, 0, 0
+	}
+	if stop.stopped() {
+		markPlanStopped(tr, p, planIdx, planCount)
+		return 0, p.NewMessages, 0
 	}
 
 	tr.UpdateTotal(int64(p.NewMessages))
@@ -148,6 +213,45 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			planIdx+1, planCount, srcShown, dstShown))
 		tr.MarkAsErrored()
 	}
+	finishTracker := func() {
+		if errors > 0 {
+			tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s",
+				planIdx+1, planCount, synced, errors, srcShown, dstShown))
+			tr.MarkAsErrored()
+		} else {
+			tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d %s → %s",
+				planIdx+1, planCount, synced, srcShown, dstShown))
+			tr.MarkAsDone()
+		}
+	}
+
+	// A destination that gave up would make the plan download bodies that it cannot append, so the source is not read.
+	if err := w.dst.EnsureSession(ctx); err != nil {
+		if ctx.Err() != nil {
+			reportCanceled()
+			return 0, 0, 0
+		}
+		stop.recordThrottled(sideDestination, err)
+		errors = p.NewMessages
+		finishTracker()
+		return 0, errors, 0
+	}
+
+	// destinationUsable ends the plan when a failed APPEND left the destination without a session that the gate allows.
+	destinationUsable := func() error {
+		if stop.stopped() {
+			return errPlanStopped
+		}
+		err := w.dst.EnsureSession(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		stop.recordThrottled(sideDestination, err)
+		return errPlanStopped
+	}
 
 	// pending holds the planned UIDs that a standby copy can still replace. The cause decides whether one that no copy replaces counts as an error or as gone.
 	var pending map[uint32]pendingCause
@@ -163,7 +267,11 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	delivered := make([]bool, len(sortedUIDs))
 	deliveredCount := 0
 
-	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDValidity, p.SrcUIDs, func(msg client.Message) error {
+	streamErr := w.src.StreamMessagesByUIDs(ctx, p.SourceFolder, p.SrcUIDValidity, p.SrcUIDs, stop.halt, func(msg client.Message) error {
+		// A stop comes before the mark, so the stream counts this message once among the stranded UIDs.
+		if stop.stopped() {
+			return errPlanStopped
+		}
 		if i, found := slices.BinarySearch(sortedUIDs, msg.UID()); found && !delivered[i] {
 			delivered[i] = true
 			deliveredCount++
@@ -172,7 +280,9 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if refusedBody(err) && len(p.standbysOf(msg.UID())) > 0 {
+			throttled := stop.recordThrottled(sideDestination, err)
+			refused := refusedBody(err)
+			if refused && len(p.standbysOf(msg.UID())) > 0 {
 				addPending(msg.UID(), causeRefusedBody)
 			} else {
 				errors++
@@ -187,7 +297,14 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 				pw.Log("Failed to append message to %s: %s", dstShown, termsafe.Escape(err.Error()))
 			}
 			refreshTracker()
-			return nil
+			switch {
+			case throttled:
+				return errPlanStopped
+			case refused:
+				return nil
+			default:
+				return destinationUsable()
+			}
 		}
 		synced++
 		tr.Increment(1)
@@ -212,23 +329,33 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	// The plan prints one stream line: the first failure of any stream, with the number of batches that failed in all streams.
 	var planFail client.StreamError
 	var failShown string
-	noteStreamFailure := func(shown string, err error) bool {
-		batches, throttled, first := streamFailure(err)
+	noteStreamFailure := func(shown string, err error) error {
+		batches, throttle, first := streamFailure(err)
 		if planFail.FailedBatches == 0 {
 			planFail.First, failShown = first, shown
 		}
 		planFail.FailedBatches += batches
-		return throttled
+		return throttle
 	}
-	throttled := streamErr != nil && noteStreamFailure(srcShown, streamErr)
+	// planStopped ends the plan: no UID SEARCH, no standby stream, and every UID not copied is an error.
+	planStopped := isPlanStopped(streamErr)
+	if streamErr != nil && !planStopped {
+		if throttle := noteStreamFailure(srcShown, streamErr); throttle != nil {
+			stop.record(sideSource, throttle)
+			planStopped = true
+		}
+	}
 
 	// A UID that the stream did not deliver ends here as an error or as gone.
 	var strandedErrors, strandedGone int
-	if throttled {
-		// A throttled source gets no UID SEARCH. A UIDVALIDITY stop takes the check below, which fails before UID SEARCH, so a standby from another folder can still replace each UID.
-		strandedErrors = len(sortedUIDs) - deliveredCount
-	} else if deliveredCount < len(sortedUIDs) {
-		undelivered := make([]uint32, 0, len(sortedUIDs)-deliveredCount)
+	undeliveredCount := len(sortedUIDs) - deliveredCount
+	if undeliveredCount > 0 && stop.stopped() {
+		planStopped = true
+	}
+	if planStopped {
+		strandedErrors = undeliveredCount
+	} else if undeliveredCount > 0 {
+		undelivered := make([]uint32, 0, undeliveredCount)
 		for i, uid := range sortedUIDs {
 			if !delivered[i] {
 				undelivered = append(undelivered, uid)
@@ -239,38 +366,50 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			reportCanceled()
 			return synced, errors, 0
 		}
-		// A failed check proves nothing, so every UID of the call counts as still held.
-		if err != nil {
-			held = undelivered
-		}
-		next := 0
-		for _, uid := range undelivered {
-			for next < len(held) && held[next] < uid {
-				next++
+		if err != nil && stop.recordThrottled(sideSource, err) {
+			planStopped = true
+			strandedErrors = undeliveredCount
+		} else {
+			// A failed check proves nothing, so every UID of the call counts as still held.
+			if err != nil {
+				held = undelivered
 			}
-			cause := causeGone
-			if next < len(held) && held[next] == uid {
-				cause = causeNotDelivered
-			}
-			switch {
-			case len(p.standbysOf(uid)) > 0:
-				addPending(uid, cause)
-			case cause == causeGone:
-				strandedGone++
-			default:
-				strandedErrors++
+			next := 0
+			for _, uid := range undelivered {
+				for next < len(held) && held[next] < uid {
+					next++
+				}
+				cause := causeGone
+				if next < len(held) && held[next] == uid {
+					cause = causeNotDelivered
+				}
+				switch {
+				case len(p.standbysOf(uid)) > 0:
+					addPending(uid, cause)
+				case cause == causeGone:
+					strandedGone++
+				default:
+					strandedErrors++
+				}
 			}
 		}
 	}
 
 	// The main FETCH has ended, so the source session can run the next command.
 	for source, standby := range p.standbySources {
+		if planStopped || stop.stopped() {
+			planStopped = true
+			break
+		}
 		uids, owner := standbyRequest(&p, pending, uint32(source))
 		if len(uids) == 0 || ctx.Err() != nil {
 			continue
 		}
 		standbyShown := termsafe.Escape(standby.folder)
-		err := w.src.StreamMessagesByUIDs(ctx, standby.folder, standby.uidValidity, uids, func(msg client.Message) error {
+		err := w.src.StreamMessagesByUIDs(ctx, standby.folder, standby.uidValidity, uids, stop.halt, func(msg client.Message) error {
+			if stop.stopped() {
+				return errPlanStopped
+			}
 			planned := owner[msg.UID()]
 			if _, waiting := pending[planned]; !waiting {
 				return nil
@@ -299,14 +438,26 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 					pw.Log("Failed to append message to %s: %s", dstShown, termsafe.Escape(err.Error()))
 				}
 				refreshTracker()
+				if stop.recordThrottled(sideDestination, err) {
+					return errPlanStopped
+				}
+				return destinationUsable()
 			}
 			return nil
 		})
 		if ctx.Err() != nil {
 			break
 		}
+		if isPlanStopped(err) {
+			planStopped = true
+			break
+		}
 		if err != nil {
-			noteStreamFailure(standbyShown, err)
+			if throttle := noteStreamFailure(standbyShown, err); throttle != nil {
+				stop.record(sideSource, throttle)
+				planStopped = true
+				break
+			}
 		}
 	}
 	if ctx.Err() != nil {
@@ -316,7 +467,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 	errors += strandedErrors
 	gone += strandedGone
 	for _, cause := range pending {
-		if cause == causeGone {
+		if cause == causeGone && !planStopped {
 			gone++
 		} else {
 			errors++
@@ -331,24 +482,19 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		pw.Log("  ℹ️  Source folder %s no longer holds %d of the %d planned messages for %s, so they are not copied",
 			srcShown, gone, p.NewMessages, dstShown)
 	}
-	if errors > 0 {
-		tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d (errors: %d) %s → %s",
-			planIdx+1, planCount, synced, errors, srcShown, dstShown))
-		tr.MarkAsErrored()
-	} else {
-		tr.UpdateMessage(fmt.Sprintf("%d/%d Synced messages %d %s → %s",
-			planIdx+1, planCount, synced, srcShown, dstShown))
-		tr.MarkAsDone()
-	}
+	finishTracker()
 	return synced, errors, gone
 }
 
-// streamFailure reads a StreamMessagesByUIDs error: the failed batches, whether a throttled reply ended the stream and the first failure. Any other error counts as one batch.
-func streamFailure(err error) (batches int, throttled bool, first error) {
+// streamFailure reads a StreamMessagesByUIDs error: the failed batches, the throttled reply that ended the stream, if any, and the first failure. Any other error counts as one batch.
+func streamFailure(err error) (batches int, throttle error, first error) {
 	if se, ok := errors.AsType[*client.StreamError](err); ok {
-		return se.FailedBatches, se.Stop != nil && !errors.Is(se.Stop, client.ErrUIDValidityChanged), se.First
+		if client.IsThrottled(se.Stop) {
+			throttle = se.Stop
+		}
+		return se.FailedBatches, throttle, se.First
 	}
-	return 1, false, err
+	return 1, nil, err
 }
 
 func refusedBody(err error) bool {

@@ -602,10 +602,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		wg          sync.WaitGroup
 		totalSynced atomic.Int64
 		totalErrors atomic.Int64
+		stop        throttleStop
 	)
 
+	// A stop ends the dispatch: the plans from firstUnstarted on never begin.
+	firstUnstarted := len(activePlans)
 	for i, plan := range activePlans {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || stop.stopped() {
+			firstUnstarted = i
 			break
 		}
 		var w *syncWorker
@@ -614,13 +618,20 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		case <-ctx.Done():
 		}
 		if w == nil {
+			firstUnstarted = i
+			break
+		}
+		// The stop can land while the loop waits for a worker.
+		if stop.stopped() {
+			free <- w
+			firstUnstarted = i
 			break
 		}
 		wg.Add(1)
 		go func(idx int, p FolderSyncPlan, w *syncWorker, tr *progress.Tracker) {
 			defer wg.Done()
 			defer func() { free <- w }()
-			synced, errs, _ := runFolderSync(ctx, w, p, tr, idx, len(activePlans), syncPW, verbose)
+			synced, errs, _ := runFolderSync(ctx, w, p, &stop, tr, idx, len(activePlans), syncPW, verbose)
 			totalSynced.Add(int64(synced))
 			totalErrors.Add(int64(errs))
 		}(i, plan, w, trackers[i])
@@ -631,12 +642,23 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		return err
 	}
 
+	cause := stop.get()
+	if cause != nil {
+		for i := firstUnstarted; i < len(activePlans); i++ {
+			totalErrors.Add(int64(activePlans[i].NewMessages))
+			markPlanStopped(trackers[i], activePlans[i], i, len(activePlans))
+		}
+	}
+
 	totalSyncedN := int(totalSynced.Load())
 	totalErrorsN := int(totalErrors.Load())
 
-	if totalErrorsN > 0 || len(summary.Failures) > 0 {
+	if totalErrorsN > 0 || len(summary.Failures) > 0 || cause != nil {
 		if len(summary.Failures) > 0 && !quiet {
 			printFolderFailures(out, summary.Failures)
+		}
+		if cause != nil {
+			printThrottleStop(out, cfg, cause)
 		}
 		printSyncErrors(out, totalSyncedN, totalErrorsN, len(summary.Failures))
 		// Friendly summary already printed; signal non-zero exit without
@@ -923,6 +945,16 @@ func printFolderSkips(out io.Writer, skips []FolderSkip) {
 		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s: %s\n",
 			termsafe.Escape(s.SourceFolder), skipReasonUnlisted, termsafe.Escape(s.Err.Error()))
 	}
+}
+
+// The reason is server text, so it goes through termsafe.Escape. Labels come from the operator.
+func printThrottleStop(out io.Writer, cfg *config.Config, cause *throttleCause) {
+	label := cfg.Dst.Label
+	if cause.side == sideSource {
+		label = cfg.Src.Label
+	}
+	_, _ = fmt.Fprintf(out, "⛔ Sync stopped: the %s server [%s] reports a rate limit or a full quota: %s. Run sync again later: it continues where this run stopped.\n",
+		cause.side, label, termsafe.Escape(cause.err.Error()))
 }
 
 func printSyncErrors(out io.Writer, synced, errs, failedFolders int) {

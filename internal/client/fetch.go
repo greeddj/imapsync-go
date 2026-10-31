@@ -452,8 +452,8 @@ func (c *Client) ExistingUIDs(ctx context.Context, folder string, uidValidity ui
 	return held, nil
 }
 
-// StreamMessagesByUIDs feeds onMessage, which must not call c. Failed batches return one *StreamError. A cancel, an onMessage error, a UIDVALIDITY change or throttling ends it; uidValidity 0 skips.
-func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
+// StreamMessagesByUIDs feeds onMessage, which must not call c. A halt or onMessage error ends the stream unchanged and closes a busy session. A nil halt and uidValidity 0 skip checks.
+func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, halt func() error, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()
 
@@ -480,6 +480,11 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if halt != nil {
+			if err := halt(); err != nil {
+				return err
+			}
+		}
 
 		end := min(start+uidFetchBatchSize, len(uids))
 		batch := uids[start:end]
@@ -497,6 +502,13 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 			}
 			if uidSet.Empty() {
 				return nil
+			}
+			// A retry runs on a new session, so a stop since the batch began must send no UID FETCH.
+			if halt != nil {
+				if err := halt(); err != nil {
+					cbErr = err
+					return errStreamStopped
+				}
 			}
 			if err := c.selectChecked(cli, folder, uidValidity); err != nil {
 				return err
@@ -530,10 +542,19 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 				seen[i] = true
 				if e != nil {
 					cbErr = e
+					// go-imap cannot end a FETCH in flight, so the drain would download every body left in the batch.
+					if slices.Contains(seen, false) {
+						_ = cli.Terminate()
+					}
 				}
 			}
-			if err := <-batchDone; err != nil {
-				return fmt.Errorf("[%s] body fetch: %w", c.prefix, err)
+			berr := <-batchDone
+			// After a caller stop the batch error proves nothing, and a retry would fetch again.
+			if cbErr != nil {
+				return errStreamStopped
+			}
+			if berr != nil {
+				return fmt.Errorf("[%s] body fetch: %w", c.prefix, berr)
 			}
 			return nil
 		})

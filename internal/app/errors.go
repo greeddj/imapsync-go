@@ -26,3 +26,6 @@ var errDestinationClash = errors.New("same destination folder as source folder")
 
 // errSourceConflict stops the run before the plan, because the order of the map items must not choose the destination.
 var errSourceConflict = errors.New("different destination folders for source folder")
+
+// errPlanStopped ends one plan after a throttled reply or a destination that gave up. It stays inside the worker, so its text never reaches the user.
+var errPlanStopped = errors.New("plan stopped")

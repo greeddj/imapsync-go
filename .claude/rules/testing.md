@@ -88,6 +88,7 @@
 
   The error class has these tests:
   - `TestClassifyError` and `TestClassifyError_When_WrapperTextHoldsAPhrase_Then_LeafDecides` - the text of a wrapper (a folder name or a label) never changes the class, and a leaf reply keeps its class under each wrapper;
+  - `TestIsThrottled` - the predicate is true for a throttle or quota reply under any wrapper, and for a throttled give-up of a reconnect. It is false for a network error, also under a wrapper that holds a quota phrase, for a locked account that names a quota, for the go-imap text `imap: cannot send literal: no continuation request received` and for `ErrUIDValidityChanged`. It is false for a whole `StreamError` with a network error in `First`, so callers read `Stop`;
   - `TestCanRevive` - only a transient or throttled give-up can revive;
   - `TestIsAlreadyExistsErr` - the CREATE refusal texts, with the Gmail text `Duplicate folder name`;
   - `Test_FetchMessageMap_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndRetries` and `Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Then_ReconnectsAndStreams` - a folder name that holds a throttle phrase does not stop the reconnect;
@@ -119,6 +120,21 @@
   - `Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect` - each public operation that uses `safeCall` logs in again on a Client that has no session;
   - the "account lock" and "account lockout" cases of `Test_safeCall_When_ServerStillRefusesAfterGiveUp_Then_EachCallSpendsOneAttempt` - after an account-lock reply, the Client sends no further login;
   - `Test_AppendMessage_When_RepairGaveUpTransiently_Then_NextAppendProbesAfterCooldown` - `AppendMessage` goes through the same gate.
+
+  The session check of the destination has these tests:
+  - `Test_EnsureSession_When_SessionIsLive_Then_SendsNothing` - a working session gets no dial and no command;
+  - `Test_EnsureSession_When_SessionEndedWhileIdle_Then_ReconnectsOnce` - after a BYE while idle, the call logs in one time, and a later command works;
+  - `Test_EnsureSession_When_GateRefuses_Then_ReturnsTheStoredGiveUpWithoutDial` - inside the cool-down of a transient give-up, and after a permanent give-up (also with `reviveDur` zero), each call returns the stored give-up with no dial and no LOGIN;
+  - `Test_EnsureSession_When_ReviveIntervalPassed_Then_OneLoginDecides` - after `reviveInterval`, one login attempt runs. A successful attempt gives nil and the full reconnect budget. A failed attempt gives its error, and the next call sends no LOGIN;
+  - `Test_EnsureSession_When_GiveUpIsThrottled_Then_IsThrottledReportsIt` - a throttled give-up gives an error for which `IsThrottled` is true, with no dial;
+  - `Test_EnsureSession_When_CancelledOrContextEnded_Then_ReturnsWithoutDial` - a cancelled Client gives `context.Canceled`, an ended context gives its error, and neither dials;
+  - `Test_EnsureSession_When_ContextEndsDuringReconnect_Then_ReturnsContextError` - a context that ends while the login of a reconnect waits gives the context error, not a stored give-up.
+
+  The halt hook and the stop of a stream have these tests:
+  - `Test_StreamMessagesByUIDs_When_HaltBeforeTheFirstBatch_Then_SendsNoCommand` - a halt error comes back unchanged, and the stream sends no EXAMINE and no UID FETCH;
+  - `Test_StreamMessagesByUIDs_When_HaltTurnsOnAfterABatch_Then_NoNextBatch` - with 501 UIDs, a halt after the 500th message gives one UID FETCH and 500 deliveries;
+  - `Test_StreamMessagesByUIDs_When_HaltTurnsOnDuringARetry_Then_NewSessionGetsNoFetch` - a halt that turns on before the retry of a cut batch sends no UID FETCH on the new session;
+  - `Test_StreamMessagesByUIDs_When_CallbackStopsTheStream_Then_SessionClosesAndNothingIsRetried` - an `onMessage` error with UIDs in flight makes the client close the connection. The stream returns the error with one LOGIN and one UID FETCH, and a later stream reconnects and delivers. When the server drops the connection after the error, the stream starts no reconnect and no second UID FETCH.
 
   The `selectIfNeeded` check has these tests:
   - `Test_selectIfNeeded_shortCircuitsOnNetwork` - a second call for the selected folder sends no EXAMINE;
@@ -395,6 +411,25 @@
   - `TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother` - in a mirror run, the own mapping of each folder wins;
   - `TestRunSync_When_ExplicitChildDestinationEqualsRenamedSiblingDestination_Then_BothFailAsAClash` - a typed destination that equals a renamed destination gives a clash, and both folders fail.
 
+  The throttle stop and the destination that gave up have these tests:
+  - `TestRunSync_When_DestinationThrottlesAppend_Then_RunStopsWithoutDownloadingTheRest` - for the Gmail reply and the Dovecot reply, with one worker, one APPEND and one UID FETCH of `1:500` go to the servers. The run prints the stop line one time, counts all 603 messages as errors, and ends with `ErrSilentExit` and no `Cancelled`. A `--quiet` case shows the stop line and the summary;
+  - `TestRunSync_When_DestinationGivesUpMidPlan_Then_NoMoreBodiesAreFetched` - a destination that drops the connection at its second APPEND and refuses every login gives one UID FETCH of `1:500`. The second plan sends no source command, and the run prints no stop line;
+  - `TestRunSync_When_SourceThrottlesTheBodyFetch_Then_RunStops` - a throttled UID FETCH names the source in the stop line. The second plan does not start, and the counts cover both plans;
+  - `TestRunSync_When_TwoWorkersAndTheDestinationThrottles_Then_NoPlanStartsAfterTheStop` - in every interleaving, at most two APPEND commands and two UID FETCH commands of `1:500` go to the servers, and the third plan does not start;
+  - `TestRunSync_When_ThrottleStopsTheRun_Then_TheNextRunCopiesTheRest` - the first run copies 3 messages and stops. The second run copies the rest and succeeds;
+  - `TestRunSync_When_StopReasonCarriesControlCharacters_Then_TheStopLineShowsEscapes` - the stop line shows the control and bidi characters of the reply as escapes;
+  - `Test_runFolderSync_When_RunIsAlreadyStopped_Then_SendsNoCommand` - a stopped run sends no command on either worker Client. Each message counts as an error, and the tracker shows `Stopped`;
+  - `Test_runFolderSync_When_AnotherWorkerStopsTheRunDuringAnAppend_Then_NoFurtherAppend` and `Test_runFolderSync_When_TheRunStopsAtTheLastMessageOfABatch_Then_NoNextBatch` - a stop from another worker ends the plan before the next APPEND and before the next batch;
+  - `Test_runFolderSync_When_AppendFailsAfterAnotherWorkerStoppedTheRun_Then_ThePlanEndsAtOnce` - a refused APPEND on a working session ends the plan when a stop exists, and each message counts as an error;
+  - `Test_runFolderSync_When_DestinationThrottles_Then_RecordsTheDestinationAndStops`, `Test_runFolderSync_When_ExistenceCheckIsThrottled_Then_RecordsTheSourceAndSkipsStandbys` and `Test_runFolderSync_When_StandbySourceThrottles_Then_RecordsTheSourceAndTriesNoOtherSource` - the stop holds the side and the reply, and no standby source is tried;
+  - `Test_runFolderSync_When_AThrottledStopFollowsARefusedBody_Then_NoStandbyIsFetchedAndBothAreErrors` - a throttled source stop after a refused body fetches no standby, and the waiting UID counts as an error;
+  - `Test_runFolderSync_When_StandbyAppendFindsTheDestinationGone_Then_NoOtherSourceIsTried` and `Test_runFolderSync_When_TheRunStopsDuringAStandbyStream_Then_NoLaterSourceIsTried` - a standby search ends when the destination gave up or the run stopped, whether the standby stream delivers a message or not;
+  - `Test_runFolderSync_When_DestinationGaveUpBeforeThePlan_Then_NoSourceCommand` - a destination that gave up gets no dial and no command, the source gets no command, and each message counts as an error;
+  - `Test_runFolderSync_When_AppendIsRefusedOnALiveSession_Then_ThePlanGoesOn` - a refusal that is no throttle counts one error for each message and records no stop;
+  - `Test_streamFailure` and `Test_streamFailure_When_StopIsThrottledAndFirstIsANetworkError_Then_ReportsTheThrottle` - `streamFailure` reads the throttled `Stop` of a stream error, also when `First` is a network error.
+
+  Each stop test checks that synced, errors and gone add up to the planned messages.
+
   The case-variant warning has these tests:
   - `Test_printCaseVariantDestinations` - the groups, their order, the escapes and the rule that a group with every name listed gets no line. Four cases repeat a spelling. In two cases, the line names the repeated spelling one time. In one case, two mappings name one destination with no other spelling, so no line shows. In one case, the LIST holds every spelling, so the group gets no line;
   - `Test_printCaseVariantDestinations_When_GroupHoldsEveryLetterCaseVariant_Then_ListsEachNameOnce` - the test gives the warning all 16384 letter-case spellings of one name, in reverse order, with three of them repeated. When the LIST misses one spelling, the line names each spelling one time, in byte order. When the LIST holds every spelling, the line does not show. The call changes neither the mappings nor the LIST;
@@ -456,8 +491,13 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
   - `runSync`, after the connect errgroup;
   - `runSync`, at the top of the dispatch loop;
   - `expandMappingsWithSubfolders`, in the per-mapping loop, after `getSubfolders` and in the per-subfolder loop;
-  - `isHierarchyLevel`, the error return after `getSubfolders`.
+  - `isHierarchyLevel`, the error return after `getSubfolders`;
+  - `runSync`, the stop check at the top of the dispatch loop. A stop that lands between two iterations has no hook. The check after the wait for a worker is covered, and `TestRunSync_When_TwoWorkersAndTheDestinationThrottles_Then_NoPlanStartsAfterTheStop` tests the property in each interleaving;
+  - `runFolderSync`, the context check after a failed `EnsureSession`, before the plan and after a failed APPEND. `Test_EnsureSession_When_ContextEndsDuringReconnect_Then_ReturnsContextError` covers the call.
 - **`buildSyncPlan`, the `MailboxExists` error in the destination goroutine** - `MailboxExists` reads the mailbox cache, so it fails only when the context ends. The `gCtx.Err()` check at the top of the loop runs first. `gCtx` comes from `errgroup.WithContext`, so a test cannot replace its `Err`. So the error needs a cancel in the short time between the two calls. A deterministic test needs a production hook there. `Test_buildSyncPlan_When_ContextEndsAfterEntryCheck_Then_NeitherScanStarts` covers the check at the top of the loop.
+- **The throttled give-up of `EnsureSession` before a plan** - a throttled give-up comes from `reconnect`, and `reconnect` waits `throttledBackoff = 5m` between login attempts. An end-to-end test would wait 5 minutes. `Test_EnsureSession_When_GiveUpIsThrottled_Then_IsThrottledReportsIt` and the gate tests cover the client side. `Test_runFolderSync_When_DestinationThrottles_Then_RecordsTheDestinationAndStops` and the throttled APPEND tests cover `recordThrottled`, which the give-up path shares.
+- **The revive login before a plan after `reviveInterval`** - the test would wait `reviveInterval = 5m`. `Test_EnsureSession_When_ReviveIntervalPassed_Then_OneLoginDecides` covers the login attempt with an expired cool-down.
+- **A refusal before the `+` continuation, end to end** - go-imap drops the `false` continuation signal when the writer does not yet wait, so the test can hang. `TestIsThrottled` covers the classification of the text that go-imap returns.
 - **A cancel before the `+` continuation of an APPEND** - the cancel closes the socket, and go-imap then waits on the `continues` channel with no end (see the Known limitation in `CLAUDE.md`). So a test of this window can hang. A `fakeServer.onCommand` hook for APPEND runs before the fake server sends `+`. Do not cancel in such a hook. `TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted` cancels through `scriptedHandler`, which reacts after the server reads the literal.
 
 ### Deliberate exclusions in `cmd/imapsync-go`

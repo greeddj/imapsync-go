@@ -3831,7 +3831,7 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 			run: func(t *testing.T, c *Client) error {
 				t.Helper()
 				delivered := make(map[uint32]int)
-				err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+				err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, nil, func(msg Message) error {
 					delivered[msg.m.Uid]++
 					return nil
 				})
@@ -4110,5 +4110,318 @@ func Test_folderLock_When_NamesDifferOnlyInInboxCase_Then_ShareOneMutex(t *testi
 	}
 	if c.folderLock("Archive") == c.folderLock("archive") {
 		t.Error("folderLock gave one mutex for two names that differ in letter case outside INBOX")
+	}
+}
+
+// commandsSeen counts every command the server has seen, whatever its verb.
+func commandsSeen(srv *fakeServer) int {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	total := 0
+	for _, n := range srv.counts {
+		total += n
+	}
+	return total
+}
+
+func Test_EnsureSession_When_SessionIsLive_Then_SendsNothing(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	dials := countDials(c)
+	dialsBefore, commandsBefore := dials.Load(), commandsSeen(srv)
+
+	for range laterCalls {
+		if err := c.EnsureSession(t.Context()); err != nil {
+			t.Fatalf("EnsureSession error = %v, want nil", err)
+		}
+	}
+
+	if got := dials.Load(); got != dialsBefore {
+		t.Errorf("dial count went from %d to %d, want no dial", dialsBefore, got)
+	}
+	if got := commandsSeen(srv); got != commandsBefore {
+		t.Errorf("the server saw %d new commands, want none", got-commandsBefore)
+	}
+}
+
+func Test_EnsureSession_When_SessionEndedWhileIdle_Then_ReconnectsOnce(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(byeAfterLoginHandler(srv, release, "* BYE server shutting down"))
+	c := newClientWithFake(t, srv)
+	loggedOut := c.c.Load().LoggedOut()
+	releaseOnce()
+	awaitSignal(t, loggedOut, "the client to notice the server ending the session")
+
+	err := awaitCall(t, "EnsureSession", func() error { return c.EnsureSession(t.Context()) })
+	if err != nil {
+		t.Fatalf("EnsureSession error = %v, want nil after a reconnect", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2: the first session and one reconnect", got)
+	}
+
+	if err := c.EnsureSession(t.Context()); err != nil {
+		t.Fatalf("second EnsureSession error = %v, want nil", err)
+	}
+	err = c.safeCall(func(cli *imapclient.Client) error { return cli.Noop() })
+	if err != nil {
+		t.Errorf("a command on the new session failed: %v", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d after the later calls, want it to stay 2", got)
+	}
+}
+
+func Test_EnsureSession_When_GateRefuses_Then_ReturnsTheStoredGiveUpWithoutDial(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		giveUp    func(t *testing.T, srv *fakeServer, c *Client) error
+		name      string
+		wantClass ErrClass
+	}{
+		{
+			name: "transient give-up inside the cool-down",
+			giveUp: func(t *testing.T, srv *fakeServer, c *Client) error {
+				t.Helper()
+				err := giveUpOn(t, srv, c, dovecotTempAuthFailure, ClassTransient)
+				c.reviveDur = time.Hour
+				return err
+			},
+			wantClass: ClassTransient,
+		},
+		{
+			name: "permanent give-up without a cool-down",
+			giveUp: func(t *testing.T, srv *fakeServer, c *Client) error {
+				t.Helper()
+				err := loseSession(t, srv, c)
+				c.reviveDur = 0
+				return err
+			},
+			wantClass: ClassPermanent,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c := newClientWithFake(t, srv)
+			dials := countDials(c)
+			giveUp := tt.giveUp(t, srv, c)
+			// A stray LOGIN would reach a handler that refuses, so it shows in the count.
+			for range laterCalls {
+				srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+			}
+			dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+			for range laterCalls {
+				checkStoredGiveUp(t, c.EnsureSession(t.Context()), giveUp, tt.wantClass)
+			}
+
+			if got := dials.Load(); got != dialsBefore {
+				t.Errorf("dial count went from %d to %d, want no dial", dialsBefore, got)
+			}
+			if got := srv.callCount("LOGIN"); got != loginsBefore {
+				t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, got)
+			}
+			if !c.mu.TryLock() {
+				t.Fatal("c.mu is still held after the calls")
+			}
+			c.mu.Unlock()
+		})
+	}
+}
+
+// Sequential - swaps the package-level sleepCtx var.
+func Test_EnsureSession_When_ReviveIntervalPassed_Then_OneLoginDecides(t *testing.T) {
+	t.Run("the login succeeds", func(t *testing.T) {
+		srv := newFakeServer(t)
+		c := newClientWithFake(t, srv)
+		rec := recordSleeps(t, srv)
+		dials := countDials(c)
+		_ = giveUpOn(t, srv, c, dovecotTempAuthFailure, ClassTransient)
+		expireCooldown(c)
+		srv.addConnHandler(interceptHandler(srv, serveNormally))
+		dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+		if err := c.EnsureSession(t.Context()); err != nil {
+			t.Fatalf("EnsureSession error = %v, want nil", err)
+		}
+
+		if got := dials.Load() - dialsBefore; got != 1 {
+			t.Errorf("the call dialed %d times, want 1", got)
+		}
+		if got := srv.callCount("LOGIN") - loginsBefore; got != 1 {
+			t.Errorf("the call sent %d LOGINs, want 1", got)
+		}
+		if c.c.Load() == nil || c.giveUpErr != nil {
+			t.Errorf("session = %v, giveUpErr = %v, want a session and no give-up", c.c.Load(), c.giveUpErr)
+		}
+
+		for range maxReconnectAttempts {
+			srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+		}
+		loginsBefore, waitsBefore := srv.callCount("LOGIN"), len(rec.waits)
+		err := c.safeCall(func(*imapclient.Client) error { return io.EOF })
+		if got := classifyError(err); got != ClassTransient {
+			t.Errorf("classifyError(%v) = %s, want %s", err, got, ClassTransient)
+		}
+		if got := srv.callCount("LOGIN") - loginsBefore; got != maxReconnectAttempts {
+			t.Errorf("the next reconnect sent %d LOGINs, want the whole budget of %d", got, maxReconnectAttempts)
+		}
+		if got, want := rec.waits[waitsBefore:], transientBackoffs(); !slices.Equal(got, want) {
+			t.Errorf("the next reconnect waited %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the login fails", func(t *testing.T) {
+		srv := newFakeServer(t)
+		c := newClientWithFake(t, srv)
+		rec := recordSleeps(t, srv)
+		dials := countDials(c)
+		_ = giveUpOn(t, srv, c, dovecotTempAuthFailure, ClassTransient)
+		expireCooldown(c)
+		srv.addConnHandler(connHandlerWithLoginReply(srv, dovecotTempAuthFailure))
+		dialsBefore, loginsBefore, waitsBefore := dials.Load(), srv.callCount("LOGIN"), len(rec.waits)
+
+		err := c.EnsureSession(t.Context())
+
+		if got := classifyError(err); got != ClassTransient {
+			t.Errorf("classifyError(%v) = %s, want %s", err, got, ClassTransient)
+		}
+		if got := srv.callCount("LOGIN") - loginsBefore; got != 1 {
+			t.Errorf("the call sent %d LOGINs, want exactly the one attempt", got)
+		}
+		if got := len(rec.waits) - waitsBefore; got != 0 {
+			t.Errorf("the call waited %v, want no wait", rec.waits[waitsBefore:])
+		}
+
+		dialsAfter := dials.Load()
+		if err := c.EnsureSession(t.Context()); !errors.Is(err, c.giveUpErr) {
+			t.Errorf("second EnsureSession error = %v, want the stored give-up", err)
+		}
+		if got := dials.Load(); got != dialsAfter || dialsAfter-dialsBefore != 1 {
+			t.Errorf("dials after the first call = %d, after the second = %d (from %d), want one dial in all", dialsAfter, got, dialsBefore)
+		}
+		if got := srv.callCount("LOGIN") - loginsBefore; got != 1 {
+			t.Errorf("both calls sent %d LOGINs, want 1: the cool-down starts again", got)
+		}
+	})
+}
+
+// Sequential - swaps the package-level sleepCtx var.
+func Test_EnsureSession_When_GiveUpIsThrottled_Then_IsThrottledReportsIt(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newClientWithFake(t, srv)
+	_ = recordSleeps(t, srv)
+	dials := countDials(c)
+	giveUp := giveUpOn(t, srv, c, "NO [ALERT] Too many simultaneous connections", ClassThrottled)
+	c.reviveDur = time.Hour
+	dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+	err := c.EnsureSession(t.Context())
+
+	if !IsThrottled(err) {
+		t.Errorf("IsThrottled(%v) = false, want true", err)
+	}
+	checkStoredGiveUp(t, err, giveUp, ClassThrottled)
+	if got := dials.Load(); got != dialsBefore {
+		t.Errorf("dial count went from %d to %d, want no dial", dialsBefore, got)
+	}
+	if got := srv.callCount("LOGIN"); got != loginsBefore {
+		t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, got)
+	}
+}
+
+func Test_EnsureSession_When_CancelledOrContextEnded_Then_ReturnsWithoutDial(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		prepare func(t *testing.T, c *Client) context.Context
+		want    error
+		name    string
+	}{
+		{
+			name: "client cancelled",
+			prepare: func(t *testing.T, c *Client) context.Context {
+				t.Helper()
+				c.Cancel()
+				return t.Context()
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "context ended",
+			prepare: func(t *testing.T, _ *Client) context.Context {
+				t.Helper()
+				ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			want: context.DeadlineExceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c := newClientWithFake(t, srv)
+			dials := countDials(c)
+			ctx := tt.prepare(t, c)
+			dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+			err := c.EnsureSession(ctx)
+
+			if !errors.Is(err, tt.want) {
+				t.Errorf("EnsureSession error = %v, want %v", err, tt.want)
+			}
+			if got := dials.Load(); got != dialsBefore {
+				t.Errorf("dial count went from %d to %d, want no dial", dialsBefore, got)
+			}
+			if got := srv.callCount("LOGIN"); got != loginsBefore {
+				t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, got)
+			}
+		})
+	}
+}
+
+func Test_EnsureSession_When_ContextEndsDuringReconnect_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	login := newStall(verbIs("LOGIN"))
+	srv := newFakeServer(t)
+	srv.addConnHandler(byeAfterLoginHandler(srv, release, "* BYE server shutting down"))
+	srv.addConnHandler(interceptHandler(srv, login.intercept))
+	c := newClientWithFake(t, srv)
+	loggedOut := c.c.Load().LoggedOut()
+	releaseOnce()
+	awaitSignal(t, loggedOut, "the client to notice the server ending the session")
+
+	ctx := newFiredContext(t.Context())
+	errc := make(chan error, 1)
+	go func() { errc <- c.EnsureSession(ctx) }()
+	awaitSignal(t, login.reached, "the server to receive the LOGIN of the reconnect")
+	ctx.fire()
+
+	err := awaitError(t, errc, "EnsureSession")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want %v, not a stored give-up", err, context.DeadlineExceeded)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2: the first login and the stalled one", got)
 	}
 }

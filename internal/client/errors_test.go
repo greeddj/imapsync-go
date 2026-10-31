@@ -222,6 +222,50 @@ func TestIsRetryable(t *testing.T) {
 	}
 }
 
+func TestIsThrottled(t *testing.T) {
+	t.Parallel()
+
+	gmailLimit := errors.New("Account exceeded command or bandwidth limits. (Failure)")
+	tests := []struct {
+		err  error
+		name string
+		want bool
+	}{
+		{name: "Gmail limit reply under the append wrapper", err: fmt.Errorf("[dst-w1] append: %w", gmailLimit), want: true},
+		{name: "Dovecot quota reply under the append wrapper", err: fmt.Errorf("[dst-w1] append: %w", errors.New("Quota exceeded (mailbox for user is full)")), want: true},
+		{name: "too many connections", err: errors.New("Too many simultaneous connections"), want: true},
+		{name: "throttled give-up of a reconnect", err: fmt.Errorf("[dst] failed to reconnect after retries: %w", gmailLimit), want: true},
+		{name: "throttled stop of a stream", err: &StreamError{First: gmailLimit, Stop: gmailLimit, FailedBatches: 1}, want: true},
+
+		{name: "nil", err: nil, want: false},
+		{name: "end of file", err: io.EOF, want: false},
+		{name: "end of file under a wrapper that holds a quota phrase", err: fmt.Errorf("folder exceeded quota: %w", io.EOF), want: false},
+		{name: "authentication failure", err: errors.New("Authentication failed."), want: false},
+		{name: "locked account that also names a quota", err: errors.New("Account locked: quota exceeded"), want: false},
+		{name: "refusal before the continuation request", err: errors.New("imap: cannot send literal: no continuation request received"), want: false},
+		{name: "changed UIDVALIDITY", err: fmt.Errorf("[src] folder INBOX: %w", ErrUIDValidityChanged), want: false},
+		{name: "refused body", err: fmt.Errorf("[dst] %w", ErrEmptyBody), want: false},
+		{name: "whole stream error with a network failure first", err: &StreamError{First: io.EOF, Stop: gmailLimit, FailedBatches: 2}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsThrottled(tt.err); got != tt.want {
+				t.Errorf("IsThrottled(%v) = %v, want %v (class %s)", tt.err, got, tt.want, classifyError(tt.err))
+			}
+		})
+	}
+
+	t.Run("the stop of a stream error with a network failure first", func(t *testing.T) {
+		t.Parallel()
+
+		se := &StreamError{First: io.EOF, Stop: gmailLimit, FailedBatches: 2}
+		if !IsThrottled(se.Stop) {
+			t.Errorf("IsThrottled(Stop) = false, want true: callers read Stop, not the whole error")
+		}
+	})
+}
+
 func TestCanRevive(t *testing.T) {
 	t.Parallel()
 

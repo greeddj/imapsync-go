@@ -341,6 +341,16 @@ The defaults (no throttle) match `imapsync`'s default behaviour - they're
 appropriate for self-hosted IMAP servers on a LAN, not for big-provider
 mailboxes.
 
+When a server reports a rate limit or a full quota during the copy, `sync` stops. It prints this line one time, also with `-q`:
+
+```text
+⛔ Sync stopped: the destination server [dst] reports a rate limit or a full quota: <reply>. Run sync again later: it continues where this run stopped.
+```
+
+The line names the side (`source` or `destination`), the label of the server and the reply of the server. `sync` counts each message that it did not copy as an error. It ends with exit code 1. It does not wait and it does not print `Cancelled.` Run `sync` again later. The next run continues where this run stopped.
+
+Some servers refuse an upload before they ask for the message data. These servers hide the reason. `sync` then counts one failed message and continues.
+
 ## Notes
 
 - **Exit code 1** - `sync` ends with code 1 when a message or a folder fails. If you answer no to the question before the copy, `sync` ends with code 0, also when a folder failed. `show` ends with code 1 when it cannot read a folder. Any other error, except a cancel with Ctrl-C, prints `Error:` and ends with code 1.

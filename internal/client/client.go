@@ -724,6 +724,28 @@ func (c *Client) reconnectSession() (*imapclient.Client, error) {
 	return nil, errors.New("imap client not connected after reconnect")
 }
 
+// EnsureSession sends no command on a working session. If the session is gone, it reconnects through the give-up and revive gate, which may return the stored give-up with no dial.
+func (c *Client) EnsureSession(ctx context.Context) error {
+	defer c.withCancel(ctx)()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.isCancelled() {
+		return context.Canceled
+	}
+	if cli := c.c.Load(); cli != nil && !sessionEnded(cli) {
+		return nil
+	}
+	if _, err := c.reconnectSession(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	return nil
+}
+
 // noteIdleTrip logs why a reconnect follows a watchdog trip; the reconnect
 // messages alone do not say. Unlike log it ignores verbose, because a trip is
 // rare and worth a line.

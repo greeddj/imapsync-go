@@ -123,7 +123,7 @@ func Test_StreamMessagesByUIDs_batchesAt500(t *testing.T) {
 		uids[i] = uint32(i + 1)
 	}
 
-	err := c.StreamMessagesByUIDs(context.Background(), "INBOX", 0, uids, func(_ Message) error {
+	err := c.StreamMessagesByUIDs(context.Background(), "INBOX", 0, uids, nil, func(_ Message) error {
 		return nil
 	})
 	if err != nil {
@@ -272,7 +272,7 @@ func Test_StreamMessagesByUIDs_returnsWithoutFetching(t *testing.T) {
 			}
 
 			calls := 0
-			err := c.StreamMessagesByUIDs(ctx, "INBOX", 0, tt.uids, func(Message) error {
+			err := c.StreamMessagesByUIDs(ctx, "INBOX", 0, tt.uids, nil, func(Message) error {
 				calls++
 				return nil
 			})
@@ -308,7 +308,7 @@ func Test_StreamMessagesByUIDs_deliversMessages(t *testing.T) {
 		gotUIDs []uint32
 		bodies  []string
 	)
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 		lit := msg.m.GetBody(fullBodyPeekSection)
 		if lit == nil {
 			return errors.New("message has no body section")
@@ -348,8 +348,8 @@ func Test_StreamMessagesByUIDs_deliversMessages(t *testing.T) {
 }
 
 // Test_StreamMessagesByUIDs_callbackErrorStopsFurtherBatches asserts that a
-// callback error in the first batch is returned, the batch is drained without
-// more callbacks, and no second batch is requested.
+// callback error in the first batch is returned, no more callbacks run for the
+// batch, and no second batch is requested.
 func Test_StreamMessagesByUIDs_callbackErrorStopsFurtherBatches(t *testing.T) {
 	t.Parallel()
 
@@ -365,7 +365,7 @@ func Test_StreamMessagesByUIDs_callbackErrorStopsFurtherBatches(t *testing.T) {
 
 	errStop := errors.New("callback refused the message")
 	calls := 0
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(Message) error {
 		calls++
 		return errStop
 	})
@@ -415,7 +415,7 @@ func Test_StreamMessagesByUIDs_whenServerRefuses(t *testing.T) {
 			srv, c := newScriptedClient(t, tt.script)
 
 			calls := 0
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, nil, func(Message) error {
 				calls++
 				return nil
 			})
@@ -464,7 +464,7 @@ func Test_StreamMessagesByUIDs_whenContextExpiresMidBatch(t *testing.T) {
 	calls := 0
 	errc := make(chan error, 1)
 	go func() {
-		errc <- c.StreamMessagesByUIDs(ctx, "INBOX", 0, uids, func(Message) error {
+		errc <- c.StreamMessagesByUIDs(ctx, "INBOX", 0, uids, nil, func(Message) error {
 			calls++
 			ctx.fire()
 			return nil
@@ -908,7 +908,7 @@ func Test_StreamMessagesByUIDs_When_MessagesAreDelivered_Then_UIDIsTheRequestedO
 	})
 	var got []uint32
 
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{12, 10, 11}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{12, 10, 11}, nil, func(msg Message) error {
 		got = append(got, msg.UID())
 		return nil
 	})
@@ -950,7 +950,7 @@ func Test_StreamMessagesByUIDs_When_CallbackBlocks_Then_AtMostOneBodyIsReadAhead
 			uids[i] = uint32(i + 1)
 		}
 		var seen []int32
-		err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(Message) error {
+		err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(Message) error {
 			synctest.Wait()
 			seen = append(seen, read.Load())
 			return nil
@@ -1003,7 +1003,7 @@ func Test_StreamMessagesByUIDs_When_CallbackIsSlow_Then_WatchdogDoesNotTrip(t *t
 				uids[i] = uint32(i + 1)
 			}
 			delivered := 0
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(Message) error {
 				delivered++
 				if delivered == 1 {
 					time.Sleep(3*holdLimit + holdLimit/2)
@@ -1046,7 +1046,7 @@ func Test_StreamMessagesByUIDs_When_ServerSilentBeforeFirstMessage_Then_Watchdog
 
 	delivered := 0
 	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
-		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(Message) error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, nil, func(Message) error {
 			delivered++
 			time.Sleep(3*holdLimit + holdLimit/2)
 			return nil
@@ -1101,7 +1101,7 @@ func Test_StreamMessagesByUIDs_When_CallbackRuns_Then_WatchdogSpanIsClosedInside
 			w := c.idle.Load()
 
 			calls := 0
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, nil, func(Message) error {
 				calls++
 				if got := w.active.Load(); got != 0 {
 					t.Errorf("open spans inside callback %d = %d, want 0", calls, got)
@@ -1255,7 +1255,7 @@ func Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_Reconnects
 		uids[i] = uint32(i + 1)
 	}
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		if msg.m.Uid == uidFetchBatchSize {
 			releaseOnce()
@@ -1317,7 +1317,7 @@ func Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAga
 	}
 
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -1373,7 +1373,7 @@ func Test_StreamMessagesByUIDs_When_TransientErrorAfterPartialBatch_Then_RetryFe
 			}
 			var got []uint32
 			err := awaitCall(t, "StreamMessagesByUIDs", func() error {
-				return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+				return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 					got = append(got, msg.m.Uid)
 					return nil
 				})
@@ -1420,7 +1420,7 @@ func Test_StreamMessagesByUIDs_When_TransientErrorAfterEveryMessage_Then_RetrySe
 	}
 	var got []uint32
 	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
-		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 			got = append(got, msg.m.Uid)
 			return nil
 		})
@@ -1459,7 +1459,7 @@ func Test_StreamMessagesByUIDs_When_ServerRepeatsAUID_Then_CallbackRunsOnce(t *t
 	c := newClientWithFake(t, srv)
 
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -1494,7 +1494,7 @@ func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageS
 
 	calls := make(map[uint32]int)
 	withoutBody := 0
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, nil, func(msg Message) error {
 		calls[msg.m.Uid]++
 		if msg.m.GetBody(fullBodyPeekSection) == nil {
 			withoutBody++
@@ -1535,7 +1535,7 @@ func Test_StreamMessagesByUIDs_When_UIDOnlyGetsBodylessResponses_Then_CallbackSk
 	c := newClientWithFake(t, srv)
 
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -1566,7 +1566,7 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_EveryUIDIsDelivered(
 		uids[i] = uint32(i + 1)
 	}
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -1608,7 +1608,7 @@ func Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce(t 
 				uids[i] = uint32(i + 1)
 			}
 			var got []uint32
-			err := c.StreamMessagesByUIDs(t.Context(), tt.folder, 0, uids, func(msg Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), tt.folder, 0, uids, nil, func(msg Message) error {
 				got = append(got, msg.m.Uid)
 				return nil
 			})
@@ -1653,7 +1653,7 @@ func Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_Reselect
 
 	uids := []uint32{1, 2, 3}
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -1890,7 +1890,7 @@ func Test_StreamMessagesByUIDs_When_ConnectionDropsAndNameHoldsThrottlePhrase_Th
 
 	uids := []uint32{1, 2, 3}
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "Quota exceeded", 0, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "Quota exceeded", 0, uids, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -2109,7 +2109,7 @@ func Test_StreamMessagesByUIDs_When_UIDValidityDiffers_Then_FetchesNothing(t *te
 			c := newClientWithFake(t, srv)
 
 			var got []uint32
-			err := c.StreamMessagesByUIDs(t.Context(), tt.folder, 5, []uint32{1, 2, 3}, func(msg Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), tt.folder, 5, []uint32{1, 2, 3}, nil, func(msg Message) error {
 				got = append(got, msg.m.Uid)
 				return nil
 			})
@@ -2165,7 +2165,7 @@ func Test_StreamMessagesByUIDs_When_UIDValidityChangesAcrossReconnect_Then_Stops
 		uids[i] = uint32(i + 1)
 	}
 	var got []uint32
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		if msg.m.Uid == uidFetchBatchSize {
 			releaseOnce()
@@ -2218,7 +2218,7 @@ func Test_StreamMessagesByUIDs_When_SessionReportsNoUIDValidity_Then_FetchesNoth
 			}
 
 			var got []uint32
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, func(msg Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, nil, func(msg Message) error {
 				got = append(got, msg.m.Uid)
 				return nil
 			})
@@ -2275,7 +2275,7 @@ func Test_StreamMessagesByUIDs_When_PlanHasNoUIDValidityOrValuesMatch_Then_Strea
 
 			uids := []uint32{1, 2, 3}
 			var got []uint32
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", tt.planned, uids, func(msg Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", tt.planned, uids, nil, func(msg Message) error {
 				got = append(got, msg.m.Uid)
 				return nil
 			})
@@ -2315,7 +2315,7 @@ func Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_Fetche
 			}
 
 			var got []uint32
-			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", tt.planned, []uint32{1}, func(msg Message) error {
+			err := c.StreamMessagesByUIDs(t.Context(), "INBOX", tt.planned, []uint32{1}, nil, func(msg Message) error {
 				got = append(got, msg.m.Uid)
 				return nil
 			})
@@ -2564,7 +2564,7 @@ func Test_StreamMessagesByUIDs_When_UIDValidityChangesOnRetryInsideFirstBatch_Th
 	uids := []uint32{1, 2, 3, 4, 5}
 	var got []uint32
 	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
-		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, func(msg Message) error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 5, uids, nil, func(msg Message) error {
 			got = append(got, msg.m.Uid)
 			return nil
 		})
@@ -2606,7 +2606,7 @@ func Test_StreamMessagesByUIDs_When_ResponseCarriesFlags_Then_MessageKeepsTheSer
 	c := newClientWithFake(t, srv)
 
 	got := make(map[uint32][]string)
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, nil, func(msg Message) error {
 		got[msg.UID()] = msg.m.Flags
 		return nil
 	})
@@ -2686,7 +2686,7 @@ func Test_StreamMessagesByUIDs_When_ResponseCarriesInternalDate_Then_MessageKeep
 	c := newClientWithFake(t, srv)
 
 	got := make(map[uint32]time.Time)
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
 		got[msg.UID()] = msg.m.InternalDate
 		return nil
 	})
@@ -2740,7 +2740,7 @@ func Test_StreamMessagesByUIDs_When_UnilateralOrUnrequestedFetchArrives_Then_Cal
 
 	flags := make(map[uint32][]string)
 	calls := 0
-	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2}, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2}, nil, func(msg Message) error {
 		calls++
 		flags[msg.UID()] = msg.m.Flags
 		return nil
@@ -3511,7 +3511,7 @@ func refuseBatches(reply string, batches ...int) func(n int) string {
 // streamedUIDs collects the UIDs that StreamMessagesByUIDs hands to the callback.
 func streamedUIDs(ctx context.Context, c *Client, folder string, uidValidity uint32, uids []uint32) ([]uint32, error) {
 	var got []uint32
-	err := c.StreamMessagesByUIDs(ctx, folder, uidValidity, uids, func(msg Message) error {
+	err := c.StreamMessagesByUIDs(ctx, folder, uidValidity, uids, nil, func(msg Message) error {
 		got = append(got, msg.m.Uid)
 		return nil
 	})
@@ -3958,4 +3958,235 @@ func Test_StreamMessagesByUIDs_When_CancelledAfterARefusedBatch_Then_ReturnsCanc
 			}
 		})
 	}
+}
+
+// holdAfterOneMessage answers the first UID FETCH with its first message and no tagged reply. It waits for the client to close the connection, then closes closed.
+func holdAfterOneMessage(log *uidFetchLog, closed chan<- struct{}) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		log.record(requested)
+		writeUIDMessage(conn, requested[0])
+		_, _ = io.Copy(io.Discard, rd)
+		close(closed)
+		return true, false
+	}
+}
+
+// hangUpAfterOneMessage is holdAfterOneMessage for a server that closes the connection after the message and then closes hungUp.
+func hangUpAfterOneMessage(log *uidFetchLog, hungUp chan<- struct{}) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		log.record(requested)
+		writeUIDMessage(conn, requested[0])
+		_ = conn.Close()
+		close(hungUp)
+		return true, false
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_HaltBeforeTheFirstBatch_Then_SendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+	errHalt := errors.New("the run stopped")
+	calls := 0
+
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2, 3}, func() error { return errHalt }, func(Message) error {
+		calls++
+		return nil
+	})
+
+	if !errors.Is(err, errHalt) {
+		t.Errorf("error = %v, want the halt error", err)
+	}
+	if calls != 0 {
+		t.Errorf("callback ran %d times, want 0", calls)
+	}
+	if got := srv.callCount("EXAMINE") + srv.callCount("SELECT"); got != 0 {
+		t.Errorf("EXAMINE+SELECT count = %d, want 0", got)
+	}
+	if got := srv.callCount("UID FETCH"); got != 0 {
+		t.Errorf("UID FETCH count = %d, want 0", got)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_HaltTurnsOnAfterABatch_Then_NoNextBatch(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+	errHalt := errors.New("the run stopped")
+	var halted atomic.Bool
+	halt := func() error {
+		if halted.Load() {
+			return errHalt
+		}
+		return nil
+	}
+
+	uids := make([]uint32, uidFetchBatchSize+1)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	calls := 0
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, halt, func(msg Message) error {
+		calls++
+		if msg.UID() == uidFetchBatchSize {
+			halted.Store(true)
+		}
+		return nil
+	})
+
+	if !errors.Is(err, errHalt) {
+		t.Errorf("error = %v, want the halt error", err)
+	}
+	if calls != uidFetchBatchSize {
+		t.Errorf("callback ran %d times, want %d: the whole first batch", calls, uidFetchBatchSize)
+	}
+	if got := srv.callCount("UID FETCH"); got != 1 {
+		t.Errorf("UID FETCH count = %d, want 1: no second batch", got)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_HaltTurnsOnDuringARetry_Then_NewSessionGetsNoFetch(t *testing.T) {
+	t.Parallel()
+
+	const total, sent = 5, 2
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, cutUIDFetch(fetches, sent, true)))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+	errHalt := errors.New("the run stopped")
+	var halted atomic.Bool
+	halt := func() error {
+		if halted.Load() {
+			return errHalt
+		}
+		return nil
+	}
+
+	uids := make([]uint32, total)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	var got []uint32
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, halt, func(msg Message) error {
+			got = append(got, msg.UID())
+			if len(got) == sent {
+				halted.Store(true)
+			}
+			return nil
+		})
+	})
+
+	if !errors.Is(err, errHalt) {
+		t.Errorf("error = %v, want the halt error", err)
+	}
+	if !slices.Equal(got, uids[:sent]) {
+		t.Errorf("callback got UIDs %v, want %v", got, uids[:sent])
+	}
+	if gotSets := fetches.all(); !slices.EqualFunc(gotSets, [][]uint32{uids}, slices.Equal) {
+		t.Errorf("UID FETCH asked for %v, want one request: the new session gets none", gotSets)
+	}
+	if got := srv.callCount("EXAMINE") + srv.callCount("SELECT"); got != 1 {
+		t.Errorf("EXAMINE+SELECT count = %d, want 1: the new session never selects", got)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_CallbackStopsTheStream_Then_SessionClosesAndNothingIsRetried(t *testing.T) {
+	t.Parallel()
+
+	errStop := errors.New("the run stopped")
+	uids := []uint32{1, 2, 3}
+
+	t.Run("the server keeps waiting", func(t *testing.T) {
+		t.Parallel()
+
+		fetches := new(uidFetchLog)
+		closed := make(chan struct{})
+		srv := newFakeServer(t)
+		srv.addConnHandler(interceptHandler(srv, holdAfterOneMessage(fetches, closed)))
+		srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+		c := newWatchedClient(t, srv, 0)
+
+		calls := 0
+		err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+			return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(Message) error {
+				calls++
+				return errStop
+			})
+		})
+
+		if !errors.Is(err, errStop) {
+			t.Errorf("error = %v, want the callback error", err)
+		}
+		awaitSignal(t, closed, "the client to close the connection with a batch in flight")
+		if calls != 1 {
+			t.Errorf("callback ran %d times, want 1", calls)
+		}
+		if got := srv.callCount("LOGIN"); got != 1 {
+			t.Errorf("LOGIN count = %d, want 1: a stop starts no reconnect", got)
+		}
+		if got := srv.callCount("UID FETCH"); got != 1 {
+			t.Errorf("UID FETCH count = %d, want 1: a stop starts no retry", got)
+		}
+
+		var got []uint32
+		err = awaitCall(t, "later StreamMessagesByUIDs", func() error {
+			return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(msg Message) error {
+				got = append(got, msg.UID())
+				return nil
+			})
+		})
+		if err != nil {
+			t.Fatalf("later stream error = %v, want success on a new session", err)
+		}
+		if !slices.Equal(got, uids) {
+			t.Errorf("later stream delivered %v, want %v", got, uids)
+		}
+		if got := srv.callCount("LOGIN"); got != 2 {
+			t.Errorf("LOGIN count = %d after the later stream, want 2: one reconnect", got)
+		}
+	})
+
+	t.Run("the server drops the connection after the callback error", func(t *testing.T) {
+		t.Parallel()
+
+		fetches := new(uidFetchLog)
+		hungUp := make(chan struct{})
+		srv := newFakeServer(t)
+		srv.addConnHandler(interceptHandler(srv, hangUpAfterOneMessage(fetches, hungUp)))
+		srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+		c := newWatchedClient(t, srv, 0)
+
+		err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+			return c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, uids, nil, func(Message) error {
+				awaitSignal(t, hungUp, "the server to drop the connection")
+				return errStop
+			})
+		})
+
+		if !errors.Is(err, errStop) {
+			t.Errorf("error = %v, want the callback error", err)
+		}
+		if got := srv.callCount("LOGIN"); got != 1 {
+			t.Errorf("LOGIN count = %d, want 1: the drop after a stop starts no reconnect", got)
+		}
+		if got := srv.callCount("UID FETCH"); got != 1 {
+			t.Errorf("UID FETCH count = %d, want 1: the drop after a stop starts no retry", got)
+		}
+	})
 }

@@ -26,12 +26,19 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 
 - Every IMAP op goes through `safeCall`. New ops must follow.
 - `classifyError` is the single source of error policy: `Transient` → reconnect+retry, `Throttled` → backoff `throttledBackoff = 5m`, `Permanent` → surface.
+- In the copy phase, `Throttled` stops the run. `throttledBackoff` applies only inside `reconnect`.
+  - `client.IsThrottled(err)` is `classifyError(err) == ClassThrottled`. It is the only predicate that `internal/app` uses. `internal/app` never reads error text.
+  - Pass the `Stop` error of a `StreamError` to `IsThrottled`, not the whole `StreamError`. A network error in `First` hides the throttled `Stop`.
+  - A worker records the first throttled reply in the `throttleStop` of the run. The stop is not a context cancel and it does not call `Client.Cancel`. So Ctrl-C keeps its `Cancelled.` output and exit code 130.
+  - After a stop, the run starts no plan and sends no APPEND. It counts every message that it did not copy as an error and ends with exit code 1.
+  - Do not add a wait for the stop. A wait keeps the throttled sessions busy.
 - `classifyError` matches text on the leaf error only. Text that our wrappers add, such as a folder name or a label, never sets the class. Wrap an error with `%w`. A `%v` of an error makes a new leaf that holds the wrapper text.
 - `safeCall` starts at most one `reconnect` for each call. After a `reconnect` that returns nil, `safeCall` and `AppendMessage` check again whether `Cancel()` ran. They return an error and send no command when `reconnect` leaves no session.
 - All sleeps in the reconnect path use `sleepCtx` so Ctrl-C is honoured.
 - The give-up and revive gate in `reconnect` holds the give-up of a Client. A `Permanent` or `Unknown` give-up is final. After a `Transient` or `Throttled` give-up, a Client makes at most one login attempt per `reviveInterval = 5m`.
   - The gate runs under `c.mu`, after the cancellation check and before any wait, logout or dial.
   - Only `New` and `reconnect` call `connectAndLogin`. A new caller would bypass the gate.
+  - `EnsureSession` reaches `reconnect` only through `reconnectSession`. It sends no command on a working session, and it returns the stored give-up with no dial while the gate refuses.
   - A reply that reports a locked, disabled, suspended or blocked account is `Permanent`.
   - A login reply that reports a temporary outage of the authentication service is `Transient`. The locked-account rule comes first.
   - A change to the gate is a security review point. See [security.md](security.md) item 10.
@@ -39,6 +46,8 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 - `c.pw` / `c.tracker` are `atomic.Pointer`. Read via `progressWriter()` / `progressTracker()`. Direct field access is a bug.
 - A go-imap call outside `safeCall` opens its own watchdog span, as `AppendMessage` and `connectAndLogin` do. Without a span, a silent server can hold that call forever.
 - Caller work inside a `safeCall` closure ends the span while it runs and opens it again after, as `StreamMessagesByUIDs` does around `onMessage`. Otherwise slow work on the other side counts as server silence.
+- `StreamMessagesByUIDs` takes a `halt` hook. It checks the hook at the top of each batch and of each attempt, before any command. An error of `halt` or of `onMessage` ends the stream, and the stream returns it unchanged. `safeCall` neither reconnects nor retries for it. If a UID of the batch is not yet delivered, the stream closes the session, because go-imap v1 cannot end a FETCH in flight.
+- A worker calls `EnsureSession` on its destination Client before each plan and after each failed APPEND that is not a refused body. A plan whose destination gave up ends, and the worker downloads no body for it.
 
 ## Rate limiting
 

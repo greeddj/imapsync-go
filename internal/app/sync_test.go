@@ -13774,3 +13774,252 @@ func TestRunSync_When_OneMessageCannotBeFetched_Then_TheRestOfTheFolderIsCopied(
 	}
 	assertReadOnly(t, "source", src)
 }
+
+// timesNamed counts how often a captured command argument equals name.
+func timesNamed(names []string, name string) int {
+	n := 0
+	for _, got := range names {
+		if got == name {
+			n++
+		}
+	}
+	return n
+}
+
+const (
+	gmailThrottleReply   = "NO [OVERQUOTA] Account exceeded command or bandwidth limits. (Failure)"
+	dovecotQuotaReply    = "NO [OVERQUOTA] Quota exceeded (mailbox for user is full)"
+	destinationStopStart = "⛔ Sync stopped: the destination server [dst] reports a rate limit or a full quota: "
+)
+
+func TestRunSync_When_DestinationThrottlesAppend_Then_RunStopsWithoutDownloadingTheRest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		reply  string
+		reason string
+		quiet  bool
+	}{
+		{name: "Gmail reply", reply: gmailThrottleReply, reason: "Account exceeded command or bandwidth limits. (Failure)"},
+		{name: "Dovecot reply", reply: dovecotQuotaReply, reason: "Quota exceeded (mailbox for user is full)"},
+		{name: "Gmail reply with quiet", reply: gmailThrottleReply, reason: "Account exceeded command or bandwidth limits. (Failure)", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(600)...), "B": fakeMsgs("b1@x", "b2@x", "b3@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil})
+			dst.refuseAppendWith(tt.reply)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.quiet = tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("destination saw %d APPEND commands, want 1: the first refusal stops the run", n)
+			}
+			if n := dst.callCount("LOGIN"); n != 2 {
+				t.Errorf("destination saw %d LOGIN commands, want 2: planning and the worker", n)
+			}
+			assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1:500")
+			if n := timesNamed(src.capturedNames("EXAMINE"), "B"); n != 1 {
+				t.Errorf("source examined B %d times, want 1: only the planning scan", n)
+			}
+			if n := src.callCount("UID SEARCH"); n != 0 {
+				t.Errorf("source saw %d UID SEARCH commands, want 0", n)
+			}
+			got := out.String()
+			if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+				t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+			}
+			assertContainsAll(t, got, destinationStopStart, tt.reason, "0 messages uploaded, 603 errors occurred")
+			assertContainsNone(t, got, "Cancelled", "Canceled")
+		})
+	}
+}
+
+func TestRunSync_When_DestinationGivesUpMidPlan_Then_NoMoreBodiesAreFetched(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(600)...), "B": fakeMsgs("b1@x", "b2@x", "b3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil})
+	dst.dropAtAppendAndRefuseLogin(2)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	if got := len(dst.folderMsgIDs("A")) + len(dst.folderMsgIDs("B")); got != 1 {
+		t.Errorf("destination holds %d messages, want 1", got)
+	}
+	if n := dst.callCount("APPEND"); n != 2 {
+		t.Errorf("destination saw %d APPEND commands, want 2", n)
+	}
+	if n := dst.callCount("LOGIN"); n != 3 {
+		t.Errorf("destination saw %d LOGIN commands, want 3: planning, the worker and one refused repair", n)
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1:500")
+	if n := src.callCount("LOGIN"); n != 2 {
+		t.Errorf("source saw %d LOGIN commands, want 2: planning and the worker", n)
+	}
+	if n := timesNamed(src.capturedNames("EXAMINE"), "B"); n != 1 {
+		t.Errorf("source examined B %d times, want 1: only the planning scan", n)
+	}
+	assertContainsAll(t, out.String(), "1 messages uploaded, 602 errors occurred")
+	assertContainsNone(t, out.String(), "Sync stopped")
+}
+
+func TestRunSync_When_SourceThrottlesTheBodyFetch_Then_RunStops(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(600)...), "B": fakeMsgs("b1@x", "b2@x", "b3@x")})
+	src.endUIDFetchWith("A", throttleReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1:500")
+	if n := timesNamed(src.capturedNames("EXAMINE"), "B"); n != 1 {
+		t.Errorf("source examined B %d times, want 1: only the planning scan", n)
+	}
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: a throttled source gets no check", n)
+	}
+	if n := dst.callCount("APPEND"); n != 500 {
+		t.Errorf("destination saw %d APPEND commands, want 500: the delivered first batch", n)
+	}
+	got := out.String()
+	if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+		t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+	}
+	assertContainsAll(t, got,
+		"⛔ Sync stopped: the source server [src] reports a rate limit or a full quota: ",
+		"Account exceeded command or bandwidth limits",
+		"500 messages uploaded, 103 errors occurred, 0 folders failed")
+	assertContainsNone(t, got, "Cancelled", "Canceled")
+}
+
+func TestRunSync_When_TwoWorkersAndTheDestinationThrottles_Then_NoPlanStartsAfterTheStop(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": fakeMsgs(numberedIDs(600)...),
+		"B": fakeMsgs(prefixedIDs("b", 600)...),
+		"C": fakeMsgs("c1@x", "c2@x", "c3@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil, "C": nil})
+	dst.refuseAppendWith(gmailThrottleReply)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 2, mapping("A", "A"), mapping("B", "B"), mapping("C", "C")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	if n := dst.callCount("APPEND"); n > 2 {
+		t.Errorf("destination saw %d APPEND commands, want at most 2: one for each running plan", n)
+	}
+	sets := src.capturedNames("UID FETCH")
+	if len(sets) > 2 || slices.ContainsFunc(sets, func(set string) bool { return set != "1:500" }) {
+		t.Errorf("source UID FETCH sets = %v, want at most two, each 1:500", sets)
+	}
+	if n := timesNamed(src.capturedNames("EXAMINE"), "C"); n != 1 {
+		t.Errorf("source examined C %d times, want 1: only the planning scan", n)
+	}
+	got := out.String()
+	if n := strings.Count(got, "⛔ Sync stopped"); n != 1 {
+		t.Errorf("output holds the stop line %d times, want 1\noutput: %q", n, got)
+	}
+	assertContainsAll(t, got, destinationStopStart, "0 messages uploaded, 1203 errors occurred, 0 folders failed")
+}
+
+func TestRunSync_When_ThrottleStopsTheRun_Then_TheNextRunCopiesTheRest(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(6)...), "B": fakeMsgs("b1@x", "b2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil})
+	dst.onCommand("APPEND", func() {
+		if dst.callCount("APPEND") == 4 {
+			dst.refuseAppendWith(gmailThrottleReply)
+		}
+	})
+	cfg := e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"))
+
+	first := &syncBuffer{}
+	opts := e2eOptions(first, "")
+	opts.autoConfirm = true
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("first run error = %v, want ErrSilentExit\noutput: %s", err, first.String())
+	}
+	assertContainsAll(t, first.String(), destinationStopStart, "3 messages uploaded, 5 errors occurred, 0 folders failed")
+	assertIDs(t, "destination A after the first run", dst.folderMsgIDs("A"), "n1@x", "n2@x", "n3@x")
+	assertIDs(t, "destination B after the first run", dst.folderMsgIDs("B"))
+
+	dst.refuseAppendWith("")
+	second := &syncBuffer{}
+	opts = e2eOptions(second, "")
+	opts.autoConfirm = true
+	err = runSync(e2eContext(t), cfg, opts)
+
+	if err != nil {
+		t.Fatalf("second run error = %v, want success\noutput: %s", err, second.String())
+	}
+	assertContainsAll(t, second.String(), "Sync completed successfully")
+	assertContainsNone(t, second.String(), "Sync stopped")
+	assertIDs(t, "destination A after the second run", dst.folderMsgIDs("A"), numberedIDs(6)...)
+	assertIDs(t, "destination B after the second run", dst.folderMsgIDs("B"), "b1@x", "b2@x")
+}
+
+func TestRunSync_When_StopReasonCarriesControlCharacters_Then_TheStopLineShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseAppendWith("NO [OVERQUOTA] Quota \x1b[2J\u202eevil exceeded")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	_, rest, found := strings.Cut(out.String(), "⛔ Sync stopped")
+	if !found {
+		t.Fatalf("output has no stop line\noutput: %q", out.String())
+	}
+	line, _, _ := strings.Cut(rest, "\n")
+	assertContainsAll(t, line, `Quota \x1b[2J\u202eevil exceeded`)
+	assertContainsNone(t, line, "\x1b", "\u202e")
+}
+
+// prefixedIDs returns the Message-Ids prefix1@x to prefixN@x.
+func prefixedIDs(prefix string, n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%s%d@x", prefix, i+1)
+	}
+	return ids
+}

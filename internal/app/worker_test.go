@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"strconv"
@@ -58,7 +60,7 @@ func Test_runFolderSync_successCounter(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, new(throttleStop), tr, 0, 1, pw, false)
 
 	if synced != 2 {
 		t.Errorf("synced=%d, want 2", synced)
@@ -87,7 +89,7 @@ func Test_runFolderSync_appendErrorIncrementsErrorsCounter(t *testing.T) {
 	}
 
 	srcSrv.addConnHandler(uidFetchBodyHandler(srcSrv, []string{"INBOX"}, srcBodies, ""))
-	dstSrv.addConnHandler(uidFetchBodyHandler(dstSrv, []string{"INBOX"}, nil, "NO Quota exceeded"))
+	dstSrv.addConnHandler(uidFetchBodyHandler(dstSrv, []string{"INBOX"}, nil, "NO [CANNOT] APPEND refused by policy"))
 
 	srcC := newAppClient(t, srcSrv, "src")
 	dstC := newAppClient(t, dstSrv, "dst")
@@ -105,7 +107,7 @@ func Test_runFolderSync_appendErrorIncrementsErrorsCounter(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, new(throttleStop), tr, 0, 1, pw, false)
 
 	if synced != 0 {
 		t.Errorf("synced=%d, want 0", synced)
@@ -142,7 +144,7 @@ func Test_runFolderSync_canceledContext_returnsEarly(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors, _ := runFolderSync(ctx, w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(ctx, w, plan, new(throttleStop), tr, 0, 1, pw, false)
 
 	if synced != 0 || errors != 0 {
 		t.Errorf("canceled: synced=%d, errors=%d, want (0, 0)", synced, errors)
@@ -240,7 +242,7 @@ func Test_runFolderSync_verboseSuccess(t *testing.T) {
 	tr := progress.NewTracker("test", 10)
 
 	// verbose=true exercises pw.Log("Synced %d/%d...") on success path.
-	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, true)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, new(throttleStop), tr, 0, 1, pw, true)
 	if synced != 1 {
 		t.Errorf("synced=%d, want 1", synced)
 	}
@@ -275,7 +277,7 @@ func Test_runFolderSync_streamError(t *testing.T) {
 	pw := progress.NewWriter(1, true)
 	tr := progress.NewTracker("test", 10)
 
-	synced, errors, _ := runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, false)
+	synced, errors, _ := runFolderSync(context.Background(), w, plan, new(throttleStop), tr, 0, 1, pw, false)
 	if synced != 0 {
 		t.Errorf("synced=%d, want 0", synced)
 	}
@@ -383,7 +385,7 @@ func Test_runFolderSync_persistentLogOnlyUnderVerbose(t *testing.T) {
 
 			srcSrv.addConnHandler(uidFetchBodyHandler(srcSrv, []string{"INBOX"}, srcBodies, ""))
 			// dst rejects APPEND so the per-message error path is exercised.
-			dstSrv.addConnHandler(uidFetchBodyHandler(dstSrv, []string{"INBOX"}, nil, "NO Quota exceeded"))
+			dstSrv.addConnHandler(uidFetchBodyHandler(dstSrv, []string{"INBOX"}, nil, "NO [CANNOT] APPEND refused by policy"))
 
 			srcC := newAppClient(t, srcSrv, "src")
 			dstC := newAppClient(t, dstSrv, "dst")
@@ -412,7 +414,7 @@ func Test_runFolderSync_persistentLogOnlyUnderVerbose(t *testing.T) {
 			tr := progress.NewTracker("test", 10)
 			pw.AppendTracker(tr)
 
-			runFolderSync(context.Background(), w, plan, tr, 0, 1, pw, tc.verbose)
+			runFolderSync(context.Background(), w, plan, new(throttleStop), tr, 0, 1, pw, tc.verbose)
 
 			// Stop signals the render goroutine; it performs one final render pass
 			// (flushing any queued Log lines) then sets renderInProgress=false.
@@ -630,7 +632,7 @@ func Test_runFolderSync_When_NamesCarryControlCharacters_Then_LogsAndTrackerShow
 			tr := progress.NewTracker("test", 10)
 			pw.AppendTracker(tr)
 
-			synced, _, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, true)
+			synced, _, _ := runFolderSync(t.Context(), w, plan, new(throttleStop), tr, 0, 1, pw, true)
 			pw.Stop()
 			pw.WaitForRenderDone()
 
@@ -730,7 +732,7 @@ func Test_runFolderSync_When_PlanIsInFlight_Then_TrackerLinesShowEscapes(t *test
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runFolderSync(t.Context(), w, plan, tr, 0, 1, progress.NewWriter(1, true), false)
+		runFolderSync(t.Context(), w, plan, new(throttleStop), tr, 0, 1, progress.NewWriter(1, true), false)
 	}()
 	awaitAppend := func(nth int) {
 		t.Helper()
@@ -792,7 +794,7 @@ func Test_runFolderSync_When_CanceledMidStream_Then_CancelLineShowsEscapes(t *te
 	}
 	tr := progress.NewTracker("test", 10)
 
-	synced, errs, _ := runFolderSync(ctx, w, plan, tr, 0, 1, progress.NewWriter(1, true), false)
+	synced, errs, _ := runFolderSync(ctx, w, plan, new(throttleStop), tr, 0, 1, progress.NewWriter(1, true), false)
 
 	if synced != 0 || errs != 0 {
 		t.Errorf("synced, errors = %d, %d, want 0, 0", synced, errs)
@@ -833,7 +835,7 @@ func Test_runFolderSync_When_StreamFailsWithHostileReply_Then_LogAndTrackerShowE
 	tr := progress.NewTracker("test", 10)
 	pw.AppendTracker(tr)
 
-	synced, errs, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
+	synced, errs, _ := runFolderSync(t.Context(), w, plan, new(throttleStop), tr, 0, 1, pw, false)
 	pw.Stop()
 	pw.WaitForRenderDone()
 
@@ -873,7 +875,7 @@ func Test_runFolderSync_When_SourceUIDValidityChanged_Then_CountsAnErrorForEachP
 	tr := progress.NewTracker("test", 10)
 	pw.AppendTracker(tr)
 
-	synced, errs, _ := runFolderSync(t.Context(), w, plan, tr, 0, 1, pw, false)
+	synced, errs, _ := runFolderSync(t.Context(), w, plan, new(throttleStop), tr, 0, 1, pw, false)
 	pw.Stop()
 	pw.WaitForRenderDone()
 
@@ -978,7 +980,13 @@ type standbyRun struct {
 func runStandbyPlan(ctx context.Context, t *testing.T, src, dst *fakeServer, plan FolderSyncPlan, verbose bool) standbyRun {
 	t.Helper()
 
-	w := &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}
+	return runStopPlan(ctx, t, &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}, plan, new(throttleStop), verbose)
+}
+
+// runStopPlan is runStandbyPlan on a worker that the caller built, with the stop of the run.
+func runStopPlan(ctx context.Context, t *testing.T, w *syncWorker, plan FolderSyncPlan, stop *throttleStop, verbose bool) standbyRun {
+	t.Helper()
+
 	sb := &syncBuffer{}
 	// The sentinel stays active so the render pass Stop triggers still prints the
 	// queued log lines.
@@ -989,7 +997,7 @@ func runStandbyPlan(ctx context.Context, t *testing.T, src, dst *fakeServer, pla
 	tr := progress.NewTracker("test", 10)
 	pw.AppendTracker(tr)
 
-	synced, errs, gone := runFolderSync(ctx, w, plan, tr, 0, 1, pw, verbose)
+	synced, errs, gone := runFolderSync(ctx, w, plan, stop, tr, 0, 1, pw, verbose)
 	pw.Stop()
 	pw.WaitForRenderDone()
 	return standbyRun{tr: tr, log: sb.String(), synced: synced, errs: errs, gone: gone}
@@ -2054,7 +2062,7 @@ func Test_runFolderSync_When_SourceThrottlesTheFirstBatch_Then_EveryPlannedMessa
 	assertContainsNone(t, got.log, "batches failed")
 }
 
-func Test_runFolderSync_When_AThrottledStopFollowsARefusedBody_Then_TheStandbyStillCopiesAndTheRestAreErrors(t *testing.T) {
+func Test_runFolderSync_When_AThrottledStopFollowsARefusedBody_Then_NoStandbyIsFetchedAndBothAreErrors(t *testing.T) {
 	t.Parallel()
 
 	ids := numberedIDs(clientBatchSize + 1)
@@ -2073,20 +2081,26 @@ func Test_runFolderSync_When_AThrottledStopFollowsARefusedBody_Then_TheStandbySt
 	plan := copyPlan(len(ids))
 	plan.standbySources = []standbySource{{folder: "B", uidValidity: 1}}
 	plan.standbys = []standbyCopy{{planned: 1, uid: 2, source: 0}}
+	stop := new(throttleStop)
 
-	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+	got := runStopPlan(t.Context(), t, &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}, plan, stop, false)
 
-	if got.synced != clientBatchSize || got.errs != 1 || got.gone != 0 {
-		t.Errorf("synced, errors, gone = %d, %d, %d, want %d, 1, 0: 499 copies and the standby copy", got.synced, got.errs, got.gone, clientBatchSize)
+	if got.synced != clientBatchSize-1 || got.errs != 2 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want %d, 2, 0: the refused body and the undelivered UID are errors", got.synced, got.errs, got.gone, clientBatchSize-1)
 	}
+	assertAccounted(t, got, plan)
+	bodies := dst.folderBodies("X")
+	if len(bodies) != clientBatchSize-1 || slices.Contains(bodies, bodyOfB) {
+		t.Errorf("dst X holds %d bodies, want %d, none from B", len(bodies), clientBatchSize-1)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
 	if n := src.callCount("UID SEARCH"); n != 0 {
 		t.Errorf("source saw %d UID SEARCH commands, want 0", n)
 	}
-	bodies := dst.folderBodies("X")
-	if len(bodies) != clientBatchSize || !slices.Contains(bodies, bodyOfB) {
-		t.Errorf("dst X holds %d bodies, want %d, including the copy of B", len(bodies), clientBatchSize)
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource || !client.IsThrottled(cause.err) {
+		t.Errorf("stop cause = %+v, want a throttled reply from the source", cause)
 	}
-	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
 	assertContainsAll(t, got.log, "Stream error for folder A: ", "exceeded command or bandwidth limits")
 }
 
@@ -2142,5 +2156,423 @@ func Test_runFolderSync_When_ContextEndsAfterARefusedBatch_Then_PrintsNoStreamLi
 	assertContainsNone(t, got.log, "Stream error", "no longer holds")
 	if n := src.callCount("UID FETCH"); n != 2 {
 		t.Errorf("source saw %d UID FETCH commands, want 2: no batch follows the cancel", n)
+	}
+}
+
+// totalCommands counts every command the server has seen, whatever its verb.
+func totalCommands(srv *fakeServer) int {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	total := 0
+	for _, n := range srv.counts {
+		total += n
+	}
+	return total
+}
+
+// assertAccounted checks that each planned message ended as synced, an error or gone.
+func assertAccounted(t *testing.T, got standbyRun, plan FolderSyncPlan) {
+	t.Helper()
+
+	if sum := got.synced + got.errs + got.gone; sum != plan.NewMessages {
+		t.Errorf("synced + errors + gone = %d + %d + %d = %d, want the %d planned messages", got.synced, got.errs, got.gone, sum, plan.NewMessages)
+	}
+}
+
+func newStopWorker(t *testing.T, src, dst *fakeServer) *syncWorker {
+	t.Helper()
+
+	return &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}
+}
+
+func Test_runFolderSync_When_RunIsAlreadyStopped_Then_SendsNoCommand(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	w := newStopWorker(t, src, dst)
+	stop := new(throttleStop)
+	stop.record(sideDestination, errors.New("Quota exceeded"))
+	srcBefore, dstBefore := totalCommands(src), totalCommands(dst)
+	plan := copyPlan(2)
+
+	got := runStopPlan(t.Context(), t, w, plan, stop, false)
+
+	if got.synced != 0 || got.errs != 2 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 2, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	if n := totalCommands(src) - srcBefore; n != 0 {
+		t.Errorf("source saw %d new commands, want none", n)
+	}
+	if n := totalCommands(dst) - dstBefore; n != 0 {
+		t.Errorf("destination saw %d new commands, want none", n)
+	}
+	if want := "1/1 Stopped A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+}
+
+func Test_runFolderSync_When_AnotherWorkerStopsTheRunDuringAnAppend_Then_NoFurtherAppend(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(5)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.onCommand("APPEND", func() { stop.record(sideSource, errors.New("another worker was throttled")) })
+	plan := copyPlan(5)
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 1 || got.errs != 4 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 4, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	if n := src.callCount("UID FETCH"); n != 1 {
+		t.Errorf("source saw %d UID FETCH commands, want 1", n)
+	}
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: a stopped plan gets no check", n)
+	}
+	if cause := stop.get(); cause == nil || cause.side != sideSource {
+		t.Errorf("stop cause = %+v, want the first recorded one, from the source", cause)
+	}
+	assertContainsNone(t, got.log, "Stream error")
+}
+
+func Test_runFolderSync_When_TheRunStopsAtTheLastMessageOfABatch_Then_NoNextBatch(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(clientBatchSize + 1)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.onCommand("APPEND", func() {
+		if dst.callCount("APPEND") == clientBatchSize {
+			stop.record(sideSource, errors.New("another worker was throttled"))
+		}
+	})
+	plan := copyPlan(clientBatchSize + 1)
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != clientBatchSize || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want %d, 1, 0", got.synced, got.errs, got.gone, clientBatchSize)
+	}
+	assertAccounted(t, got, plan)
+	if n := dst.callCount("APPEND"); n != clientBatchSize {
+		t.Errorf("destination saw %d APPEND commands, want %d", n, clientBatchSize)
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1:500")
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_DestinationThrottles_Then_RecordsTheDestinationAndStops(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(5)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.refuseAppendWith(gmailThrottleReply)
+	plan := copyPlan(5)
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, true)
+
+	if got.synced != 0 || got.errs != 5 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 5, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	cause := stop.get()
+	if cause == nil || cause.side != sideDestination || !strings.Contains(cause.err.Error(), "Account exceeded command or bandwidth limits. (Failure)") {
+		t.Fatalf("stop cause = %+v, want the destination and the reply", cause)
+	}
+	if !client.IsThrottled(cause.err) {
+		t.Errorf("IsThrottled(%v) = false, want true", cause.err)
+	}
+	assertContainsAll(t, got.log, "Failed to append message to X: ")
+	assertContainsNone(t, got.log, "Stream error")
+	if !got.tr.IsErrored() {
+		t.Error("tracker not marked as errored")
+	}
+}
+
+func Test_runFolderSync_When_ExistenceCheckIsThrottled_Then_RecordsTheSourceAndSkipsStandbys(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder("")})
+	src.omitInUIDFetch("A", "m1@x")
+	src.refuseUIDSearchWith("A", throttleReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := standbyPlan("B")
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 0 || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource || !client.IsThrottled(cause.err) {
+		t.Errorf("stop cause = %+v, want the source and a throttled reply", cause)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_StandbyAppendFindsTheDestinationGone_Then_NoOtherSourceIsTried(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.dropAtAppendAndRefuseLogin(1)
+	plan := standbyPlan("B", "C")
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 0 || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	if stop.stopped() {
+		t.Errorf("stop cause = %+v, want none: a permanent give-up is no throttle", stop.get())
+	}
+	assertContainsNone(t, got.log, "Stream error")
+}
+
+func Test_runFolderSync_When_StandbySourceThrottles_Then_RecordsTheSourceAndTriesNoOtherSource(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	src.endUIDFetchWith("B", throttleReply)
+	src.omitInUIDFetch("B", "m1@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := standbyPlan("B", "C")
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 0 || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource || !client.IsThrottled(cause.err) {
+		t.Errorf("stop cause = %+v, want the source and a throttled reply", cause)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	assertContainsAll(t, got.log, "Stream error for folder B: ", "exceeded command or bandwidth limits")
+}
+
+func Test_runFolderSync_When_TheRunStopsDuringAStandbyStream_Then_NoLaterSourceIsTried(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		omit bool
+	}{
+		{name: "the standby stream delivers no message", omit: true},
+		{name: "the standby stream delivers its message"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			stop := new(throttleStop)
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(""), "C": standbyFolder("")})
+			src.answerBodyIn("A", "m1@x", "NIL")
+			if tt.omit {
+				src.omitInUIDFetch("B", "m1@x")
+			}
+			// The first UID command is the FETCH of A, the second is the standby FETCH of B.
+			var commands atomic.Int32
+			src.onCommand("UID", func() {
+				if commands.Add(1) == 2 {
+					stop.record(sideDestination, errors.New("another worker was throttled"))
+				}
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+			plan := standbyPlan("B", "C")
+
+			got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+			if got.synced != 0 || got.errs != 1 || got.gone != 0 {
+				t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1, 0", got.synced, got.errs, got.gone)
+			}
+			assertAccounted(t, got, plan)
+			assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("destination saw %d APPEND commands, want 0", n)
+			}
+		})
+	}
+}
+
+func Test_runFolderSync_When_AppendFailsAfterAnotherWorkerStoppedTheRun_Then_ThePlanEndsAtOnce(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(5)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.refuseAppendWith("NO [CANNOT] APPEND refused by policy")
+	dst.onCommand("APPEND", func() { stop.record(sideSource, errors.New("another worker was throttled")) })
+	plan := copyPlan(5)
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 0 || got.errs != 5 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 5, 0", got.synced, got.errs, got.gone)
+	}
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1: the stop ends the plan after the failed one", n)
+	}
+	assertAccounted(t, got, plan)
+}
+
+func Test_runFolderSync_When_DestinationGaveUpBeforeThePlan_Then_NoSourceCommand(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(3)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	w := newStopWorker(t, src, dst)
+	// A BYE in reply to EXAMINE ends the session, and the refused LOGIN is a permanent give-up.
+	dst.dropOnceOnOpen("X")
+	dst.refuseLogin()
+	if _, err := w.dst.FetchMessageCopies(t.Context(), "X"); err == nil {
+		t.Fatal("FetchMessageCopies error = nil, want the give-up of the destination")
+	}
+	srcBefore, dstBefore := totalCommands(src), totalCommands(dst)
+	plan := copyPlan(3)
+
+	got := runStopPlan(t.Context(), t, w, plan, stop, false)
+
+	if got.synced != 0 || got.errs != 3 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 3, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	if n := totalCommands(src) - srcBefore; n != 0 {
+		t.Errorf("source saw %d new commands, want none", n)
+	}
+	if n := totalCommands(dst) - dstBefore; n != 0 {
+		t.Errorf("destination saw %d new commands, want none: the gate refuses without a dial or a LOGIN", n)
+	}
+	if stop.stopped() {
+		t.Errorf("stop cause = %+v, want none: a permanent give-up is no throttle", stop.get())
+	}
+	if want := "1/1 Synced messages 0 (errors: 3) A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+}
+
+func Test_runFolderSync_When_AppendIsRefusedOnALiveSession_Then_ThePlanGoesOn(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(5)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.refuseAppendWith("NO [CANNOT] APPEND refused by policy")
+	plan := copyPlan(5)
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 0 || got.errs != 5 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 5, 0", got.synced, got.errs, got.gone)
+	}
+	if n := dst.callCount("APPEND"); n != 5 {
+		t.Errorf("destination saw %d APPEND commands, want 5: every message is tried", n)
+	}
+	if stop.stopped() {
+		t.Errorf("stop cause = %+v, want none: a refusal on a live session is no stop", stop.get())
+	}
+	if n := dst.callCount("LOGIN"); n != 1 {
+		t.Errorf("destination saw %d LOGIN commands, want 1", n)
+	}
+}
+
+func Test_streamFailure(t *testing.T) {
+	t.Parallel()
+
+	throttled := fmt.Errorf("[src] body fetch: %w", errors.New("Account exceeded command or bandwidth limits"))
+	tests := []struct {
+		err          error
+		wantFirst    error
+		wantThrottle error
+		name         string
+		wantBatches  int
+	}{
+		{
+			name:         "throttled stop with a network failure first",
+			err:          &client.StreamError{First: io.EOF, Stop: throttled, FailedBatches: 2},
+			wantBatches:  2,
+			wantThrottle: throttled,
+			wantFirst:    io.EOF,
+		},
+		{
+			name:         "throttled stop under a wrapper",
+			err:          fmt.Errorf("stream: %w", &client.StreamError{First: throttled, Stop: throttled, FailedBatches: 1}),
+			wantBatches:  1,
+			wantThrottle: throttled,
+			wantFirst:    throttled,
+		},
+		{
+			name:        "UIDVALIDITY stop",
+			err:         &client.StreamError{First: client.ErrUIDValidityChanged, Stop: client.ErrUIDValidityChanged, FailedBatches: 1},
+			wantBatches: 1,
+			wantFirst:   client.ErrUIDValidityChanged,
+		},
+		{
+			name:        "failed batches without a stop",
+			err:         &client.StreamError{First: io.EOF, FailedBatches: 3},
+			wantBatches: 3,
+			wantFirst:   io.EOF,
+		},
+		{
+			name:        "other error counts as one batch",
+			err:         io.ErrUnexpectedEOF,
+			wantBatches: 1,
+			wantFirst:   io.ErrUnexpectedEOF,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			batches, throttle, first := streamFailure(tt.err)
+
+			if batches != tt.wantBatches || !errors.Is(throttle, tt.wantThrottle) || !errors.Is(first, tt.wantFirst) {
+				t.Errorf("streamFailure = %d, %v, %v, want %d, %v, %v", batches, throttle, first, tt.wantBatches, tt.wantThrottle, tt.wantFirst)
+			}
+		})
+	}
+}
+
+func Test_streamFailure_When_StopIsThrottledAndFirstIsANetworkError_Then_ReportsTheThrottle(t *testing.T) {
+	t.Parallel()
+
+	throttled := errors.New("Account exceeded command or bandwidth limits")
+	err := &client.StreamError{First: io.EOF, Stop: throttled, FailedBatches: 2}
+
+	if client.IsThrottled(err) {
+		t.Fatal("IsThrottled(whole error) = true, want false: the network failure hides the stop")
+	}
+	if _, throttle, _ := streamFailure(err); !errors.Is(throttle, throttled) {
+		t.Errorf("streamFailure throttle = %v, want %v", throttle, throttled)
 	}
 }
