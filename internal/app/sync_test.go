@@ -927,6 +927,110 @@ func Test_splitDestinationClashes(t *testing.T) {
 	}
 }
 
+func Test_splitRefusedDestinations(t *testing.T) {
+	t.Parallel()
+
+	errRefused := errors.New("CREATE refused by policy")
+	plan := func(src, dst string) FolderSyncPlan {
+		return FolderSyncPlan{SourceFolder: src, DestinationFolder: dst, NewMessages: 1, SrcUIDs: []uint32{1}}
+	}
+	type failure struct{ source, destination string }
+	tests := []struct {
+		refused      map[string]error
+		name         string
+		in           []FolderSyncPlan
+		wantKept     []string
+		wantFailures []failure
+	}{
+		{
+			name:     "no refused name keeps every plan in order",
+			refused:  map[string]error{},
+			in:       []FolderSyncPlan{plan("A", "X"), plan("B", "Y"), plan("C", "Z")},
+			wantKept: []string{"A>X", "B>Y", "C>Z"},
+		},
+		{
+			name:     "nil map keeps every plan",
+			in:       []FolderSyncPlan{plan("A", "X"), plan("B", "Y")},
+			wantKept: []string{"A>X", "B>Y"},
+		},
+		{
+			name:         "refused shared destination fails both plans in plan order",
+			refused:      map[string]error{"S": errRefused},
+			in:           []FolderSyncPlan{plan("A", "X"), plan("B", "S"), plan("C", "Y"), plan("D", "S"), plan("E", "Z")},
+			wantKept:     []string{"A>X", "C>Y", "E>Z"},
+			wantFailures: []failure{{"B", "S"}, {"D", "S"}},
+		},
+		{
+			name:     "refused name that no plan uses changes nothing",
+			refused:  map[string]error{"Unused": errRefused},
+			in:       []FolderSyncPlan{plan("A", "X"), plan("B", "Y")},
+			wantKept: []string{"A>X", "B>Y"},
+		},
+		{
+			name:         "every plan refused leaves no plan",
+			refused:      map[string]error{"X": errRefused, "Y": errRefused},
+			in:           []FolderSyncPlan{plan("A", "X"), plan("B", "Y")},
+			wantFailures: []failure{{"A", "X"}, {"B", "Y"}},
+		},
+		{
+			name:         "destination bytes decide the match",
+			refused:      map[string]error{"inbox/Sub": errRefused},
+			in:           []FolderSyncPlan{plan("A", "INBOX/Sub"), plan("B", "inbox/Sub")},
+			wantKept:     []string{"A>INBOX/Sub"},
+			wantFailures: []failure{{"B", "inbox/Sub"}},
+		},
+		{
+			name:     "no plan at all",
+			refused:  map[string]error{"X": errRefused},
+			wantKept: []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			pairs := func(plans []FolderSyncPlan) []string {
+				out := make([]string, len(plans))
+				for i, p := range plans {
+					out[i] = p.SourceFolder + ">" + p.DestinationFolder
+				}
+				return out
+			}
+			before := pairs(tt.in)
+
+			kept, failures := splitRefusedDestinations(tt.in, tt.refused)
+
+			if got := pairs(kept); !slices.Equal(got, tt.wantKept) {
+				t.Errorf("kept plans = %q, want %q", got, tt.wantKept)
+			}
+			if len(failures) != len(tt.wantFailures) {
+				t.Fatalf("failures = %v, want %d", failures, len(tt.wantFailures))
+			}
+			for i, want := range tt.wantFailures {
+				got := failures[i]
+				if got.SourceFolder != want.source || got.DestinationFolder != want.destination {
+					t.Errorf("failure %d = %q -> %q, want %q -> %q", i, got.SourceFolder, got.DestinationFolder, want.source, want.destination)
+				}
+				if !errors.Is(got.Err, errDestinationCreate) {
+					t.Errorf("failure %d error = %v, want errDestinationCreate", i, got.Err)
+				}
+				if !errors.Is(got.Err, errRefused) {
+					t.Errorf("failure %d error = %v, want the refusal behind it", i, got.Err)
+				}
+				if wantText := "cannot create destination folder: CREATE refused by policy"; got.Err.Error() != wantText {
+					t.Errorf("failure %d error text = %q, want %q", i, got.Err.Error(), wantText)
+				}
+			}
+			if len(kept) > 0 {
+				kept[0].SourceFolder = "changed"
+			}
+			if after := pairs(tt.in); !slices.Equal(after, before) {
+				t.Errorf("input plans = %q after the call, want %q: kept must not share the input slice", after, before)
+			}
+		})
+	}
+}
+
 func Test_expandMappingsWithSubfolders_When_SegmentHoldsDestinationDelimiter_Then_ItBecomesUnderscore(t *testing.T) {
 	t.Parallel()
 
@@ -2488,24 +2592,281 @@ func TestRunSync_When_SourceHasSubfolders_Then_TheyAreCopiedToMatchingPaths(t *t
 	}
 }
 
-func TestRunSync_When_FolderCreationRefused_Then_FailsBeforeAnyAppend(t *testing.T) {
+func TestRunSync_When_OneCreateIsRefused_Then_OtherFoldersStillCopy(t *testing.T) {
 	t.Parallel()
 
-	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("m1@x"),
+		"Good":  fakeMsgs("m2@x"),
+		"Bad":   fakeMsgs("m3@x"),
+	})
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
-	dst.refuseCreate()
-	cfg := e2eConfig(src, dst, 1, mapping("Work", "Work"))
-	opts := e2eOptions(&syncBuffer{}, "")
+	dst.refuseCreateOf("Bad", "NO [CANNOT] Invalid folder name")
+	cfg := e2eConfig(src, dst, 1)
+	const badLine = "• Bad → Bad: cannot create destination folder: [dst] failed to create mailbox Bad: Invalid folder name"
+
+	first := &syncBuffer{}
+	opts := e2eOptions(first, "")
 	opts.autoConfirm = true
 
 	err := runSync(e2eContext(t), cfg, opts)
 
-	if err == nil || !strings.Contains(err.Error(), "failed to create 1 folders") {
-		t.Fatalf("error = %v, want %q", err, "failed to create 1 folders")
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("first run error = %v, want ErrSilentExit\noutput: %s", err, first.String())
 	}
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	assertIDs(t, "dst Good", dst.folderMsgIDs("Good"), "m2@x")
+	assertIDs(t, "dst APPENDs to Bad", dst.appended("Bad"))
+	if dst.hasFolder("Bad") {
+		t.Error("dst has Bad, which it refused to create")
+	}
+	got := first.String()
+	assertContainsAll(t, got, `Failed to create folder "Bad"`, badLine)
+	assertInOrder(t, got, "Creating destination folders", folderFailuresHeader, badLine, "Syncing messages")
+	assertContainsAll(t, got, "2 messages uploaded, 0 errors occurred, 1 folders failed")
+
+	second := &syncBuffer{}
+	opts = e2eOptions(second, "")
+	opts.autoConfirm = true
+
+	err = runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("second run error = %v, want ErrSilentExit\noutput: %s", err, second.String())
+	}
+	if n := dst.callCount("APPEND"); n != 2 {
+		t.Errorf("dst saw %d APPEND commands over both runs, want 2", n)
+	}
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Bad", "Good", "Bad")
+	// Run one logs in the planning client and one worker. Run two plans only, so it opens no worker.
+	if n := dst.callCount("LOGIN"); n != 3 {
+		t.Errorf("dst LOGIN count = %d, want 3", n)
+	}
+	assertContainsAll(t, second.String(), badLine, "0 messages uploaded, 0 errors occurred, 1 folders failed")
+	assertContainsNone(t, second.String(), "Syncing messages")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_EveryCreateIsRefused_Then_FolderFailsAndNoWorkerConnects(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "default output"},
+		{name: "quiet output", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.refuseCreate()
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Work")), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit", err)
+			}
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+			for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+				if n := srv.callCount("LOGIN"); n != 1 {
+					t.Errorf("%s LOGIN count = %d, want 1: no worker connection after the last plan failed", name, n)
+				}
+			}
+			got := out.String()
+			assertContainsAll(t, got,
+				"• Work → Work: cannot create destination folder: [dst] failed to create mailbox Work: CREATE refused by policy",
+				"0 messages uploaded, 0 errors occurred, 1 folders failed",
+			)
+			assertContainsNone(t, got, "Syncing messages")
+			if tt.quiet {
+				assertContainsNone(t, got, "Messages to be copied", "Failed to create folder")
+			} else {
+				assertContainsAll(t, got, `Failed to create folder "Work"`)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_CreateOfASharedDestinationIsRefused_Then_EveryMappingOfItFails(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x"), "B": fakeMsgs("b1@x"), "C": fakeMsgs("c1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseCreateOf("Shared", "NO [CANNOT] Invalid folder name")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 2, mapping("A", "Shared"), mapping("B", "Shared"), mapping("C", "Other")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertInOrder(t, got,
+		folderFailuresHeader,
+		"• A → Shared: cannot create destination folder: [dst] failed to create mailbox Shared: Invalid folder name",
+		"• B → Shared: cannot create destination folder: [dst] failed to create mailbox Shared: Invalid folder name",
+		"Syncing messages",
+	)
+	assertContainsAll(t, got, "1 messages uploaded, 0 errors occurred, 2 folders failed")
+	assertIDs(t, "dst Other", dst.folderMsgIDs("Other"), "c1@x")
+	assertIDs(t, "dst APPENDs to Shared", dst.appended("Shared"))
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Other", "Shared")
+	if slices.Contains(dst.capturedNames("EXAMINE"), "Shared") {
+		t.Error("dst received EXAMINE for Shared, which it refused to create")
+	}
+	// One plan is left, so the pool holds one worker: the dropped plans must not size it.
+	for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+		if n := srv.callCount("LOGIN"); n != 2 {
+			t.Errorf("%s LOGIN count = %d, want 2", name, n)
+		}
+	}
+}
+
+func TestRunSync_When_ParentCreateIsRefused_Then_FoldersBelowItFail(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src         map[string][]fakeMsg
+		copied      map[string]string
+		name        string
+		refused     string
+		mappings    []config.DirectoryMapping
+		wantLines   []string
+		wantCreates []string
+		wantAbsent  []string
+	}{
+		{
+			name: "parent and child are both planned",
+			src: map[string][]fakeMsg{
+				"Bad":     fakeMsgs("m1@x"),
+				"Bad/Sub": fakeMsgs("m2@x"),
+				"Good":    fakeMsgs("m3@x"),
+			},
+			refused: "Bad",
+			wantLines: []string{
+				"• Bad → Bad: cannot create destination folder: [dst] failed to create mailbox Bad: ",
+				"• Bad/Sub → Bad/Sub: cannot create destination folder: [dst] failed to create parent folder Bad: ",
+			},
+			wantCreates: []string{"Bad", "Bad", "Good"},
+			copied:      map[string]string{"Good": "m3@x"},
+			wantAbsent:  []string{"Bad", "Bad/Sub"},
+		},
+		{
+			name: "parent has no plan",
+			src: map[string][]fakeMsg{
+				"Top/Child": fakeMsgs("m1@x"),
+				"Good":      fakeMsgs("m2@x"),
+			},
+			refused:  "Top",
+			mappings: []config.DirectoryMapping{mapping("Top/Child", "Top/Child"), mapping("Good", "Good")},
+			wantLines: []string{
+				"• Top/Child → Top/Child: cannot create destination folder: [dst] failed to create parent folder Top: ",
+			},
+			wantCreates: []string{"Good", "Top"},
+			copied:      map[string]string{"Good": "m2@x"},
+			wantAbsent:  []string{"Top", "Top/Child"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.refuseCreateOf(tt.refused, "NO [CANNOT] Invalid folder name")
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertInOrder(t, out.String(), append([]string{folderFailuresHeader}, tt.wantLines...)...)
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantCreates...)
+			for folder, id := range tt.copied {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), id)
+			}
+			for _, folder := range tt.wantAbsent {
+				if dst.hasFolder(folder) {
+					t.Errorf("dst has %s, which it refused to create", folder)
+				}
+				assertIDs(t, "dst APPENDs to "+folder, dst.appended(folder))
+			}
+		})
+	}
+}
+
+func TestRunSync_When_ContextEndsDuringCreateAfterARefusal_Then_ReturnsCanceledWithoutFailureList(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, nth int) (string, bool) {
+		if verb != "CREATE" {
+			return "", false
+		}
+		if nth == 1 {
+			return "NO [CANNOT] refused", true
+		}
+		cancel()
+		return "", true
+	}))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	assertContainsNone(t, out.String(), folderFailuresHeader, "cannot create destination folder")
 	if n := dst.callCount("APPEND"); n != 0 {
 		t.Errorf("dst saw %d APPEND commands, want 0", n)
 	}
+}
+
+func TestRunSync_When_CreateIsRefusedAndAnotherDestinationIsHidden_Then_OnlyTheHiddenOneIsRechecked(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Hidden": fakeMsgs("m1@x", "m2@x"), "Bad": fakeMsgs("m3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Hidden": fakeMsgs("m1@x")})
+	dst.hideFromList("Hidden")
+	dst.refuseCreateOf("Bad", "NO [CANNOT] Invalid folder name")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Hidden", "Hidden"), mapping("Bad", "Bad")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	assertInOrder(t, out.String(),
+		"• Bad → Bad: cannot create destination folder: [dst] failed to create mailbox Bad: Invalid folder name",
+		"already exists and holds 1 of the 2 planned messages",
+		"Syncing messages",
+	)
+	if slices.Contains(dst.capturedNames("EXAMINE"), "Bad") {
+		t.Error("dst received EXAMINE for Bad, which it refused to create")
+	}
+	assertIDs(t, "dst Hidden", dst.folderMsgIDs("Hidden"), "m1@x", "m2@x")
+	assertIDs(t, "dst APPENDs to Bad", dst.appended("Bad"))
 }
 
 func TestRunSync_When_CreateAnswersDuplicateFolderName_Then_SyncCompletes(t *testing.T) {
@@ -3852,13 +4213,15 @@ func TestRunSync_When_FolderCreationFails_Then_LogShowsEscapes(t *testing.T) {
 		name        string
 		createReply string
 		wantLog     string
+		wantListed  string
 		verbose     bool
 	}{
 		{
 			name:        "refused with a hostile reply",
 			createReply: "NO " + hostileReply,
 			wantLog:     `Failed to create folder "` + hostileShownName + `": [dst] failed to create mailbox ` + hostileShownName + ": ",
-			wantErr:     func(err error) bool { return err != nil && strings.Contains(err.Error(), "failed to create 1 folders") },
+			wantListed:  "• " + hostileShownName + " → " + hostileShownName + ": cannot create destination folder: [dst] failed to create mailbox " + hostileShownName + ": " + hostileReplyShown,
+			wantErr:     func(err error) bool { return errors.Is(err, ErrSilentExit) },
 		},
 		{
 			name:        "already exists",
@@ -3888,6 +4251,9 @@ func TestRunSync_When_FolderCreationFails_Then_LogShowsEscapes(t *testing.T) {
 			}
 			got := out.String()
 			assertContainsAll(t, got, tt.wantLog)
+			if tt.wantListed != "" {
+				assertInOrder(t, got, folderFailuresHeader, tt.wantListed)
+			}
 			assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned")
 		})
 	}
@@ -5345,7 +5711,7 @@ func TestRunSync_When_NoSelectDestinationReceivesDuplicateMessageIds_Then_Failur
 	assertReadOnly(t, "source", src)
 }
 
-func TestRunSync_When_FolderFailsAndCreateIsRefused_Then_FailuresPrecedeTheCreateError(t *testing.T) {
+func TestRunSync_When_FolderFailsAndCreateIsRefused_Then_BothFailuresAreListedInOrder(t *testing.T) {
 	t.Parallel()
 
 	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
@@ -5357,15 +5723,20 @@ func TestRunSync_When_FolderFailsAndCreateIsRefused_Then_FailuresPrecedeTheCreat
 
 	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "Copy"), mapping("Gone", "Gone")), opts)
 
-	if err == nil || !strings.Contains(err.Error(), "failed to create 1 folders") {
-		t.Fatalf("error = %v, want %q", err, "failed to create 1 folders")
-	}
-	if errors.Is(err, ErrSilentExit) {
-		t.Errorf("error = %v, want a create error, not ErrSilentExit", err)
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
 	}
 	got := out.String()
-	assertInOrder(t, got, folderFailuresHeader, "• Gone → Gone: cannot scan source folder:", "Messages to be copied to destination", "Creating destination folders")
-	assertContainsNone(t, got, "Syncing messages", "Sync completed")
+	assertInOrder(t, got,
+		folderFailuresHeader,
+		"• Gone → Gone: cannot scan source folder:",
+		"Messages to be copied to destination",
+		"Creating destination folders",
+		folderFailuresHeader,
+		"• INBOX → Copy: cannot create destination folder:",
+	)
+	assertContainsAll(t, got, "2 folders failed")
+	assertContainsNone(t, got, "Syncing messages", "Sync completed successfully")
 	if n := dst.callCount("APPEND"); n != 0 {
 		t.Errorf("dst saw %d APPEND commands, want 0", n)
 	}

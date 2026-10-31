@@ -635,6 +635,7 @@ type mailStore struct {
 	hidden       map[string]bool
 	openReply    map[string]string
 	statusReply  map[string]string
+	createRefuse map[string]string
 	literal      map[string]bool
 	nilDelim     map[string]bool
 	rawBody      map[string]string
@@ -1008,6 +1009,16 @@ func (s *fakeServer) dropAtAppendAndRefuseLogin(n int) {
 
 func (s *fakeServer) refuseCreate() {
 	s.refuseCreateWith("NO CREATE refused by policy")
+}
+
+// reply carries its own status word, as the tagged status line. The key is the store name the wire name resolves to. It wins over refuseCreateWith.
+func (s *fakeServer) refuseCreateOf(folder, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.createRefuse == nil {
+		s.store.createRefuse = make(map[string]string)
+	}
+	s.store.createRefuse[folder] = reply
 }
 
 // refuseCreateWith makes every CREATE end with reply, which carries its own
@@ -1545,11 +1556,15 @@ func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {
 	name, _ := parseMailboxArg(arg)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := s.store.resolve(name)
+	if reply := s.store.createRefuse[key]; reply != "" {
+		rw.line("%s %s", tag, reply)
+		return
+	}
 	if s.store.createReply != "" {
 		rw.line("%s %s", tag, s.store.createReply)
 		return
 	}
-	key := s.store.resolve(name)
 	if _, ok := s.store.folders[key]; ok {
 		rw.line("%s NO [ALREADYEXISTS] Mailbox already exists", tag)
 		return

@@ -497,7 +497,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		creationPW.AppendTracker(creationTracker)
 
 		createdCount := 0
-		failedCount := 0
+		refused := make(map[string]error)
 		dstListIncomplete := len(dstClient.InvalidMailboxNames()) > 0
 
 		// Sorted, so a parent path is created before its children and the log
@@ -507,7 +507,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				creationPW.Stop()
 				return err
 			}
-			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+failedCount+1, len(foldersToCreate), termsafe.Escape(folder)))
+			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+len(refused)+1, len(foldersToCreate), termsafe.Escape(folder)))
 
 			created, err := dstClient.CreateMailbox(ctx, folder)
 			switch {
@@ -516,7 +516,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				return ctx.Err()
 			case err != nil:
 				creationPW.Log("Failed to create folder %q: %s", folder, termsafe.Escape(err.Error()))
-				failedCount++
+				refused[folder] = err
 			case created:
 				if verbose {
 					creationPW.Log("Created folder %q", folder)
@@ -540,8 +540,11 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		creationTracker.MarkAsDone()
 		creationPW.StopAndClear()
 
-		if failedCount > 0 {
-			return fmt.Errorf("failed to create %d folders", failedCount)
+		if len(refused) > 0 {
+			var refusals []FolderFailure
+			activePlans, refusals = splitRefusedDestinations(activePlans, refused)
+			summary.Failures = append(summary.Failures, refusals...)
+			printFolderFailures(out, refusals)
 		}
 	}
 
@@ -555,9 +558,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			summary.Failures = append(summary.Failures, newFailures...)
 			printFolderFailures(out, newFailures)
 		}
-		if len(activePlans) == 0 {
-			return endRunWithoutCopy(out, quiet, len(summary.Failures))
-		}
+	}
+
+	if len(activePlans) == 0 {
+		return endRunWithoutCopy(out, quiet, len(summary.Failures))
 	}
 
 	if !quiet {
@@ -680,6 +684,24 @@ func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
 		_, _ = fmt.Fprintln(out, "✅ All folders already synced!")
 	}
 	return nil
+}
+
+// The folder that would receive their messages does not exist, so each plan of a refused destination fails and the others stay.
+func splitRefusedDestinations(plans []FolderSyncPlan, refused map[string]error) (kept []FolderSyncPlan, failures []FolderFailure) {
+	kept = make([]FolderSyncPlan, 0, len(plans))
+	for _, plan := range plans {
+		err, ok := refused[plan.DestinationFolder]
+		if !ok {
+			kept = append(kept, plan)
+			continue
+		}
+		failures = append(failures, FolderFailure{
+			SourceFolder:      plan.SourceFolder,
+			DestinationFolder: plan.DestinationFolder,
+			Err:               fmt.Errorf("%w: %w", errDestinationCreate, err),
+		})
+	}
+	return kept, failures
 }
 
 // The prompt already showed the plans, so a plan only loses messages here and never gains one.
