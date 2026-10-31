@@ -662,6 +662,7 @@ type mailStore struct {
 	bareInbox    bool
 	onePerID     bool
 	gmailExt     bool
+	flagExtBad   bool
 }
 
 // newStoreServer starts a fake IMAP server with in-memory mailboxes; queued connHandlers take precedence. An empty delimiter makes LIST answer NIL, and no folders means no LIST entry.
@@ -786,6 +787,13 @@ func (s *fakeServer) advertiseGmailExtension() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store.gmailExt = true
+}
+
+// refuseFlagExtensions makes APPEND answer BAD, as Dovecot does, for a flag list with a backslash flag that is not a system flag.
+func (s *fakeServer) refuseFlagExtensions() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store.flagExtBad = true
 }
 
 func (s *fakeServer) capabilities() string {
@@ -1623,6 +1631,14 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 		s.store.loginReply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
 		return false
 	}
+	if s.store.flagExtBad {
+		for flag := range strings.FieldsSeq(flags) {
+			if strings.HasPrefix(flag, `\`) && !isSystemFlag(flag) {
+				rw.line("%s BAD Error in IMAP command APPEND: Invalid system flag %s", tag, flag)
+				return true
+			}
+		}
+	}
 	if s.store.appendReply != "" {
 		rw.line("%s %s", tag, s.store.appendReply)
 		return true
@@ -1651,6 +1667,15 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	s.store.appends = append(s.store.appends, appendRecord{folder: key, msgID: msgID, flagList: flagList, date: date})
 	rw.line("%s OK APPEND completed", tag)
 	return true
+}
+
+func isSystemFlag(flag string) bool {
+	for _, system := range []string{`\Seen`, `\Answered`, `\Flagged`, `\Deleted`, `\Draft`} {
+		if strings.EqualFold(flag, system) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseAppendFlags splits the text after the APPEND mailbox name. flagList keeps the parentheses and flags drops them; both are "" for no list. tail is the rest.

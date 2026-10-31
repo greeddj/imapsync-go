@@ -1532,6 +1532,12 @@ func Test_appendFlags(t *testing.T) {
 		{name: "invalid entries are dropped", in: []string{`\Seen`, "a b", "x)", "", `\`, "$ok", "{5}"}, want: []string{`\Seen`, "$ok"}},
 		{name: "only invalid entries", in: []string{"x)\r\nA1 DELETE INBOX", `"q"`}, want: nil},
 		{name: "duplicates and letter case are kept", in: []string{"$a", "$A", "$a"}, want: []string{"$a", "$A", "$a"}},
+		{name: "flag extensions are dropped", in: []string{`\X-Ext`, `\Flagged`, `\EXCEEDEDQUOTA`, "$a", `\Junk`}, want: []string{`\Flagged`, "$a"}},
+		{name: "system flags keep their spelling", in: []string{`\seen`, `\ANSWERED`, `\draft`, `\fLaGgEd`}, want: []string{`\seen`, `\ANSWERED`, `\draft`, `\fLaGgEd`}},
+		{name: "only flag extensions", in: []string{`\X-Ext`, `\Junk`, `\EXCEEDEDQUOTA`}, want: nil},
+		{name: "near misses of the system flags are dropped", in: []string{`\See`, `\Seen2`, `\Drafts`, `\Flag`, `\Answer`}, want: nil},
+		{name: "a long s that folds to Seen is dropped by the syntax check", in: []string{"\\\u017feen", `\Seen`}, want: []string{`\Seen`}},
+		{name: "keywords that spell a system flag without the backslash are kept", in: []string{"Seen", "Recent", "Deleted"}, want: []string{"Seen", "Recent", "Deleted"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1553,10 +1559,14 @@ func Test_appendFlags(t *testing.T) {
 	t.Run("a list that drops nothing is returned as it is", func(t *testing.T) {
 		t.Parallel()
 
-		in := []string{`\Seen`, "$Forwarded"}
-		got := appendFlags(in)
-		if len(got) != len(in) || &got[0] != &in[0] {
-			t.Errorf("appendFlags(%q) = %q, want the same backing array", in, got)
+		for _, in := range [][]string{
+			{`\Seen`, "$Forwarded"},
+			{`\seen`, `\ANSWERED`, `\draft`, `\fLaGgEd`},
+		} {
+			got := appendFlags(in)
+			if len(got) != len(in) || &got[0] != &in[0] {
+				t.Errorf("appendFlags(%q) = %q, want the same backing array", in, got)
+			}
 		}
 	})
 
@@ -1569,18 +1579,36 @@ func Test_appendFlags(t *testing.T) {
 			t.Errorf("appendFlags(%q) = %q, want a new slice of two flags", in, got)
 		}
 	})
+
+	t.Run("a list that drops a flag extension is a new slice", func(t *testing.T) {
+		t.Parallel()
+
+		in := []string{`\Seen`, `\X-Ext`, "$Label"}
+		before := slices.Clone(in)
+		got := appendFlags(in)
+		if want := []string{`\Seen`, "$Label"}; !slices.Equal(got, want) || &got[0] == &in[0] {
+			t.Errorf("appendFlags(%q) = %q, want a new slice %q", before, got, want)
+		}
+		if !slices.Equal(in, before) {
+			t.Errorf("input after the call = %q, want it unchanged %q", in, before)
+		}
+	})
 }
 
 // Not parallel: AllocsPerRun counts allocations of the whole process.
 func Test_appendFlags_When_NothingIsDropped_Then_AllocatesNothing(t *testing.T) {
 	valid := []string{`\Seen`, `\Flagged`, "$Forwarded", "NonJunk"}
+	mixedCase := []string{`\seen`, `\ANSWERED`, `\Flagged`, `\dRaFt`, "$Label", "NonJunk"}
 
 	tests := []struct {
 		call func()
 		name string
 	}{
 		{name: "a valid list", call: func() { _ = appendFlags(valid) }},
+		{name: "four system flags in mixed case and keywords", call: func() { _ = appendFlags(mixedCase) }},
 		{name: "nil", call: func() { _ = appendFlags(nil) }},
+		{name: "carriedFlag on a flag extension", call: func() { _ = carriedFlag(`\X-Ext`) }},
+		{name: "carriedFlag on a system flag in capitals", call: func() { _ = carriedFlag(`\DRAFT`) }},
 		{name: "validFlag", call: func() { _ = validFlag("$Forwarded") }},
 		{name: "validFlag on a rejected flag", call: func() { _ = validFlag("a b") }},
 	}
@@ -1603,8 +1631,22 @@ func FuzzAppendFlags(f *testing.F) {
 		`\Seen` + sep + "a b" + sep + "x)" + sep + "" + sep + `\`,
 		"[x" + sep + "a]" + sep + `a"b` + sep + `a\b` + sep + "{5}",
 		"caf\u00e9" + sep + "\x00" + sep + "\x7f",
+		`\X-Ext`,
+		`\EXCEEDEDQUOTA`,
+		`\seen` + sep + `\ANSWERED` + sep + `\draft`,
+		`\Seen` + sep + `\X-Ext` + sep + `$Label`,
+		"\\\u017feen",
 	} {
 		f.Add(seed)
+	}
+
+	carried := func(flag string) bool {
+		if !validFlag(flag) {
+			return false
+		}
+		return !strings.HasPrefix(flag, `\`) ||
+			strings.EqualFold(flag, `\Seen`) || strings.EqualFold(flag, `\Answered`) ||
+			strings.EqualFold(flag, `\Flagged`) || strings.EqualFold(flag, `\Draft`)
 	}
 
 	f.Fuzz(func(t *testing.T, joined string) {
@@ -1621,7 +1663,7 @@ func FuzzAppendFlags(f *testing.F) {
 		}
 		next := 0
 		for _, flag := range out {
-			if !validFlag(flag) || strings.EqualFold(flag, `\Recent`) || strings.EqualFold(flag, `\Deleted`) {
+			if !carried(flag) {
 				t.Errorf("output flag %q is not allowed", flag)
 			}
 			found := slices.Index(in[next:], flag)
@@ -1632,7 +1674,7 @@ func FuzzAppendFlags(f *testing.F) {
 		}
 		allowed := 0
 		for _, flag := range in {
-			if validFlag(flag) && !strings.EqualFold(flag, `\Recent`) && !strings.EqualFold(flag, `\Deleted`) {
+			if carried(flag) {
 				allowed++
 			}
 		}
@@ -1696,6 +1738,7 @@ func Test_AppendMessage_When_NoFlagRemains_Then_AppendHasNoFlagList(t *testing.T
 		{name: "empty", flags: []string{}},
 		{name: "only Recent and Deleted", flags: []string{`\Recent`, `\Deleted`}},
 		{name: "only invalid flags", flags: []string{"a b", "x)"}},
+		{name: "only flag extensions", flags: []string{`\X-Ext`, `\EXCEEDEDQUOTA`, `\Junk`}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

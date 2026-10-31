@@ -14596,6 +14596,9 @@ func TestRunSync_When_SourceMessagesHaveFlags_Then_EachCopyKeepsTheFlagsOfItsSou
 		{id: "m3@x", sourceList: `\Flagged $Forwarded`, wantList: `(\Flagged $Forwarded)`, wantStored: `\Flagged $Forwarded`},
 		{id: "m4@x", sourceList: `\Seen \Answered \Recent \Deleted NonJunk`, wantList: `(\Seen \Answered NonJunk)`, wantStored: `\Seen \Answered NonJunk`},
 		{id: "m5@x", sourceList: `\Draft \FLAGGED`, wantList: `(\Draft \FLAGGED)`, wantStored: `\Draft \FLAGGED`},
+		{id: "m6@x", sourceList: `\Seen \X-Ext $Label`, wantList: `(\Seen $Label)`, wantStored: `\Seen $Label`},
+		{id: "m7@x", sourceList: `\seen \ANSWERED \draft`, wantList: `(\seen \ANSWERED \draft)`, wantStored: `\seen \ANSWERED \draft`},
+		{id: "m8@x", sourceList: `\X-Ext \EXCEEDEDQUOTA \Junk`, wantList: ``, wantStored: ``},
 	}
 	msgs := make([]fakeMsg, len(rows))
 	ids := make([]string, len(rows))
@@ -14626,6 +14629,73 @@ func TestRunSync_When_SourceMessagesHaveFlags_Then_EachCopyKeepsTheFlagsOfItsSou
 		}
 	}
 	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_DestinationRefusesFlagExtensions_Then_TheMessageIsCopiedOnceWithoutThem(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		msgs      []fakeMsg
+		wantIDs   []string
+		wantLists []string
+		wantFlags []string
+	}{
+		{
+			name:      "unknown extension flag",
+			msgs:      []fakeMsg{{msgID: "m1@x", flags: `\Seen \X-Ext $Label`}, {msgID: "m2@x", flags: `\Flagged`}},
+			wantIDs:   []string{"m1@x", "m2@x"},
+			wantLists: []string{`(\Seen $Label)`, `(\Flagged)`},
+			wantFlags: []string{`\Seen $Label`, `\Flagged`},
+		},
+		{
+			name:      "extension flag that the refusal would echo as a full quota",
+			msgs:      []fakeMsg{{msgID: "m1@x", flags: `\Seen \EXCEEDEDQUOTA`}},
+			wantIDs:   []string{"m1@x"},
+			wantLists: []string{`(\Seen)`},
+			wantFlags: []string{`\Seen`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": tt.msgs})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.refuseFlagExtensions()
+			cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+			first := &syncBuffer{}
+			firstOpts := e2eOptions(first, "")
+			firstOpts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), cfg, firstOpts); err != nil {
+				t.Fatalf("first runSync: %v\noutput: %s", err, first.String())
+			}
+
+			assertContainsAll(t, first.String(), "Sync completed successfully")
+			assertContainsNone(t, first.String(), "errors occurred", "Sync stopped")
+			assertIDs(t, "dst APPENDs to INBOX", dst.appended("INBOX"), tt.wantIDs...)
+			assertIDs(t, "dst APPEND flag lists", dst.appendedFlagLists("INBOX"), tt.wantLists...)
+			for i, id := range tt.wantIDs {
+				if got := dst.flagsOf("INBOX", id); got != tt.wantFlags[i] {
+					t.Errorf("flags of %s on the destination = %q, want %q", id, got, tt.wantFlags[i])
+				}
+			}
+			assertReadOnly(t, "source", src)
+
+			appends := dst.callCount("APPEND")
+			second := &syncBuffer{}
+			secondOpts := e2eOptions(second, "")
+			secondOpts.autoConfirm = true
+			if err := runSync(e2eContext(t), cfg, secondOpts); err != nil {
+				t.Fatalf("second runSync: %v\noutput: %s", err, second.String())
+			}
+			assertContainsAll(t, second.String(), "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != appends {
+				t.Errorf("APPEND count went from %d to %d on the second run", appends, n)
+			}
+		})
+	}
 }
 
 func TestRunSync_When_SourceMessagesHaveInternalDates_Then_EachCopyKeepsTheDateOfItsSource(t *testing.T) {

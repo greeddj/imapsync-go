@@ -51,9 +51,16 @@ func validFlag(flag string) bool {
 	return true
 }
 
-// APPEND cannot set \Recent, and \Deleted would let an EXPUNGE on the destination remove the copy.
+// APPEND cannot set \Recent, \Deleted would let an EXPUNGE remove the copy, and a destination can refuse an unknown system flag on every run.
 func carriedFlag(flag string) bool {
-	return validFlag(flag) && !strings.EqualFold(flag, `\Recent`) && !strings.EqualFold(flag, `\Deleted`)
+	if !validFlag(flag) {
+		return false
+	}
+	return !strings.HasPrefix(flag, `\`) ||
+		strings.EqualFold(flag, imap.SeenFlag) ||
+		strings.EqualFold(flag, imap.AnsweredFlag) ||
+		strings.EqualFold(flag, imap.FlaggedFlag) ||
+		strings.EqualFold(flag, imap.DraftFlag)
 }
 
 // appendFlags returns flags itself when it drops nothing, and nil when no flag remains, so go-imap sends no flag list.
