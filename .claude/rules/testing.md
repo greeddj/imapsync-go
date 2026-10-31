@@ -185,7 +185,18 @@
   - `Test_Client_When_SessionIsReplacedAfterTheCheck_Then_KeepsTheValueAndAsksNothingMore` - after `New`, a BYE in reply to EXAMINE makes `FetchMessageMap` reconnect and try again. The new session does not advertise `X-GM-EXT-1`, but the flag keeps the value of `New`, and the reconnect sends no CAPABILITY;
   - `Test_hasCapability` - the name matches in any letter case among other names. A nil map, an empty map, a longer, shorter or other name, a look-alike letter and a false value do not match;
   - `Test_hasCapability_When_Called_Then_AllocatesNothing` - a match and a miss cost no allocation.
+
+  The greeting and the rate limit have these tests:
+  - `Test_New_When_SharedLimiterIsInDebt_Then_GreetingDoesNotWaitAndLoginDoes` - a debt on a shared limiter does not count against `dialTimeout`. Three cases run. First: a write limiter, and a greeting with no capability list. Second: a read limiter, and a greeting with a list. Third: a read limiter, and a greeting with no list. `New` succeeds. It takes at least 1 s, because LOGIN waits for the debt. The server sees one LOGIN. It sees two CAPABILITY commands when the greeting has no list, and one when the greeting has a list;
+  - `Test_AppendMessage_When_SessionDropsWhileSharedWriteLimiterIsInDebt_Then_ReconnectsAndAppends` - a session that ends while the shared write limiter is in debt gets a reconnect with a greeting that has no capability list. The debt is longer than all reconnect attempts together. `AppendMessage` returns nil, and the server sees two LOGIN commands and one APPEND. The Client holds no give-up. The call takes at least half of the debt.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
+  The mode with no wait has these tests:
+  - `TestConn_When_WaitIsOff_Then_ReadAndWriteTakeTokensWithoutWaiting` - on a limiter in debt, a `Write` and a `Read` return at once with no error. Each direction loses exactly the bytes that moved;
+  - `TestConn_When_WaitIsOff_Then_ChargeSplitsAtTheBurst` - a `Write` of 3 bursts and 1 byte returns at once and charges all of the bytes;
+  - `TestConn_When_WaitTurnsBackOn_Then_WritesWaitAgain` - after `SetWait(false)` and `SetWait(true)`, a `Write` waits for tokens;
+  - `TestConn_When_WaitTurnsOnDuringARead_Then_ThatReadWaits` - a `Read` that began before `SetWait(true)` waits for tokens after the inner read returns, and `Close` ends the wait with `context.Canceled`;
+  - `TestConn_When_LimitersAreNilAndWaitIsOff_Then_PassesThrough` - both directions pass through when the limiters are `nil`;
+  - `Test_chargeN_When_BurstIsZero_Then_Returns` - a limiter with burst 0 does not cause an endless loop.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
 - **`internal/app`** - sync plan diff (count of copies for each Message-Id), subfolder expansion, delimiter reconciliation, worker pool dispatch.
   The `runSync` and `runShow` tests run end to end against a fake IMAP server that holds mailboxes in memory. These tests cover:

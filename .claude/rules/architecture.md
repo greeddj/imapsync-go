@@ -53,6 +53,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 
 - One limiter per direction is shared across all `Client`s that talk to the same side. Per-connection limiters would defeat the global cap.
 - `ratelimit.NewLimiter(bps)` returning `nil` is the "unlimited" sentinel. Callers must nil-check, not call methods on it.
+- The greeting and the CAPABILITY probe of go-imap take tokens with no wait. `guardConn` starts the `ratelimit.Conn` in this mode, and `connectAndLogin` turns the waits on before LOGIN. LOGIN and all later traffic wait. So a debt that other Clients leave on a shared limiter never counts against `dialTimeout`.
 
 ## Terminal output
 

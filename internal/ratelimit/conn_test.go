@@ -146,3 +146,199 @@ func TestWaitNChunksLargerThanBurst(t *testing.T) {
 		t.Fatalf("waitN: %v", err)
 	}
 }
+
+// putInDebt drains the bucket and then borrows one more burst, so a call that waits
+// for tokens would block for a very long time.
+func putInDebt(lim *rate.Limiter) {
+	lim.ReserveN(time.Now(), lim.Burst())
+	lim.ReserveN(time.Now(), lim.Burst())
+}
+
+// returnsWithin fails the test when fn is still running after d.
+func returnsWithin(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatalf("%s did not return within %s", what, d)
+	}
+}
+
+func TestConn_When_WaitIsOff_Then_ReadAndWriteTakeTokensWithoutWaiting(t *testing.T) {
+	t.Parallel()
+
+	const burst = 1 << 12
+	// A near-zero refill rate keeps the token counts stable during the test.
+	readLim := rate.NewLimiter(rate.Limit(1e-9), burst)
+	writeLim := rate.NewLimiter(rate.Limit(1e-9), burst)
+	putInDebt(readLim)
+	putInDebt(writeLim)
+	readBefore, writeBefore := readLim.Tokens(), writeLim.Tokens()
+
+	fake := &fakeConn{readBuf: []byte("hello")}
+	c := New(fake, readLim, writeLim)
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetWait(false)
+
+	payload := make([]byte, 256)
+	buf := make([]byte, 5)
+	var (
+		wn, rn     int
+		werr, rerr error
+	)
+	returnsWithin(t, time.Second, "Write and Read", func() {
+		wn, werr = c.Write(payload)
+		rn, rerr = c.Read(buf)
+	})
+
+	if werr != nil || wn != len(payload) {
+		t.Errorf("Write = (%d, %v), want (%d, nil)", wn, werr, len(payload))
+	}
+	if got := string(buf[:rn]); rerr != nil || got != "hello" {
+		t.Errorf("Read = (%q, %v), want (%q, nil)", got, rerr, "hello")
+	}
+	if len(fake.writeBuf) != len(payload) {
+		t.Errorf("the connection received %d bytes, want %d", len(fake.writeBuf), len(payload))
+	}
+	if spent := writeBefore - writeLim.Tokens(); spent < float64(len(payload))-1 || spent > float64(len(payload))+1 {
+		t.Errorf("write limiter spent %v tokens, want %d", spent, len(payload))
+	}
+	if spent := readBefore - readLim.Tokens(); spent < 4 || spent > 6 {
+		t.Errorf("read limiter spent %v tokens, want 5", spent)
+	}
+}
+
+func TestConn_When_WaitIsOff_Then_ChargeSplitsAtTheBurst(t *testing.T) {
+	t.Parallel()
+
+	const burst = 1 << 10
+	lim := rate.NewLimiter(rate.Limit(1e-9), burst)
+	putInDebt(lim)
+	before := lim.Tokens()
+
+	fake := &fakeConn{}
+	c := New(fake, nil, lim)
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetWait(false)
+
+	size := 3*burst + 1
+	var (
+		n   int
+		err error
+	)
+	returnsWithin(t, time.Second, "Write", func() { n, err = c.Write(make([]byte, size)) })
+
+	if err != nil || n != size {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, size)
+	}
+	if spent := before - lim.Tokens(); spent < float64(size)-1 || spent > float64(size)+1 {
+		t.Errorf("limiter spent %v tokens, want %d", spent, size)
+	}
+}
+
+func TestConn_When_WaitTurnsBackOn_Then_WritesWaitAgain(t *testing.T) {
+	t.Parallel()
+
+	lim := NewLimiter(1024)
+	fake := &fakeConn{}
+	c := New(fake, nil, lim)
+	t.Cleanup(func() { _ = c.Close() })
+
+	c.SetWait(false)
+	c.SetWait(true)
+
+	// Drain the bucket first so the write must wait.
+	if err := lim.WaitN(context.Background(), lim.Burst()); err != nil {
+		t.Fatalf("priming wait: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := c.Write(make([]byte, 256)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("Write returned in %s, expected throttling delay", elapsed)
+	}
+}
+
+func TestConn_When_WaitTurnsOnDuringARead_Then_ThatReadWaits(t *testing.T) {
+	t.Parallel()
+
+	local, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+
+	lim := rate.NewLimiter(1, 1024)
+	putInDebt(lim)
+	c := New(local, lim, nil)
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetWait(false)
+
+	type result struct {
+		err error
+		n   int
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := c.Read(make([]byte, 16))
+		done <- result{n: n, err: err}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	c.SetWait(true)
+	if _, err := peer.Write([]byte("hello")); err != nil {
+		t.Fatalf("peer Write: %v", err)
+	}
+
+	select {
+	case r := <-done:
+		t.Fatalf("Read returned (%d, %v), want it blocked on tokens", r.n, r.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case r := <-done:
+		if r.n != 5 || !errors.Is(r.err, context.Canceled) {
+			t.Errorf("Read = (%d, %v), want (5, context.Canceled)", r.n, r.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read did not return after Close")
+	}
+}
+
+func TestConn_When_LimitersAreNilAndWaitIsOff_Then_PassesThrough(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeConn{readBuf: []byte("hello")}
+	c := New(fake, nil, nil)
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetWait(false)
+
+	buf := make([]byte, 5)
+	n, err := c.Read(buf)
+	if err != nil || string(buf[:n]) != "hello" {
+		t.Errorf("Read = (%q, %v), want (%q, nil)", buf[:n], err, "hello")
+	}
+	n, err = c.Write([]byte("abc"))
+	if err != nil || n != 3 || string(fake.writeBuf) != "abc" {
+		t.Errorf("Write = (%d, %v), the connection got %q, want (3, nil) and %q", n, err, fake.writeBuf, "abc")
+	}
+}
+
+func Test_chargeN_When_BurstIsZero_Then_Returns(t *testing.T) {
+	t.Parallel()
+
+	lim := rate.NewLimiter(1, 0)
+	returnsWithin(t, time.Second, "chargeN", func() { chargeN(lim, 100) })
+}

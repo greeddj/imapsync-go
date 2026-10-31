@@ -22,6 +22,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/greeddj/imapsync-go/internal/ratelimit"
 	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"golang.org/x/time/rate"
 )
@@ -1797,6 +1798,66 @@ func Test_New_whenClientsShareLimiters_Then_TheyDrawOneBudget(t *testing.T) {
 	}
 	if diff := write3 - 3*write1; diff < -1 || diff > 1 {
 		t.Errorf("three clients spent %v write tokens, want 3 x %v", write3, write1)
+	}
+}
+
+// A debt that other clients leave on a shared limiter stays out of the greeting limit,
+// but LOGIN still waits for its tokens.
+func Test_New_When_SharedLimiterIsInDebt_Then_GreetingDoesNotWaitAndLoginDoes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bareGreeting = "* OK Gimap ready for requests from 127.0.0.1"
+		listGreeting = "* OK [CAPABILITY IMAP4rev1] fake ready"
+	)
+	onWrite := func(o *Options, lim *rate.Limiter) { o.WriteLimiter = lim }
+	onRead := func(o *Options, lim *rate.Limiter) { o.ReadLimiter = lim }
+	tests := []struct {
+		limit          func(*Options, *rate.Limiter)
+		name           string
+		greeting       string
+		wantCapability int
+	}{
+		{name: "write limiter and a greeting without a capability list", limit: onWrite, greeting: bareGreeting, wantCapability: 2},
+		{name: "read limiter and a greeting with a capability list", limit: onRead, greeting: listGreeting, wantCapability: 1},
+		{name: "read limiter and a greeting without a capability list", limit: onRead, greeting: bareGreeting, wantCapability: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The first reservation drains the full bucket, the next two leave a debt of about 2 s.
+			lim := ratelimit.NewLimiter(64 << 10)
+			for range 3 {
+				lim.ReserveN(time.Now(), lim.Burst())
+			}
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandlerGreeting(srv, tt.greeting, capabilityAs("IMAP4rev1")))
+			opts := Options{DialTimeout: 500 * time.Millisecond}
+			tt.limit(&opts, lim)
+
+			start := time.Now()
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", opts)
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("New: %v, want the greeting to take no token wait", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if elapsed < time.Second {
+				t.Errorf("New took %s, want LOGIN to wait for the debt of the shared limiter", elapsed)
+			}
+			if got := srv.callCount("LOGIN"); got != 1 {
+				t.Errorf("LOGIN count = %d, want 1", got)
+			}
+			if got := srv.callCount("CAPABILITY"); got != tt.wantCapability {
+				t.Errorf("CAPABILITY count = %d, want %d", got, tt.wantCapability)
+			}
+		})
 	}
 }
 

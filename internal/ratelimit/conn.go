@@ -6,6 +6,8 @@ package ratelimit
 import (
 	"context"
 	"net"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -27,6 +29,7 @@ type Conn struct {
 	write  *rate.Limiter
 	ctx    context.Context
 	cancel context.CancelFunc
+	noWait atomic.Bool
 }
 
 // NewLimiter constructs a *rate.Limiter for the given bytes-per-second budget.
@@ -45,19 +48,25 @@ func New(c net.Conn, read, write *rate.Limiter) *Conn {
 	return &Conn{Conn: c, read: read, write: write, ctx: ctx, cancel: cancel}
 }
 
+// SetWait chooses whether Read and Write wait for tokens. With false they charge
+// the tokens at once, and the debt delays later callers that wait.
+func (c *Conn) SetWait(wait bool) { c.noWait.Store(!wait) }
+
 // Close cancels any in-flight WaitN call and closes the underlying connection.
 func (c *Conn) Close() error {
 	c.cancel()
 	return c.Conn.Close()
 }
 
-// Read reads from the underlying connection, then waits for tokens proportional
-// to the bytes returned. Throttling after the read is correct because the
-// bytes are already in flight: we just delay the next read.
+// Read charges tokens for the bytes returned, after the read, because they are
+// already in flight. The mode loads after the inner Read, so a Read pending at
+// SetWait(true) waits.
 func (c *Conn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 && c.read != nil {
-		if werr := waitN(c.ctx, c.read, n); werr != nil && err == nil {
+		if c.noWait.Load() {
+			chargeN(c.read, n)
+		} else if werr := waitN(c.ctx, c.read, n); werr != nil && err == nil {
 			err = werr
 		}
 	}
@@ -68,7 +77,9 @@ func (c *Conn) Read(p []byte) (int, error) {
 // burst that could trigger server-side rate limits.
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.write != nil {
-		if err := waitN(c.ctx, c.write, len(p)); err != nil {
+		if c.noWait.Load() {
+			chargeN(c.write, len(p))
+		} else if err := waitN(c.ctx, c.write, len(p)); err != nil {
 			return 0, err
 		}
 	}
@@ -88,4 +99,19 @@ func waitN(ctx context.Context, lim *rate.Limiter, n int) error {
 		n -= chunk
 	}
 	return nil
+}
+
+// chargeN takes n tokens without waiting. ReserveN charges nothing for a request
+// above the burst, so it splits large requests; a zero burst charges nothing.
+func chargeN(lim *rate.Limiter, n int) {
+	burst := lim.Burst()
+	if burst <= 0 {
+		return
+	}
+	now := time.Now()
+	for n > 0 {
+		chunk := min(n, burst)
+		lim.ReserveN(now, chunk)
+		n -= chunk
+	}
 }

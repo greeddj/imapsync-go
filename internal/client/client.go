@@ -456,11 +456,15 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	conn, w := c.guardConn(conn)
+	conn, w, rl := c.guardConn(conn)
 
 	cli, err := c.greet(ctx, conn)
 	if err != nil {
 		return err
+	}
+	if rl != nil {
+		// The greeting limit counts only server time. LOGIN and all later traffic wait for the shared tokens.
+		rl.SetWait(true)
 	}
 
 	// Stored before cli so a reader that sees the new cli also sees its watchdog.
@@ -497,18 +501,21 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	return nil
 }
 
-// guardConn keeps the watchdog innermost, so rate-limit token waits never run
-// inside it. The watchdog is nil when idleDur is zero.
-func (c *Client) guardConn(conn net.Conn) (net.Conn, *idleConn) {
+// guardConn keeps the watchdog innermost, so token waits never run inside it.
+// The watchdog and the limiter wrapper may be nil; the wrapper starts without waits.
+func (c *Client) guardConn(conn net.Conn) (net.Conn, *idleConn, *ratelimit.Conn) {
 	var w *idleConn
 	if c.idleDur > 0 {
 		w = newIdleConn(conn, c.idleDur)
 		conn = w
 	}
+	var rl *ratelimit.Conn
 	if c.readLimiter != nil || c.writeLimiter != nil {
-		conn = ratelimit.New(conn, c.readLimiter, c.writeLimiter)
+		rl = ratelimit.New(conn, c.readLimiter, c.writeLimiter)
+		rl.SetWait(false)
+		conn = rl
 	}
-	return conn, w
+	return conn, w, rl
 }
 
 // greet replaces a bare imapclient.New, which waits forever when the server

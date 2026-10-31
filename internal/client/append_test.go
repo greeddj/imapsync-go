@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	"github.com/greeddj/imapsync-go/internal/ratelimit"
 )
 
 func Test_AppendMessage_rejectsWithoutAppend(t *testing.T) {
@@ -386,6 +387,79 @@ func Test_AppendMessage_When_SessionEndedWhileIdle_Then_ReconnectsAndAppends(t *
 				t.Errorf("APPEND count after the second call = %d, want 2", got)
 			}
 		})
+	}
+}
+
+// A debt that other workers leave on the shared write limiter stays out of the greeting
+// limit, so the reconnect succeeds and the Client keeps no give-up.
+func Test_AppendMessage_When_SessionDropsWhileSharedWriteLimiterIsInDebt_Then_ReconnectsAndAppends(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bareGreeting = "* OK Gimap ready for requests from 127.0.0.1"
+		// The debt must outlast every reconnect attempt, so a greeting that waits for tokens gives up.
+		debtBursts  = 3
+		dialTimeout = 300 * time.Millisecond
+	)
+	lim := ratelimit.NewLimiter(64 << 10)
+	debt := debtBursts * time.Second
+
+	appendOK := func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "APPEND" {
+			return false, true
+		}
+		if !readAppendLiteral(conn, rd, cmd) {
+			return true, false
+		}
+		writeLine(conn, "%s OK APPEND completed", cmd.tag)
+		return true, true
+	}
+	srv := newFakeServer(t)
+	for range 1 + maxReconnectAttempts {
+		srv.addConnHandler(interceptHandlerGreeting(srv, bareGreeting, chainHooks(capabilityAs("IMAP4rev1"), appendOK)))
+	}
+	c := newDisconnectedClient(t, srv)
+	c.writeLimiter = lim
+	c.backoff = 0
+	c.dialTimeout = dialTimeout
+	if err := c.connectAndLogin(t.Context()); err != nil {
+		t.Fatalf("connectAndLogin: %v", err)
+	}
+
+	// The first reservation drains what the bucket still holds.
+	for range 1 + debtBursts {
+		lim.ReserveN(time.Now(), lim.Burst())
+	}
+	cli := c.c.Load()
+	loggedOut := cli.LoggedOut()
+	_ = cli.Terminate()
+	awaitSignal(t, loggedOut, "the client to notice the closed session")
+
+	start := time.Now()
+	errc := make(chan error, 1)
+	go func() { errc <- c.AppendMessage(t.Context(), "INBOX", buildTestIMAPMessage()) }()
+	var err error
+	select {
+	case err = <-errc:
+	case <-time.After(30 * time.Second):
+		t.Fatal("AppendMessage still blocked after 30s")
+	}
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("AppendMessage: %v, want the message sent on a new session", err)
+	}
+	if got := srv.callCount("LOGIN"); got != 2 {
+		t.Errorf("LOGIN count = %d, want 2", got)
+	}
+	if got := srv.callCount("APPEND"); got != 1 {
+		t.Errorf("APPEND count = %d, want 1", got)
+	}
+	if c.giveUpErr != nil {
+		t.Errorf("giveUpErr = %v, want none", c.giveUpErr)
+	}
+	if elapsed < debt/2 {
+		t.Errorf("AppendMessage took %s, want LOGIN to wait for the debt of the shared limiter", elapsed)
 	}
 }
 
