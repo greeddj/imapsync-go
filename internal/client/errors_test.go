@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"testing"
 
 	imapclient "github.com/emersion/go-imap/client"
@@ -250,6 +251,92 @@ func TestCanRevive(t *testing.T) {
 			t.Parallel()
 			if got := canRevive(tt.err); got != tt.want {
 				t.Errorf("canRevive(%v) = %v, want %v (class %s)", tt.err, got, tt.want, classifyError(tt.err))
+			}
+		})
+	}
+}
+
+func TestStreamError(t *testing.T) {
+	t.Parallel()
+
+	errRefusal := errors.New("fetch refused")
+	errStop := errors.New("source folder changed")
+	throttled := errors.New("Account exceeded command or bandwidth limits")
+	missing := errors.New("NO such mailbox")
+	tests := []struct {
+		err         *StreamError
+		name        string
+		wantMessage string
+		wantUnwrap  []error
+		wantIs      []error
+		wantClass   ErrClass
+	}{
+		{
+			name:        "one failed batch",
+			err:         &StreamError{First: errRefusal, FailedBatches: 1},
+			wantMessage: "fetch refused",
+			wantUnwrap:  []error{errRefusal},
+			wantIs:      []error{errRefusal},
+			wantClass:   ClassUnknown,
+		},
+		{
+			name:        "three failed batches",
+			err:         &StreamError{First: errRefusal, FailedBatches: 3},
+			wantMessage: "fetch refused (3 batches failed)",
+			wantUnwrap:  []error{errRefusal},
+			wantIs:      []error{errRefusal},
+			wantClass:   ClassUnknown,
+		},
+		{
+			name:        "a stop cause comes first",
+			err:         &StreamError{First: errRefusal, Stop: errStop, FailedBatches: 2},
+			wantMessage: "fetch refused (2 batches failed)",
+			wantUnwrap:  []error{errStop, errRefusal},
+			wantIs:      []error{errStop, errRefusal},
+			wantClass:   ClassUnknown,
+		},
+		{
+			name:        "a throttled stop beats an earlier permanent failure",
+			err:         &StreamError{First: missing, Stop: throttled, FailedBatches: 2},
+			wantMessage: "NO such mailbox (2 batches failed)",
+			wantUnwrap:  []error{throttled, missing},
+			wantIs:      []error{throttled, missing},
+			wantClass:   ClassThrottled,
+		},
+		{
+			name:        "without a stop the first failure decides",
+			err:         &StreamError{First: missing, FailedBatches: 4},
+			wantMessage: "NO such mailbox (4 batches failed)",
+			wantUnwrap:  []error{missing},
+			wantIs:      []error{missing},
+			wantClass:   ClassPermanent,
+		},
+		{
+			name:        "wrapper text with a throttle phrase sets no class",
+			err:         &StreamError{First: fmt.Errorf("[src] folder exceeded quota: %w", errRefusal), FailedBatches: 3},
+			wantMessage: "[src] folder exceeded quota: fetch refused (3 batches failed)",
+			wantClass:   ClassUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.err.Error(); got != tt.wantMessage {
+				t.Errorf("Error() = %q, want %q", got, tt.wantMessage)
+			}
+			if tt.wantUnwrap != nil {
+				if got := tt.err.Unwrap(); !slices.Equal(got, tt.wantUnwrap) {
+					t.Errorf("Unwrap() = %v, want %v", got, tt.wantUnwrap)
+				}
+			}
+			for _, want := range tt.wantIs {
+				if !errors.Is(tt.err, want) {
+					t.Errorf("errors.Is(err, %q) = false, want true", want)
+				}
+			}
+			if got := classifyError(tt.err); got != tt.wantClass {
+				t.Errorf("classifyError(err) = %s, want %s", got, tt.wantClass)
 			}
 		})
 	}

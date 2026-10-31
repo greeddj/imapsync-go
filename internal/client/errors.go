@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 
 	imapclient "github.com/emersion/go-imap/client"
@@ -59,6 +60,28 @@ var errMissingUID = errors.New("server sent no UID for a message")
 
 // ErrUIDValidityChanged marks a source folder that no longer reports the UIDVALIDITY its planned UIDs belong to.
 var ErrUIDValidityChanged = errors.New("source folder changed after the sync plan, run sync again")
+
+// StreamError is the result of StreamMessagesByUIDs when a batch failed. First is the first failure and Stop, if set, the one that ended the stream.
+type StreamError struct {
+	First         error
+	Stop          error
+	FailedBatches int
+}
+
+func (e *StreamError) Error() string {
+	if e.FailedBatches <= 1 {
+		return e.First.Error()
+	}
+	return e.First.Error() + " (" + strconv.Itoa(e.FailedBatches) + " batches failed)"
+}
+
+// Stop comes first, so a throttled stop sets the class even when an earlier failure has another class.
+func (e *StreamError) Unwrap() []error {
+	if e.Stop == nil {
+		return []error{e.First}
+	}
+	return []error{e.Stop, e.First}
+}
 
 // classifyError inspects err and returns its class.
 func classifyError(err error) ErrClass {

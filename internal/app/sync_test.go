@@ -13729,3 +13729,48 @@ func TestRunSync_When_PlannedMessageLeavesTheSourceBeforeTheCopy_Then_RunSucceed
 		})
 	}
 }
+
+func TestRunSync_When_OneMessageCannotBeFetched_Then_TheRestOfTheFolderIsCopied(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(1200)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs(ids...)})
+	src.omitInUIDFetch("INBOX", ids[2])
+	src.endUIDFetchThatOmitsWith("INBOX", gmailUnreadableReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+	const streamLine = "Stream error for folder INBOX: "
+
+	first := &syncBuffer{}
+	opts := e2eOptions(first, "")
+	opts.autoConfirm = true
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("first run error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, first.String(), "1199 messages uploaded, 1 errors occurred")
+	if n := strings.Count(first.String(), streamLine); n != 1 {
+		t.Errorf("first run printed the stream line %d times, want 1\noutput: %q", n, first.String())
+	}
+	if got := len(dst.folderMsgIDs("INBOX")); got != 1199 {
+		t.Errorf("destination INBOX holds %d messages after the first run, want 1199", got)
+	}
+	if n := src.callCount("UID FETCH"); n != 3 {
+		t.Errorf("source saw %d UID FETCH commands in the first run, want 3: one for each batch of 500", n)
+	}
+
+	second := &syncBuffer{}
+	opts = e2eOptions(second, "")
+	opts.autoConfirm = true
+	err = runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("second run error = %v, want ErrSilentExit", err)
+	}
+	assertContainsAll(t, second.String(), "INBOX → INBOX will copy 1 messages", "0 messages uploaded, 1 errors occurred")
+	if got := len(dst.folderMsgIDs("INBOX")); got != 1199 {
+		t.Errorf("destination INBOX holds %d messages after the second run, want 1199", got)
+	}
+	assertReadOnly(t, "source", src)
+}

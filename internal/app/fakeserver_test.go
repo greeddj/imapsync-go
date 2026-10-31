@@ -641,6 +641,7 @@ type mailStore struct {
 	rawBodyIn    map[string]map[string]string
 	rawBodyAt    map[folderUID]string
 	uidFetchEnd  map[string]string
+	omitFetchEnd map[string]string
 	omitBody     map[folderMsg]bool
 	omitFirst    map[folderMsg]bool
 	omitFetch    map[folderMsg]bool
@@ -920,6 +921,16 @@ func (s *fakeServer) omitInUIDFetch(folder, msgID string) {
 		s.store.omitFetch = make(map[folderMsg]bool)
 	}
 	s.store.omitFetch[folderMsg{folder, msgID}] = true
+}
+
+// endUIDFetchThatOmitsWith makes a UID FETCH of folder end with reply when omitInUIDFetch left out one of its messages. Others end with OK. reply carries its status word.
+func (s *fakeServer) endUIDFetchThatOmitsWith(folder, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.omitFetchEnd == nil {
+		s.store.omitFetchEnd = make(map[string]string)
+	}
+	s.store.omitFetchEnd[folder] = reply
 }
 
 // refuseUIDSearchWith makes every UID SEARCH in folder end with reply, which carries its own status word, as the tagged status line.
@@ -1404,9 +1415,10 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	omitFirst := maps.Clone(s.store.omitFirst)
 	omitFetch := maps.Clone(s.store.omitFetch)
 	scanNoUID := s.store.scanNoUID[selected]
-	endReply := ""
+	endReply, omitEndReply := "", ""
 	if byUID {
 		endReply = s.store.uidFetchEnd[selected]
+		omitEndReply = s.store.omitFetchEnd[selected]
 	}
 	s.mu.Unlock()
 
@@ -1424,6 +1436,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	wantFlags := hasToken(upper, "FLAGS")
 	wantInternalDate := hasToken(upper, "INTERNALDATE")
 
+	omitted := false
 	for i, m := range msgs {
 		id := uint32(i + 1)
 		if byUID {
@@ -1454,6 +1467,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 		}
 		key := folderMsg{selected, m.msgID}
 		if byUID && omitFetch[key] {
+			omitted = true
 			rw.line("* NO Message %d could not be read", i+1)
 			continue
 		}
@@ -1472,6 +1486,9 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			}
 		}
 		rw.line("* %d FETCH (%s)", i+1, strings.Join(parts, " "))
+	}
+	if endReply == "" && omitted {
+		endReply = omitEndReply
 	}
 	if endReply != "" {
 		rw.line("%s %s", tag, endReply)

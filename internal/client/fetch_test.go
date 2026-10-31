@@ -422,6 +422,9 @@ func Test_StreamMessagesByUIDs_whenServerRefuses(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %v, want it to contain %q", err, tt.wantErr)
 			}
+			if se, ok := errors.AsType[*StreamError](err); !ok || se.FailedBatches != 1 {
+				t.Errorf("error = %v, want a *StreamError with one failed batch", err)
+			}
 			if calls != 0 {
 				t.Errorf("callback ran %d times, want 0", calls)
 			}
@@ -3404,17 +3407,18 @@ func Test_uidSearchIDs_When_SessionHasNoSelection_Then_ReturnsErrNoMailboxSelect
 	}
 }
 
-// searchedContext reports cancellation through Err once the server has seen n UID SEARCH commands. Its Done channel stays nil, so nothing cancels the client.
-type searchedContext struct {
+// countedContext reports cancellation through Err once the server has seen n commands of the verb, such as "UID SEARCH". Its Done channel stays nil, so nothing cancels the client.
+type countedContext struct {
 	context.Context
-	srv *fakeServer
-	n   int
+	srv  *fakeServer
+	verb string
+	n    int
 }
 
-func (c searchedContext) Done() <-chan struct{} { return nil }
+func (c countedContext) Done() <-chan struct{} { return nil }
 
-func (c searchedContext) Err() error {
-	if c.srv.callCount("UID SEARCH") >= c.n {
+func (c countedContext) Err() error {
+	if c.srv.callCount(c.verb) >= c.n {
 		return context.Canceled
 	}
 	return nil
@@ -3443,13 +3447,514 @@ func Test_ExistingUIDs_When_ContextEndsAfterAReply_Then_ReturnsItsErrorAndSendsN
 				asked[i] = uint32(i + 1)
 			}
 
-			got, err := c.ExistingUIDs(searchedContext{Context: t.Context(), srv: srv, n: 1}, "INBOX", 0, asked)
+			got, err := c.ExistingUIDs(countedContext{Context: t.Context(), srv: srv, verb: "UID SEARCH", n: 1}, "INBOX", 0, asked)
 
 			if !errors.Is(err, context.Canceled) || got != nil {
 				t.Errorf("ExistingUIDs = %v, %v, want nil, context.Canceled", got, err)
 			}
 			if n := srv.callCount("UID SEARCH"); n != tt.wantSearches {
 				t.Errorf("UID SEARCH count = %d, want %d", n, tt.wantSearches)
+			}
+		})
+	}
+}
+
+// sequentialUIDs returns the UIDs 1 to n.
+func sequentialUIDs(n int) []uint32 {
+	uids := make([]uint32, n)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	return uids
+}
+
+// without returns a send function for answerUIDFetchEnding that sends every requested UID except skip.
+func without(skip ...uint32) func(requested []uint32) []uint32 {
+	return func(requested []uint32) []uint32 {
+		return slices.DeleteFunc(slices.Clone(requested), func(uid uint32) bool { return slices.Contains(skip, uid) })
+	}
+}
+
+func sendNothing([]uint32) []uint32 { return nil }
+
+// answerUIDFetchEnding is answerUIDFetch with its own tagged status. status gives the text for the n-th UID FETCH of the server, counted from 1; empty means OK.
+func answerUIDFetchEnding(log *uidFetchLog, send func(requested []uint32) []uint32, status func(n int) string) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+	var fetches atomic.Int32
+	return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		log.record(requested)
+		for _, uid := range send(requested) {
+			writeUIDMessage(conn, uid)
+		}
+		if reply := status(int(fetches.Add(1))); reply != "" {
+			writeLine(conn, "%s %s", cmd.tag, reply)
+		} else {
+			writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		}
+		return true, true
+	}
+}
+
+// refuseBatches gives answerUIDFetchEnding the status text reply for each UID FETCH whose number is in batches.
+func refuseBatches(reply string, batches ...int) func(n int) string {
+	return func(n int) string {
+		if slices.Contains(batches, n) {
+			return reply
+		}
+		return ""
+	}
+}
+
+// streamedUIDs collects the UIDs that StreamMessagesByUIDs hands to the callback.
+func streamedUIDs(ctx context.Context, c *Client, folder string, uidValidity uint32, uids []uint32) ([]uint32, error) {
+	var got []uint32
+	err := c.StreamMessagesByUIDs(ctx, folder, uidValidity, uids, func(msg Message) error {
+		got = append(got, msg.m.Uid)
+		return nil
+	})
+	return got, err
+}
+
+// streamErrorOf returns the *StreamError in err and fails the test when err holds none.
+func streamErrorOf(t *testing.T, err error) *StreamError {
+	t.Helper()
+
+	se, ok := errors.AsType[*StreamError](err)
+	if !ok {
+		t.Fatalf("error = %v (%T), want a *StreamError", err, err)
+	}
+	return se
+}
+
+func Test_StreamMessagesByUIDs_When_ABatchIsRefused_Then_LaterBatchesAreStillFetched(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetchEnding(fetches, without(3), refuseBatches("NO Some messages could not be FETCHed (Failure)", 1))))
+	c := newClientWithFake(t, srv)
+	uids := sequentialUIDs(2*uidFetchBatchSize + 1)
+
+	got, err := streamedUIDs(t.Context(), c, "INBOX", 0, uids)
+
+	want := [][]uint32{uids[:uidFetchBatchSize], uids[uidFetchBatchSize : 2*uidFetchBatchSize], uids[2*uidFetchBatchSize:]}
+	if gotSets := fetches.all(); !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH sets = %d, want the 3 batches [1..500], [501..1000], [1001] and no retry of UID 3", len(gotSets))
+	}
+	if wantUIDs := slices.DeleteFunc(slices.Clone(uids), func(uid uint32) bool { return uid == 3 }); !slices.Equal(got, wantUIDs) {
+		t.Errorf("callback got %d UIDs, want every UID except 3, once, in ascending order (%d)", len(got), len(wantUIDs))
+	}
+	se := streamErrorOf(t, err)
+	if se.FailedBatches != 1 || se.Stop != nil {
+		t.Errorf("FailedBatches, Stop = %d, %v, want 1, nil", se.FailedBatches, se.Stop)
+	}
+	if se.First == nil || !strings.Contains(se.First.Error(), "body fetch: Some messages could not be FETCHed (Failure)") {
+		t.Errorf("First = %v, want the refusal of the first batch", se.First)
+	}
+	if strings.Contains(err.Error(), "batches failed") {
+		t.Errorf("error = %q, want no batch count for one failed batch", err)
+	}
+	if got := classifyError(err); got != ClassUnknown {
+		t.Errorf("classifyError(err) = %s, want %s", got, ClassUnknown)
+	}
+	for verb, wantCount := range map[string]int{"LOGIN": 1, "EXAMINE": 1} {
+		if n := srv.callCount(verb); n != wantCount {
+			t.Errorf("%s count = %d, want %d", verb, n, wantCount)
+		}
+	}
+}
+
+// throttleReply is how Gmail ends a command once the account is over its limits.
+const throttleReply = "NO [OVERQUOTA] Account exceeded command or bandwidth limits"
+
+func Test_StreamMessagesByUIDs_When_SeveralBatchesFail_Then_ErrorKeepsTheFirstAndCountsThem(t *testing.T) {
+	t.Parallel()
+
+	uids := sequentialUIDs(2*uidFetchBatchSize + 1)
+	numbered := func(n int) string { return fmt.Sprintf("NO refusal %d", n) }
+	onlyTheMiddleBatch := func(requested []uint32) []uint32 {
+		if requested[0] == uids[uidFetchBatchSize] {
+			return requested
+		}
+		return nil
+	}
+	tests := []struct {
+		hook         func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool)
+		name         string
+		wantFirst    string
+		wantUIDs     []uint32
+		wantFailed   int
+		wantFetches  int
+		wantExamines int
+	}{
+		{
+			name: "every batch is refused",
+			hook: func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+				return answerUIDFetchEnding(fetches, sendNothing, numbered)
+			},
+			wantFirst:    "body fetch: refusal 1",
+			wantFailed:   3,
+			wantFetches:  3,
+			wantExamines: 1,
+		},
+		{
+			name: "the first and the last batch are refused",
+			hook: func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+				return answerUIDFetchEnding(fetches, onlyTheMiddleBatch, func(n int) string {
+					if n == 2 {
+						return ""
+					}
+					return numbered(n)
+				})
+			},
+			wantFirst:    "body fetch: refusal 1",
+			wantUIDs:     uids[uidFetchBatchSize : 2*uidFetchBatchSize],
+			wantFailed:   2,
+			wantFetches:  3,
+			wantExamines: 1,
+		},
+		{
+			name: "every EXAMINE is refused",
+			hook: func(*uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+				return func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+					if cmd.verb != "EXAMINE" {
+						return false, true
+					}
+					writeLine(conn, "%s NO [CANNOT] examine refused", cmd.tag)
+					return true, true
+				}
+			},
+			wantFirst:    "select folder INBOX: examine refused",
+			wantFailed:   3,
+			wantFetches:  0,
+			wantExamines: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fetches := new(uidFetchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, tt.hook(fetches)))
+			c := newClientWithFake(t, srv)
+
+			got, err := streamedUIDs(t.Context(), c, "INBOX", 0, uids)
+
+			se := streamErrorOf(t, err)
+			if se.FailedBatches != tt.wantFailed || se.Stop != nil {
+				t.Errorf("FailedBatches, Stop = %d, %v, want %d, nil", se.FailedBatches, se.Stop, tt.wantFailed)
+			}
+			if se.First == nil || !strings.Contains(se.First.Error(), tt.wantFirst) {
+				t.Errorf("First = %v, want the failure of the first batch (%q)", se.First, tt.wantFirst)
+			}
+			if want := fmt.Sprintf(" (%d batches failed)", tt.wantFailed); !strings.HasSuffix(err.Error(), want) {
+				t.Errorf("error = %q, want it to end with %q", err, want)
+			}
+			if !slices.Equal(got, tt.wantUIDs) {
+				t.Errorf("callback got %d UIDs, want %d", len(got), len(tt.wantUIDs))
+			}
+			for verb, want := range map[string]int{"UID FETCH": tt.wantFetches, "EXAMINE": tt.wantExamines, "LOGIN": 1} {
+				if n := srv.callCount(verb); n != want {
+					t.Errorf("%s count = %d, want %d", verb, n, want)
+				}
+			}
+		})
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_ABatchFailsAfterItsRetry_Then_TheNextBatchRunsOnANewSession(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, dropThenHold(isUIDFetch)))
+	srv.addConnHandler(interceptHandler(srv, dropThenHold(isUIDFetch)))
+	srv.addConnHandler(interceptHandler(srv, answerUIDFetch(fetches, requestedAsSent)))
+	c := newWatchedClient(t, srv, 0)
+	uids := sequentialUIDs(2*uidFetchBatchSize + 1)
+
+	var got []uint32
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		var err error
+		got, err = streamedUIDs(t.Context(), c, "INBOX", 0, uids)
+		return err
+	})
+
+	se := streamErrorOf(t, err)
+	if se.FailedBatches != 1 || se.Stop != nil {
+		t.Errorf("FailedBatches, Stop = %d, %v, want 1, nil", se.FailedBatches, se.Stop)
+	}
+	if got := classifyError(se.First); got != ClassTransient {
+		t.Errorf("classifyError(First) = %s, want %s: both sessions dropped", got, ClassTransient)
+	}
+	if want := uids[uidFetchBatchSize:]; !slices.Equal(got, want) {
+		t.Errorf("callback got %d UIDs, want the %d of the second and third batch, each once", len(got), len(want))
+	}
+	if gotSets, want := fetches.all(), [][]uint32{uids[uidFetchBatchSize : 2*uidFetchBatchSize], uids[2*uidFetchBatchSize:]}; !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("answered UID FETCH sets = %d, want the second and third batch", len(gotSets))
+	}
+	if n := srv.callCount("LOGIN"); n != 3 {
+		t.Errorf("LOGIN count = %d, want 3: the first batch used two sessions and the next batch a third", n)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_AStopCauseArrives_Then_TheStreamEndsThere(t *testing.T) {
+	t.Parallel()
+
+	uids := sequentialUIDs(2*uidFetchBatchSize + 1)
+	tests := []struct {
+		hook        func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool)
+		wantStopIs  error
+		name        string
+		wantFirst   string
+		wantStop    string
+		wantSuffix  string
+		uidValidity uint32
+		wantFailed  int
+		wantFetches int
+		wantClass   ErrClass
+	}{
+		{
+			name: "the first batch gets a throttled reply",
+			hook: func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+				return answerUIDFetchEnding(fetches, sendNothing, refuseBatches(throttleReply, 1))
+			},
+			wantFirst:   "exceeded command or bandwidth limits",
+			wantStop:    "exceeded command or bandwidth limits",
+			wantFailed:  1,
+			wantFetches: 1,
+			wantClass:   ClassThrottled,
+		},
+		{
+			name: "a throttled reply follows an unknown refusal",
+			hook: func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+				return answerUIDFetchEnding(fetches, sendNothing, func(n int) string {
+					if n == 1 {
+						return "NO [CANNOT] fetch refused"
+					}
+					return throttleReply
+				})
+			},
+			wantFirst:   "fetch refused",
+			wantStop:    "exceeded command or bandwidth limits",
+			wantSuffix:  " (2 batches failed)",
+			wantFailed:  2,
+			wantFetches: 2,
+			wantClass:   ClassThrottled,
+		},
+		{
+			name: "the UIDVALIDITY differs",
+			hook: func(fetches *uidFetchLog) func(net.Conn, *bufio.Reader, command) (handled, keep bool) {
+				return chainHooks(examineAs(6), answerUIDFetch(fetches, requestedAsSent))
+			},
+			uidValidity: 5,
+			wantStopIs:  ErrUIDValidityChanged,
+			wantFirst:   "UIDVALIDITY 5, now 6",
+			wantStop:    "UIDVALIDITY 5, now 6",
+			wantFailed:  1,
+			wantFetches: 0,
+			wantClass:   ClassUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fetches := new(uidFetchLog)
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, tt.hook(fetches)))
+			c := newClientWithFake(t, srv)
+
+			_, err := streamedUIDs(t.Context(), c, "INBOX", tt.uidValidity, uids)
+
+			se := streamErrorOf(t, err)
+			if se.FailedBatches != tt.wantFailed {
+				t.Errorf("FailedBatches = %d, want %d", se.FailedBatches, tt.wantFailed)
+			}
+			if se.First == nil || !strings.Contains(se.First.Error(), tt.wantFirst) {
+				t.Errorf("First = %v, want it to contain %q", se.First, tt.wantFirst)
+			}
+			if se.Stop == nil || !strings.Contains(se.Stop.Error(), tt.wantStop) {
+				t.Errorf("Stop = %v, want it to contain %q", se.Stop, tt.wantStop)
+			}
+			if tt.wantStopIs != nil && !errors.Is(se.Stop, tt.wantStopIs) {
+				t.Errorf("Stop = %v, want it to wrap %v", se.Stop, tt.wantStopIs)
+			}
+			if tt.wantSuffix != "" && !strings.HasSuffix(err.Error(), tt.wantSuffix) {
+				t.Errorf("error = %q, want it to end with %q", err, tt.wantSuffix)
+			}
+			if got := classifyError(err); got != tt.wantClass {
+				t.Errorf("classifyError(err) = %s, want %s", got, tt.wantClass)
+			}
+			if n := srv.callCount("UID FETCH"); n != tt.wantFetches {
+				t.Errorf("UID FETCH count = %d, want %d: no batch follows a stop cause", n, tt.wantFetches)
+			}
+			if n := srv.callCount("LOGIN"); n != 1 {
+				t.Errorf("LOGIN count = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_UIDValidityChangesAfterARefusedBatch_Then_TheStreamStops(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(5), func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		fetches.record(requestedUIDs(cmd))
+		writeLine(conn, "%s NO [CANNOT] fetch refused", cmd.tag)
+		writeLine(conn, "* BYE Autologout; idle for too long")
+		return true, false
+	})))
+	srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(6), answerUIDFetch(fetches, requestedAsSent))))
+	c := newWatchedClient(t, srv, 0)
+	uids := sequentialUIDs(2*uidFetchBatchSize + 1)
+
+	var got []uint32
+	err := awaitCall(t, "StreamMessagesByUIDs", func() error {
+		var err error
+		got, err = streamedUIDs(t.Context(), c, "INBOX", 5, uids)
+		return err
+	})
+
+	if !errors.Is(err, ErrUIDValidityChanged) {
+		t.Fatalf("StreamMessagesByUIDs = %v, want ErrUIDValidityChanged", err)
+	}
+	se := streamErrorOf(t, err)
+	if se.First == nil || !strings.Contains(se.First.Error(), "fetch refused") || errors.Is(se.First, ErrUIDValidityChanged) {
+		t.Errorf("First = %v, want the refusal of the first batch", se.First)
+	}
+	if se.Stop == nil || !errors.Is(se.Stop, ErrUIDValidityChanged) || !strings.Contains(se.Stop.Error(), "UIDVALIDITY 5, now 6") {
+		t.Errorf("Stop = %v, want the mismatch of the new session", se.Stop)
+	}
+	if se.FailedBatches != 2 {
+		t.Errorf("FailedBatches = %d, want 2", se.FailedBatches)
+	}
+	if len(got) != 0 {
+		t.Errorf("callback got %d UIDs, want none", len(got))
+	}
+	if n := srv.callCount("UID FETCH"); n != 1 {
+		t.Errorf("UID FETCH count = %d, want 1: the third batch is never requested", n)
+	}
+	if n := srv.callCount("LOGIN"); n != 2 {
+		t.Errorf("LOGIN count = %d, want 2: one new session after the BYE", n)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_ClientHasGivenUp_Then_EachBatchFailsWithoutALogin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		giveUp func(t *testing.T, srv *fakeServer, c *Client) error
+		name   string
+	}{
+		{
+			name:   "permanent refusal",
+			giveUp: loseSession,
+		},
+		{
+			name: "transient refusals within the revive interval",
+			giveUp: func(t *testing.T, srv *fakeServer, c *Client) error {
+				t.Helper()
+				err := giveUpOn(t, srv, c, "NO [UNAVAILABLE] Temporary authentication failure", ClassTransient)
+				c.reviveDur = time.Hour
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c := newClientWithFake(t, srv)
+			dials := countDials(c)
+			stored := tt.giveUp(t, srv, c)
+			dialsBefore, loginsBefore := dials.Load(), srv.callCount("LOGIN")
+
+			got, err := streamedUIDs(t.Context(), c, "INBOX", 0, sequentialUIDs(2*uidFetchBatchSize+1))
+
+			se := streamErrorOf(t, err)
+			if se.FailedBatches != 3 || se.Stop != nil {
+				t.Errorf("FailedBatches, Stop = %d, %v, want 3, nil", se.FailedBatches, se.Stop)
+			}
+			if !errors.Is(err, stored) {
+				t.Errorf("error = %v, want the stored give-up %v", err, stored)
+			}
+			if len(got) != 0 {
+				t.Errorf("callback got %d UIDs, want none", len(got))
+			}
+			if n := dials.Load(); n != dialsBefore {
+				t.Errorf("dial count went from %d to %d, want no dial", dialsBefore, n)
+			}
+			if n := srv.callCount("LOGIN"); n != loginsBefore {
+				t.Errorf("LOGIN count went from %d to %d, want no LOGIN", loginsBefore, n)
+			}
+			if n := srv.callCount("UID FETCH"); n != 0 {
+				t.Errorf("UID FETCH count = %d, want 0", n)
+			}
+		})
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_CancelledAfterARefusedBatch_Then_ReturnsCanceledAndFetchesNoMore(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		setup func(t *testing.T, srv *fakeServer, target *atomic.Pointer[Client]) context.Context
+		name  string
+	}{
+		{
+			name: "the context ends",
+			setup: func(t *testing.T, srv *fakeServer, _ *atomic.Pointer[Client]) context.Context {
+				srv.addConnHandler(interceptHandler(srv, answerUIDFetchEnding(new(uidFetchLog), sendNothing, refuseBatches("NO [CANNOT] fetch refused", 1))))
+				return countedContext{Context: t.Context(), srv: srv, verb: "UID FETCH", n: 1}
+			},
+		},
+		{
+			name: "the client is cancelled",
+			setup: func(t *testing.T, srv *fakeServer, target *atomic.Pointer[Client]) context.Context {
+				// The hook runs after the server counted the command and before it answers.
+				srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+					if !isUIDFetch(cmd) {
+						return false, true
+					}
+					target.Load().Cancel()
+					writeLine(conn, "%s NO [CANNOT] fetch refused", cmd.tag)
+					return true, false
+				}))
+				return t.Context()
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			var target atomic.Pointer[Client]
+			ctx := tt.setup(t, srv, &target)
+			c := newClientWithFake(t, srv)
+			target.Store(c)
+
+			_, err := streamedUIDs(ctx, c, "INBOX", 0, sequentialUIDs(2*uidFetchBatchSize+1))
+
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want context.Canceled", err)
+			}
+			if _, ok := errors.AsType[*StreamError](err); ok {
+				t.Errorf("error = %v, want the bare cancellation and no *StreamError", err)
+			}
+			if n := srv.callCount("UID FETCH"); n != 1 {
+				t.Errorf("UID FETCH count = %d, want 1: no batch follows the cancellation", n)
 			}
 		})
 	}

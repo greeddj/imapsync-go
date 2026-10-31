@@ -208,13 +208,26 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		reportCanceled()
 		return synced, errors, 0
 	}
-	if streamErr != nil {
-		pw.Log("Stream error for folder %s: %s", srcShown, termsafe.Escape(streamErr.Error()))
-	}
 
-	// A UID that the stream did not deliver, also one in a batch that it never requested, ends here as an error or as gone.
+	// The plan prints one stream line: the first failure of any stream, with the number of batches that failed in all streams.
+	var planFail client.StreamError
+	var failShown string
+	noteStreamFailure := func(shown string, err error) bool {
+		batches, throttled, first := streamFailure(err)
+		if planFail.FailedBatches == 0 {
+			planFail.First, failShown = first, shown
+		}
+		planFail.FailedBatches += batches
+		return throttled
+	}
+	throttled := streamErr != nil && noteStreamFailure(srcShown, streamErr)
+
+	// A UID that the stream did not deliver ends here as an error or as gone.
 	var strandedErrors, strandedGone int
-	if deliveredCount < len(sortedUIDs) {
+	if throttled {
+		// A throttled source gets no UID SEARCH. A UIDVALIDITY stop takes the check below, which fails before UID SEARCH, so a standby from another folder can still replace each UID.
+		strandedErrors = len(sortedUIDs) - deliveredCount
+	} else if deliveredCount < len(sortedUIDs) {
 		undelivered := make([]uint32, 0, len(sortedUIDs)-deliveredCount)
 		for i, uid := range sortedUIDs {
 			if !delivered[i] {
@@ -293,7 +306,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 			break
 		}
 		if err != nil {
-			pw.Log("Stream error for folder %s: %s", standbyShown, termsafe.Escape(err.Error()))
+			noteStreamFailure(standbyShown, err)
 		}
 	}
 	if ctx.Err() != nil {
@@ -310,7 +323,10 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		}
 	}
 
-	// The log comes before MarkAsDone: go-pretty drops a queued log line once no tracker is active.
+	// The logs come before MarkAsDone: go-pretty drops a queued log line once no tracker is active.
+	if planFail.FailedBatches > 0 {
+		pw.Log("Stream error for folder %s: %s", failShown, termsafe.Escape(planFail.Error()))
+	}
 	if gone > 0 {
 		pw.Log("  ℹ️  Source folder %s no longer holds %d of the %d planned messages for %s, so they are not copied",
 			srcShown, gone, p.NewMessages, dstShown)
@@ -325,6 +341,14 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, tr *pro
 		tr.MarkAsDone()
 	}
 	return synced, errors, gone
+}
+
+// streamFailure reads a StreamMessagesByUIDs error: the failed batches, whether a throttled reply ended the stream and the first failure. Any other error counts as one batch.
+func streamFailure(err error) (batches int, throttled bool, first error) {
+	if se, ok := errors.AsType[*client.StreamError](err); ok {
+		return se.FailedBatches, se.Stop != nil && !errors.Is(se.Stop, client.ErrUIDValidityChanged), se.First
+	}
+	return 1, false, err
 }
 
 func refusedBody(err error) bool {

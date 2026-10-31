@@ -1841,3 +1841,306 @@ func Test_runFolderSync_When_GoneNamesCarryControlCharacters_Then_TheGoneLineSho
 	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2")
 	assertIDs(t, "dst APPENDs", dst.appended(hostileWireName), "m1@x")
 }
+
+// gmailUnreadableReply is how Gmail ends a UID FETCH that holds a message it cannot read, after it sent the others.
+const gmailUnreadableReply = "NO Some messages could not be FETCHed (Failure)"
+
+// throttleReply is how Gmail ends a command once the account is over its limits.
+const throttleReply = "NO [OVERQUOTA] Account exceeded command or bandwidth limits"
+
+// numberedIDs returns the Message-Ids n1@x to nN@x.
+func numberedIDs(n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("n%d@x", i+1)
+	}
+	return ids
+}
+
+// bodiesOf returns the full body of each Message-Id, in order, leaving out the ones in skip.
+func bodiesOf(ids []string, skip ...string) []string {
+	bodies := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !slices.Contains(skip, id) {
+			bodies = append(bodies, imapFullBody(id))
+		}
+	}
+	return bodies
+}
+
+func Test_runFolderSync_When_ABatchHoldsAnUnreadableMessage_Then_LaterBatchesAreCopied(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(2*clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...)})
+	src.omitInUIDFetch("A", ids[2])
+	src.endUIDFetchThatOmitsWith("A", gmailUnreadableReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := copyPlan(len(ids))
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+	if got.synced != 1000 || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 1000, 1, 0", got.synced, got.errs, got.gone)
+	}
+	if sum := got.synced + got.errs + got.gone; sum != plan.NewMessages {
+		t.Errorf("synced + errors + gone = %d, want the %d planned messages", sum, plan.NewMessages)
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1:500", "501:1000", "1001")
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "3")
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, bodiesOf(ids, ids[2])) {
+		t.Errorf("dst X holds %d bodies, want the 1000 readable ones, in order", len(bodies))
+	}
+	if n := strings.Count(got.log, "Stream error for folder A: "); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsAll(t, got.log, "Some messages could not be FETCHed (Failure)")
+	assertContainsNone(t, got.log, "batches failed")
+	if !got.tr.IsErrored() {
+		t.Error("tracker not marked as errored")
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func Test_runFolderSync_When_SeveralBatchesFail_Then_OneLineCountsThem(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(2*clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...)})
+	src.omitInUIDFetch("A", ids[1])
+	src.omitInUIDFetch("A", ids[599])
+	src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := copyPlan(len(ids))
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+	if got.synced != 999 || got.errs != 2 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 999, 2, 0", got.synced, got.errs, got.gone)
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1:500", "501:1000", "1001")
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2,600")
+	if n := strings.Count(got.log, "Stream error for folder"); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "fetch cut short (3 batches failed)")
+	if !got.tr.IsErrored() {
+		t.Error("tracker not marked as errored")
+	}
+}
+
+func Test_runFolderSync_When_SourceFolderCannotBeOpened_Then_EveryPlannedMessageIsAnError(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(2*clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...)})
+	src.refuseOpenWith("A", "NO [NONEXISTENT] Unknown Mailbox")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := copyPlan(len(ids))
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+	if got.synced != 0 || got.errs != 1001 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1001, 0", got.synced, got.errs, got.gone)
+	}
+	if n := src.callCount("UID FETCH"); n != 0 {
+		t.Errorf("source saw %d UID FETCH commands, want 0", n)
+	}
+	if n := src.callCount("EXAMINE"); n != 4 {
+		t.Errorf("source saw %d EXAMINE commands, want 4: one for each batch and one for the check", n)
+	}
+	if n := strings.Count(got.log, "Stream error for folder"); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "Unknown Mailbox (3 batches failed)")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+}
+
+func Test_runFolderSync_When_SourceUIDValidityChangedAndAStandbyExists_Then_TheStandbyOfAnotherFolderCopiesTheMessage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		wantStreamEnd  string
+		plan           FolderSyncPlan
+		wantBatchCount bool
+	}{
+		{
+			name:          "the standby is in another folder",
+			plan:          standbyPlan("B"),
+			wantStreamEnd: "(UIDVALIDITY 1, now 2)",
+		},
+		{
+			name:           "the plan's own folder is the first standby source",
+			plan:           standbyPlan("A", "B"),
+			wantStreamEnd:  "(UIDVALIDITY 1, now 2) (2 batches failed)",
+			wantBatchCount: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bodyOfB := subjectBody("m1@x", "from B")
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+			src.setUIDValidity("A", 2)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+			got := runStandbyPlan(t.Context(), t, src, dst, tt.plan, false)
+
+			if got.synced != 1 || got.errs != 0 || got.gone != 0 {
+				t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 0, 0", got.synced, got.errs, got.gone)
+			}
+			if sum := got.synced + got.errs + got.gone; sum != tt.plan.NewMessages {
+				t.Errorf("synced + errors + gone = %d, want the %d planned messages", sum, tt.plan.NewMessages)
+			}
+			if n := src.callCount("UID SEARCH"); n != 0 {
+				t.Errorf("source saw %d UID SEARCH commands, want 0", n)
+			}
+			if n := src.callCount("UID FETCH"); n != 1 {
+				t.Errorf("source saw %d UID FETCH commands, want 1: only the standby in B", n)
+			}
+			assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "2")
+			assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+			if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+				t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+			}
+			if n := strings.Count(got.log, "Stream error for folder A: "); n != 1 {
+				t.Errorf("log holds the stream line of A %d times, want 1\nlog: %s", n, got.log)
+			}
+			assertContainsAll(t, got.log, tt.wantStreamEnd)
+			assertContainsNone(t, got.log, "Stream error for folder B")
+			if !tt.wantBatchCount {
+				assertContainsNone(t, got.log, "batches failed")
+			}
+			if !got.tr.IsDone() || got.tr.IsErrored() {
+				t.Errorf("tracker done = %t, errored = %t, want done and not errored", got.tr.IsDone(), got.tr.IsErrored())
+			}
+		})
+	}
+}
+
+func Test_runFolderSync_When_SourceThrottlesTheFirstBatch_Then_EveryPlannedMessageIsAnErrorWithoutACheck(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeServer(t)
+	src.addConnHandler(scriptedHandler(src, []string{"A"}, func(verb string, _ int) (string, bool) {
+		if verb == "UID" {
+			return throttleReply, true
+		}
+		return "", false
+	}))
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := copyPlan(2*clientBatchSize + 1)
+	plan.SrcUIDValidity = 0
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+	if got.synced != 0 || got.errs != 1001 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1001, 0", got.synced, got.errs, got.gone)
+	}
+	if n := src.callCount("UID FETCH"); n != 1 {
+		t.Errorf("source saw %d UID FETCH commands, want 1: a throttled reply ends the stream", n)
+	}
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: a throttled source gets no check", n)
+	}
+	if n := strings.Count(got.log, "Stream error for folder"); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "exceeded command or bandwidth limits")
+	assertContainsNone(t, got.log, "batches failed")
+}
+
+func Test_runFolderSync_When_AThrottledStopFollowsARefusedBody_Then_TheStandbyStillCopiesAndTheRestAreErrors(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(clientBatchSize + 1)
+	ids[0] = "m1@x"
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...), "B": standbyFolder(bodyOfB)})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	var fetches atomic.Int32
+	src.onCommand("UID", func() {
+		if fetches.Add(1) == 2 {
+			src.omitInUIDFetch("A", ids[clientBatchSize])
+			src.endUIDFetchThatOmitsWith("A", throttleReply)
+		}
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	plan := copyPlan(len(ids))
+	plan.standbySources = []standbySource{{folder: "B", uidValidity: 1}}
+	plan.standbys = []standbyCopy{{planned: 1, uid: 2, source: 0}}
+
+	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+	if got.synced != clientBatchSize || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want %d, 1, 0: 499 copies and the standby copy", got.synced, got.errs, got.gone, clientBatchSize)
+	}
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0", n)
+	}
+	bodies := dst.folderBodies("X")
+	if len(bodies) != clientBatchSize || !slices.Contains(bodies, bodyOfB) {
+		t.Errorf("dst X holds %d bodies, want %d, including the copy of B", len(bodies), clientBatchSize)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "exceeded command or bandwidth limits")
+}
+
+func Test_runFolderSync_When_MainAndStandbyStreamsFail_Then_OneLineNamesTheFirst(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+	src.answerBodyIn("A", "m1@x", "NIL")
+	src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short")
+	src.endUIDFetchWith("B", "NO [CANNOT] standby cut short")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 0 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 0, 0", got.synced, got.errs, got.gone)
+	}
+	if n := strings.Count(got.log, "Stream error for folder"); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "fetch cut short (2 batches failed)")
+	assertContainsNone(t, got.log, "standby cut short", "Stream error for folder B")
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+	}
+}
+
+func Test_runFolderSync_When_ContextEndsAfterARefusedBatch_Then_PrintsNoStreamLine(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	ids := numberedIDs(2*clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...)})
+	src.endUIDFetchWith("A", "NO [CANNOT] fetch refused")
+	var fetches atomic.Int32
+	src.onCommand("UID", func() {
+		if fetches.Add(1) == 2 {
+			cancel()
+		}
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(ctx, t, src, dst, copyPlan(len(ids)), false)
+
+	if got.errs != 0 || got.gone != 0 {
+		t.Errorf("errors, gone = %d, %d, want 0, 0", got.errs, got.gone)
+	}
+	if want := "1/1 Canceled A → X"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored", got.tr.Message, got.tr.IsErrored(), want)
+	}
+	assertContainsNone(t, got.log, "Stream error", "no longer holds")
+	if n := src.callCount("UID FETCH"); n != 2 {
+		t.Errorf("source saw %d UID FETCH commands, want 2: no batch follows the cancel", n)
+	}
+}

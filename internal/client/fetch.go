@@ -452,7 +452,7 @@ func (c *Client) ExistingUIDs(ctx context.Context, folder string, uidValidity ui
 	return held, nil
 }
 
-// StreamMessagesByUIDs reads at most one body ahead of onMessage, which must not call c and gets each UID once, only with BODY[]. A UIDVALIDITY mismatch returns ErrUIDValidityChanged; 0 skips.
+// StreamMessagesByUIDs feeds onMessage, which must not call c. Failed batches return one *StreamError. A cancel, an onMessage error, a UIDVALIDITY change or throttling ends it; uidValidity 0 skips.
 func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidValidity uint32, uids []uint32, onMessage func(Message) error) error {
 	stop := c.withCancel(ctx)
 	defer stop()
@@ -472,7 +472,10 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 	c.log("[%s] Streaming %d messages from %s", c.prefix, len(uids), folder)
 
 	delivered := make([]bool, min(len(uids), uidFetchBatchSize))
-	var cbErr error
+	var (
+		cbErr  error
+		failed *StreamError
+	)
 	for start := 0; start < len(uids); start += uidFetchBatchSize {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -534,15 +537,27 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 			}
 			return nil
 		})
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
+		if cerr := c.cancelErr(ctx); cerr != nil {
+			return cerr
 		}
 		if cbErr != nil {
 			return cbErr
 		}
+		if err == nil {
+			continue
+		}
+		if failed == nil {
+			failed = &StreamError{First: err}
+		}
+		failed.FailedBatches++
+		// A refused batch costs only its own messages. A UIDVALIDITY change makes the planned UIDs unsafe, and more commands after a throttled reply extend the limit.
+		if errors.Is(err, ErrUIDValidityChanged) || classifyError(err) == ClassThrottled {
+			failed.Stop = err
+			return failed
+		}
+	}
+	if failed != nil {
+		return failed
 	}
 	return nil
 }
