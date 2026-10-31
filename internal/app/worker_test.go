@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"strconv"
@@ -980,7 +981,7 @@ type standbyRun struct {
 func runStandbyPlan(ctx context.Context, t *testing.T, src, dst *fakeServer, plan FolderSyncPlan, verbose bool) standbyRun {
 	t.Helper()
 
-	return runStopPlan(ctx, t, &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}, plan, new(throttleStop), verbose)
+	return runStopPlan(ctx, t, newStopWorker(t, src, dst), plan, new(throttleStop), verbose)
 }
 
 // runStopPlan is runStandbyPlan on a worker that the caller built, with the stop of the run.
@@ -2179,9 +2180,17 @@ func assertAccounted(t *testing.T, got standbyRun, plan FolderSyncPlan) {
 	}
 }
 
+// newStopWorker also checks, when the test ends, that the worker only read from the source.
 func newStopWorker(t *testing.T, src, dst *fakeServer) *syncWorker {
 	t.Helper()
 
+	t.Cleanup(func() {
+		if src.store != nil {
+			assertReadOnly(t, "source", src)
+		} else {
+			assertNoWriteCommands(t, "source", src)
+		}
+	})
 	return &syncWorker{src: newAppClient(t, src, "src"), dst: newAppClient(t, dst, "dst")}
 }
 
@@ -2574,5 +2583,540 @@ func Test_streamFailure_When_StopIsThrottledAndFirstIsANetworkError_Then_Reports
 	}
 	if _, throttle, _ := streamFailure(err); !errors.Is(throttle, throttled) {
 		t.Errorf("streamFailure throttle = %v, want %v", throttle, throttled)
+	}
+}
+
+func Test_throttleStop_When_SeveralRepliesAreRecorded_Then_TheFirstOneWins(t *testing.T) {
+	t.Parallel()
+
+	var stop throttleStop
+	if stop.stopped() || stop.get() != nil || stop.halt() != nil {
+		t.Fatalf("a new stop: stopped = %t, cause = %+v, halt = %v, want a run that goes on", stop.stopped(), stop.get(), stop.halt())
+	}
+	if stop.recordThrottled(sideSource, errors.New("[CANNOT] refused by policy")) || stop.stopped() {
+		t.Fatalf("a reply that is no throttle stopped the run: %+v", stop.get())
+	}
+
+	first := errors.New("Account exceeded command or bandwidth limits")
+	if !stop.recordThrottled(sideSource, first) {
+		t.Fatal("recordThrottled = false for a throttled reply, want true")
+	}
+	stop.record(sideDestination, errors.New("later destination reply"))
+	if !stop.recordThrottled(sideDestination, errors.New("Quota exceeded (mailbox for user is full)")) {
+		t.Error("recordThrottled = false for a later throttled reply, want true: it is a throttle, even if it does not win")
+	}
+
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource || !errors.Is(cause.err, first) {
+		t.Errorf("cause = %+v, want the source and the first reply", cause)
+	}
+	if err := stop.halt(); !errors.Is(err, errPlanStopped) {
+		t.Errorf("halt = %v, want errPlanStopped", err)
+	}
+}
+
+func Test_throttleStop_When_WorkersRecordAtTheSameTime_Then_OneCauseStaysForEveryReader(t *testing.T) {
+	t.Parallel()
+
+	var stop throttleStop
+	replies := make([]error, 16)
+	seen := make([]*throttleCause, len(replies))
+	var wg sync.WaitGroup
+	for i := range replies {
+		replies[i] = fmt.Errorf("reply %d", i)
+		wg.Go(func() {
+			stop.record(sideDestination, replies[i])
+			seen[i] = stop.get()
+		})
+	}
+	wg.Wait()
+
+	cause := stop.get()
+	if cause == nil || !slices.Contains(replies, cause.err) {
+		t.Fatalf("cause = %+v, want one of the recorded replies", cause)
+	}
+	for i, got := range seen {
+		if got != cause {
+			t.Errorf("worker %d read cause %+v after it recorded, want the one cause %+v", i, got, cause)
+		}
+	}
+}
+
+func Test_runFolderSync_When_TheRunStopsAtTheLastMessageOfAStandbyBatch_Then_NoNextStandbyBatch(t *testing.T) {
+	t.Parallel()
+
+	stop := new(throttleStop)
+	ids := numberedIDs(clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...), "B": fakeMsgs(ids...)})
+	for _, id := range ids {
+		src.answerBodyIn("A", id, "NIL")
+	}
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	dst.onCommand("APPEND", func() {
+		if dst.callCount("APPEND") == clientBatchSize {
+			stop.record(sideSource, errors.New("another worker was throttled"))
+		}
+	})
+	plan := copyPlan(len(ids))
+	plan.standbySources = []standbySource{{folder: "B", uidValidity: 1}}
+	for uid := uint32(1); uid <= uint32(len(ids)); uid++ {
+		plan.standbys = append(plan.standbys, standbyCopy{planned: uid, uid: uid, source: 0})
+	}
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != clientBatchSize || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want %d, 1, 0", got.synced, got.errs, got.gone, clientBatchSize)
+	}
+	assertAccounted(t, got, plan)
+	// Two batches of A, then one batch of B. The stop falls on the last message of that batch.
+	if n := src.callCount("UID FETCH"); n != 3 {
+		t.Errorf("source saw %d UID FETCH commands, want 3: no standby batch follows the stop", n)
+	}
+	if n := dst.callCount("APPEND"); n != clientBatchSize {
+		t.Errorf("destination saw %d APPEND commands, want %d", n, clientBatchSize)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func Test_runFolderSync_When_StandbySourceHasItsOwnUIDValidity_Then_TheStandbyStreamUsesThatValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		wantLog      []string
+		standbyValue uint32
+		wantSynced   int
+		wantErrs     int
+	}{
+		{name: "the standby source still reports its value", standbyValue: 7, wantSynced: 1},
+		{name: "the standby source changed", standbyValue: 8, wantErrs: 1, wantLog: []string{"Stream error for folder B: ", "(UIDVALIDITY 8, now 7)"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bodyOfB := subjectBody("m1@x", "from B")
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+			src.answerBodyIn("A", "m1@x", "NIL")
+			// The plan holds 1 for folder A, so a stream that used it for B would fail the check.
+			src.setUIDValidity("B", 7)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+			plan := standbyPlan("B")
+			plan.standbySources[0].uidValidity = tt.standbyValue
+
+			got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+
+			if got.synced != tt.wantSynced || got.errs != tt.wantErrs || got.gone != 0 {
+				t.Errorf("synced, errors, gone = %d, %d, %d, want %d, %d, 0", got.synced, got.errs, got.gone, tt.wantSynced, tt.wantErrs)
+			}
+			assertAccounted(t, got, plan)
+			assertContainsAll(t, got.log, tt.wantLog...)
+			wantFetches := 1 + tt.wantSynced
+			if n := src.callCount("UID FETCH"); n != wantFetches {
+				t.Errorf("source saw %d UID FETCH commands, want %d", n, wantFetches)
+			}
+		})
+	}
+}
+
+func Test_runFolderSync_When_ExamineGetsAThrottledReply_Then_TheStopNamesTheSourceAndNoCommandFollows(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeServer(t)
+	src.addConnHandler(scriptedHandler(src, []string{"A"}, func(verb string, _ int) (string, bool) {
+		if verb == "EXAMINE" {
+			return throttleReply, true
+		}
+		return "", false
+	}))
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	stop := new(throttleStop)
+	plan := copyPlan(3)
+	plan.SrcUIDValidity = 0
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 0 || got.errs != 3 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 3, 0", got.synced, got.errs, got.gone)
+	}
+	assertAccounted(t, got, plan)
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource || !client.IsThrottled(cause.err) {
+		t.Errorf("stop cause = %+v, want the source and a throttled reply", cause)
+	}
+	for verb, want := range map[string]int{"EXAMINE": 1, "UID FETCH": 0, "UID SEARCH": 0} {
+		if n := src.callCount(verb); n != want {
+			t.Errorf("source saw %d %s commands, want %d", n, verb, want)
+		}
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "select folder A", "exceeded command or bandwidth limits")
+	assertContainsNone(t, got.log, "batches failed")
+}
+
+func Test_runFolderSync_When_ARefusedBatchIsFollowedByAThrottledBatch_Then_OneLineCountsBothAndTheStopNamesTheSource(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(2*clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...)})
+	var fetches atomic.Int32
+	src.onCommand("UID", func() {
+		switch fetches.Add(1) {
+		case 1:
+			src.endUIDFetchWith("A", "NO [CANNOT] fetch refused")
+		case 2:
+			src.endUIDFetchWith("A", throttleReply)
+		}
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	stop := new(throttleStop)
+	plan := copyPlan(len(ids))
+
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+	if got.synced != 2*clientBatchSize || got.errs != 1 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want %d, 1, 0: both batches delivered their bodies before the status", got.synced, got.errs, got.gone, 2*clientBatchSize)
+	}
+	assertAccounted(t, got, plan)
+	cause := stop.get()
+	if cause == nil || cause.side != sideSource || !client.IsThrottled(cause.err) {
+		t.Errorf("stop cause = %+v, want the source and a throttled reply", cause)
+	}
+	if n := strings.Count(got.log, "Stream error for folder"); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "fetch refused", "(2 batches failed)")
+	if n := src.callCount("UID FETCH"); n != 2 {
+		t.Errorf("source saw %d UID FETCH commands, want 2: the throttled reply ends the stream", n)
+	}
+	if n := src.callCount("UID SEARCH"); n != 0 {
+		t.Errorf("source saw %d UID SEARCH commands, want 0: a throttled source gets no check", n)
+	}
+}
+
+func Test_runFolderSync_When_RunIsStoppedAndContextEnds_Then_ReturnsCanceledWithoutCommands(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+	w := newStopWorker(t, src, dst)
+	stop := new(throttleStop)
+	stop.record(sideDestination, errors.New("Quota exceeded"))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	srcBefore, dstBefore := totalCommands(src), totalCommands(dst)
+
+	got := runStopPlan(ctx, t, w, copyPlan(2), stop, false)
+
+	if got.synced != 0 || got.errs != 0 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 0, 0: a cancel counts nothing", got.synced, got.errs, got.gone)
+	}
+	if want := "1/1 Canceled"; got.tr.Message != want || !got.tr.IsErrored() {
+		t.Errorf("tracker message = %q, errored = %t, want %q and errored: the cancel wins over the stop", got.tr.Message, got.tr.IsErrored(), want)
+	}
+	if n := totalCommands(src) - srcBefore; n != 0 {
+		t.Errorf("source saw %d new commands, want none", n)
+	}
+	if n := totalCommands(dst) - dstBefore; n != 0 {
+		t.Errorf("destination saw %d new commands, want none", n)
+	}
+	if cause := stop.get(); cause == nil || cause.side != sideDestination {
+		t.Errorf("stop cause = %+v, want the one recorded before the cancel", cause)
+	}
+}
+
+// messageEvent is what the source does to one planned message in the random run.
+type messageEvent int
+
+const (
+	eventNone          messageEvent = iota
+	eventBodylessFirst              // a response without BODY[] comes before the full one
+	eventEmptyBody                  // BODY[] is NIL
+	eventNoBodyItem                 // no response carries BODY[]
+	eventOmitted                    // the FETCH leaves the message out, and the source still holds it
+	eventExpunged                   // the source no longer holds the message
+	eventKinds
+)
+
+// standbyEvent is what the source does to the standby copy of one planned message.
+type standbyEvent int
+
+const (
+	standbyNone standbyEvent = iota
+	standbyOK
+	standbyEmpty
+	standbyOmitted
+	standbyExpunged
+)
+
+// throttleKind is the one throttled reply of a random run.
+type throttleKind int
+
+const (
+	throttleNone throttleKind = iota
+	throttleDestinationAppend
+	throttleSourceFetch
+	throttleSourceExamine
+	throttleSourceSearch
+	throttleKinds
+)
+
+// randomRun is one scripted run of runFolderSync. Index k is the planned message with UID k+1.
+type randomRun struct {
+	events          []messageEvent
+	standbys        []standbyEvent
+	dstRefuses      []bool
+	throttleAt      int
+	throttle        throttleKind
+	batchRefused    bool
+	validityChanged bool
+	searchRefused   bool
+}
+
+func (r randomRun) id(k int) string { return fmt.Sprintf("r%d@x", k+1) }
+
+func (r randomRun) bodyOfStandby(k int) string { return subjectBody(r.id(k), "from B") }
+
+// randomOutcome is what runFolderSync must report and send when no reply is a throttle.
+type randomOutcome struct {
+	fromA, fromB []string
+	errs, gone   int
+	attempts     int
+	searched     int
+	standbyAsked int
+}
+
+func newRandomRun(rng *rand.Rand) randomRun {
+	n := 1 + rng.IntN(12)
+	dense := rng.IntN(20) > 0
+	if rng.IntN(25) == 0 {
+		n, dense = clientBatchSize+2, false
+	}
+	r := randomRun{
+		events:     make([]messageEvent, n),
+		standbys:   make([]standbyEvent, n),
+		dstRefuses: make([]bool, n),
+	}
+	for k := range n {
+		if dense || rng.IntN(100) == 0 {
+			r.events[k] = messageEvent(rng.IntN(int(eventKinds)))
+		}
+		if dense && rng.IntN(2) == 0 {
+			r.standbys[k] = standbyEvent(1 + rng.IntN(4))
+		}
+		r.dstRefuses[k] = dense && rng.IntN(12) == 0
+	}
+	r.batchRefused = rng.IntN(8) == 0
+	r.validityChanged = rng.IntN(12) == 0
+	r.searchRefused = rng.IntN(10) == 0
+	if rng.IntN(7) == 0 {
+		r.throttle = throttleKind(1 + rng.IntN(int(throttleKinds)-1))
+		r.throttleAt = rng.IntN(n)
+	}
+	return r
+}
+
+// expect follows the rules of the copy: a message ends as synced, an error or gone, and a standby copy can replace a planned one that waits.
+func (r randomRun) expect() randomOutcome {
+	var out randomOutcome
+	pending := make(map[int]pendingCause)
+	var undelivered []int
+	for k, event := range r.events {
+		delivered := !r.validityChanged && (event == eventNone || event == eventBodylessFirst || event == eventEmptyBody)
+		switch {
+		case !delivered:
+			undelivered = append(undelivered, k)
+		case event == eventEmptyBody:
+			if r.standbys[k] != standbyNone {
+				pending[k] = causeRefusedBody
+			} else {
+				out.errs++
+			}
+		case r.dstRefuses[k]:
+			out.attempts++
+			out.errs++
+		default:
+			out.attempts++
+			out.fromA = append(out.fromA, r.id(k))
+		}
+	}
+	switch {
+	case len(undelivered) == 0 || r.validityChanged:
+	case r.searchRefused:
+		out.searched = 1
+	default:
+		out.searched = (len(undelivered) + clientBatchSize - 1) / clientBatchSize
+	}
+	for _, k := range undelivered {
+		cause := causeNotDelivered
+		if r.events[k] == eventExpunged && !r.validityChanged && !r.searchRefused {
+			cause = causeGone
+		}
+		switch {
+		case r.standbys[k] != standbyNone:
+			pending[k] = cause
+		case cause == causeGone:
+			out.gone++
+		default:
+			out.errs++
+		}
+	}
+	out.standbyAsked = len(pending)
+	for k := range r.events {
+		if _, waits := pending[k]; !waits || r.standbys[k] != standbyOK {
+			continue
+		}
+		out.attempts++
+		if r.dstRefuses[k] {
+			out.errs++
+		} else {
+			out.fromB = append(out.fromB, r.id(k))
+		}
+		delete(pending, k)
+	}
+	for _, cause := range pending {
+		if cause == causeGone {
+			out.gone++
+		} else {
+			out.errs++
+		}
+	}
+	return out
+}
+
+func Test_runFolderSync_When_EventsAreRandom_Then_EveryPlannedMessageEndsOnceAndNothingIsSentTwice(t *testing.T) {
+	t.Parallel()
+
+	for seed := uint64(1); seed <= 150; seed++ {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			t.Parallel()
+
+			run := newRandomRun(rand.New(rand.NewPCG(seed, seed*7919)))
+			n := len(run.events)
+			folderA := make([]fakeMsg, n)
+			var folderB []fakeMsg
+			plan := copyPlan(n)
+			plan.standbySources = []standbySource{{folder: "B", uidValidity: 1}}
+			for k := range n {
+				folderA[k] = fakeMsg{msgID: run.id(k)}
+				if run.standbys[k] != standbyNone {
+					folderB = append(folderB, fakeMsg{msgID: run.id(k), body: run.bodyOfStandby(k)})
+					plan.standbys = append(plan.standbys, standbyCopy{planned: uint32(k + 1), uid: uint32(len(folderB)), source: 0})
+				}
+			}
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": folderA, "B": folderB})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+			for k, event := range run.events {
+				id := run.id(k)
+				switch event {
+				case eventBodylessFirst:
+					src.omitBodyFirstIn("A", id)
+				case eventEmptyBody:
+					src.answerBodyIn("A", id, "NIL")
+				case eventNoBodyItem:
+					src.omitBodyIn("A", id)
+				case eventOmitted:
+					src.omitInUIDFetch("A", id)
+				case eventExpunged:
+					src.removeMessage("A", id)
+				}
+				switch run.standbys[k] {
+				case standbyEmpty:
+					src.answerBodyIn("B", id, "NIL")
+				case standbyOmitted:
+					src.omitInUIDFetch("B", id)
+				case standbyExpunged:
+					src.removeMessage("B", id)
+				}
+				if run.dstRefuses[k] {
+					dst.refuseAppendOf(id, "NO [CANNOT] message refused by policy")
+				}
+			}
+			if run.batchRefused {
+				src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short")
+			}
+			if run.validityChanged {
+				src.setUIDValidity("A", 2)
+			}
+			if run.searchRefused {
+				src.refuseUIDSearchWith("A", "NO [CANNOT] search refused")
+			}
+			switch run.throttle {
+			case throttleDestinationAppend:
+				dst.refuseAppendOf(run.id(run.throttleAt), gmailThrottleReply)
+			case throttleSourceFetch:
+				src.endUIDFetchWith("A", throttleReply)
+			case throttleSourceExamine:
+				src.refuseOpenWith("A", throttleReply)
+			case throttleSourceSearch:
+				src.refuseUIDSearchWith("A", throttleReply)
+			}
+			stop := new(throttleStop)
+
+			got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
+
+			assertAccounted(t, got, plan)
+			appended := dst.appended("X")
+			sortedIDs := slices.Sorted(slices.Values(appended))
+			if compacted := slices.Compact(slices.Clone(sortedIDs)); len(compacted) != len(sortedIDs) {
+				t.Errorf("destination stored a Message-Id twice: %v", appended)
+			}
+			if len(appended) != got.synced {
+				t.Errorf("destination stored %d messages, runFolderSync reported %d synced", len(appended), got.synced)
+			}
+			for _, body := range dst.folderBodies("X") {
+				if body == "" {
+					t.Error("destination stored an empty message")
+				}
+			}
+			assertReadOnly(t, "source", src)
+
+			if run.throttle != throttleNone {
+				if stop.stopped() && run.throttle != throttleDestinationAppend && slices.Contains(src.capturedNames("EXAMINE"), "B") {
+					t.Errorf("source examined the standby folder after its own throttled reply: %v", src.capturedNames("EXAMINE"))
+				}
+				if stop.stopped() && run.throttle == throttleSourceFetch && src.callCount("UID SEARCH") != 0 {
+					t.Errorf("source saw %d UID SEARCH commands after a throttled FETCH, want 0", src.callCount("UID SEARCH"))
+				}
+				return
+			}
+
+			want := run.expect()
+			if got.synced != len(want.fromA)+len(want.fromB) || got.errs != want.errs || got.gone != want.gone {
+				t.Errorf("synced, errors, gone = %d, %d, %d, want %d, %d, %d\nrun: %+v", got.synced, got.errs, got.gone, len(want.fromA)+len(want.fromB), want.errs, want.gone, run)
+			}
+			if wantIDs := slices.Sorted(slices.Values(slices.Concat(want.fromA, want.fromB))); !slices.Equal(sortedIDs, wantIDs) {
+				t.Errorf("destination holds %v, want %v", sortedIDs, wantIDs)
+			}
+			wantBodies := make([]string, 0, len(want.fromA)+len(want.fromB))
+			for _, id := range want.fromA {
+				wantBodies = append(wantBodies, imapFullBody(id))
+			}
+			for k := range n {
+				if slices.Contains(want.fromB, run.id(k)) {
+					wantBodies = append(wantBodies, run.bodyOfStandby(k))
+				}
+			}
+			if bodies := dst.folderBodies("X"); !slices.Equal(slices.Sorted(slices.Values(bodies)), slices.Sorted(slices.Values(wantBodies))) {
+				t.Errorf("destination bodies differ from the copies the rules choose (%d stored, %d wanted)", len(bodies), len(wantBodies))
+			}
+			if stop.stopped() {
+				t.Errorf("stop cause = %+v, want none: no reply was a throttle", stop.get())
+			}
+			if appends := dst.callCount("APPEND"); appends != want.attempts {
+				t.Errorf("destination saw %d APPEND commands, want %d", appends, want.attempts)
+			}
+			if searches := src.callCount("UID SEARCH"); searches != want.searched {
+				t.Errorf("source saw %d UID SEARCH commands, want %d", searches, want.searched)
+			}
+			wantFetches := 0
+			if !run.validityChanged {
+				wantFetches = (n + clientBatchSize - 1) / clientBatchSize
+			}
+			wantFetches += (want.standbyAsked + clientBatchSize - 1) / clientBatchSize
+			if fetches := src.callCount("UID FETCH"); fetches != wantFetches {
+				t.Errorf("source saw %d UID FETCH commands, want %d", fetches, wantFetches)
+			}
+		})
 	}
 }

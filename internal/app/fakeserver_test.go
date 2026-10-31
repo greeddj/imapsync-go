@@ -646,6 +646,8 @@ type mailStore struct {
 	omitBody     map[folderMsg]bool
 	omitFirst    map[folderMsg]bool
 	omitFetch    map[folderMsg]bool
+	omitUID      map[folderMsg]bool
+	appendRefuse map[string]string
 	searchReply  map[string]string
 	scanNoUID    map[string]bool
 	delimiter    string
@@ -923,6 +925,26 @@ func (s *fakeServer) omitInUIDFetch(folder, msgID string) {
 		s.store.omitFetch = make(map[folderMsg]bool)
 	}
 	s.store.omitFetch[folderMsg{folder, msgID}] = true
+}
+
+// omitUIDInUIDFetch makes every UID FETCH answer for the message without the UID item, as a server does that breaks the rule that UID FETCH names the UID.
+func (s *fakeServer) omitUIDInUIDFetch(folder, msgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.omitUID == nil {
+		s.store.omitUID = make(map[folderMsg]bool)
+	}
+	s.store.omitUID[folderMsg{folder, msgID}] = true
+}
+
+// refuseAppendOf makes the APPEND of the message with msgID end with reply, which carries its own status word. The server stores every other message.
+func (s *fakeServer) refuseAppendOf(msgID, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store.appendRefuse == nil {
+		s.store.appendRefuse = make(map[string]string)
+	}
+	s.store.appendRefuse[msgID] = reply
 }
 
 // endUIDFetchThatOmitsWith makes a UID FETCH of folder end with reply when omitInUIDFetch left out one of its messages. Others end with OK. reply carries its status word.
@@ -1417,7 +1439,8 @@ func (s *fakeServer) storeStatus(rw replyWriter, tag, arg string) {
 }
 
 // storeFetch answers FETCH and UID FETCH. Only the requested items are sent,
-// except UID, which a UID FETCH response always carries.
+// except UID, which a UID FETCH response carries unless omitUIDInUIDFetch names
+// the message.
 func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID bool) {
 	set, items, _ := strings.Cut(arg, " ")
 	upper := strings.ToUpper(items)
@@ -1433,6 +1456,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 	omitBody := maps.Clone(s.store.omitBody)
 	omitFirst := maps.Clone(s.store.omitFirst)
 	omitFetch := maps.Clone(s.store.omitFetch)
+	omitUID := maps.Clone(s.store.omitUID)
 	scanNoUID := s.store.scanNoUID[selected]
 	endReply, omitEndReply := "", ""
 	if byUID {
@@ -1465,7 +1489,7 @@ func (s *fakeServer) storeFetch(rw replyWriter, tag, selected, arg string, byUID
 			continue
 		}
 		var parts []string
-		if wantUID {
+		if wantUID && (!byUID || !omitUID[folderMsg{selected, m.msgID}]) {
 			parts = append(parts, fmt.Sprintf("UID %d", m.uid))
 		}
 		if wantSize {
@@ -1615,6 +1639,10 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 	msgID := ""
 	if m, err := mail.ReadMessage(bytes.NewReader(lit)); err == nil {
 		msgID = strings.Trim(m.Header.Get("Message-Id"), "<>")
+	}
+	if reply := s.store.appendRefuse[msgID]; reply != "" {
+		rw.line("%s %s", tag, reply)
+		return true
 	}
 	dropped := s.store.onePerID && msgID != "" && slices.ContainsFunc(s.store.folders[key], func(m storedMsg) bool { return m.msgID == msgID })
 	if !dropped {

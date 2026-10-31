@@ -1985,13 +1985,19 @@ func assertIDs(t *testing.T, what string, got []string, want ...string) {
 // or flags, and never opened a mailbox read-write.
 func assertReadOnly(t *testing.T, name string, srv *fakeServer) {
 	t.Helper()
-	for _, verb := range []string{"APPEND", "CREATE", "STORE", "UID STORE", "EXPUNGE", "DELETE", "RENAME", "SELECT"} {
+	assertNoWriteCommands(t, name, srv)
+	if n := srv.seenMutatingFetches(); n != 0 {
+		t.Errorf("%s saw %d fetches that set \\Seen, want 0", name, n)
+	}
+}
+
+// assertNoWriteCommands is assertReadOnly without the \Seen check, which needs a store-backed server.
+func assertNoWriteCommands(t *testing.T, name string, srv *fakeServer) {
+	t.Helper()
+	for _, verb := range []string{"APPEND", "CREATE", "STORE", "UID STORE", "COPY", "UID COPY", "MOVE", "UID MOVE", "EXPUNGE", "UID EXPUNGE", "DELETE", "RENAME", "SELECT"} {
 		if n := srv.callCount(verb); n != 0 {
 			t.Errorf("%s saw %d %s commands, want 0", name, n, verb)
 		}
-	}
-	if n := srv.seenMutatingFetches(); n != 0 {
-		t.Errorf("%s saw %d fetches that set \\Seen, want 0", name, n)
 	}
 }
 
@@ -15135,4 +15141,424 @@ func prefixedIDs(prefix string, n int) []string {
 		ids[i] = fmt.Sprintf("%s%d@x", prefix, i+1)
 	}
 	return ids
+}
+
+func TestRunSync_When_SourceEventsAreRandom_Then_NoMessageIsStoredTwiceAcrossTwoRuns(t *testing.T) {
+	t.Parallel()
+
+	for seed := uint64(1); seed <= 30; seed++ {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			t.Parallel()
+
+			run := newRandomRun(rand.New(rand.NewPCG(seed, seed*104729)))
+			n := min(len(run.events), 12)
+			folderA := make([]fakeMsg, n)
+			var folderX []fakeMsg
+			for k := range n {
+				folderA[k] = fakeMsg{msgID: run.id(k)}
+				if k%5 == 2 {
+					folderX = append(folderX, fakeMsg{msgID: run.id(k)})
+				}
+			}
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": folderA})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": folderX})
+			var held []string
+			for k := range n {
+				id := run.id(k)
+				switch run.events[k] {
+				case eventBodylessFirst:
+					src.omitBodyFirstIn("A", id)
+				case eventEmptyBody:
+					src.answerBodyIn("A", id, "NIL")
+				case eventNoBodyItem:
+					src.omitBodyIn("A", id)
+				case eventOmitted:
+					src.omitInUIDFetch("A", id)
+				case eventExpunged:
+					src.removeMessage("A", id)
+					continue
+				}
+				held = append(held, id)
+				if run.dstRefuses[k] {
+					dst.refuseAppendOf(id, "NO [CANNOT] message refused by policy")
+				}
+			}
+			if run.batchRefused {
+				src.endUIDFetchWith("A", "NO [CANNOT] fetch cut short")
+			}
+			if run.searchRefused {
+				src.refuseUIDSearchWith("A", "NO [CANNOT] search refused")
+			}
+			switch run.throttle {
+			case throttleDestinationAppend:
+				dst.refuseAppendOf(run.id(run.throttleAt%n), gmailThrottleReply)
+			// refuseOpenWith would also refuse the EXAMINE of the planning scan, so no plan would run. The EXAMINE kind throttles the body FETCH here instead.
+			case throttleSourceFetch, throttleSourceExamine:
+				src.endUIDFetchWith("A", throttleReply)
+			case throttleSourceSearch:
+				src.refuseUIDSearchWith("A", throttleReply)
+			}
+			cfg := e2eConfig(src, dst, 2, mapping("A", "X"))
+			prefilled := dst.folderMsgIDs("X")
+
+			var attempts [2]int
+			var stored [2][]string
+			for i := range 2 {
+				out := &syncBuffer{}
+				opts := e2eOptions(out, "")
+				opts.autoConfirm = true
+				if err := runSync(e2eContext(t), cfg, opts); err != nil && !errors.Is(err, ErrSilentExit) {
+					t.Fatalf("run %d: %v\noutput: %s", i+1, err, out.String())
+				}
+				attempts[i] = dst.callCount("APPEND")
+				stored[i] = dst.appended("X")
+			}
+
+			firstRun, secondRun := stored[0], stored[1][len(stored[0]):]
+			for _, id := range secondRun {
+				if slices.Contains(firstRun, id) || slices.Contains(prefilled, id) {
+					t.Errorf("the second run stored %s again", id)
+				}
+			}
+			inFolder := slices.Sorted(slices.Values(dst.folderMsgIDs("X")))
+			if compacted := slices.Compact(slices.Clone(inFolder)); len(compacted) != len(inFolder) {
+				t.Errorf("destination holds a Message-Id twice: %v", inFolder)
+			}
+			for _, body := range dst.folderBodies("X") {
+				if body == "" {
+					t.Error("destination holds an empty message")
+				}
+			}
+			missingAfterFirstRun := 0
+			for _, id := range held {
+				if !slices.Contains(firstRun, id) && !slices.Contains(prefilled, id) {
+					missingAfterFirstRun++
+				}
+			}
+			if sent := attempts[1] - attempts[0]; sent > missingAfterFirstRun {
+				t.Errorf("the second run sent %d APPEND commands for %d missing messages", sent, missingAfterFirstRun)
+			}
+			if run.throttle == throttleNone {
+				for k := range n {
+					deliverable := (run.events[k] == eventNone || run.events[k] == eventBodylessFirst) && !run.dstRefuses[k]
+					id := run.id(k)
+					if deliverable && !slices.Contains(firstRun, id) && !slices.Contains(prefilled, id) {
+						t.Errorf("the first run did not copy %s, which the source delivers and the destination accepts", id)
+					}
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_ExistenceCheckAnswersOrIsRefused_Then_OnlyAnAnsweredCheckCountsAMessageAsGone(t *testing.T) {
+	t.Parallel()
+
+	const goneLine = "Source folder INBOX no longer holds "
+	tests := []struct {
+		name         string
+		wantSummary  string
+		wantGoneLine string
+		refuseSearch bool
+	}{
+		{
+			name:         "the check works",
+			wantSummary:  "1 messages uploaded, 1 errors occurred, 0 folders failed",
+			wantGoneLine: goneLine + "1 of the 3 planned messages for INBOX, so they are not copied",
+		},
+		{name: "the check is refused", refuseSearch: true, wantSummary: "1 messages uploaded, 2 errors occurred, 0 folders failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("good@x", "held@x", "gone@x")})
+			src.omitInUIDFetch("INBOX", "held@x")
+			if tt.refuseSearch {
+				src.refuseUIDSearchWith("INBOX", "NO [CANNOT] search refused")
+			}
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.in = &hookReader{r: strings.NewReader("y\n"), hook: func() { src.removeMessage("INBOX", "gone@x") }}
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertContainsAll(t, out.String(), tt.wantSummary, "Sync completed with errors")
+			assertContainsNone(t, out.String(), "Sync completed successfully")
+			if tt.wantGoneLine != "" {
+				assertContainsAll(t, out.String(), tt.wantGoneLine)
+			} else {
+				assertContainsNone(t, out.String(), goneLine)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "good@x")
+			assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2:3")
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_AWholeBatchIsRefusedInQuietMode_Then_OtherBatchesCopyAndTheSummaryCountsEveryUndeliveredMessage(t *testing.T) {
+	t.Parallel()
+
+	idsB := prefixedIDs("b", 1200)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": fakeMsgs(prefixedIDs("a", 3)...),
+		"B": fakeMsgs(idsB...),
+		"C": fakeMsgs(prefixedIDs("c", 2)...),
+	})
+	for _, id := range idsB[clientBatchSize : 2*clientBatchSize] {
+		src.omitInUIDFetch("B", id)
+	}
+	src.endUIDFetchThatOmitsWith("B", gmailUnreadableReply)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1)
+	first := &syncBuffer{}
+	opts := e2eOptions(first, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("first run error = %v, want ErrSilentExit\noutput: %s", err, first.String())
+	}
+	assertContainsAll(t, first.String(), "705 messages uploaded, 500 errors occurred, 0 folders failed")
+	if got := len(dst.folderMsgIDs("B")); got != 700 {
+		t.Errorf("destination B holds %d messages after the first run, want 700: the first and the last batch", got)
+	}
+	if n := src.callCount("UID FETCH"); n != 5 {
+		t.Errorf("source saw %d UID FETCH commands, want 5: one for each batch of B and one for each of A and C", n)
+	}
+
+	second := &syncBuffer{}
+	opts = e2eOptions(second, "")
+	opts.quiet, opts.autoConfirm = true, true
+	err = runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("second run error = %v, want ErrSilentExit\noutput: %s", err, second.String())
+	}
+	assertContainsAll(t, second.String(), "0 messages uploaded, 500 errors occurred, 0 folders failed")
+	if got := len(dst.folderMsgIDs("B")); got != 700 {
+		t.Errorf("destination B holds %d messages after the second run, want 700", got)
+	}
+	if n := dst.callCount("APPEND"); n != 705 {
+		t.Errorf("destination saw %d APPEND commands over both runs, want 705", n)
+	}
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceAnswersWithoutUID_Then_TheMessageIsAnErrorOnEveryRun(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("good@x", "nouid@x")})
+	src.omitUIDInUIDFetch("INBOX", "nouid@x")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "INBOX"))
+
+	for run, wantPlanned := range []int{2, 1} {
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+
+		err := runSync(e2eContext(t), cfg, opts)
+
+		if !errors.Is(err, ErrSilentExit) {
+			t.Fatalf("run %d error = %v, want ErrSilentExit\noutput: %s", run+1, err, out.String())
+		}
+		assertContainsAll(t, out.String(),
+			fmt.Sprintf("INBOX → INBOX will copy %d messages", wantPlanned),
+			fmt.Sprintf("%d messages uploaded, 1 errors occurred, 0 folders failed", wantPlanned-1),
+		)
+		assertContainsNone(t, out.String(), "no longer holds", "Sync completed successfully")
+	}
+
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "good@x")
+	assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), "2", "2")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_FirstPlanOfAHiddenSharedDestinationIsRebuiltBeforeTheRecheck_Then_OnlyItFailsAndTheNextRunCompletesTheFolder(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("x@x", "a1@x"), "B": fakeMsgs("x@x", "b1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "D": fakeMsgs("d0@x")})
+	dst.hideFromList("D")
+	cfg := e2eConfig(src, dst, 1, mapping("A", "D"), mapping("B", "D"))
+	first := &syncBuffer{}
+	opts := e2eOptions(first, "")
+	opts.in = &hookReader{r: strings.NewReader("y\n"), hook: func() { src.rebuildFolder("A", 2, 1, 0) }}
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("first run error = %v, want ErrSilentExit\noutput: %s", err, first.String())
+	}
+	assertContainsAll(t, first.String(),
+		"• A → D will copy 2 messages",
+		"• B → D will copy 1 messages",
+		folderFailuresHeader,
+		"• A → D: source folder changed after the sync plan, run sync again",
+		"1 messages uploaded, 0 errors occurred, 1 folders failed",
+	)
+	assertIDs(t, "dst D after the first run", dst.folderMsgIDs("D"), "d0@x", "b1@x")
+
+	second := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, second, "Sync completed successfully")
+	assertIDs(t, "dst D after the second run", slices.Sorted(slices.Values(dst.folderMsgIDs("D"))), "a1@x", "b1@x", "d0@x", "x@x")
+	assertIDs(t, "dst APPENDs over both runs", slices.Sorted(slices.Values(dst.appended("D"))), "a1@x", "b1@x", "x@x")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_CreateRefusalCarriesControlCharactersInQuietMode_Then_TheFailureListShowsEscapes(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{hostileWireName: fakeMsgs("a@x"), "Good": fakeMsgs("g@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseCreateOf(hostileWireName, "NO "+hostileReply)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(hostileName, hostileName), mapping("Good", "Good")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertInOrder(t, got, folderFailuresHeader,
+		"• "+hostileShownName+" → "+hostileShownName+": cannot create destination folder: [dst] failed to create mailbox "+hostileShownName+": "+hostileReplyShown)
+	assertContainsAll(t, got, "1 messages uploaded, 0 errors occurred, 1 folders failed")
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\x1b]0;pwned", "Failed to create folder")
+	assertIDs(t, "dst Good", dst.folderMsgIDs("Good"), "g@x")
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_SourceThrottlesAfterTheLastBodyIsCopied_Then_RunStopsAndTheNextRunHasNothingToCopy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		quiet bool
+	}{
+		{name: "default output"},
+		{name: "quiet output", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x")})
+			src.endUIDFetchWith("A", throttleReply)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil})
+			cfg := e2eConfig(src, dst, 1, mapping("A", "A"))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit: the stop is recorded although every body was copied\noutput: %s", err, out.String())
+			}
+			assertContainsAll(t, out.String(), "⛔ Sync stopped: the source server [src] reports a rate limit or a full quota", "3 messages uploaded, 0 errors occurred, 0 folders failed")
+			assertContainsNone(t, out.String(), "Sync completed successfully")
+			assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x", "a2@x", "a3@x")
+			if n := src.callCount("UID SEARCH"); n != 0 {
+				t.Errorf("source saw %d UID SEARCH commands, want 0: nothing was left undelivered", n)
+			}
+
+			fetches := src.callCount("UID FETCH")
+			assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
+			if n := src.callCount("UID FETCH"); n != fetches {
+				t.Errorf("source saw %d more UID FETCH commands in the second run, want 0", n-fetches)
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_DestinationThrottlesWithBodiesInFlight_Then_TheClosedSourceSessionCostsNoLogoutWait(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(numberedIDs(600)...)})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil})
+	dst.refuseAppendWith(gmailThrottleReply)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	start := time.Now()
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A")), opts)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	// The default logout limit is 2 s. A closed session must fail its LOGOUT at once.
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("runSync took %s, want it to end without waiting for the logout limit of a closed session", elapsed)
+	}
+	// The planning session logs out. The worker session was closed with 499 bodies in flight, so its LOGOUT never reaches the server.
+	if n, logins := src.callCount("LOGOUT"), src.callCount("LOGIN"); n != 1 || logins != 2 {
+		t.Errorf("source LOGOUT, LOGIN counts = %d, %d, want 1, 2", n, logins)
+	}
+	if n, logins := dst.callCount("LOGOUT"), dst.callCount("LOGIN"); n != 2 || logins != 2 {
+		t.Errorf("destination LOGOUT, LOGIN counts = %d, %d, want 2, 2: its sessions stay usable", n, logins)
+	}
+}
+
+func TestRunSync_When_DestinationThrottlesBeforeTheNextPlan_Then_ThePlansThatNeverStartedShowStopped(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x"), "C": fakeMsgs("c1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "B": nil, "C": nil})
+	dst.refuseAppendWith(gmailThrottleReply)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"), mapping("C", "C")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got, "1/3 Synced messages 0 (errors: 3) A → A", "2/3 Stopped B → B", "3/3 Stopped C → C", "0 messages uploaded, 6 errors occurred, 0 folders failed")
+	for _, folder := range []string{"B", "C"} {
+		if n := timesNamed(src.capturedNames("EXAMINE"), folder); n != 1 {
+			t.Errorf("source examined %s %d times, want 1: only the planning scan", folder, n)
+		}
+	}
+}
+
+func TestRunSync_When_LowestGmailCopyHasAnEmptyBody_Then_TheHigherCopyKeepsItsOwnFlagsAndDate(t *testing.T) {
+	t.Parallel()
+
+	const id = "scan@printer"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Scans": {
+		{msgID: id, body: subjectBody(id, "copy 1"), flags: `\Seen`, internalDate: "01-Jan-2020 10:00:00 +0100"},
+		{msgID: id, body: subjectBody(id, "copy 2"), flags: `\Flagged $Label1`, internalDate: " 2-Feb-2021 11:30:00 -0500"},
+	}})
+	src.answerBodyAt("Scans", 1, "NIL")
+	dst := newGmailDestination(t, map[string][]fakeMsg{})
+	cfg := e2eConfig(src, dst, 1, mapping("Scans", "Scans"))
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, "Sync completed successfully")
+	assertIDs(t, "dst APPENDs to Scans", dst.appended("Scans"), id)
+	assertIDs(t, "dst APPEND flag lists", dst.appendedFlagLists("Scans"), `(\Flagged $Label1)`)
+	assertIDs(t, "dst APPEND dates", dst.appendedDates("Scans"), " 2-Feb-2021 11:30:00 -0500")
+	if bodies := dst.folderBodies("Scans"); !slices.Equal(bodies, []string{subjectBody(id, "copy 2")}) {
+		t.Errorf("dst Scans bodies = %q, want only the second copy", bodies)
+	}
+	assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
+	assertReadOnly(t, "source", src)
 }

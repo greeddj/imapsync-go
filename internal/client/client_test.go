@@ -4486,3 +4486,112 @@ func Test_EnsureSession_When_ContextEndsDuringReconnect_Then_ReturnsContextError
 		t.Errorf("LOGIN count = %d, want 2: the first login and the stalled one", got)
 	}
 }
+
+func Test_New_When_SharedLimiterIsInDebtAndAuthIsCramMD5_Then_GreetingDoesNotWaitAndAuthenticateDoes(t *testing.T) {
+	t.Parallel()
+
+	onWrite := func(o *Options, lim *rate.Limiter) { o.WriteLimiter = lim }
+	onRead := func(o *Options, lim *rate.Limiter) { o.ReadLimiter = lim }
+	tests := []struct {
+		limit func(*Options, *rate.Limiter)
+		name  string
+	}{
+		{name: "write limiter", limit: onWrite},
+		{name: "read limiter", limit: onRead},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The first reservation drains the full bucket, the next two leave a debt of about 2 s.
+			lim := ratelimit.NewLimiter(64 << 10)
+			for range 3 {
+				lim.ReserveN(time.Now(), lim.Burst())
+			}
+			srv := newFakeServer(t)
+			srv.addConnHandler(cramMD5Handler(srv, "user", "pass"))
+			opts := Options{Auth: "cram-md5", DialTimeout: 500 * time.Millisecond}
+			tt.limit(&opts, lim)
+
+			start := time.Now()
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", opts)
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("New: %v, want the greeting to take no token wait", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if elapsed < time.Second {
+				t.Errorf("New took %s, want AUTHENTICATE to wait for the debt of the shared limiter", elapsed)
+			}
+			if got := srv.callCount("CRAM-MD5 VERIFIED"); got != 1 {
+				t.Errorf("verified digests = %d, want 1", got)
+			}
+			if got := srv.callCount("LOGIN"); got != 0 {
+				t.Errorf("LOGIN count = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func Test_New_When_ServerNeverGreetsAndLimitersAreSet_Then_FailsAndClosesTheSocket(t *testing.T) {
+	t.Parallel()
+
+	lim := ratelimit.NewLimiter(64 << 10)
+	srv := newFakeServer(t)
+	accepted, closed := make(chan struct{}), make(chan struct{})
+	srv.addConnHandler(silentHandler(accepted, closed))
+
+	var got *Client
+	errc := make(chan error, 1)
+	go func() {
+		var err error
+		got, err = New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 200 * time.Millisecond, ReadLimiter: lim, WriteLimiter: lim})
+		errc <- err
+	}()
+
+	err := awaitError(t, errc, "New")
+
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("New error = %v, want os.ErrDeadlineExceeded", err)
+	}
+	if got != nil {
+		got.Cancel()
+		t.Error("New returned a client alongside the error")
+	}
+	awaitSignal(t, closed, "the client to close the socket")
+	if n := srv.callCount("LOGIN"); n != 0 {
+		t.Errorf("LOGIN count = %d, want 0", n)
+	}
+}
+
+func Test_connectAndLogin_When_ReadLimiterIsSet_Then_TheGreetingTakesTokensWithoutWaiting(t *testing.T) {
+	t.Parallel()
+
+	const greeting = "* OK [CAPABILITY IMAP4rev1] fake ready"
+	// One token per second, so the refill during the test is negligible. A greeting that waited for the debt of about 131000 tokens would never end.
+	lim := rate.NewLimiter(rate.Limit(1), 1<<16)
+	for range 3 {
+		lim.ReserveN(time.Now(), lim.Burst())
+	}
+	st := newStall(verbIs("LOGIN"))
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandlerGreeting(srv, greeting, st.intercept))
+	c := newDisconnectedClient(t, srv)
+	c.readLimiter = lim
+	before := lim.Tokens()
+
+	errc := make(chan error, 1)
+	go func() { errc <- c.connectAndLogin(t.Context()) }()
+	awaitSignal(t, st.reached, "the server to receive LOGIN")
+	after := lim.Tokens()
+	c.Cancel()
+	_ = awaitError(t, errc, "connectAndLogin")
+
+	if charged := before - after; charged < float64(len(greeting)) || charged > float64(len(greeting))+16 {
+		t.Errorf("the greeting took %.1f tokens, want about %d: the shared budget counts the greeting, but the greeting does not wait for it", charged, len(greeting)+2)
+	}
+}

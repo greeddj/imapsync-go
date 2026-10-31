@@ -4190,3 +4190,135 @@ func Test_StreamMessagesByUIDs_When_CallbackStopsTheStream_Then_SessionClosesAnd
 		}
 	})
 }
+
+func Test_ExistingUIDs_When_ReplyNamesUIDsBetweenTheAskedOnes_Then_OnlyTheAskedUIDsCount(t *testing.T) {
+	t.Parallel()
+
+	searches := new(uidSearchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, func([]uint32) []uint32 {
+		return []uint32{3, 7, 5, 4, 10, 0}
+	})))
+	c := newClientWithFake(t, srv)
+
+	got, err := c.ExistingUIDs(t.Context(), "INBOX", 0, []uint32{1, 5, 9})
+	if err != nil {
+		t.Fatalf("ExistingUIDs: %v", err)
+	}
+
+	if want := []uint32{5}; !slices.Equal(got, want) {
+		t.Errorf("ExistingUIDs = %v, want %v: a UID that nobody asked for must not stand for a neighbour", got, want)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_HaltIsOnAndTheClientHasNoSession_Then_SendsNoLogin(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, serveNormally))
+	c := newDisconnectedClient(t, srv)
+	errHalt := errors.New("the run stopped")
+
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1, 2}, func() error { return errHalt }, func(Message) error {
+		t.Error("callback ran, want no message")
+		return nil
+	})
+
+	if !errors.Is(err, errHalt) {
+		t.Errorf("error = %v, want the halt error", err)
+	}
+	for _, verb := range []string{"LOGIN", "EXAMINE", "UID FETCH"} {
+		if n := srv.callCount(verb); n != 0 {
+			t.Errorf("%s count = %d, want 0: a stopped run must not log in a Client for a stream it will not start", verb, n)
+		}
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_ExamineGetsAThrottledReply_Then_TheStreamEndsThere(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "EXAMINE" {
+			return false, true
+		}
+		writeLine(conn, "%s %s", cmd.tag, throttleReply)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	got, err := streamedUIDs(t.Context(), c, "INBOX", 0, sequentialUIDs(2*uidFetchBatchSize+1))
+
+	se := streamErrorOf(t, err)
+	if se.FailedBatches != 1 {
+		t.Errorf("FailedBatches = %d, want 1", se.FailedBatches)
+	}
+	if se.Stop == nil || !strings.Contains(se.Stop.Error(), "select folder INBOX: ") || !IsThrottled(se.Stop) {
+		t.Errorf("Stop = %v, want the throttled reply of EXAMINE", se.Stop)
+	}
+	if got := classifyError(err); got != ClassThrottled {
+		t.Errorf("classifyError(err) = %s, want %s", got, ClassThrottled)
+	}
+	if len(got) != 0 {
+		t.Errorf("callback got %d UIDs, want none", len(got))
+	}
+	for verb, want := range map[string]int{"EXAMINE": 1, "UID FETCH": 0, "LOGIN": 1} {
+		if n := srv.callCount(verb); n != want {
+			t.Errorf("%s count = %d, want %d: no batch follows a throttled reply", verb, n, want)
+		}
+	}
+}
+
+func Test_ExistingUIDs_When_InputRepeatsEachUID_Then_OneCommandCarriesTheDistinctUIDs(t *testing.T) {
+	t.Parallel()
+
+	searches := new(uidSearchLog)
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, answerUIDSearch(searches, requestedAsSent)))
+	c := newClientWithFake(t, srv)
+	asked := slices.Concat(sequentialUIDs(uidFetchBatchSize), sequentialUIDs(uidFetchBatchSize))
+
+	got, err := c.ExistingUIDs(t.Context(), "INBOX", 0, asked)
+	if err != nil {
+		t.Fatalf("ExistingUIDs: %v", err)
+	}
+
+	if want := sequentialUIDs(uidFetchBatchSize); !slices.Equal(got, want) {
+		t.Errorf("ExistingUIDs returned %d UIDs, want the %d distinct ones", len(got), len(want))
+	}
+	if n := srv.callCount("UID SEARCH"); n != 1 {
+		t.Errorf("UID SEARCH count = %d, want 1: the repeats must not use up the room of a command", n)
+	}
+}
+
+func Test_StreamMessagesByUIDs_When_ItemNamesAreLowerCase_Then_FlagsAndDateAreKept(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		writeUIDMessageWithItems(conn, 1, ` flags (\Seen $MixedCase NonJunk) internaldate "17-Jul-2012 09:30:00 +0200"`)
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+
+	var flags []string
+	var date time.Time
+	err := c.StreamMessagesByUIDs(t.Context(), "INBOX", 0, []uint32{1}, nil, func(msg Message) error {
+		flags, date = msg.m.Flags, msg.m.InternalDate
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamMessagesByUIDs: %v", err)
+	}
+
+	if want := []string{`\Seen`, "$MixedCase", "NonJunk"}; !slices.Equal(flags, want) {
+		t.Errorf("flags = %q, want %q: the keywords keep the spelling of the server", flags, want)
+	}
+	if want := time.Date(2012, 7, 17, 9, 30, 0, 0, time.FixedZone("", 2*3600)); !date.Equal(want) {
+		t.Errorf("InternalDate = %v, want %v", date, want)
+	}
+}
