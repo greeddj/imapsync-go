@@ -704,139 +704,272 @@ func splitRefusedDestinations(plans []FolderSyncPlan, refused map[string]error) 
 	return kept, failures
 }
 
-// The prompt already showed the plans, so a plan only loses messages here and never gains one.
+// The prompt already showed the plans, so a plan only loses messages. Lines print after every check, so a cancel leaves no output.
 func recheckExistingDestinations(ctx context.Context, out io.Writer, quiet bool, srcClient, dstClient *client.Client, plans []FolderSyncPlan, existing map[string]struct{}) ([]FolderSyncPlan, []FolderFailure, error) {
+	groupOf := make(map[string]int)
+	var groups [][]int
+	for i, plan := range plans {
+		if _, ok := existing[plan.DestinationFolder]; !ok {
+			continue
+		}
+		g, seen := groupOf[plan.DestinationFolder]
+		if !seen {
+			g = len(groups)
+			groupOf[plan.DestinationFolder] = g
+			groups = append(groups, nil)
+		}
+		groups[g] = append(groups[g], i)
+	}
+
+	results := make([]recheckResult, len(plans))
+	for _, indexes := range groups {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		group := make([]FolderSyncPlan, len(indexes))
+		for slot, i := range indexes {
+			group[slot] = plans[i]
+		}
+		rechecked, err := recheckDestination(ctx, srcClient, dstClient, group)
+		if err != nil {
+			return nil, nil, err
+		}
+		for slot, i := range indexes {
+			results[i] = rechecked[slot]
+		}
+	}
+
 	kept := make([]FolderSyncPlan, 0, len(plans))
 	var failures []FolderFailure
-	for _, plan := range plans {
+	for i, plan := range plans {
 		if _, ok := existing[plan.DestinationFolder]; !ok {
 			kept = append(kept, plan)
 			continue
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-		rechecked, drops, err := recheckPlan(ctx, srcClient, dstClient, plan)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, nil, ctxErr
-			}
+		result := results[i]
+		if result.err != nil {
 			failures = append(failures, FolderFailure{
 				SourceFolder:      plan.SourceFolder,
 				DestinationFolder: plan.DestinationFolder,
-				Err:               err,
+				Err:               result.err,
 			})
 			continue
 		}
-		if drops.held > 0 && !quiet {
+		if result.drops.held > 0 && !quiet {
 			_, _ = fmt.Fprintf(out, "  ℹ️  Destination folder %s already exists and holds %d of the %d planned messages from %s, so they are not copied\n",
-				termsafe.Escape(plan.DestinationFolder), drops.held, plan.NewMessages, termsafe.Escape(plan.SourceFolder))
+				termsafe.Escape(plan.DestinationFolder), result.drops.held, plan.NewMessages, termsafe.Escape(plan.SourceFolder))
 		}
-		if drops.gone > 0 && !quiet {
+		if result.drops.gone > 0 && !quiet {
 			_, _ = fmt.Fprintf(out, "  ℹ️  Source folder %s no longer holds %d of the %d planned messages for %s, so they are not copied\n",
-				termsafe.Escape(plan.SourceFolder), drops.gone, plan.NewMessages, termsafe.Escape(plan.DestinationFolder))
+				termsafe.Escape(plan.SourceFolder), result.drops.gone, plan.NewMessages, termsafe.Escape(plan.DestinationFolder))
 		}
-		if len(rechecked.SrcUIDs) > 0 {
-			kept = append(kept, rechecked)
+		if len(result.plan.SrcUIDs) > 0 {
+			kept = append(kept, result.plan)
 		}
 	}
 	return kept, failures, nil
 }
 
-// The destination is read first: an empty folder holds nothing the plan could drop, so it needs no source scan.
-func recheckPlan(ctx context.Context, srcClient, dstClient *client.Client, plan FolderSyncPlan) (FolderSyncPlan, recheckDrops, error) {
-	dstMap, err := dstClient.FetchMessageCopies(ctx, plan.DestinationFolder)
-	if err != nil {
-		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errDestinationRecheck, err)
-	}
-	if len(dstMap) == 0 {
-		plan.DestinationFolderExists = true
-		return plan, recheckDrops{}, nil
-	}
-	srcMap, uidValidity, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
-	if err != nil {
-		return plan, recheckDrops{}, fmt.Errorf("%w: %w", errSourceScan, err)
-	}
-	// A new UIDVALIDITY means the planned UIDs point elsewhere, and a diff would mix two UID spaces.
-	if err := client.CheckUIDValidity(plan.SrcUIDValidity, uidValidity); err != nil {
-		return plan, recheckDrops{}, err
-	}
-	rechecked, drops := rediffPlan(plan, srcMap, dstMap)
-	return rechecked, drops, nil
+type recheckResult struct {
+	err   error
+	plan  FolderSyncPlan
+	drops recheckDrops
 }
 
-// held counts planned messages that the source still lists and the destination count covers. gone counts those that the source no longer lists.
+// The plans share one destination, in mapping order. An empty folder holds nothing to drop, so it needs no source scan. The error is only for an ended context.
+func recheckDestination(ctx context.Context, srcClient, dstClient *client.Client, plans []FolderSyncPlan) ([]recheckResult, error) {
+	results := make([]recheckResult, len(plans))
+	for slot, plan := range plans {
+		results[slot].plan = plan
+	}
+	dstMap, err := dstClient.FetchMessageCopies(ctx, plans[0].DestinationFolder)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		for slot := range results {
+			results[slot].err = fmt.Errorf("%w: %w", errDestinationRecheck, err)
+		}
+		return results, nil
+	}
+	if len(dstMap) == 0 {
+		for slot := range results {
+			results[slot].plan.DestinationFolderExists = true
+		}
+		return results, nil
+	}
+
+	diff := newDestinationDiff(plans, dstMap)
+	added := make([]bool, len(plans))
+	for slot, plan := range plans {
+		// FetchMessageMap returns the context error before it sends a command.
+		srcMap, uidValidity, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			results[slot].err = fmt.Errorf("%w: %w", errSourceScan, err)
+			continue
+		}
+		// A new UIDVALIDITY means the planned UIDs point elsewhere, and a diff would mix two UID spaces.
+		if err := client.CheckUIDValidity(plan.SrcUIDValidity, uidValidity); err != nil {
+			results[slot].err = err
+			continue
+		}
+		diff.addSource(slot, srcMap)
+		added[slot] = true
+	}
+	joint := diff.results()
+	for slot := range results {
+		if added[slot] {
+			results[slot] = joint[slot]
+		}
+	}
+	return results, nil
+}
+
+// held counts the dropped planned messages that the source still lists. gone counts those that the source no longer lists.
 type recheckDrops struct {
 	held, gone int
 }
 
-// The result intersects the planned UIDs with the fresh diff, so it never gains a UID. It gets a new slice, because plan.SrcUIDs backs summary.Plans.
-func rediffPlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageRef) (FolderSyncPlan, recheckDrops) {
-	var m copyMatcher
-	fresh := make([]client.MessageRef, 0, len(srcMap))
-	onDst := make([]uint32, 0, min(len(srcMap), len(dstMap)))
-	var extra []uint32
-	var repeated []repeatedCopies
+// destinationDiff pairs each source with the sources before it, as maybeDiff does for an empty destination, then lets the destination cover the rest.
+type destinationDiff struct {
+	dstMap map[string][]client.MessageRef
+	// union holds the copies the destination needs if no source changes. A reservation names its slot, because UIDs of two folders collide.
+	union map[string][]reservation
+	plans []FolderSyncPlan
+	slots []slotDiff
+	refs  []client.MessageRef
+	m     copyMatcher
+}
+
+// slotDiff keeps what one source adds to the diff. listed holds the planned UIDs that the new scan lists, once for each listed copy.
+type slotDiff struct {
+	repeated []repeatedCopies
+	kept     []keptCopy
+	listed   []uint32
+}
+
+type keptCopy struct {
+	uid   uint32
+	size  uint32
+	extra bool
+}
+
+func newDestinationDiff(plans []FolderSyncPlan, dstMap map[string][]client.MessageRef) *destinationDiff {
+	return &destinationDiff{
+		dstMap: dstMap,
+		union:  make(map[string][]reservation),
+		plans:  plans,
+		slots:  make([]slotDiff, len(plans)),
+	}
+}
+
+func isPlanned(plan *FolderSyncPlan, uid uint32) bool {
+	_, ok := slices.BinarySearch(plan.SrcUIDs, uid)
+	return ok
+}
+
+// addSource takes the maps one at a time, so peak memory stays proportional to one source folder and the union.
+func (d *destinationDiff) addSource(slot int, srcMap map[string][]client.MessageRef) {
+	plan := &d.plans[slot]
+	s := &d.slots[slot]
 	for id, all := range srcMap {
-		held := dstMap[id]
-		refs := plan.copyRule.sourceCopies(all)
-		left := m.destinationLeft(refs, held)
-		fresh = append(fresh, left...)
-		if len(held) > 0 {
-			for _, ref := range left {
-				extra = append(extra, ref.UID)
-			}
-		}
-		// Only the one-copy rule cuts a group, so a plan that counts by copies never fills repeated.
-		if others := len(all) - len(refs); others > 0 {
-			for _, ref := range left {
-				repeated = append(repeated, repeatedCopies{uid: ref.UID, others: others})
-			}
-		}
-		// Both lists ascend by UID and left is a subsequence of all, so one walk finds the covered refs. Cut refs count as covered.
-		next := 0
 		for _, ref := range all {
-			if next < len(left) && left[next].UID == ref.UID {
-				next++
+			if isPlanned(plan, ref.UID) {
+				s.listed = append(s.listed, ref.UID)
+			}
+		}
+		refs := plan.copyRule.sourceCopies(all)
+		entries := d.union[id]
+		var owner []int32
+		if len(entries) > 0 && len(refs) > 0 {
+			owner = d.m.reservationOwners(refs, entries)
+		}
+		others := len(all) - len(refs)
+		for i, ref := range refs {
+			if len(owner) > 0 && owner[i] >= 0 {
 				continue
 			}
-			onDst = append(onDst, ref.UID)
+			d.union[id] = append(d.union[id], reservation{uid: ref.UID, size: ref.Size, slot: int32(slot)})
+			// Only the one-copy rule cuts a group, so a plan that counts by copies never has others.
+			if others > 0 && isPlanned(plan, ref.UID) {
+				s.repeated = append(s.repeated, repeatedCopies{uid: ref.UID, others: others})
+			}
 		}
 	}
-	slices.SortFunc(fresh, func(a, b client.MessageRef) int { return cmp.Compare(a.UID, b.UID) })
-	slices.Sort(onDst)
-	slices.Sort(extra)
-	slices.SortFunc(repeated, func(a, b repeatedCopies) int { return cmp.Compare(a.uid, b.uid) })
-	var drops recheckDrops
-	var newSize uint64
-	var extraCopies, repeatedTotal int
-	kept := make([]uint32, 0, min(len(plan.SrcUIDs), len(fresh)))
-	for _, uid := range plan.SrcUIDs {
-		if i, ok := slices.BinarySearchFunc(fresh, uid, compareRefToUID); ok {
-			kept = append(kept, uid)
-			newSize += uint64(fresh[i].Size)
-			if _, ok := slices.BinarySearch(extra, uid); ok {
-				extraCopies++
-			}
-			if j, ok := slices.BinarySearchFunc(repeated, uid, compareRepeatedToUID); ok {
-				repeatedTotal += repeated[j].others
-			}
+}
+
+// The result gets new UID slices, because plan.SrcUIDs backs summary.Plans. Call it once, after the last addSource.
+func (d *destinationDiff) results() []recheckResult {
+	for id, entries := range d.union {
+		dst := d.dstMap[id]
+		if len(dst) >= len(entries) {
 			continue
 		}
-		if _, ok := slices.BinarySearch(onDst, uid); ok {
-			drops.held++
-		} else {
-			drops.gone++
+		var owner []int32
+		if len(dst) > 0 {
+			d.refs = d.refs[:0]
+			for _, e := range entries {
+				d.refs = append(d.refs, client.MessageRef{UID: e.uid, Size: e.size})
+			}
+			owner = d.m.destinationOwners(d.refs, dst)
+		}
+		// Owners map back by entry index, never by UID.
+		for i, e := range entries {
+			if len(owner) > 0 && owner[i] >= 0 {
+				continue
+			}
+			if isPlanned(&d.plans[e.slot], e.uid) {
+				d.slots[e.slot].kept = append(d.slots[e.slot].kept, keptCopy{uid: e.uid, size: e.size, extra: len(dst) > 0})
+			}
 		}
 	}
-	plan.SrcUIDs = kept
-	plan.NewMessages = len(kept)
-	plan.NewSize = newSize
-	plan.ExtraCopies = extraCopies
-	plan.RepeatedCopies = repeatedTotal
-	plan.DestinationFolderExists = true
-	return plan, drops
+
+	out := make([]recheckResult, len(d.plans))
+	for slot := range d.plans {
+		plan := d.plans[slot]
+		s := &d.slots[slot]
+		slices.SortFunc(s.kept, func(a, b keptCopy) int { return cmp.Compare(a.uid, b.uid) })
+		slices.SortFunc(s.repeated, func(a, b repeatedCopies) int { return cmp.Compare(a.uid, b.uid) })
+		slices.Sort(s.listed)
+		kept := make([]uint32, 0, len(s.kept))
+		var drops recheckDrops
+		var newSize uint64
+		var extraCopies, repeatedTotal int
+		for _, uid := range plan.SrcUIDs {
+			i, ok := slices.BinarySearchFunc(s.kept, uid, compareKeptToUID)
+			if !ok {
+				// A server can list one UID under two Message-Ids, so counting listed copies could pass the planned count.
+				if _, listed := slices.BinarySearch(s.listed, uid); listed {
+					drops.held++
+				} else {
+					drops.gone++
+				}
+				continue
+			}
+			kept = append(kept, uid)
+			newSize += uint64(s.kept[i].size)
+			if s.kept[i].extra {
+				extraCopies++
+			}
+			if j, ok := slices.BinarySearchFunc(s.repeated, uid, compareRepeatedToUID); ok {
+				repeatedTotal += s.repeated[j].others
+			}
+		}
+		plan.SrcUIDs = kept
+		plan.NewMessages = len(kept)
+		plan.NewSize = newSize
+		plan.ExtraCopies = extraCopies
+		plan.RepeatedCopies = repeatedTotal
+		plan.DestinationFolderExists = true
+		out[slot] = recheckResult{plan: plan, drops: drops}
+	}
+	return out
 }
+
+func compareKeptToUID(c keptCopy, uid uint32) int { return cmp.Compare(c.uid, uid) }
 
 // repeatedCopies says that the planned uid stands for others more source copies of its Message-Id.
 type repeatedCopies struct {
@@ -845,8 +978,6 @@ type repeatedCopies struct {
 }
 
 func compareRepeatedToUID(r repeatedCopies, uid uint32) int { return cmp.Compare(r.uid, uid) }
-
-func compareRefToUID(ref client.MessageRef, uid uint32) int { return cmp.Compare(ref.UID, uid) }
 
 // copyMatcher is the scratch of one diff, reused across Message-Id groups. Never share it between goroutines.
 type copyMatcher struct {
@@ -866,11 +997,7 @@ func (m *copyMatcher) destinationLeft(refs, dst []client.MessageRef) []client.Me
 	if len(dst) >= len(refs) {
 		return nil
 	}
-	m.sizes = m.sizes[:0]
-	for _, d := range dst {
-		m.sizes = append(m.sizes, d.Size)
-	}
-	owner := m.match(refs, m.sizes)
+	owner := m.destinationOwners(refs, dst)
 	m.left = m.left[:0]
 	for i, ref := range refs {
 		if owner[i] < 0 {
@@ -878,6 +1005,15 @@ func (m *copyMatcher) destinationLeft(refs, dst []client.MessageRef) []client.Me
 		}
 	}
 	return m.left
+}
+
+// destinationOwners is match with the sizes of the destination copies. Valid until the next call.
+func (m *copyMatcher) destinationOwners(refs, dst []client.MessageRef) []int32 {
+	m.sizes = m.sizes[:0]
+	for _, d := range dst {
+		m.sizes = append(m.sizes, d.Size)
+	}
+	return m.match(refs, m.sizes)
 }
 
 // reservationOwners pairs the refs that remain after the destination step with the reserved copies. Call it with at least one of each.

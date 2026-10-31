@@ -7991,6 +7991,545 @@ func Test_recheckExistingDestinations_When_PlannedMessagesAreDropped_Then_EachCa
 	}
 }
 
+func sharedPlan(src, dst string, size uint64, uids ...uint32) FolderSyncPlan {
+	return FolderSyncPlan{SourceFolder: src, DestinationFolder: dst, SrcUIDs: uids, NewMessages: len(uids), NewSize: size}
+}
+
+func Test_recheckExistingDestinations_When_PlansShareADestination_Then_TheyAreComparedTogether(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	small, large := bodyOfSize(id, 200), bodyOfSize(id, 300)
+	heldLine := func(dst string, count, planned int, src string) string {
+		return fmt.Sprintf("  ℹ️  Destination folder %s already exists and holds %d of the %d planned messages from %s, so they are not copied\n", dst, count, planned, src)
+	}
+	goneLine := func(src string, count, planned int, dst string) string {
+		return fmt.Sprintf("  ℹ️  Source folder %s no longer holds %d of the %d planned messages for %s, so they are not copied\n", src, count, planned, dst)
+	}
+	type keptPlan struct {
+		src, dst string
+		uids     []uint32
+		size     uint64
+	}
+	reportedSrc := map[string][]fakeMsg{
+		"A": {{msgID: id, body: small}},
+		"B": {{msgID: id, body: small}, {msgID: id, body: large}},
+	}
+	reportedDst := map[string][]fakeMsg{"D": {{msgID: id, body: large}}}
+	reportedPlans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("B", "D", 300, 2)}
+	tests := []struct {
+		srcFolders map[string][]fakeMsg
+		dstFolders map[string][]fakeMsg
+		name       string
+		wantOut    string
+		plans      []FolderSyncPlan
+		existing   []string
+		wantKept   []keptPlan
+		quiet      bool
+	}{
+		{
+			name:       "the destination holds the copy that matches the second plan",
+			srcFolders: reportedSrc,
+			dstFolders: reportedDst,
+			plans:      reportedPlans,
+			existing:   []string{"D"},
+			wantOut:    heldLine("D", 1, 1, "B"),
+			wantKept:   []keptPlan{{src: "A", dst: "D", uids: []uint32{1}, size: 200}},
+		},
+		{
+			name:       "the same case in quiet mode",
+			quiet:      true,
+			srcFolders: reportedSrc,
+			dstFolders: reportedDst,
+			plans:      reportedPlans,
+			existing:   []string{"D"},
+			wantOut:    "",
+			wantKept:   []keptPlan{{src: "A", dst: "D", uids: []uint32{1}, size: 200}},
+		},
+		{
+			name: "the first planned message is gone and the second is held",
+			srcFolders: map[string][]fakeMsg{
+				"A": fakeMsgs("other@x"),
+				"B": {{msgID: id, body: small}, {msgID: id, body: large}},
+			},
+			dstFolders: reportedDst,
+			plans:      []FolderSyncPlan{sharedPlan("A", "D", 200, 3), sharedPlan("B", "D", 300, 2)},
+			existing:   []string{"D"},
+			wantOut:    goneLine("A", 1, 1, "D") + heldLine("D", 1, 1, "B"),
+		},
+		{
+			name: "plans of two destinations are interleaved",
+			srcFolders: map[string][]fakeMsg{
+				"A": {{msgID: id, body: small}},
+				"X": fakeMsgs("m1@x", "m2@x"),
+				"B": {{msgID: id, body: small}, {msgID: id, body: large}},
+			},
+			dstFolders: map[string][]fakeMsg{"D": {{msgID: id, body: large}}, "E": fakeMsgs("m1@x")},
+			plans:      []FolderSyncPlan{sharedPlan("A", "D", 500, 1, 2), sharedPlan("X", "E", 200, 1, 2), sharedPlan("B", "D", 300, 2)},
+			existing:   []string{"D", "E"},
+			wantOut:    goneLine("A", 1, 2, "D") + heldLine("E", 1, 2, "X") + heldLine("D", 1, 1, "B"),
+			wantKept: []keptPlan{
+				{src: "A", dst: "D", uids: []uint32{1}, size: 200},
+				{src: "X", dst: "E", uids: []uint32{2}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srcC := newAppClient(t, newStoreServer(t, "/", tt.srcFolders), "src")
+			dstC := newAppClient(t, newStoreServer(t, "/", tt.dstFolders), "dst")
+			existing := make(map[string]struct{}, len(tt.existing))
+			for _, folder := range tt.existing {
+				existing[folder] = struct{}{}
+			}
+			plannedUIDs := make([][]uint32, len(tt.plans))
+			for i, plan := range tt.plans {
+				plannedUIDs[i] = slices.Clone(plan.SrcUIDs)
+			}
+			out := &syncBuffer{}
+
+			kept, failures, err := recheckExistingDestinations(t.Context(), out, tt.quiet, srcC, dstC, tt.plans, existing)
+
+			if err != nil || failures != nil {
+				t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
+			}
+			if out.String() != tt.wantOut {
+				t.Errorf("output = %q, want %q", out.String(), tt.wantOut)
+			}
+			if len(kept) != len(tt.wantKept) {
+				t.Fatalf("kept %d plans %+v, want %d", len(kept), kept, len(tt.wantKept))
+			}
+			for i, want := range tt.wantKept {
+				got := kept[i]
+				if got.SourceFolder != want.src || got.DestinationFolder != want.dst || !slices.Equal(got.SrcUIDs, want.uids) || got.NewMessages != len(want.uids) {
+					t.Errorf("kept[%d] = %s → %s %v (%d), want %s → %s %v", i, got.SourceFolder, got.DestinationFolder, got.SrcUIDs, got.NewMessages, want.src, want.dst, want.uids)
+				}
+				if want.size != 0 && got.NewSize != want.size {
+					t.Errorf("kept[%d] NewSize = %d, want %d", i, got.NewSize, want.size)
+				}
+				if !got.DestinationFolderExists {
+					t.Errorf("kept[%d] DestinationFolderExists = false, want true", i)
+				}
+			}
+			for i, plan := range tt.plans {
+				if !slices.Equal(plan.SrcUIDs, plannedUIDs[i]) {
+					t.Errorf("the input SrcUIDs of plan %d changed to %v, was %v", i, plan.SrcUIDs, plannedUIDs[i])
+				}
+			}
+		})
+	}
+}
+
+func Test_recheckExistingDestinations_When_PlansShareADestination_Then_TheDestinationIsReadOnce(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": {{msgID: id, body: bodyOfSize(id, 200)}},
+		"B": {{msgID: id, body: bodyOfSize(id, 200)}, {msgID: id, body: bodyOfSize(id, 300)}},
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": {{msgID: id, body: bodyOfSize(id, 300)}}})
+	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("B", "D", 300, 2)}
+
+	_, _, err := recheckExistingDestinations(t.Context(), &syncBuffer{}, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	if n := dst.callCount("FETCH"); n != 1 {
+		t.Errorf("destination saw %d Message-Id FETCH commands, want 1", n)
+	}
+	if n := dst.callCount("EXAMINE"); n != 1 {
+		t.Errorf("destination saw %d EXAMINE commands, want 1", n)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "B")
+}
+
+func Test_recheckExistingDestinations_When_OneSharedPlanCannotBeRescanned_Then_OnlyItFails(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	tests := []struct {
+		breakSource func(src *fakeServer)
+		wantErr     error
+		name        string
+		wantReason  string
+	}{
+		{
+			name:        "the source refuses to open the folder",
+			breakSource: func(src *fakeServer) { src.refuseOpenWith("A", "NO [CANNOT] folder gone") },
+			wantErr:     errSourceScan,
+			wantReason:  "folder gone",
+		},
+		{
+			name:        "the source folder has a new UIDVALIDITY",
+			breakSource: func(src *fakeServer) { src.setUIDValidity("A", 9) },
+			wantErr:     client.ErrUIDValidityChanged,
+			wantReason:  "source folder changed after the sync plan",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": {{msgID: id, body: bodyOfSize(id, 200)}},
+				"B": {{msgID: id, body: bodyOfSize(id, 200)}, {msgID: id, body: bodyOfSize(id, 300)}},
+			})
+			tt.breakSource(src)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": {{msgID: id, body: bodyOfSize(id, 300)}}})
+			plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("B", "D", 300, 2)}
+			plans[0].SrcUIDValidity = 1
+			plans[1].SrcUIDValidity = 1
+			out := &syncBuffer{}
+
+			kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+
+			if err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			if len(failures) != 1 || failures[0].SourceFolder != "A" || failures[0].DestinationFolder != "D" {
+				t.Fatalf("failures = %+v, want one failure for A → D", failures)
+			}
+			if !errors.Is(failures[0].Err, tt.wantErr) || !strings.Contains(failures[0].Err.Error(), tt.wantReason) {
+				t.Errorf("failure error = %v, want %v and %q", failures[0].Err, tt.wantErr, tt.wantReason)
+			}
+			if errors.Is(failures[0].Err, errDestinationRecheck) {
+				t.Errorf("failure error = %v, must not wrap errDestinationRecheck", failures[0].Err)
+			}
+			want := "  ℹ️  Destination folder D already exists and holds 1 of the 1 planned messages from B, so they are not copied\n"
+			if out.String() != want {
+				t.Errorf("output = %q, want only the line for B %q", out.String(), want)
+			}
+			if len(kept) != 0 {
+				t.Errorf("kept = %+v, want none: B is covered by the destination", kept)
+			}
+		})
+	}
+}
+
+func Test_recheckExistingDestinations_When_SharedDestinationCannotBeRead_Then_EveryPlanOfItFails(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": {{msgID: id, body: bodyOfSize(id, 200)}},
+		"B": {{msgID: id, body: bodyOfSize(id, 200)}, {msgID: id, body: bodyOfSize(id, 300)}},
+		"X": fakeMsgs("m1@x", "m2@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": nil, "E": fakeMsgs("m1@x")})
+	dst.refuseOpenWith("D", "NO [CANNOT] folder gone")
+	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("X", "E", 200, 1, 2), sharedPlan("B", "D", 300, 2)}
+	out := &syncBuffer{}
+
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}, "E": {}})
+
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	if len(failures) != 2 || failures[0].SourceFolder != "A" || failures[1].SourceFolder != "B" {
+		t.Fatalf("failures = %+v, want one failure each for A and B, in plan order", failures)
+	}
+	for _, f := range failures {
+		if !errors.Is(f.Err, errDestinationRecheck) || errors.Is(f.Err, errSourceScan) || !strings.Contains(f.Err.Error(), "folder gone") {
+			t.Errorf("failure error for %s = %v, want errDestinationRecheck with the reason", f.SourceFolder, f.Err)
+		}
+	}
+	if len(kept) != 1 || kept[0].SourceFolder != "X" || !slices.Equal(kept[0].SrcUIDs, []uint32{2}) {
+		t.Errorf("kept = %+v, want the plan of X with UID 2", kept)
+	}
+	if want := "  ℹ️  Destination folder E already exists and holds 1 of the 2 planned messages from X, so they are not copied\n"; out.String() != want {
+		t.Errorf("output = %q, want %q", out.String(), want)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "X")
+}
+
+func Test_recheckExistingDestinations_When_SharedDestinationIsEmpty_Then_NoSourceIsScanned(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": nil})
+	plans := []FolderSyncPlan{sharedPlan("A", "D", 100, 1), sharedPlan("B", "D", 100, 1)}
+	out := &syncBuffer{}
+
+	kept, failures, err := recheckExistingDestinations(t.Context(), out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+
+	if err != nil || failures != nil {
+		t.Fatalf("error = %v, failures = %v, want both nil", err, failures)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("kept = %+v, want both plans", kept)
+	}
+	for i, plan := range kept {
+		if !slices.Equal(plan.SrcUIDs, []uint32{1}) || plan.NewMessages != 1 || !plan.DestinationFolderExists {
+			t.Errorf("kept[%d] = %+v, want UID 1, one message and DestinationFolderExists", i, plan)
+		}
+	}
+	if out.String() != "" {
+		t.Errorf("output = %q, want empty", out.String())
+	}
+	for _, verb := range []string{"EXAMINE", "STATUS", "FETCH"} {
+		if n := src.callCount(verb); n != 0 {
+			t.Errorf("source saw %d %s commands, want 0", n, verb)
+		}
+	}
+}
+
+func Test_recheckExistingDestinations_When_ContextEndsBetweenSharedSourceScans_Then_ReturnsCanceledWithoutOutput(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": {{msgID: id, body: bodyOfSize(id, 200)}},
+		"B": {{msgID: id, body: bodyOfSize(id, 200)}, {msgID: id, body: bodyOfSize(id, 300)}},
+	})
+	var examines atomic.Int32
+	src.onCommand("EXAMINE", func() {
+		if examines.Add(1) == 2 {
+			cancel()
+		}
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"D": {{msgID: id, body: bodyOfSize(id, 300)}}})
+	plans := []FolderSyncPlan{sharedPlan("A", "D", 200, 1), sharedPlan("B", "D", 300, 2)}
+	out := &syncBuffer{}
+
+	kept, failures, err := recheckExistingDestinations(ctx, out, false, newAppClient(t, src, "src"), newAppClient(t, dst, "dst"), plans, map[string]struct{}{"D": {}})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if kept != nil || failures != nil {
+		t.Errorf("kept = %v, failures = %v, want both nil", kept, failures)
+	}
+	if out.String() != "" {
+		t.Errorf("output = %q, want empty", out.String())
+	}
+	if n := examines.Load(); n != 2 {
+		t.Errorf("source saw %d EXAMINE commands, want 2: the cancel comes with the second one", n)
+	}
+}
+
+func Test_destinationDiff_When_UIDsOfTwoSourcesCollide_Then_EachPlanKeepsOnlyItsOwnUIDs(t *testing.T) {
+	t.Parallel()
+
+	plans := []FolderSyncPlan{
+		{SourceFolder: "A", DestinationFolder: "D", SrcUIDs: []uint32{5}, NewMessages: 1, NewSize: 200},
+		{SourceFolder: "B", DestinationFolder: "D", SrcUIDs: []uint32{5}, NewMessages: 1, NewSize: 300},
+	}
+	dstMap := map[string][]client.MessageRef{"x@x": {{UID: 1, Size: 300}}}
+	d := newDestinationDiff(plans, dstMap)
+
+	d.addSource(0, map[string][]client.MessageRef{"x@x": {{UID: 5, Size: 200}}})
+	d.addSource(1, map[string][]client.MessageRef{"x@x": {{UID: 4, Size: 200}, {UID: 5, Size: 300}}})
+	got := d.results()
+
+	if !slices.Equal(got[0].plan.SrcUIDs, []uint32{5}) || got[0].plan.NewSize != 200 || got[0].drops != (recheckDrops{}) {
+		t.Errorf("plan A = %v (%d B), drops %+v, want UID 5 (200 B) and no drops", got[0].plan.SrcUIDs, got[0].plan.NewSize, got[0].drops)
+	}
+	if len(got[1].plan.SrcUIDs) != 0 || got[1].plan.NewMessages != 0 || got[1].drops != (recheckDrops{held: 1}) {
+		t.Errorf("plan B = %v, drops %+v, want no UID and one held", got[1].plan.SrcUIDs, got[1].drops)
+	}
+}
+
+// jointCase is one random destination: the mappings, the source maps and the destination copies.
+type jointCase struct {
+	srcMaps []map[string][]client.MessageRef
+	dstMap  map[string][]client.MessageRef
+	plans   []FolderSyncPlan
+	slotOf  []int
+}
+
+// newJointCase plans random sources for one destination that LIST hides, as buildSyncPlan does, and adds the real destination copies.
+func newJointCase(t *testing.T, rng *rand.Rand, rule copyRule) jointCase {
+	t.Helper()
+
+	ids := []string{"a@x", "b@x", "c@x"}
+	slots := 2 + rng.IntN(3)
+	mappings := make([]config.DirectoryMapping, slots)
+	for i := range mappings {
+		mappings[i] = mapping("S"+strconv.Itoa(i), "D")
+	}
+	jc := jointCase{srcMaps: make([]map[string][]client.MessageRef, slots), dstMap: make(map[string][]client.MessageRef)}
+	for _, id := range ids {
+		for k := range rng.IntN(4) {
+			jc.dstMap[id] = append(jc.dstMap[id], client.MessageRef{UID: uint32(900 + k), Size: uint32(100 * (1 + rng.IntN(3)))})
+		}
+	}
+	shared := newSharedDestinations(mappings)
+	plans := make([]FolderSyncPlan, slots)
+	var totalNew atomic.Int64
+	var totalNewSize atomic.Uint64
+	for i := range slots {
+		jc.srcMaps[i] = make(map[string][]client.MessageRef)
+		var uid uint32
+		for _, id := range ids {
+			for range rng.IntN(4) {
+				uid += uint32(1 + rng.IntN(3))
+				jc.srcMaps[i][id] = append(jc.srcMaps[i][id], client.MessageRef{UID: uid, Size: uint32(100 * (1 + rng.IntN(3)))})
+			}
+		}
+		s := &folderScan{srcMap: maps.Clone(jc.srcMaps[i]), srcMessages: countRefs(jc.srcMaps[i]), srcUIDValidity: 1}
+		diffBothSidesUnder(t, rule, s, i, mappings, plans, &totalNew, &totalNewSize, shared)
+	}
+	for i, plan := range plans {
+		if plan.SourceFolder != "" {
+			jc.plans = append(jc.plans, plan)
+			jc.slotOf = append(jc.slotOf, i)
+		}
+	}
+	return jc
+}
+
+func Test_destinationDiff_When_PlansShareADestinationAndSourcesAreUnchanged_Then_TheDestinationEndsWithTheLargestCount(t *testing.T) {
+	t.Parallel()
+
+	for _, rule := range []copyRule{copyByCount, copyOnePerMessageID} {
+		rng := rand.New(rand.NewPCG(41, 43+uint64(rule)))
+		for round := range 500 {
+			jc := newJointCase(t, rng, rule)
+			if len(jc.plans) == 0 {
+				continue
+			}
+			before := make([][]uint32, len(jc.plans))
+			idOf := make([]map[uint32]string, len(jc.plans))
+			sizeOf := make([]map[uint32]uint32, len(jc.plans))
+			for k, plan := range jc.plans {
+				before[k] = slices.Clone(plan.SrcUIDs)
+				idOf[k] = make(map[uint32]string)
+				sizeOf[k] = make(map[uint32]uint32)
+				for id, refs := range jc.srcMaps[jc.slotOf[k]] {
+					for _, ref := range refs {
+						idOf[k][ref.UID] = id
+						sizeOf[k][ref.UID] = ref.Size
+					}
+				}
+			}
+
+			d := newDestinationDiff(jc.plans, jc.dstMap)
+			for k := range jc.plans {
+				d.addSource(k, jc.srcMaps[jc.slotOf[k]])
+			}
+			got := d.results()
+
+			keptPerID := make(map[string]int)
+			for k, res := range got {
+				if !slices.Equal(jc.plans[k].SrcUIDs, before[k]) {
+					t.Fatalf("rule %d round %d plan %d: the input SrcUIDs changed to %v, was %v", rule, round, k, jc.plans[k].SrcUIDs, before[k])
+				}
+				var wantSize uint64
+				var wantExtra, wantRepeated int
+				for _, uid := range res.plan.SrcUIDs {
+					if _, ok := slices.BinarySearch(before[k], uid); !ok {
+						t.Fatalf("rule %d round %d plan %d: kept UID %d was not planned in %v", rule, round, k, uid, before[k])
+					}
+					id := idOf[k][uid]
+					keptPerID[id]++
+					wantSize += uint64(sizeOf[k][uid])
+					if len(jc.dstMap[id]) > 0 {
+						wantExtra++
+					}
+					all := jc.srcMaps[jc.slotOf[k]][id]
+					wantRepeated += len(all) - len(rule.sourceCopies(all))
+				}
+				if res.drops.gone != 0 || res.drops.held+len(res.plan.SrcUIDs) != len(before[k]) {
+					t.Fatalf("rule %d round %d plan %d: drops %+v with %d kept of %d planned, want gone 0 and held + kept = planned", rule, round, k, res.drops, len(res.plan.SrcUIDs), len(before[k]))
+				}
+				if res.plan.NewMessages != len(res.plan.SrcUIDs) || res.plan.NewSize != wantSize || res.plan.ExtraCopies != wantExtra || res.plan.RepeatedCopies != wantRepeated || !res.plan.DestinationFolderExists {
+					t.Fatalf("rule %d round %d plan %d: NewMessages, NewSize, ExtraCopies, RepeatedCopies = %d, %d, %d, %d, want %d, %d, %d, %d",
+						rule, round, k, res.plan.NewMessages, res.plan.NewSize, res.plan.ExtraCopies, res.plan.RepeatedCopies, len(res.plan.SrcUIDs), wantSize, wantExtra, wantRepeated)
+				}
+			}
+			for _, id := range []string{"a@x", "b@x", "c@x"} {
+				largest := len(jc.dstMap[id])
+				for k := range jc.plans {
+					all := jc.srcMaps[jc.slotOf[k]][id]
+					largest = max(largest, len(rule.sourceCopies(all)))
+				}
+				if have := len(jc.dstMap[id]) + keptPerID[id]; have != largest {
+					t.Fatalf("rule %d round %d: %s ends with %d copies, want %d (destination %v)", rule, round, id, have, largest, jc.dstMap[id])
+				}
+			}
+		}
+	}
+}
+
+func Test_destinationDiff_When_SourcesChangeAfterThePlan_Then_ResultNeverAddsAndNeverExceedsTheLargestFreshCount(t *testing.T) {
+	t.Parallel()
+
+	for _, rule := range []copyRule{copyByCount, copyOnePerMessageID} {
+		rng := rand.New(rand.NewPCG(47, 53+uint64(rule)))
+		for round := range 500 {
+			jc := newJointCase(t, rng, rule)
+			if len(jc.plans) == 0 {
+				continue
+			}
+			fresh := make([]map[string][]client.MessageRef, len(jc.plans))
+			for k := range jc.plans {
+				fresh[k] = make(map[string][]client.MessageRef)
+				old := jc.srcMaps[jc.slotOf[k]]
+				next := uint32(100)
+				for id, refs := range old {
+					for _, ref := range refs {
+						if rng.IntN(4) != 0 {
+							fresh[k][id] = append(fresh[k][id], ref)
+						}
+					}
+					for range rng.IntN(3) {
+						fresh[k][id] = append(fresh[k][id], client.MessageRef{UID: next, Size: uint32(100 * (1 + rng.IntN(3)))})
+						next++
+					}
+				}
+			}
+
+			d := newDestinationDiff(jc.plans, jc.dstMap)
+			for k := range jc.plans {
+				d.addSource(k, fresh[k])
+			}
+			got := d.results()
+
+			keptPerID := make(map[string]int)
+			for k, res := range got {
+				listed := make(map[uint32]bool)
+				idOf := make(map[uint32]string)
+				for id, refs := range fresh[k] {
+					for _, ref := range refs {
+						listed[ref.UID] = true
+						idOf[ref.UID] = id
+					}
+				}
+				var wantGone int
+				for _, uid := range jc.plans[k].SrcUIDs {
+					if !listed[uid] {
+						wantGone++
+					}
+				}
+				for _, uid := range res.plan.SrcUIDs {
+					if _, ok := slices.BinarySearch(jc.plans[k].SrcUIDs, uid); !ok {
+						t.Fatalf("rule %d round %d plan %d: kept UID %d was not planned", rule, round, k, uid)
+					}
+					keptPerID[idOf[uid]]++
+				}
+				if res.drops.gone != wantGone || res.drops.held+res.drops.gone+len(res.plan.SrcUIDs) != len(jc.plans[k].SrcUIDs) {
+					t.Fatalf("rule %d round %d plan %d: drops %+v with %d kept of %d planned, want gone %d and held + gone + kept = planned", rule, round, k, res.drops, len(res.plan.SrcUIDs), len(jc.plans[k].SrcUIDs), wantGone)
+				}
+			}
+			for id, kept := range keptPerID {
+				largest := len(jc.dstMap[id])
+				for k := range jc.plans {
+					largest = max(largest, len(rule.sourceCopies(fresh[k][id])))
+				}
+				if have := len(jc.dstMap[id]) + kept; have > largest {
+					t.Fatalf("rule %d round %d: %s ends with %d copies, want at most %d", rule, round, id, have, largest)
+				}
+			}
+		}
+	}
+}
+
 func msgRefs(uids ...uint32) []client.MessageRef {
 	refs := make([]client.MessageRef, len(uids))
 	for i, uid := range uids {
@@ -8189,7 +8728,15 @@ func Test_copyMatcher_When_GroupIsUncoveredOrFullyCovered_Then_AllocatesNothing(
 	}
 }
 
-func Test_rediffPlan(t *testing.T) {
+// rediffOnePlan runs destinationDiff on a destination that has one plan.
+func rediffOnePlan(plan FolderSyncPlan, srcMap, dstMap map[string][]client.MessageRef) (FolderSyncPlan, recheckDrops) {
+	d := newDestinationDiff([]FolderSyncPlan{plan}, dstMap)
+	d.addSource(0, srcMap)
+	got := d.results()[0]
+	return got.plan, got.drops
+}
+
+func Test_destinationDiff(t *testing.T) {
 	t.Parallel()
 
 	// The planned value is not zero, so each row shows that the recheck computes ExtraCopies again.
@@ -8345,7 +8892,7 @@ func Test_rediffPlan(t *testing.T) {
 
 			before := slices.Clone(tt.plan.SrcUIDs)
 
-			got, drops := rediffPlan(tt.plan, tt.srcMap, tt.dstMap)
+			got, drops := rediffOnePlan(tt.plan, tt.srcMap, tt.dstMap)
 
 			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) {
 				t.Errorf("SrcUIDs = %v, want %v", got.SrcUIDs, tt.wantUIDs)
@@ -8373,6 +8920,56 @@ func Test_rediffPlan(t *testing.T) {
 			}
 			if !slices.Equal(tt.plan.SrcUIDs, before) {
 				t.Errorf("input SrcUIDs = %v, want %v: the plan slice must not change", tt.plan.SrcUIDs, before)
+			}
+		})
+	}
+}
+
+func Test_destinationDiff_When_ScanListsOneUIDUnderTwoMessageIds_Then_EachPlannedUIDCountsOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		dstMap    map[string][]client.MessageRef
+		wantUIDs  []uint32
+		wantDrops recheckDrops
+	}{
+		{
+			name:      "destination holds only one of the two Message-Ids",
+			dstMap:    map[string][]client.MessageRef{"a@x": {{UID: 1, Size: 10}}},
+			wantUIDs:  []uint32{5},
+			wantDrops: recheckDrops{},
+		},
+		{
+			name: "destination holds both Message-Ids",
+			dstMap: map[string][]client.MessageRef{
+				"a@x": {{UID: 1, Size: 10}},
+				"b@x": {{UID: 2, Size: 10}},
+			},
+			wantUIDs:  nil,
+			wantDrops: recheckDrops{held: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			plan := FolderSyncPlan{SourceFolder: "A", DestinationFolder: "D", SrcUIDs: []uint32{5}, NewMessages: 1, NewSize: 10}
+			srcMap := map[string][]client.MessageRef{
+				"a@x": {{UID: 5, Size: 10}},
+				"b@x": {{UID: 5, Size: 10}},
+			}
+
+			got, drops := rediffOnePlan(plan, srcMap, tt.dstMap)
+
+			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) {
+				t.Errorf("SrcUIDs = %v, want %v", got.SrcUIDs, tt.wantUIDs)
+			}
+			if drops != tt.wantDrops {
+				t.Errorf("drops = %+v, want %+v", drops, tt.wantDrops)
+			}
+			if total := drops.held + drops.gone + len(got.SrcUIDs); total != len(plan.SrcUIDs) {
+				t.Errorf("held %d + gone %d + kept %d = %d, want %d planned UIDs", drops.held, drops.gone, len(got.SrcUIDs), total, len(plan.SrcUIDs))
 			}
 		})
 	}
@@ -10233,6 +10830,151 @@ func TestRunSync_When_SharedDestinationExistsButLISTHidesIt_Then_TheRecheckKeeps
 	}
 }
 
+func TestRunSync_When_HiddenSharedDestinationHoldsOneSizeOfAMessageId_Then_ItEndsWithEverySize(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	small, large := bodyOfSize(id, 200), bodyOfSize(id, 300)
+	tests := []struct {
+		name   string
+		folder string
+		hidden bool
+	}{
+		{name: "hidden folder", folder: "D", hidden: true},
+		{name: "visible folder", folder: "D"},
+		{name: "unlisted INBOX", folder: "INBOX", hidden: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": {{msgID: id, body: small}},
+				"B": {{msgID: id, body: small}, {msgID: id, body: large}},
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, tt.folder: {{msgID: id, body: large}}})
+			if tt.hidden {
+				dst.hideFromList(tt.folder)
+			}
+			cfg := e2eConfig(src, dst, 1, mapping("A", tt.folder), mapping("B", tt.folder))
+
+			first := runSyncOnce(t, cfg)
+
+			if tt.hidden {
+				assertContainsAll(t, first,
+					fmt.Sprintf("• A → %s will copy 1 messages", tt.folder),
+					fmt.Sprintf("• B → %s will copy 1 messages", tt.folder),
+					fmt.Sprintf("Destination folder %s already exists and holds 1 of the 1 planned messages from B, so they are not copied", tt.folder),
+				)
+				assertContainsNone(t, first, "planned messages from A")
+				if n := strings.Count(first, "already exists and holds"); n != 1 {
+					t.Errorf("output holds %d lines about held messages, want 1\noutput: %q", n, first)
+				}
+			} else {
+				assertContainsAll(t, first, fmt.Sprintf("• B → %s will copy 1 messages (≈ 200 B)", tt.folder))
+				assertContainsNone(t, first, "already exists and holds")
+			}
+			assertContainsAll(t, first, "Sync completed successfully")
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("destination saw %d APPEND commands in the first run, want 1", n)
+			}
+			wantSizes := []int{200, 300}
+			if got := slices.Sorted(slices.Values(bodySizes(dst.folderBodies(tt.folder)))); !slices.Equal(got, wantSizes) {
+				t.Fatalf("dst %s holds copies of sizes %v after the first run, want %v", tt.folder, got, wantSizes)
+			}
+
+			for run := 2; run <= 3; run++ {
+				again := runSyncOnce(t, cfg)
+
+				assertContainsAll(t, again, "All folders already synced!")
+				if n := dst.callCount("APPEND"); n != 1 {
+					t.Errorf("destination saw %d APPEND commands after run %d, want 1", n, run)
+				}
+				if got := slices.Sorted(slices.Values(bodySizes(dst.folderBodies(tt.folder)))); !slices.Equal(got, wantSizes) {
+					t.Errorf("dst %s holds copies of sizes %v after run %d, want %v", tt.folder, got, run, wantSizes)
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_ThreeMappingsShareAHiddenDestination_Then_ItEndsWithTheLargestCount(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	one, two, three := bodyOfSize(id, 100), bodyOfSize(id, 200), bodyOfSize(id, 300)
+	for _, workers := range []int{1, 2} {
+		t.Run(fmt.Sprintf("%d workers", workers), func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": {{msgID: id, body: one}},
+				"B": {{msgID: id, body: one}, {msgID: id, body: two}},
+				"C": {{msgID: id, body: one}, {msgID: id, body: two}, {msgID: id, body: three}},
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "D": {{msgID: id, body: two}}})
+			dst.hideFromList("D")
+			cfg := e2eConfig(src, dst, workers, mapping("A", "D"), mapping("B", "D"), mapping("C", "D"))
+
+			first := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, first,
+				"• A → D will copy 1 messages",
+				"• B → D will copy 1 messages",
+				"• C → D will copy 1 messages",
+				"Destination folder D already exists and holds 1 of the 1 planned messages from B, so they are not copied",
+				"Sync completed successfully",
+			)
+			assertContainsNone(t, first, "planned messages from A", "planned messages from C")
+			if n := dst.callCount("APPEND"); n != 2 {
+				t.Errorf("destination saw %d APPEND commands in the first run, want 2", n)
+			}
+			wantSizes := []int{100, 200, 300}
+			if got := slices.Sorted(slices.Values(bodySizes(dst.folderBodies("D")))); !slices.Equal(got, wantSizes) {
+				t.Fatalf("dst D holds copies of sizes %v after the first run, want %v", got, wantSizes)
+			}
+
+			assertContainsAll(t, runSyncOnce(t, cfg), "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != 2 {
+				t.Errorf("destination saw %d APPEND commands after the second run, want 2", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_HiddenSharedDestinationKeepsTheFirstMappingsCopyAndItsBodyIsEmpty_Then_ItsStandbyArrives(t *testing.T) {
+	t.Parallel()
+
+	const id = "x@x"
+	small, large := bodyOfSize(id, 200), bodyOfSize(id, 300)
+	smallOfB := bodyOfSize(id, 199) + "y"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"A": {{msgID: id, body: small}},
+		"B": {{msgID: id, body: smallOfB}, {msgID: id, body: large}},
+	})
+	src.answerBodyIn("A", id, "NIL")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "D": {{msgID: id, body: large}}})
+	dst.hideFromList("D")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "D"), mapping("B", "D")), opts)
+
+	if err != nil {
+		t.Fatalf("runSync error = %v, want nil\noutput: %s", err, out.String())
+	}
+	assertContainsAll(t, out.String(), "Sync completed successfully")
+	assertContainsNone(t, out.String(), "errors occurred")
+	if n := dst.callCount("APPEND"); n != 1 {
+		t.Errorf("destination saw %d APPEND commands, want 1", n)
+	}
+	if got, want := slices.Sorted(slices.Values(dst.folderBodies("D"))), slices.Sorted(slices.Values([]string{smallOfB, large})); !slices.Equal(got, want) {
+		t.Errorf("dst D holds bodies of sizes %v, want the 200-byte copy of B and the 300-byte copy", bodySizes(got))
+	}
+}
+
 func TestRunSync_When_TheFirstSharedMappingFails_Then_TheSecondCopiesTheSharedMessage(t *testing.T) {
 	t.Parallel()
 
@@ -10606,7 +11348,7 @@ func Test_maybeDiff_When_SourceAndDestinationCountsVary_Then_PlanAndRecheckPickT
 				t.Fatalf("plan = UIDs %v, size %d, want UIDs %v, size %d", planned.SrcUIDs, planned.NewSize, tt.wantUIDs, wantSize)
 			}
 			// Rechecking the plan for an empty destination against the same copies keeps exactly what a plan made with those copies picks.
-			rechecked, drops := rediffPlan(plan(nil), srcMap(), dstMap(tt.dstSizes))
+			rechecked, drops := rediffOnePlan(plan(nil), srcMap(), dstMap(tt.dstSizes))
 			if !slices.Equal(rechecked.SrcUIDs, tt.wantUIDs) || rechecked.NewSize != wantSize {
 				t.Errorf("recheck of the full plan = UIDs %v, size %d, want UIDs %v, size %d", rechecked.SrcUIDs, rechecked.NewSize, tt.wantUIDs, wantSize)
 			}
@@ -10614,7 +11356,7 @@ func Test_maybeDiff_When_SourceAndDestinationCountsVary_Then_PlanAndRecheckPickT
 				t.Errorf("recheck drops = %+v, want held %d and gone 0", drops, wantHeld)
 			}
 			// The recheck of a plan made with the same copies changes nothing.
-			again, drops := rediffPlan(planned, srcMap(), dstMap(tt.dstSizes))
+			again, drops := rediffOnePlan(planned, srcMap(), dstMap(tt.dstSizes))
 			if !slices.Equal(again.SrcUIDs, planned.SrcUIDs) || again.NewSize != planned.NewSize || drops != (recheckDrops{}) {
 				t.Errorf("recheck with equal copies = UIDs %v, size %d, drops %+v, want the plan %v, %d and no drops", again.SrcUIDs, again.NewSize, drops, planned.SrcUIDs, planned.NewSize)
 			}
@@ -11008,7 +11750,7 @@ func TestRunSync_When_SourceBodyStaysEmpty_Then_EveryRunFailsLoudAndTheDestinati
 	}
 }
 
-func Test_rediffPlan_When_CountsAndPlanVary_Then_ResultIsASubsetOfThePlan(t *testing.T) {
+func Test_destinationDiff_When_CountsAndPlanVary_Then_ResultIsASubsetOfThePlan(t *testing.T) {
 	t.Parallel()
 
 	ids := []string{"a@x", "b@x", "c@x", "d@x"}
@@ -11044,10 +11786,10 @@ func Test_rediffPlan_When_CountsAndPlanVary_Then_ResultIsASubsetOfThePlan(t *tes
 		plan := FolderSyncPlan{SourceFolder: "S", DestinationFolder: "D", SrcUIDs: planned, NewMessages: len(planned)}
 		before := slices.Clone(planned)
 
-		got, drops := rediffPlan(plan, srcMap, dstMap)
+		got, drops := rediffOnePlan(plan, srcMap, dstMap)
 
 		if !slices.Equal(plan.SrcUIDs, before) {
-			t.Fatalf("round %d: rediffPlan changed the slice of the plan: %v, was %v", round, plan.SrcUIDs, before)
+			t.Fatalf("round %d: destinationDiff changed the slice of the plan: %v, was %v", round, plan.SrcUIDs, before)
 		}
 		fresh := make(map[uint32]bool)
 		for id, refs := range srcMap {
@@ -11968,7 +12710,7 @@ func Test_maybeDiff_When_OneCopyDestinationIsShared_Then_LaterMappingsGetStandby
 	}
 }
 
-func Test_rediffPlan_When_PlanKeepsOneCopyPerMessageID_Then_TheRecheckAppliesTheSameRule(t *testing.T) {
+func Test_destinationDiff_When_PlanKeepsOneCopyPerMessageID_Then_TheRecheckAppliesTheSameRule(t *testing.T) {
 	t.Parallel()
 
 	// The stale values are not zero, so each row shows that the recheck computes them again.
@@ -12064,7 +12806,7 @@ func Test_rediffPlan_When_PlanKeepsOneCopyPerMessageID_Then_TheRecheckAppliesThe
 
 			before := slices.Clone(tt.plan.SrcUIDs)
 
-			got, drops := rediffPlan(tt.plan, tt.srcMap, tt.dstMap)
+			got, drops := rediffOnePlan(tt.plan, tt.srcMap, tt.dstMap)
 
 			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) {
 				t.Errorf("SrcUIDs = %v, want %v", got.SrcUIDs, tt.wantUIDs)
@@ -12130,7 +12872,7 @@ func Test_maybeDiff_When_DestinationKeepsOneCopyAndCountsVary_Then_PlanAndRechec
 				}
 				// Rechecking the plan for an empty destination against the real copies keeps exactly what a plan made with those copies picks.
 				full, _, _ := planUnder(t, copyOnePerMessageID, srcMap(), dstMap(0))
-				rechecked, drops := rediffPlan(full, srcMap(), dstMap(dstCount))
+				rechecked, drops := rediffOnePlan(full, srcMap(), dstMap(dstCount))
 				if !slices.Equal(rechecked.SrcUIDs, wantUIDs) || rechecked.NewSize != wantSize {
 					t.Errorf("recheck of the full plan = UIDs %v, size %d, want UIDs %v, size %d", rechecked.SrcUIDs, rechecked.NewSize, wantUIDs, wantSize)
 				}
@@ -12141,7 +12883,7 @@ func Test_maybeDiff_When_DestinationKeepsOneCopyAndCountsVary_Then_PlanAndRechec
 					t.Errorf("recheck RepeatedCopies = %d, want %d", rechecked.RepeatedCopies, srcCount-1)
 				}
 				// The recheck of a plan made with the same copies changes nothing.
-				again, drops := rediffPlan(planned, srcMap(), dstMap(dstCount))
+				again, drops := rediffOnePlan(planned, srcMap(), dstMap(dstCount))
 				if !slices.Equal(again.SrcUIDs, planned.SrcUIDs) || again.NewSize != planned.NewSize || again.RepeatedCopies != planned.RepeatedCopies || drops != (recheckDrops{}) {
 					t.Errorf("recheck with equal copies = UIDs %v, size %d, repeated %d, drops %+v, want the plan %v, %d, %d and no drops",
 						again.SrcUIDs, again.NewSize, again.RepeatedCopies, drops, planned.SrcUIDs, planned.NewSize, planned.RepeatedCopies)
@@ -12151,7 +12893,7 @@ func Test_maybeDiff_When_DestinationKeepsOneCopyAndCountsVary_Then_PlanAndRechec
 	}
 }
 
-func Test_rediffPlan_When_OneCopyRuleAndPlanVary_Then_ResultIsASubsetOfThePlan(t *testing.T) {
+func Test_destinationDiff_When_OneCopyRuleAndPlanVary_Then_ResultIsASubsetOfThePlan(t *testing.T) {
 	t.Parallel()
 
 	ids := []string{"a@x", "b@x", "c@x", "d@x"}
@@ -12185,10 +12927,10 @@ func Test_rediffPlan_When_OneCopyRuleAndPlanVary_Then_ResultIsASubsetOfThePlan(t
 		plan := FolderSyncPlan{SourceFolder: "S", DestinationFolder: "D", SrcUIDs: planned, NewMessages: len(planned), RepeatedCopies: 9, copyRule: copyOnePerMessageID}
 		before := slices.Clone(planned)
 
-		got, drops := rediffPlan(plan, srcMap, dstMap)
+		got, drops := rediffOnePlan(plan, srcMap, dstMap)
 
 		if !slices.Equal(plan.SrcUIDs, before) {
-			t.Fatalf("round %d: rediffPlan changed the slice of the plan: %v, was %v", round, plan.SrcUIDs, before)
+			t.Fatalf("round %d: destinationDiff changed the slice of the plan: %v, was %v", round, plan.SrcUIDs, before)
 		}
 		// Under the rule a group is fresh only when the destination holds none of it, and only its lowest UID is.
 		fresh := make(map[uint32]int)
@@ -13742,7 +14484,7 @@ func Test_copyRule_When_ZeroValue_Then_CopiesByCount(t *testing.T) {
 	}
 }
 
-func Test_rediffPlan_When_PlanHasNoCopyRule_Then_CountsByCopiesAndLeavesNothingOut(t *testing.T) {
+func Test_destinationDiff_When_PlanHasNoCopyRule_Then_CountsByCopiesAndLeavesNothingOut(t *testing.T) {
 	t.Parallel()
 
 	x := []client.MessageRef{{UID: 1, Size: 10}, {UID: 2, Size: 20}, {UID: 3, Size: 30}}
@@ -13764,7 +14506,7 @@ func Test_rediffPlan_When_PlanHasNoCopyRule_Then_CountsByCopiesAndLeavesNothingO
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, drops := rediffPlan(plan, map[string][]client.MessageRef{"x@x": slices.Clone(x)}, tt.dst)
+			got, drops := rediffOnePlan(plan, map[string][]client.MessageRef{"x@x": slices.Clone(x)}, tt.dst)
 
 			if !slices.Equal(got.SrcUIDs, tt.wantUIDs) || got.NewSize != tt.wantSizeLeft {
 				t.Errorf("SrcUIDs, NewSize = %v, %d, want %v, %d", got.SrcUIDs, got.NewSize, tt.wantUIDs, tt.wantSizeLeft)

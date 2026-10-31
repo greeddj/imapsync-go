@@ -443,6 +443,7 @@ These limitations apply:
 When CREATE answers that the destination folder already exists, the folder was not in the list of the destination server. The plan has no diff against this folder, so the command reads the folder again after your answer.
 
 - The command counts the copies in the folder again, and it uses the same rules. It removes from the plan each message that a copy in the destination folder covers. It never adds a message.
+- If two or more mappings share the destination folder, the command compares their plans together, in mapping order. So the folder ends with the largest count of copies, as in a run where the folder is in the list.
 - When the command reads the source folder again, it also checks the UIDVALIDITY. If the number changed since the plan, or if the server did not send it, the folder fails. The command prints it in the list `Folders that cannot be synced`, and the run ends with exit code 1.
 - Without `-q`, the command prints the line `Destination folder ... already exists and holds N of the M planned messages from ..., so they are not copied`.
 - Without `-q`, if a planned message left the source, the command prints the line `Source folder ... no longer holds N of the M planned messages for ..., so they are not copied`.
