@@ -1946,24 +1946,62 @@ func Test_runFolderSync_When_SourceFolderCannotBeOpened_Then_EveryPlannedMessage
 	src.refuseOpenWith("A", "NO [NONEXISTENT] Unknown Mailbox")
 	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
 	plan := copyPlan(len(ids))
+	stop := new(throttleStop)
 
-	got := runStandbyPlan(t.Context(), t, src, dst, plan, false)
+	got := runStopPlan(t.Context(), t, newStopWorker(t, src, dst), plan, stop, false)
 
 	if got.synced != 0 || got.errs != 1001 || got.gone != 0 {
 		t.Errorf("synced, errors, gone = %d, %d, %d, want 0, 1001, 0", got.synced, got.errs, got.gone)
 	}
-	if n := src.callCount("UID FETCH"); n != 0 {
-		t.Errorf("source saw %d UID FETCH commands, want 0", n)
+	assertAccounted(t, got, plan)
+	if stop.get() != nil {
+		t.Errorf("stop = %v, want none: a refused folder is no throttle", stop.get())
 	}
-	if n := src.callCount("EXAMINE"); n != 4 {
-		t.Errorf("source saw %d EXAMINE commands, want 4: one for each batch and one for the check", n)
+	if n := src.callCount("EXAMINE"); n != 2 {
+		t.Errorf("source saw %d EXAMINE commands, want 2: one for the stream and one for the check", n)
+	}
+	for _, verb := range []string{"UID FETCH", "UID SEARCH"} {
+		if n := src.callCount(verb); n != 0 {
+			t.Errorf("source saw %d %s commands, want 0", n, verb)
+		}
 	}
 	if n := strings.Count(got.log, "Stream error for folder"); n != 1 {
 		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
 	}
-	assertContainsAll(t, got.log, "Stream error for folder A: ", "Unknown Mailbox (3 batches failed)")
+	assertContainsAll(t, got.log, "Stream error for folder A: ", "cannot select folder A", "Unknown Mailbox")
+	assertContainsNone(t, got.log, "batches failed")
 	if n := dst.callCount("APPEND"); n != 0 {
 		t.Errorf("destination saw %d APPEND commands, want 0", n)
+	}
+	if !got.tr.IsErrored() {
+		t.Error("tracker not marked as errored")
+	}
+}
+
+func Test_runFolderSync_When_SourceFolderCannotBeOpenedAndAStandbyExists_Then_TheStandbyOfAnotherFolderCopiesTheMessage(t *testing.T) {
+	t.Parallel()
+
+	bodyOfB := subjectBody("m1@x", "from B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x"), "B": standbyFolder(bodyOfB)})
+	src.refuseOpenWith("A", "NO [NONEXISTENT] Unknown Mailbox")
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+	got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), false)
+
+	if got.synced != 1 || got.errs != 0 || got.gone != 0 {
+		t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 0, 0", got.synced, got.errs, got.gone)
+	}
+	assertIDs(t, "source EXAMINE names", src.capturedNames("EXAMINE"), "A", "A", "B")
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "2")
+	if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+		t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+	}
+	if n := strings.Count(got.log, "Stream error for folder A: "); n != 1 {
+		t.Errorf("log holds the stream line %d times, want 1\nlog: %s", n, got.log)
+	}
+	assertContainsNone(t, got.log, "batches failed")
+	if !got.tr.IsDone() || got.tr.IsErrored() {
+		t.Errorf("tracker done = %t, errored = %t, want done and not errored", got.tr.IsDone(), got.tr.IsErrored())
 	}
 }
 

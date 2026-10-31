@@ -110,12 +110,7 @@ func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missing
 		repeated = false
 		mbox, err := c.selectIfNeeded(cli, folder)
 		if err != nil {
-			// Only a server answer marks a refusal: a broken session or a throttle
-			// stays a folder failure upstream.
-			if !canRevive(err) {
-				return fmt.Errorf("[%s] %w %s: %w", c.prefix, ErrSelectRefused, folder, err)
-			}
-			return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
+			return c.selectError(folder, err)
 		}
 		// selectIfNeeded skips the round-trip when the folder is already
 		// selected; it returns nil mbox in that case. Fall back to a STATUS
@@ -353,13 +348,21 @@ func uidFetchBodies(cli *imapclient.Client, uids *imap.SeqSet, items []imap.Fetc
 	return status.Err()
 }
 
+// selectError wraps a failed SELECT or EXAMINE. Only a server answer marks a refusal: a broken session or a throttle can clear, so it stays unmarked.
+func (c *Client) selectError(folder string, err error) error {
+	if !canRevive(err) {
+		return fmt.Errorf("[%s] %w %s: %w", c.prefix, ErrSelectRefused, folder, err)
+	}
+	return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
+}
+
 // selectChecked selects folder when the session has not selected it, then compares the UIDVALIDITY of the session with uidValidity. 0 skips the comparison.
 func (c *Client) selectChecked(cli *imapclient.Client, folder string, uidValidity uint32) error {
 	// A retry after a reconnect runs on a fresh session, which has no
 	// selection, so selectIfNeeded selects the folder again.
 	status, err := c.selectIfNeeded(cli, folder)
 	if err != nil {
-		return fmt.Errorf("[%s] select folder %s: %w", c.prefix, folder, err)
+		return c.selectError(folder, err)
 	}
 	// A nil status means the folder stayed selected and no EXAMINE ran; the session still holds the value from its EXAMINE.
 	if status == nil {
@@ -571,8 +574,8 @@ func (c *Client) StreamMessagesByUIDs(ctx context.Context, folder string, uidVal
 			failed = &StreamError{First: err}
 		}
 		failed.FailedBatches++
-		// A refused batch costs only its own messages. A UIDVALIDITY change makes the planned UIDs unsafe, and more commands after a throttled reply extend the limit.
-		if errors.Is(err, ErrUIDValidityChanged) || classifyError(err) == ClassThrottled {
+		// A refused UID FETCH costs only its batch. A refused EXAMINE covers the whole folder, a UIDVALIDITY change makes planned UIDs unsafe, and commands after a throttle extend it.
+		if errors.Is(err, ErrSelectRefused) || errors.Is(err, ErrUIDValidityChanged) || classifyError(err) == ClassThrottled {
 			failed.Stop = err
 			return failed
 		}

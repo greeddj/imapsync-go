@@ -5564,6 +5564,47 @@ func TestRunSync_When_SourceExamineIsThrottled_Then_FolderIsReportedWithoutRecon
 	assertReadOnly(t, "source", src)
 }
 
+func TestRunSync_When_SourceFolderIsRefusedAfterThePlan_Then_OneExamineEndsItsStreamAndOtherFoldersCopy(t *testing.T) {
+	t.Parallel()
+
+	ids := numberedIDs(2*clientBatchSize + 1)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs(ids...), "B": fakeMsgs("b1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{})
+	var once sync.Once
+	dst.onCommand("CREATE", func() {
+		once.Do(func() { src.refuseOpenWith("A", "NO [NONEXISTENT] Unknown Mailbox") })
+	})
+	cfg := e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B"))
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit", err)
+	}
+	assertIDs(t, "dst B", dst.folderMsgIDs("B"), "b1@x")
+	assertIDs(t, "dst A", dst.folderMsgIDs("A"))
+	examinesOfA := 0
+	for _, name := range src.capturedNames("EXAMINE") {
+		if name == "A" {
+			examinesOfA++
+		}
+	}
+	if examinesOfA != 3 {
+		t.Errorf("source saw %d EXAMINE commands for A, want 3: the plan scan, the stream and the check", examinesOfA)
+	}
+	assertIDs(t, "source UID FETCH sets", src.capturedNames("UID FETCH"), "1")
+	got := out.String()
+	if n := strings.Count(got, "Stream error for folder A"); n != 1 {
+		t.Errorf("output holds the stream line %d times, want 1\noutput: %q", n, got)
+	}
+	assertContainsAll(t, got, "1 messages uploaded, 1001 errors occurred, 0 folders failed")
+	assertContainsNone(t, got, "batches failed", "Sync stopped")
+	assertReadOnly(t, "source", src)
+}
+
 func TestRunSync_When_RunTwiceWithAFailureThatStays_Then_SecondRunWritesNothingAndFailsAgain(t *testing.T) {
 	t.Parallel()
 
