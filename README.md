@@ -351,6 +351,8 @@ The line names the side (`source` or `destination`), the label of the server and
 
 Some servers refuse an upload before they ask for the message data. These servers hide the reason. `sync` then counts one failed message and continues.
 
+A refusal that repeats a folder name can stop `sync`. Some servers repeat the folder name in a refusal, and a folder name can hold a phrase such as `Quota exceeded`. If a person or a program deletes or renames such a folder during the copy, `sync` can stop with the `Sync stopped` line. The reply in the line shows the cause. The run loses no mail. The next run makes a new plan from the current folders.
+
 ## Notes
 
 - **Exit code 1** - `sync` ends with code 1 when a message or a folder fails. If you answer no to the question before the copy, `sync` ends with code 0, also when a folder failed. `show` ends with code 1 when it cannot read a folder. Any other error, except a cancel with Ctrl-C, prints `Error:` and ends with code 1.
