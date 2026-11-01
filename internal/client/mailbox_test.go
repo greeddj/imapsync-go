@@ -31,12 +31,15 @@ func Test_CreateMailbox_walksParents(t *testing.T) {
 		delimiter: "/",
 	}
 
-	created, err := c.CreateMailbox(context.Background(), "A/B/C")
+	created, parents, err := c.CreateMailbox(context.Background(), "A/B/C")
 	if err != nil {
 		t.Fatalf("CreateMailbox: %v", err)
 	}
 	if !created {
 		t.Error("CreateMailbox returned created=false, want true")
+	}
+	if parents != 2 {
+		t.Errorf("CreateMailbox parents = %d, want 2 (A and A/B)", parents)
 	}
 
 	if got := srv.callCount("CREATE"); got != 3 {
@@ -69,12 +72,15 @@ func Test_CreateMailbox_idempotent(t *testing.T) {
 		delimiter: "/",
 	}
 
-	created, err := c.CreateMailbox(context.Background(), "X")
+	created, parents, err := c.CreateMailbox(context.Background(), "X")
 	if err != nil {
 		t.Fatalf("CreateMailbox: %v", err)
 	}
 	if created {
 		t.Error("CreateMailbox returned created=true, want false")
+	}
+	if parents != 0 {
+		t.Errorf("CreateMailbox parents = %d, want 0", parents)
 	}
 	if got := srv.callCount("CREATE"); got != 0 {
 		t.Errorf("CREATE count = %d, want 0", got)
@@ -247,6 +253,7 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 		wantCreates []string
 		wantCached  []string
 		wantAbsent  []string
+		wantParents int
 		wantCreated bool
 	}{
 		{
@@ -295,6 +302,34 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 			wantCreates: []string{"A", "A/B"},
 			wantCached:  []string{"A", "A/B"},
 		},
+		{
+			name:        "deeper parent refused after one parent was made",
+			target:      "A/B/C",
+			replies:     map[string]string{"A/B": denied},
+			wantErr:     "failed to create parent folder A/B: permission denied",
+			wantParents: 1,
+			wantCreates: []string{"A", "A/B"},
+			wantCached:  []string{"A"},
+			wantAbsent:  []string{"A/B", "A/B/C"},
+		},
+		{
+			name:        "target already exists after its parent was made",
+			target:      "A/B",
+			replies:     map[string]string{"A/B": alreadyExists},
+			wantParents: 1,
+			wantCreates: []string{"A", "A/B"},
+			wantCached:  []string{"A", "A/B"},
+		},
+		{
+			name:        "target refused after its parent was made",
+			target:      "A/B",
+			replies:     map[string]string{"A/B": denied},
+			wantErr:     "failed to create mailbox A/B: permission denied",
+			wantParents: 1,
+			wantCreates: []string{"A", "A/B"},
+			wantCached:  []string{"A"},
+			wantAbsent:  []string{"A/B"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -307,7 +342,7 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 				delimiter: "/",
 			}
 
-			created, err := c.CreateMailbox(t.Context(), tt.target)
+			created, parents, err := c.CreateMailbox(t.Context(), tt.target)
 			switch {
 			case tt.wantErr == "" && err != nil:
 				t.Fatalf("CreateMailbox: %v", err)
@@ -316,6 +351,9 @@ func Test_CreateMailbox_serverReplies(t *testing.T) {
 			}
 			if created != tt.wantCreated {
 				t.Errorf("created = %v, want %v", created, tt.wantCreated)
+			}
+			if parents != tt.wantParents {
+				t.Errorf("parents = %d, want %d", parents, tt.wantParents)
 			}
 			if got := srv.capturedNames("CREATE"); !slices.Equal(got, tt.wantCreates) {
 				t.Errorf("CREATE names = %v, want %v", got, tt.wantCreates)
@@ -361,12 +399,15 @@ func Test_CreateMailbox_When_RetriedCreateAnswersDuplicateFolderName_Then_Report
 	c.delimiter = "/"
 	c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
 
-	created, err := c.CreateMailbox(t.Context(), "Archive")
+	created, parents, err := c.CreateMailbox(t.Context(), "Archive")
 	if err != nil {
 		t.Fatalf("CreateMailbox: %v", err)
 	}
 	if created {
 		t.Error("created = true, want false (the folder existed already)")
+	}
+	if parents != 0 {
+		t.Errorf("parents = %d, want 0", parents)
 	}
 	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"Archive", "Archive"}) {
 		t.Errorf("CREATE names = %v, want [Archive Archive]", got)
@@ -393,12 +434,12 @@ func Test_CreateMailbox_whenContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	created, err := c.CreateMailbox(ctx, "Archive")
+	created, parents, err := c.CreateMailbox(ctx, "Archive")
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("CreateMailbox error = %v, want %v", err, context.Canceled)
 	}
-	if created {
-		t.Error("created = true, want false")
+	if created || parents != 0 {
+		t.Errorf("created, parents = %v, %d, want false, 0", created, parents)
 	}
 	if got := srv.callCount("CREATE"); got != 0 {
 		t.Errorf("CREATE count = %d, want 0", got)
@@ -415,9 +456,11 @@ func Test_CreateMailbox_whenContextExpiresInFlight(t *testing.T) {
 		name        string
 		target      string
 		wantCreates []string
+		wantParents int
 	}{
 		{name: "parent CREATE is pending", hold: newStall(verbOn("CREATE", "A")), target: "A/B", wantCreates: []string{"A"}},
 		{name: "target CREATE is pending", hold: newStall(verbOn("CREATE", "Archive")), target: "Archive", wantCreates: []string{"Archive"}},
+		{name: "target CREATE is pending after a parent was made", hold: newStall(verbOn("CREATE", "A/B")), target: "A/B", wantCreates: []string{"A", "A/B"}, wantParents: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -429,11 +472,14 @@ func Test_CreateMailbox_whenContextExpiresInFlight(t *testing.T) {
 			c.delimiter = "/"
 
 			ctx := newFiredContext(t.Context())
-			var created bool
+			var (
+				created bool
+				parents int
+			)
 			errc := make(chan error, 1)
 			go func() {
 				var err error
-				created, err = c.CreateMailbox(ctx, tt.target)
+				created, parents, err = c.CreateMailbox(ctx, tt.target)
 				errc <- err
 			}()
 			awaitSignal(t, tt.hold.reached, "the server to stop answering")
@@ -445,6 +491,9 @@ func Test_CreateMailbox_whenContextExpiresInFlight(t *testing.T) {
 			}
 			if created {
 				t.Error("created = true, want false")
+			}
+			if parents != tt.wantParents {
+				t.Errorf("parents = %d, want %d", parents, tt.wantParents)
 			}
 			if got := srv.capturedNames("CREATE"); !slices.Equal(got, tt.wantCreates) {
 				t.Errorf("CREATE names = %v, want %v", got, tt.wantCreates)
@@ -1348,13 +1397,16 @@ func Test_CreateMailbox_When_ParentIsNoSelect_Then_CreatesOnlyTheChild(t *testin
 		{name: "[Gmail]", attrs: `\HasChildren \Noselect`},
 	}})
 
-	created, err := c.CreateMailbox(t.Context(), "[Gmail]/New")
+	created, parents, err := c.CreateMailbox(t.Context(), "[Gmail]/New")
 
 	if err != nil {
 		t.Fatalf("CreateMailbox: %v", err)
 	}
 	if !created {
 		t.Error("CreateMailbox returned created=false, want true")
+	}
+	if parents != 0 {
+		t.Errorf("CreateMailbox parents = %d, want 0: the listed parent exists", parents)
 	}
 	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"[Gmail]/New"}) {
 		t.Errorf("CREATE names = %q, want only the child: the listed parent exists", got)
@@ -1372,13 +1424,16 @@ func Test_CreateMailbox_When_ServerIsFlat_Then_SendsOneCreateWithoutParents(t *t
 
 	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX", delim: "NIL"}}})
 
-	created, err := c.CreateMailbox(t.Context(), "Work/2023")
+	created, parents, err := c.CreateMailbox(t.Context(), "Work/2023")
 
 	if err != nil {
 		t.Fatalf("CreateMailbox: %v", err)
 	}
 	if !created {
 		t.Error("CreateMailbox returned created=false, want true")
+	}
+	if parents != 0 {
+		t.Errorf("CreateMailbox parents = %d, want 0: a flat server has no parent folder", parents)
 	}
 	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"Work/2023"}) {
 		t.Errorf("CREATE names = %q, want only Work/2023: a flat server has no parent folder", got)
@@ -1588,23 +1643,26 @@ func Test_CreateMailbox_When_NameIsInboxInAnotherCase_Then_SendsNoCreateForInbox
 
 	srv, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}}})
 
-	created, err := c.CreateMailbox(t.Context(), "Inbox")
+	created, parents, err := c.CreateMailbox(t.Context(), "Inbox")
 	if err != nil {
 		t.Fatalf("CreateMailbox(Inbox): %v", err)
 	}
-	if created {
-		t.Error("CreateMailbox(Inbox) returned created=true, want false: INBOX exists")
+	if created || parents != 0 {
+		t.Errorf("CreateMailbox(Inbox) returned created, parents = %v, %d, want false, 0: INBOX exists", created, parents)
 	}
 	if got := srv.capturedNames("CREATE"); len(got) != 0 {
 		t.Fatalf("CREATE names = %q after CreateMailbox(Inbox), want none", got)
 	}
 
-	created, err = c.CreateMailbox(t.Context(), "inbox/New")
+	created, parents, err = c.CreateMailbox(t.Context(), "inbox/New")
 	if err != nil {
 		t.Fatalf("CreateMailbox(inbox/New): %v", err)
 	}
 	if !created {
 		t.Error("CreateMailbox(inbox/New) returned created=false, want true")
+	}
+	if parents != 0 {
+		t.Errorf("CreateMailbox(inbox/New) parents = %d, want 0: INBOX exists", parents)
 	}
 	if got := srv.capturedNames("CREATE"); !slices.Equal(got, []string{"inbox/New"}) {
 		t.Errorf("CREATE names = %q, want only the child, byte for byte: INBOX is the existing parent", got)
@@ -1795,5 +1853,344 @@ func Test_CacheReads_When_ContextAlreadyEnded_Then_ReturnContextError(t *testing
 	}
 	if n := srv.callCount("LIST"); n != 1 {
 		t.Errorf("LIST count = %d, want 1: the cache serves both reads", n)
+	}
+}
+
+func Test_parentLevels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		delimiter string
+		want      []string
+	}{
+		{name: "empty delimiter yields nothing", input: "A/B/C", delimiter: ""},
+		{name: "name without the delimiter yields nothing", input: "Archive", delimiter: "/"},
+		{name: "empty name yields nothing", input: "", delimiter: "/"},
+		{name: "slash path", input: "A/B/C", delimiter: "/", want: []string{"A", "A/B"}},
+		{name: "dot path", input: "A.B.C", delimiter: ".", want: []string{"A", "A.B"}},
+		{name: "the other character is name text", input: "A.B/C", delimiter: "/", want: []string{"A.B"}},
+		{name: "empty level in the middle", input: "a//b", delimiter: "/", want: []string{"a", "a/"}},
+		{name: "empty first level", input: "/x", delimiter: "/", want: []string{""}},
+		{name: "empty last level", input: "x/", delimiter: "/", want: []string{"x"}},
+		{name: "multi-byte delimiter", input: "a::b::c", delimiter: "::", want: []string{"a", "a::b"}},
+		{name: "delimiter occurrences do not overlap", input: "aXXXXb", delimiter: "XX", want: []string{"a", "aXX"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := slices.Collect(parentLevels(tt.input, tt.delimiter))
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("parentLevels(%q, %q) = %q, want %q", tt.input, tt.delimiter, got, tt.want)
+			}
+		})
+	}
+
+	t.Run("a range loop that breaks stops without a panic", func(t *testing.T) {
+		t.Parallel()
+
+		var got []string
+		for level := range parentLevels("A/B/C/D", "/") {
+			got = append(got, level)
+			break
+		}
+
+		if want := []string{"A"}; !slices.Equal(got, want) {
+			t.Errorf("levels before the break = %q, want %q", got, want)
+		}
+	})
+}
+
+func Test_parentLevels_When_Ranged_Then_AllocatesNothing(t *testing.T) {
+	name := "Old/2020/Inbox/Sub"
+	allocs := testing.AllocsPerRun(100, func() {
+		for range parentLevels(name, "/") {
+		}
+	})
+
+	if allocs != 0 {
+		t.Errorf("parentLevels allocates %v times, want 0", allocs)
+	}
+}
+
+func FuzzParentLevels(f *testing.F) {
+	seeds := []struct{ name, delimiter string }{
+		{"A/B/C", "/"}, {"A.B.C", "."}, {"a//b", "/"}, {"/x", "/"}, {"x/", "/"}, {"A/B/C", ""}, {"Archive", "/"},
+		{"", "/"}, {"a::b::c", "::"}, {"aXXXXb", "XX"}, {"///", "/"}, {"a\xff/b", "/"},
+	}
+	for _, s := range seeds {
+		f.Add(s.name, s.delimiter)
+	}
+	f.Fuzz(func(t *testing.T, name, delimiter string) {
+		got := slices.Collect(parentLevels(name, delimiter))
+
+		if delimiter == "" {
+			if len(got) != 0 {
+				t.Fatalf("parentLevels(%q, %q) = %q, want nothing for an empty delimiter", name, delimiter, got)
+			}
+			return
+		}
+		parts := strings.Split(name, delimiter)
+		var want []string
+		for i := 1; i < len(parts); i++ {
+			want = append(want, strings.Join(parts[:i], delimiter))
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("parentLevels(%q, %q) = %q, want %q", name, delimiter, got, want)
+		}
+	})
+}
+
+func Test_MissingLevels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		delimiter string
+		cache     mailboxCache
+		want      []string
+	}{
+		{
+			name:      "no parent is listed",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "Old/2020/Inbox",
+			want:      []string{"Old", "Old/2020", "Old/2020/Inbox"},
+		},
+		{
+			name:      "the first parent is listed",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "Old": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "Old/2020/Inbox",
+			want:      []string{"Old/2020", "Old/2020/Inbox"},
+		},
+		{
+			name: "a parent that cannot hold messages counts as listed",
+			cache: mailboxCache{
+				folders:   map[string]struct{}{"[Gmail]": {}},
+				noSelect:  map[string]struct{}{"[Gmail]": {}},
+				delimiter: "/",
+			},
+			delimiter: "/",
+			input:     "[Gmail]/New",
+			want:      []string{"[Gmail]/New"},
+		},
+		{
+			name:      "every level is listed",
+			cache:     mailboxCache{folders: map[string]struct{}{"Old": {}, "Old/2020": {}, "Old/2020/Inbox": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "Old/2020/Inbox",
+		},
+		{
+			name:      "only the name is missing",
+			cache:     mailboxCache{folders: map[string]struct{}{"Old": {}, "Old/2020": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "Old/2020/Inbox",
+			want:      []string{"Old/2020/Inbox"},
+		},
+		{
+			name:      "a flat server has no parent level",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}},
+			input:     "Old/2020/Inbox",
+			want:      []string{"Old/2020/Inbox"},
+			delimiter: "",
+		},
+		{
+			name:      "the INBOX level in another letter case is listed",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "inbox/New/Sub",
+			want:      []string{"inbox/New", "inbox/New/Sub"},
+		},
+		{
+			name: "a listed spelling of an INBOX child is listed",
+			cache: mailboxCache{
+				folders:        map[string]struct{}{"INBOX": {}, "Inbox/Old": {}},
+				inboxSpellings: map[string]string{"INBOX/Old": "Inbox/Old"},
+				delimiter:      "/",
+			},
+			delimiter: "/",
+			input:     "INBOX/Old/x",
+			want:      []string{"INBOX/Old/x"},
+		},
+		{
+			name:      "dot delimiter",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "Old": {}}, delimiter: "."},
+			delimiter: ".",
+			input:     "Old.2020.Inbox",
+			want:      []string{"Old.2020", "Old.2020.Inbox"},
+		},
+		{
+			name:      "a listed name whose parent is not listed gives nothing",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "Old/2020": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "Old/2020",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := newTestClient()
+			c.delimiter = tt.delimiter
+			c.mailboxCache = tt.cache
+
+			got := c.MissingLevels(tt.input)
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("MissingLevels(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_MissingLevels_When_NothingIsMissing_Then_AllocatesNothing(t *testing.T) {
+	c := newTestClient()
+	c.delimiter = "/"
+	c.mailboxCache = mailboxCache{
+		folders:   map[string]struct{}{"Old": {}, "Old/2020": {}, "Old/2020/Inbox": {}},
+		delimiter: "/",
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = c.MissingLevels("Old/2020/Inbox")
+	})
+
+	if allocs != 0 {
+		t.Errorf("MissingLevels allocates %v times when every level is listed, want 0", allocs)
+	}
+}
+
+func Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOtherNameDoes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		target    string
+		delimiter string
+		cache     mailboxCache
+	}{
+		{name: "empty level in the middle", cache: mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}, delimiter: "/", target: "a//b"},
+		{name: "empty first level", cache: mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}, delimiter: "/", target: "/x"},
+		{name: "empty last level", cache: mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}, delimiter: "/", target: "x/"},
+		{
+			name:      "INBOX level in another letter case",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			delimiter: "/",
+			target:    "inbox/New/Sub",
+		},
+		{
+			name: "parent that cannot hold messages",
+			cache: mailboxCache{
+				folders:   map[string]struct{}{"[Gmail]": {}},
+				noSelect:  map[string]struct{}{"[Gmail]": {}},
+				delimiter: "/",
+			},
+			delimiter: "/",
+			target:    "[Gmail]/New",
+		},
+		{name: "flat cache", cache: mailboxCache{folders: map[string]struct{}{"INBOX": {}}}, target: "Old/2020/Inbox"},
+		{
+			name:      "name is held",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "Old": {}}, delimiter: "/"},
+			delimiter: "/",
+			target:    "Old",
+		},
+		{name: "deep path", cache: mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"}, delimiter: "/", target: "A/B/C/D/E"},
+		{
+			name:      "name is held and its parent is not listed",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "Old/2020": {}}, delimiter: "/"},
+			delimiter: "/",
+			target:    "Old/2020",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, c := newScriptedClient(t, &mailboxScript{})
+			c.delimiter = tt.delimiter
+			c.mailboxCache = tt.cache
+			levels := c.MissingLevels(tt.target)
+
+			created, parents, err := c.CreateMailbox(t.Context(), tt.target)
+
+			if err != nil {
+				t.Fatalf("CreateMailbox(%q): %v", tt.target, err)
+			}
+			if got := srv.capturedNames("CREATE"); !slices.Equal(got, levels) {
+				t.Errorf("CREATE names = %q, want the missing levels %q in the same order", got, levels)
+			}
+			if len(levels) == 0 {
+				if created || parents != 0 {
+					t.Errorf("created, parents = %v, %d, want false, 0 for a name that the cache holds", created, parents)
+				}
+				return
+			}
+			if !created || parents+1 != len(levels) {
+				t.Errorf("created, parents = %v, %d, want true and %d for levels %q", created, parents, len(levels)-1, levels)
+			}
+			if got := c.MissingLevels(tt.target); len(got) != 0 {
+				t.Errorf("MissingLevels after the create = %q, want none", got)
+			}
+		})
+	}
+}
+
+func Test_CreateMailbox_When_ParentAnswersAlreadyExists_Then_VerboseLogSaysSo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		reply   string
+		want    string
+		notWant string
+	}{
+		{
+			name:    "the server answers already exists",
+			reply:   "NO [ALREADYEXISTS] Mailbox already exists",
+			want:    "Parent folder already exists: A",
+			notWant: "Created parent folder: A",
+		},
+		{
+			name:    "the server answers OK",
+			want:    "Created parent folder: A",
+			notWant: "Parent folder already exists: A",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			replies := map[string]string{}
+			if tt.reply != "" {
+				replies["A"] = tt.reply
+			}
+			_, c := newScriptedClient(t, &mailboxScript{createReplies: replies})
+			c.delimiter = "/"
+			c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
+			var logged []string
+			c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+			c.verbose = true
+
+			if _, _, err := c.CreateMailbox(t.Context(), "A/B"); err != nil {
+				t.Fatalf("CreateMailbox: %v", err)
+			}
+
+			all := strings.Join(logged, "\n")
+			if !strings.Contains(all, "Creating parent folder: A") {
+				t.Errorf("log = %q, want the line before the CREATE", logged)
+			}
+			if !strings.Contains(all, tt.want) {
+				t.Errorf("log = %q, want a line with %q", logged, tt.want)
+			}
+			if strings.Contains(all, tt.notWant) {
+				t.Errorf("log = %q, want no line with %q", logged, tt.notWant)
+			}
+		})
 	}
 }

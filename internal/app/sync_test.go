@@ -2932,12 +2932,35 @@ func TestRunSync_When_FolderCreationLogs_Then_EveryLogAndTheFinalTrackerLineStay
 			verbose:  true,
 			wantRows: [][]string{
 				{"Folder A already exists"},
-				{"Created 1 folders", "✓ done"},
+				{"Created 0 folders", "✓ done"},
 			},
 			noRows: [][]string{{"✗ error"}},
 			check: func(t *testing.T, dst *fakeServer) {
 				t.Helper()
 				assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x")
+			},
+		},
+		{
+			name:     "parent refused below a created parent",
+			src:      map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")},
+			dst:      map[string][]fakeMsg{"INBOX": nil},
+			setup:    func(dst *fakeServer) { dst.refuseCreateOf("Old/2020", "NO [CANNOT] Invalid folder name") },
+			mappings: []config.DirectoryMapping{mapping("INBOX", "Old/2020/Inbox")},
+			wantExit: true,
+			wantRows: [][]string{
+				{`Failed to create folder "Old/2020/Inbox"`, "failed to create parent folder Old/2020"},
+				{"Created 1 of 3 folders, 1 refused", "✗ error"},
+			},
+			noRows: [][]string{{"Created", "✓ done"}},
+			check: func(t *testing.T, dst *fakeServer) {
+				t.Helper()
+				assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Old", "Old/2020")
+				if !dst.hasFolder("Old") {
+					t.Error("dst has no Old, which it accepted as the parent")
+				}
+				if dst.hasFolder("Old/2020") {
+					t.Error("dst has Old/2020, which it refused to create")
+				}
 			},
 		},
 	}
@@ -3949,6 +3972,304 @@ func TestRunSync_When_NestedFoldersAreNew_Then_EachPathIsCreatedOnceParentFirst(
 		assertIDs(t, "dst child", dst.folderMsgIDs(fmt.Sprintf("Mail/S%02d", i)), fmt.Sprintf("s%02d@x", i))
 	}
 	assertContainsAll(t, out.String(), "Found 12 subfolders, total folders to sync: 13")
+}
+
+func TestRunSync_When_DestinationParentsAreMissing_Then_PreviewCounterAndWireAgree(t *testing.T) {
+	t.Parallel()
+
+	const header = "Folders to be created on destination:\n"
+	oneMessage := map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")}
+	tests := []struct {
+		src         map[string][]fakeMsg
+		dst         map[string][]fakeMsg
+		setup       func(dst *fakeServer)
+		arrived     map[string]string
+		name        string
+		dstDelim    string
+		mappings    []config.DirectoryMapping
+		wantFolders []string
+		quiet       bool
+	}{
+		{
+			name:        "two parents are missing",
+			src:         oneMessage,
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020/Inbox")},
+			wantFolders: []string{"Old", "Old/2020", "Old/2020/Inbox"},
+			arrived:     map[string]string{"Old/2020/Inbox": "m1@x"},
+		},
+		{
+			name:        "the first parent is listed",
+			src:         oneMessage,
+			dst:         map[string][]fakeMsg{"INBOX": nil, "Old": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020/Inbox")},
+			wantFolders: []string{"Old/2020", "Old/2020/Inbox"},
+			arrived:     map[string]string{"Old/2020/Inbox": "m1@x"},
+		},
+		{
+			name:        "the first parent is a container that cannot hold messages",
+			src:         oneMessage,
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			setup:       func(dst *fakeServer) { dst.markNoSelect("Old") },
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020/Inbox")},
+			wantFolders: []string{"Old/2020", "Old/2020/Inbox"},
+			arrived:     map[string]string{"Old/2020/Inbox": "m1@x"},
+		},
+		{
+			name:        "the destination server is flat",
+			src:         oneMessage,
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020/Inbox")},
+			wantFolders: []string{"Old/2020/Inbox"},
+			arrived:     map[string]string{"Old/2020/Inbox": "m1@x"},
+		},
+		{
+			name:        "two folders share a parent",
+			src:         map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("A", "Old/A"), mapping("B", "Old/B")},
+			wantFolders: []string{"Old", "Old/A", "Old/B"},
+			arrived:     map[string]string{"Old/A": "a@x", "Old/B": "b@x"},
+		},
+		{
+			name:        "the parent has its own plan after the child",
+			src:         map[string][]fakeMsg{"X": fakeMsgs("x@x"), "Y": fakeMsgs("y@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("X", "Top/Sub"), mapping("Y", "Top")},
+			wantFolders: []string{"Top", "Top/Sub"},
+			arrived:     map[string]string{"Top/Sub": "x@x", "Top": "y@x"},
+		},
+		{
+			name:        "quiet run shows no preview",
+			src:         oneMessage,
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020/Inbox")},
+			wantFolders: []string{"Old", "Old/2020", "Old/2020/Inbox"},
+			arrived:     map[string]string{"Old/2020/Inbox": "m1@x"},
+			quiet:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, tt.dstDelim, tt.dst)
+			if tt.setup != nil {
+				tt.setup(dst)
+			}
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "y\n")
+			if tt.quiet {
+				opts = e2eOptions(out, "")
+				opts.quiet, opts.autoConfirm = true, true
+			}
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantFolders...)
+			for folder, id := range tt.arrived {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), id)
+			}
+			if tt.quiet {
+				assertContainsNone(t, got, "Folders to be created", "Created")
+				return
+			}
+			block := header
+			for _, folder := range tt.wantFolders {
+				block += "• " + folder + "\n"
+			}
+			block += "\n📨 Total new messages to sync: " + strconv.Itoa(len(tt.arrived))
+			assertInOrder(t, got, block, "✍️ Proceed with synchronization?", "Creating destination folders")
+			start := strings.Index(got, header)
+			end := strings.Index(got, "\n📨 Total new messages")
+			if start < 0 || end < start {
+				t.Fatalf("output has no list of folders to create before the total\noutput: %s", got)
+			}
+			if n := strings.Count(got[start+len(header):end], "• "); n != len(tt.wantFolders) {
+				t.Errorf("preview lists %d folders, want %d", n, len(tt.wantFolders))
+			}
+			rows := screenRows(t, got)
+			assertOneRow(t, rows, fmt.Sprintf("Created %d folders", len(tt.wantFolders)), "✓ done")
+		})
+	}
+}
+
+func TestRunSync_When_ParentLevelNameCarriesControlCharacters_Then_PreviewShowsEscapesAndServerGetsExactNames(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", hostileName+"/Sub")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	got := out.String()
+	assertContainsAll(t, got, "Folders to be created on destination:\n• "+hostileShownName+"\n• "+hostileShownName+"/Sub\n\n")
+	assertContainsNone(t, got, hostileName, "\u202e", "\x1b[2J", "\rx")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), hostileWireName, hostileWireName+"/Sub")
+	assertIDs(t, "dst subfolder", dst.folderMsgIDs(hostileWireName+"/Sub"), "m1@x")
+}
+
+func TestRunSync_When_HiddenParentAnswersAlreadyExists_Then_CounterLeavesItOut(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Old": nil})
+	dst.hideFromList("Old")
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "y\n")
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "Old/2020")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	got := out.String()
+	assertInOrder(t, got, "Folders to be created on destination:\n• Old\n• Old/2020\n\n", "Proceed with synchronization?", "Creating destination folders")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Old", "Old/2020")
+	assertOneRow(t, screenRows(t, got), "Created 1 folders", "✓ done")
+	assertIDs(t, "dst Old/2020", dst.folderMsgIDs("Old/2020"), "m1@x")
+}
+
+func TestRunSync_When_HiddenFolderAnswersAlreadyExistsAfterItsParentIsMade_Then_OnlyTheMissingMessageIsCopied(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Old/2020": fakeMsgs("m1@x")})
+	dst.hideFromList("Old/2020")
+	cfg := e2eConfig(src, dst, 1, mapping("INBOX", "Old/2020"))
+	runOnce := func() string {
+		out := &syncBuffer{}
+		if err := runSync(e2eContext(t), cfg, e2eOptions(out, "y\n")); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+		return out.String()
+	}
+
+	first := runOnce()
+
+	assertInOrder(t, first,
+		"Folders to be created on destination:\n• Old\n• Old/2020\n\n",
+		"Creating destination folders",
+		"Destination folder Old/2020 already exists and holds 1 of the 2 planned messages from INBOX, so they are not copied",
+		"Syncing messages",
+	)
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Old", "Old/2020")
+	assertIDs(t, "dst APPENDs to Old/2020", dst.appended("Old/2020"), "m2@x")
+	assertOneRow(t, screenRows(t, first), "Created 1 folders", "✓ done")
+
+	second := runOnce()
+
+	assertIDs(t, "dst APPENDs to Old/2020 over both runs", dst.appended("Old/2020"), "m2@x")
+	assertContainsAll(t, second, "holds 2 of the 2 planned messages")
+	assertContainsNone(t, second, "Syncing messages")
+}
+
+func Test_foldersToCreate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		setup      func(dst *fakeServer)
+		dstFolders map[string][]fakeMsg
+		name       string
+		delimiter  string
+		plans      []FolderSyncPlan
+		want       []string
+	}{
+		{
+			name:       "plans that exist or copy nothing are skipped",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "A/B", NewMessages: 1, DestinationFolderExists: true},
+				{DestinationFolder: "C/D"},
+				{DestinationFolder: "E", NewMessages: 2},
+			},
+			want: []string{"E"},
+		},
+		{
+			name:       "no plan gives no folder",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+		},
+		{
+			name:       "a shared level shows one time",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "Old/X", NewMessages: 1},
+				{DestinationFolder: "Old/Y", NewMessages: 1},
+				{DestinationFolder: "Old/X", NewMessages: 1},
+			},
+			want: []string{"Old", "Old/X", "Old/Y"},
+		},
+		{
+			name:       "a parent with its own later plan comes first",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "Top/Sub", NewMessages: 1},
+				{DestinationFolder: "Top", NewMessages: 1},
+			},
+			want: []string{"Top", "Top/Sub"},
+		},
+		{
+			name:       "a listed parent is left out",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil, "Old": nil},
+			plans:      []FolderSyncPlan{{DestinationFolder: "Old/2020/Inbox", NewMessages: 1}},
+			want:       []string{"Old/2020", "Old/2020/Inbox"},
+		},
+		{
+			name:       "a flat destination gives only the plan folders",
+			delimiter:  "",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "Old/2020/Inbox", NewMessages: 1},
+				{DestinationFolder: "Old/2020/Other", NewMessages: 1},
+			},
+			want: []string{"Old/2020/Inbox", "Old/2020/Other"},
+		},
+		{
+			name:       "a parent that cannot hold messages is not listed",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			setup:      func(dst *fakeServer) { dst.markNoSelect("[Gmail]") },
+			plans:      []FolderSyncPlan{{DestinationFolder: "[Gmail]/New", NewMessages: 1}},
+			want:       []string{"[Gmail]/New"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dst := newStoreServer(t, tt.delimiter, tt.dstFolders)
+			if tt.setup != nil {
+				tt.setup(dst)
+			}
+			dstClient := newAppClient(t, dst, "dst")
+
+			got := foldersToCreate(tt.plans, dstClient)
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("foldersToCreate = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting(t *testing.T) {

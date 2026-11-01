@@ -422,19 +422,12 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		printFolderFailures(out, summary.Failures)
 	}
 
+	newFolders := foldersToCreate(summary.Plans, dstClient)
+
 	if summary.TotalNew > 0 {
 		if !quiet {
 			_, _ = fmt.Fprintf(out, "📤 Messages to be copied to destination:\n")
-			foldersToCreate := make([]string, 0, len(summary.Plans))
-			listed := make(map[string]struct{}, len(summary.Plans))
 			for _, plan := range summary.Plans {
-				// Preview only the folders we will actually create - the
-				// real creation loop below filters the same way, so showing
-				// already-existing folders here just misleads the user.
-				if _, dup := listed[plan.DestinationFolder]; !plan.DestinationFolderExists && !dup {
-					listed[plan.DestinationFolder] = struct{}{}
-					foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
-				}
 				if plan.NewMessages > 0 {
 					_, _ = fmt.Fprintf(out, "• %s → %s will copy %d messages (≈ %s)\n",
 						termsafe.Escape(plan.SourceFolder), termsafe.Escape(plan.DestinationFolder),
@@ -463,9 +456,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				}
 			}
 
-			if len(foldersToCreate) > 0 {
+			if len(newFolders) > 0 {
 				_, _ = fmt.Fprintf(out, "\n🗂️ Folders to be created on destination:\n")
-				for _, folder := range foldersToCreate {
+				for _, folder := range newFolders {
 					_, _ = fmt.Fprintf(out, "• %s\n", termsafe.Escape(folder))
 				}
 			}
@@ -500,45 +493,47 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	// Pre-creation MUST stay a pre-stage: each worker holds its own mailbox
 	// cache, so a worker-side CreateMailbox would race against other workers'
 	// stale caches.
-	foldersToCreate := make(map[string]bool)
+	planFolders := make(map[string]bool)
 	for _, plan := range activePlans {
 		if !plan.DestinationFolderExists {
-			foldersToCreate[plan.DestinationFolder] = true
+			planFolders[plan.DestinationFolder] = true
 		}
 	}
 	// Folders whose plan may have no diff against the real folder: CREATE said it exists, or the destination LIST left out names, so an OK proves nothing.
 	existing := make(map[string]struct{})
 	var stop throttleStop
 
-	if len(foldersToCreate) > 0 {
+	if len(planFolders) > 0 {
 		if !quiet {
 			_, _ = fmt.Fprintln(out, "\n📁 Creating destination folders...")
 		}
 
 		creationPW := newProgressWriter(1, quiet, out)
 		creationPW.Start()
-		creationTracker := progress.NewTracker("Creating folders", int64(len(foldersToCreate)))
+		creationTracker := progress.NewTracker("Creating folders", int64(len(newFolders)))
 		// The loop decides the final state: an auto-stop on the last Increment would make MarkAsErrored do nothing and render the (k/k) Creating text.
 		creationTracker.AutoStopDisabled = true
 		traceTracker("folder-create", creationTracker.Message)
 		creationPW.AppendTracker(creationTracker)
 		routeClientLogs(creationPW, dstClient)
 
-		createdCount, refusedCount := 0, 0
+		createdCount, refusedCount, settled := 0, 0, 0
 		refused := make(map[string]error)
 		dstListIncomplete := len(dstClient.InvalidMailboxNames()) > 0
 
 		// Sorted, so a parent path is created before its children and the log
 		// order is stable.
 	createFolders:
-		for _, folder := range slices.Sorted(maps.Keys(foldersToCreate)) {
+		for _, folder := range slices.Sorted(maps.Keys(planFolders)) {
 			if err := ctx.Err(); err != nil {
 				creationPW.Stop()
 				return err
 			}
-			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", createdCount+len(refused)+1, len(foldersToCreate), termsafe.Escape(folder)))
+			creationTracker.UpdateMessage(fmt.Sprintf("(%d/%d) Creating %s", min(settled+1, len(newFolders)), len(newFolders), termsafe.Escape(folder)))
 
-			created, err := dstClient.CreateMailbox(ctx, folder)
+			created, parents, err := dstClient.CreateMailbox(ctx, folder)
+			// A refused folder can follow parents that this call made.
+			createdCount += parents
 			switch {
 			case err != nil && ctx.Err() != nil:
 				creationPW.Stop()
@@ -564,14 +559,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 					creationPW.Log("Folder %s already exists", termsafe.Escape(folder))
 				}
 				existing[folder] = struct{}{}
-				createdCount++
 			}
 
-			creationTracker.Increment(1)
+			settled += parents + 1
+			creationTracker.Increment(int64(parents + 1))
 		}
 
 		if refusedCount > 0 {
-			creationTracker.UpdateMessage(fmt.Sprintf("Created %d of %d folders, %d refused", createdCount, len(foldersToCreate), refusedCount))
+			creationTracker.UpdateMessage(fmt.Sprintf("Created %d of %d folders, %d refused", createdCount, len(newFolders), refusedCount))
 			creationTracker.MarkAsErrored()
 		} else {
 			creationTracker.UpdateMessage(fmt.Sprintf("Created %d folders", createdCount))
@@ -735,6 +730,25 @@ func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
 		_, _ = fmt.Fprintln(out, "✅ All folders already synced!")
 	}
 	return nil
+}
+
+// Names that the creation stage sends a CREATE for: plan order, parents before children, each name once. The client owns the cut rule.
+func foldersToCreate(plans []FolderSyncPlan, dst *client.Client) []string {
+	names := make([]string, 0, len(plans))
+	listed := make(map[string]struct{}, len(plans))
+	for _, plan := range plans {
+		if plan.NewMessages == 0 || plan.DestinationFolderExists {
+			continue
+		}
+		for _, level := range dst.MissingLevels(plan.DestinationFolder) {
+			if _, dup := listed[level]; dup {
+				continue
+			}
+			listed[level] = struct{}{}
+			names = append(names, level)
+		}
+	}
+	return names
 }
 
 // The folder that would receive their messages does not exist, so each plan of a refused destination fails and the others stay.

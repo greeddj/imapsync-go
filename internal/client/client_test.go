@@ -3959,9 +3959,9 @@ func Test_Client_When_EarlierReconnectGaveUp_Then_OperationsReconnect(t *testing
 			wantCommands: map[string]int{"CREATE": 1},
 			run: func(t *testing.T, c *Client) error {
 				t.Helper()
-				created, err := c.CreateMailbox(t.Context(), "Archive")
-				if err == nil && !created {
-					t.Error("CreateMailbox returned created=false, want true")
+				created, parents, err := c.CreateMailbox(t.Context(), "Archive")
+				if err == nil && (!created || parents != 0) {
+					t.Errorf("CreateMailbox returned created, parents = %v, %d, want true, 0", created, parents)
 				}
 				if err == nil && !c.hasMailbox("Archive") {
 					t.Error("the mailbox cache does not hold Archive")

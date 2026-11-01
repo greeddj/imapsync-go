@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"iter"
 	"slices"
 	"strings"
 
@@ -35,15 +36,13 @@ func (c *Client) MailboxExists(ctx context.Context, name string) (bool, error) {
 	return c.hasMailbox(name), nil
 }
 
-// CreateMailbox ensures the destination folder (and any missing parents) exist
-// on the server. Returns true when a new mailbox was created on this call,
-// false when it already existed.
-func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
+// CreateMailbox ensures name and its parent folders exist. created reports a CREATE of name. parents counts the parents that a CREATE made, also on error.
+func (c *Client) CreateMailbox(ctx context.Context, name string) (created bool, parents int, err error) {
 	stop := c.withCancel(ctx)
 	defer stop()
 
-	if err := ctx.Err(); err != nil {
-		return false, err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, 0, ctxErr
 	}
 
 	lock := c.folderLock(name)
@@ -51,73 +50,112 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (bool, error) {
 	defer lock.Unlock()
 
 	if c.hasMailbox(name) {
-		return false, nil
+		return false, 0, nil
 	}
 
-	if c.delimiter != "" && strings.Contains(name, c.delimiter) {
-		if err := c.createParentFolders(ctx, name, c.delimiter); err != nil {
-			if ctx.Err() != nil {
-				return false, ctx.Err()
-			}
-			return false, err
+	parents, err = c.createParentFolders(ctx, name, c.delimiter)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, parents, ctxErr
 		}
+		return false, parents, err
 	}
 
-	if err := ctx.Err(); err != nil {
-		return false, err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, parents, ctxErr
 	}
 
-	err := c.safeCall(func(cli *imapclient.Client) error {
+	err = c.safeCall(func(cli *imapclient.Client) error {
 		return cli.Create(name)
 	})
 	if err != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, parents, ctxErr
 		}
 		// Another client (or our own stale cache) created the folder
 		// between hasMailbox() and Create(). Treat as idempotent success,
 		// and record the folder so later lookups see it.
 		if isAlreadyExistsErr(err) {
 			c.addMailboxToCache(name)
-			return false, nil
+			return false, parents, nil
 		}
-		return false, fmt.Errorf("[%s] failed to create mailbox %s: %w", c.prefix, name, err)
+		return false, parents, fmt.Errorf("[%s] failed to create mailbox %s: %w", c.prefix, name, err)
 	}
 	c.addMailboxToCache(name)
 
-	return true, nil
+	return true, parents, nil
 }
 
-// createParentFolders walks down the hierarchy, creating any missing parent folder.
-func (c *Client) createParentFolders(ctx context.Context, name, delimiter string) error {
-	parts := strings.Split(name, delimiter)
-
-	for i := 1; i < len(parts); i++ {
-		if err := ctx.Err(); err != nil {
-			return err
+// MissingLevels returns the names that CreateMailbox(name) sends a CREATE for while the cache stays unchanged: missing parents first, then name, or nothing when the cache holds name.
+func (c *Client) MissingLevels(name string) []string {
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	if _, ok := c.mailboxCache.resolve(name); ok {
+		return nil
+	}
+	var missing []string
+	for level := range parentLevels(name, c.delimiter) {
+		if _, ok := c.mailboxCache.resolve(level); !ok {
+			missing = append(missing, level)
 		}
-		parentPath := strings.Join(parts[:i], delimiter)
+	}
+	return append(missing, name)
+}
+
+// parentLevels yields each prefix of name that ends before a delimiter, shortest first. An empty delimiter marks a flat server, so it yields nothing.
+func parentLevels(name, delimiter string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		if delimiter == "" {
+			return
+		}
+		end := 0
+		for {
+			i := strings.Index(name[end:], delimiter)
+			if i < 0 {
+				return
+			}
+			end += i
+			if !yield(name[:end]) {
+				return
+			}
+			end += len(delimiter)
+		}
+	}
+}
+
+// createParentFolders walks down the hierarchy, creating any missing parent folder. made counts the CREATE commands that the server accepted, also when err is set.
+func (c *Client) createParentFolders(ctx context.Context, name, delimiter string) (made int, err error) {
+	for parentPath := range parentLevels(name, delimiter) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return made, ctxErr
+		}
 
 		lock := c.folderLock(parentPath)
 		lock.Lock()
 
 		if !c.hasMailbox(parentPath) {
 			c.log("[%s] Creating parent folder: %s", c.prefix, parentPath)
-			err := c.safeCall(func(cli *imapclient.Client) error {
+			createErr := c.safeCall(func(cli *imapclient.Client) error {
 				return cli.Create(parentPath)
 			})
-			if err != nil && !isAlreadyExistsErr(err) {
+			exists := createErr != nil && isAlreadyExistsErr(createErr)
+			if createErr != nil && !exists {
 				lock.Unlock()
-				return fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, err)
+				return made, fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, createErr)
 			}
 			c.addMailboxToCache(parentPath)
-			c.log("[%s] Created parent folder: %s", c.prefix, parentPath)
+			if exists {
+				c.log("[%s] Parent folder already exists: %s", c.prefix, parentPath)
+			} else {
+				made++
+				c.log("[%s] Created parent folder: %s", c.prefix, parentPath)
+			}
 		}
 
 		lock.Unlock()
 	}
 
-	return nil
+	return made, nil
 }
 
 // MailboxNames returns every cached name as LIST gave it, sorted, \Noselect names included, at no round-trip. A bare INBOX is upper case, as go-imap folds it.
