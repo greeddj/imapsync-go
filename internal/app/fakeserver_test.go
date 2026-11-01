@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1096,6 +1097,19 @@ func (s *fakeServer) takeDropOnOpen(name string) bool {
 	s.store.dropOnOpen = ""
 	s.counts["DROP"]++
 	return true
+}
+
+// stallNth holds the reply to the nth command with verb until the test ends. Later commands are served, so a client that reconnects goes on.
+func (s *fakeServer) stallNth(t *testing.T, verb string, n int) {
+	t.Helper()
+	release := make(chan struct{})
+	var stalled atomic.Bool
+	t.Cleanup(func() { close(release) })
+	s.onCommand(verb, func() {
+		if s.callCount(verb) == n && stalled.CompareAndSwap(false, true) {
+			<-release
+		}
+	})
 }
 
 func (s *fakeServer) refuseAppend() {

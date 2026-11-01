@@ -53,6 +53,24 @@ func newProgressWriter(numTrackers int, quiet bool, out io.Writer) *progress.Wri
 	return pw
 }
 
+// lineLog prints a Client line at once, for the phases that run no progress writer: go-pretty drops a log while no tracker is active.
+type lineLog struct{ out io.Writer }
+
+func (l lineLog) Log(msg string, a ...any) {
+	if len(a) > 0 {
+		msg = fmt.Sprintf(msg, a...)
+	}
+	_, _ = fmt.Fprintln(l.out, msg)
+}
+
+// Client.log prefers a tracker, and only the scan gives a Client one, so the scan tracker must go or it swallows the lines.
+func routeClientLogs(w client.ProgressWriter, clients ...*client.Client) {
+	for _, c := range clients {
+		c.SetProgressWriter(w)
+		c.SetProgressTracker(nil)
+	}
+}
+
 // FolderSyncPlan holds source UIDs that mean something only while the source folder reports SrcUIDValidity; 0 means the server sent none.
 type FolderSyncPlan struct {
 	SourceFolder            string
@@ -354,6 +372,12 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	mappings = directoryMappings(planned)
 	printCaseVariantDestinations(out, mappings, dstClient.MailboxNames())
 
+	lineOut := out
+	if quiet {
+		lineOut = io.Discard
+	}
+	lines := lineLog{out: lineOut}
+
 	// Setup progress writer for scanning phase
 	pw := newProgressWriter(2, quiet, out)
 	pw.Start()
@@ -383,6 +407,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	dstTracker.MarkAsDone()
 
 	pw.Stop()
+	routeClientLogs(lines, srcClient, dstClient)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -497,6 +522,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		creationTracker.AutoStopDisabled = true
 		traceTracker("folder-create", creationTracker.Message)
 		creationPW.AppendTracker(creationTracker)
+		routeClientLogs(creationPW, dstClient)
 
 		createdCount, refusedCount := 0, 0
 		refused := make(map[string]error)
@@ -552,6 +578,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			creationTracker.MarkAsDone()
 		}
 		creationPW.Stop()
+		routeClientLogs(lines, dstClient)
 
 		if len(refused) > 0 {
 			var refusals []FolderFailure
@@ -617,6 +644,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		)
 		traceTracker("plan", trackers[i].Message)
 		syncPW.AppendTracker(trackers[i])
+	}
+	for _, w := range workers.all {
+		routeClientLogs(syncPW, w.src, w.dst)
 	}
 
 	// free is a bounded semaphore of pre-built workers. Whoever runs first

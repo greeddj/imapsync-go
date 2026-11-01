@@ -16609,3 +16609,288 @@ func TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen(t *testing.T)
 		})
 	}
 }
+
+func TestRunSync_When_WorkerSourceReconnects_Then_VerboseRunShowsTheWorkerLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verbose bool
+	}{
+		{name: "verbose", verbose: true},
+		{name: "not verbose", verbose: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			msgs := []fakeMsg{{msgID: "m1@x", envelopeID: "<m1@x>"}, {msgID: "m2@x", envelopeID: "<m2@x>"}}
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": msgs})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			// The first LOGIN is the planning client and the second is the worker, so only the worker's EXAMINE gets the BYE.
+			src.onCommand("LOGIN", func() {
+				if src.callCount("LOGIN") == 2 {
+					src.dropOnceOnOpen("INBOX")
+				}
+			})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.verbose = tt.verbose
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			if n := src.callCount("DROP"); n != 1 {
+				t.Errorf("source dropped %d connections, want 1", n)
+			}
+			if n := src.callCount("LOGIN"); n != 3 {
+				t.Errorf("source saw %d LOGIN commands, want 3", n)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x")
+			assertContainsAll(t, out.String(), "Sync completed successfully")
+			if tt.verbose {
+				assertContainsAll(t, out.String(),
+					"[src-w1] 🔄 Reconnect attempt 1...",
+					"[src-w1] 🔄 Reconnected successfully",
+					`[dst-w1] Message "<m1@x>" appended to INBOX`,
+					`[dst-w1] Message "<m2@x>" appended to INBOX`,
+				)
+				return
+			}
+			assertContainsNone(t, out.String(), "Reconnect attempt", "[src-w1]", "[dst-w1]")
+		})
+	}
+}
+
+func TestRunSync_When_WorkerSourceGoesSilent_Then_TheTripLineShowsWithoutVerbose(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		quiet    bool
+		wantTrip bool
+	}{
+		{name: "normal", wantTrip: true},
+		{name: "quiet", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			// The planning client sends no UID command, so the stall hits the UID FETCH of the worker.
+			src.stallNth(t, "UID", 1)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.quiet = tt.quiet
+			opts.clientOpts.IdleTimeout = time.Second
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			if n := src.callCount("LOGIN"); n != 3 {
+				t.Errorf("source saw %d LOGIN commands, want 3", n)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x")
+			assertContainsAll(t, out.String(), "Sync completed successfully")
+			if tt.wantTrip {
+				assertContainsAll(t, out.String(), "[src-w1] No data from server for 1s, reconnecting")
+				assertOneRow(t, screenRows(t, out.String()), "[src-w1] No data from server for 1s, reconnecting")
+				return
+			}
+			assertContainsNone(t, out.String(), "No data from server")
+		})
+	}
+}
+
+func TestRunSync_When_DestinationGoesSilentDuringCreate_Then_TheTripLineShows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verbose bool
+	}{
+		{name: "not verbose"},
+		{name: "verbose", verbose: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.stallNth(t, "CREATE", 1)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.verbose = tt.verbose
+			opts.clientOpts.IdleTimeout = time.Second
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "A")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertInOrder(t, out.String(), "[dst] No data from server for 1s, reconnecting", "📥 Syncing messages")
+			assertOneRow(t, screenRows(t, out.String()), "[dst] No data from server for 1s, reconnecting")
+			if tt.verbose {
+				assertContainsAll(t, out.String(), "[dst] 🔄 Reconnect attempt 1...", "[dst] 🔄 Reconnected successfully")
+			} else {
+				assertContainsNone(t, out.String(), "Reconnect attempt")
+			}
+			assertIDs(t, "dst A", dst.folderMsgIDs("A"), "m1@x", "m2@x")
+		})
+	}
+}
+
+func TestRunSync_When_DestinationGoesSilentDuringTheCheckAfterCreate_Then_TheTripLineShows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		quiet    bool
+		wantTrip bool
+	}{
+		{name: "normal", wantTrip: true},
+		{name: "quiet", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "A": fakeMsgs("m1@x")})
+			dst.hideFromList("A")
+			// A hidden folder gets no destination scan while the plan is built, so the stall hits the check after CREATE.
+			dst.stallNth(t, "FETCH", 1)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.quiet = tt.quiet
+			opts.clientOpts.IdleTimeout = time.Second
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			if n := dst.callCount("FETCH"); n != 2 {
+				t.Errorf("destination saw %d FETCH commands, want 2: the stalled one and its retry", n)
+			}
+			assertIDs(t, "dst APPENDs to A", dst.appended("A"), "m2@x")
+			if tt.wantTrip {
+				assertInOrder(t, out.String(),
+					"[dst] No data from server for 1s, reconnecting",
+					"already exists and holds 1 of the 2 planned messages",
+					"📥 Syncing messages",
+				)
+				return
+			}
+			assertContainsNone(t, out.String(), "No data from server")
+		})
+	}
+}
+
+func TestRunSync_When_SourceGoesSilentDuringTheCheckAfterCreate_Then_TheTripLineShows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		quiet    bool
+		wantTrip bool
+	}{
+		{name: "normal", wantTrip: true},
+		{name: "quiet", quiet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "A": fakeMsgs("m1@x")})
+			dst.hideFromList("A")
+			// The plan scan sends the first source FETCH and the copy sends only UID FETCH, so the second FETCH is the one in the check after CREATE.
+			src.stallNth(t, "FETCH", 2)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+			opts.quiet = tt.quiet
+			opts.clientOpts.IdleTimeout = time.Second
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			if n := src.callCount("FETCH"); n != 3 {
+				t.Errorf("source saw %d FETCH commands, want 3: the plan scan, the stalled one and its retry", n)
+			}
+			assertIDs(t, "dst APPENDs to A", dst.appended("A"), "m2@x")
+			if tt.wantTrip {
+				assertInOrder(t, out.String(),
+					"[src] No data from server for 1s, reconnecting",
+					"already exists and holds 1 of the 2 planned messages",
+					"📥 Syncing messages",
+				)
+				return
+			}
+			assertContainsNone(t, out.String(), "No data from server")
+		})
+	}
+}
+
+// writeRecorder keeps each Write call apart, so a test can tell one write per line from several.
+type writeRecorder struct {
+	writes []string
+}
+
+func (r *writeRecorder) Write(p []byte) (int, error) {
+	r.writes = append(r.writes, string(p))
+	return len(p), nil
+}
+
+func Test_lineLog_When_Logged_Then_WritesOneLinePerCall(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		msg  string
+		want string
+		args []any
+	}{
+		{name: "formats the arguments", msg: "copied %d of %s", args: []any{2, "INBOX"}, want: "copied 2 of INBOX\n"},
+		{name: "keeps a percent sign when there are no arguments", msg: "100% of %s", want: "100% of %s\n"},
+		{name: "keeps a percent sign inside an argument", msg: "%s", args: []any{"50%d"}, want: "50%d\n"},
+		{name: "keeps a control character raw", msg: "a\x1b[2Jb", want: "a\x1b[2Jb\n"},
+		{name: "keeps an empty message as an empty line", msg: "", want: "\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := &writeRecorder{}
+
+			lineLog{out: rec}.Log(tt.msg, tt.args...)
+
+			if !slices.Equal(rec.writes, []string{tt.want}) {
+				t.Errorf("writes = %q, want one write %q", rec.writes, tt.want)
+			}
+		})
+	}
+
+	t.Run("writes each call on its own", func(t *testing.T) {
+		t.Parallel()
+
+		rec := &writeRecorder{}
+		sink := lineLog{out: rec}
+
+		sink.Log("first")
+		sink.Log("%s second", "the")
+
+		if want := []string{"first\n", "the second\n"}; !slices.Equal(rec.writes, want) {
+			t.Errorf("writes = %q, want %q", rec.writes, want)
+		}
+	})
+}

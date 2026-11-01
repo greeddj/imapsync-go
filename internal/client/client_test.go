@@ -2796,6 +2796,42 @@ func Test_New_When_Built_Then_WatchdogUsesIdleTimeout(t *testing.T) {
 	}
 }
 
+func Test_New_When_OptionsSetIdleTimeout_Then_WatchdogUsesIt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		set  time.Duration
+		want time.Duration
+	}{
+		{name: "a positive value replaces the default", set: tripLimit, want: tripLimit},
+		{name: "zero keeps the default", set: 0, want: idleTimeout},
+		{name: "a negative value keeps the default", set: -time.Second, want: idleTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			c, err := New(t.Context(), srv.ln.Addr().String(), "user", "pass", Options{DialTimeout: 5 * time.Second, IdleTimeout: tt.set})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				c.Cancel()
+				_ = c.Logout()
+			})
+
+			if c.idleDur != tt.want {
+				t.Errorf("idleDur = %s, want %s", c.idleDur, tt.want)
+			}
+			if c.idle.Load() == nil {
+				t.Error("no watchdog is armed on the session")
+			}
+		})
+	}
+}
+
 func Test_newClientWithFake_When_IdleDurIsZero_Then_NoWatchdogAndClientWorks(t *testing.T) {
 	t.Parallel()
 
