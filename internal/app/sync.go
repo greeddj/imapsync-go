@@ -627,24 +627,11 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	}
 	defer workers.close()
 
-	// One progress writer for the whole sync, with a tracker per plan
-	// up front. Reusing the writer across all plans replaces the older
-	// "writer-per-chunk" approach that produced visible flicker and forced
-	// a 100ms sleep between chunks.
+	// One writer serves the whole copy. go-pretty has no terminal-height limit, so a plan's tracker is appended only when a worker takes it: at most one row per worker.
 	syncPW := newProgressWriter(len(activePlans), quiet, out)
 	syncPW.Start()
 	defer syncPW.Stop()
 
-	trackers := make([]*progress.Tracker, len(activePlans))
-	for i, plan := range activePlans {
-		trackers[i] = progress.NewTracker(
-			fmt.Sprintf("%d/%d Waiting: %s → %s", i+1, len(activePlans),
-				termsafe.Escape(plan.SourceFolder), termsafe.Escape(plan.DestinationFolder)),
-			100,
-		)
-		traceTracker("plan", trackers[i].Message)
-		syncPW.AppendTracker(trackers[i])
-	}
 	for _, w := range workers.all {
 		routeClientLogs(syncPW, w.src, w.dst)
 	}
@@ -677,12 +664,15 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			firstUnstarted = i
 			break
 		}
-		// The stop can land while the loop waits for a worker.
-		if stop.stopped() {
+		// A cancel or a stop can land while the loop waits for a worker.
+		if ctx.Err() != nil || stop.stopped() {
 			free <- w
 			firstUnstarted = i
 			break
 		}
+		tr := newPlanTracker(plan, i, len(activePlans))
+		traceTracker("plan", tr.Message)
+		syncPW.AppendTracker(tr)
 		wg.Add(1)
 		go func(idx int, p FolderSyncPlan, w *syncWorker, tr *progress.Tracker) {
 			defer wg.Done()
@@ -690,7 +680,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			synced, errs, _ := runFolderSync(ctx, w, p, &stop, tr, idx, len(activePlans), syncPW, verbose)
 			totalSynced.Add(int64(synced))
 			totalErrors.Add(int64(errs))
-		}(i, plan, w, trackers[i])
+		}(i, plan, w, tr)
 	}
 	wg.Wait()
 
@@ -702,11 +692,13 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if cause != nil {
 		for i := firstUnstarted; i < len(activePlans); i++ {
 			totalErrors.Add(int64(activePlans[i].NewMessages))
-			markPlanStopped(trackers[i], activePlans[i], i, len(activePlans))
+			tr := newStoppedPlanTracker(activePlans[i], i, len(activePlans))
+			traceTracker("plan-stopped", tr.Message)
+			syncPW.AppendTracker(tr)
 		}
 	}
 
-	// Stop redraws the last frame over the active tracker rows, so a line printed before it would be erased. Unstarted plans are marked first, so their rows render.
+	// Stop redraws the last frame over the active tracker rows, so a line printed before it would be erased. The stopped rows are appended before Stop, so they render.
 	syncPW.Stop()
 
 	totalSyncedN := int(totalSynced.Load())

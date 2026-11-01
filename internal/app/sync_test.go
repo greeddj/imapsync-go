@@ -4570,13 +4570,13 @@ func TestRunSync_When_CanceledDuringFolderCreation_Then_CreatingLineShowsEscapes
 	assertContainsNone(t, got, name)
 }
 
-func TestRunSync_When_CanceledBeforeSecondPlanStarts_Then_WaitingLineShowsEscapes(t *testing.T) {
+func TestRunSync_When_CanceledBeforeSecondPlanStarts_Then_OnlyTheStartedPlanHasATracker(t *testing.T) {
 	t.Parallel()
 
-	srcWireA, srcA, _ := hostileFolder("A")
-	dstWireB, dstB, _ := hostileFolder("B")
-	srcWireC, srcC, shownC := hostileFolder("C")
-	dstWireD, dstD, shownD := hostileFolder("D")
+	srcWireA, srcA, shownA := hostileFolder("A")
+	dstWireB, dstB, shownB := hostileFolder("B")
+	srcWireC, srcC, _ := hostileFolder("C")
+	dstWireD, dstD, _ := hostileFolder("D")
 	ctx, cancel := context.WithCancel(e2eContext(t))
 	t.Cleanup(cancel)
 	src := newStoreServer(t, "/", map[string][]fakeMsg{srcWireA: fakeMsgs("a@x"), srcWireC: fakeMsgs("c@x")})
@@ -4602,8 +4602,13 @@ func TestRunSync_When_CanceledBeforeSecondPlanStarts_Then_WaitingLineShowsEscape
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
 	got := out.String()
-	assertContainsAll(t, got, "2/2 Waiting: "+shownC+" → "+shownD)
-	assertContainsNone(t, got, srcC, dstD, srcA, dstB)
+	_, afterMarker, found := strings.Cut(got, "📥 Syncing messages...")
+	if !found {
+		t.Fatalf("output does not hold the copy marker\noutput: %q", got)
+	}
+	assertContainsAll(t, afterMarker, "1/2 Canceled "+shownA+" → "+shownB)
+	assertContainsNone(t, afterMarker, "2/2")
+	assertContainsNone(t, got, "Waiting", srcC, dstD, srcA, dstB)
 }
 
 func Test_buildSyncPlan_When_ScanIsInFlight_Then_TrackerShowsEscapedFolderName(t *testing.T) {
@@ -16469,6 +16474,138 @@ func waitForCopyFrame(t *testing.T, out *syncBuffer) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Errorf("the progress writer drew no frame of the copy trackers within 5s")
+}
+
+// redrawRuns returns, for each redraw in raw, how many tracker rows it rewinds.
+func redrawRuns(raw string) []int {
+	const rewind = "\x1b[A\x1b[K"
+	var runs []int
+	for {
+		i := strings.Index(raw, rewind)
+		if i < 0 {
+			return runs
+		}
+		raw = raw[i:]
+		n := 0
+		for strings.HasPrefix(raw, rewind) {
+			n++
+			raw = raw[len(rewind):]
+		}
+		runs = append(runs, n)
+	}
+}
+
+// waitForRedraws returns after n redraws follow the output offset from, so the last one was sized after from. It runs on a server goroutine, so it uses Errorf.
+func waitForRedraws(t *testing.T, out *syncBuffer, from, n int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(redrawRuns(out.String()[from:])) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("the progress writer drew fewer than %d redraws within 5s", n)
+}
+
+func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTrackerPerWorker(t *testing.T) {
+	t.Parallel()
+
+	const copyMarker = "📥 Syncing messages..."
+	tests := []struct {
+		setup   func(dst *fakeServer)
+		name    string
+		workers int
+		plans   int
+	}{
+		{name: "one worker, four plans", workers: 1, plans: 4},
+		{name: "two workers, six plans", workers: 2, plans: 6},
+		{
+			name:    "throttle stop",
+			workers: 1,
+			plans:   5,
+			setup:   func(dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			names := []string{"A", "B", "C", "D", "E", "F"}[:tt.plans]
+			srcFolders := make(map[string][]fakeMsg, len(names))
+			dstFolders := make(map[string][]fakeMsg, len(names))
+			mappings := make([]config.DirectoryMapping, 0, len(names))
+			for _, name := range names {
+				srcFolders[name] = fakeMsgs(strings.ToLower(name) + "@x")
+				dstFolders[name] = nil
+				mappings = append(mappings, mapping(name, name))
+			}
+			src := newStoreServer(t, "/", srcFolders)
+			dst := newStoreServer(t, "/", dstFolders)
+			if tt.setup != nil {
+				tt.setup(dst)
+			}
+			out := &syncBuffer{}
+			// Each APPEND waits for two redraws that follow it, and the second one is sized after the first.
+			dst.onCommand("APPEND", func() { waitForRedraws(t, out, len(out.String()), 2) })
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, tt.workers, mappings...), opts)
+
+			raw := out.String()
+			throttled := tt.setup != nil
+			if throttled {
+				if !errors.Is(err, ErrSilentExit) {
+					t.Fatalf("error = %v, want ErrSilentExit\noutput: %q", err, raw)
+				}
+				assertContainsAll(t, raw, "0 messages uploaded, 5 errors occurred, 0 folders failed")
+			} else {
+				if err != nil {
+					t.Fatalf("runSync: %v\noutput: %q", err, raw)
+				}
+				assertContainsAll(t, raw, "Sync completed successfully")
+			}
+			assertContainsNone(t, raw, "Waiting")
+
+			start := strings.LastIndex(raw, copyMarker)
+			if start < 0 {
+				t.Fatalf("output does not hold %q\noutput: %q", copyMarker, raw)
+			}
+			runs := redrawRuns(raw[start:])
+			if len(runs) == 0 {
+				t.Fatalf("the copy drew no redraw\noutput: %q", raw[start:])
+			}
+			if largest := slices.Max(runs); largest > tt.workers {
+				t.Errorf("a redraw rewinds %d tracker rows, want at most %d (one for each worker); runs: %v", largest, tt.workers, runs)
+			}
+
+			rows := screenRows(t, raw)
+			for k, name := range names {
+				prefix := fmt.Sprintf("%d/%d ", k+1, tt.plans)
+				var final []string
+				switch {
+				case !throttled:
+					final = []string{prefix + "Synced messages 1 " + name + " → " + name, "✓ done"}
+				case k == 0:
+					final = []string{prefix + "Synced messages 0 (errors: 1) " + name + " → " + name, "✗ error"}
+				default:
+					final = []string{prefix + "Stopped " + name + " → " + name, "✗ error"}
+				}
+				assertOneRow(t, rows, prefix)
+				assertOneRow(t, rows, final...)
+				if throttled && k > 0 {
+					if n := strings.Count(raw, prefix+"Stopped"); n != 1 {
+						t.Errorf("output holds %q %d times, want 1", prefix+"Stopped", n)
+					}
+				}
+			}
+			if stale := rowsHolding(rows, "→", "%"); len(stale) != 0 {
+				t.Errorf("rows %v hold a tracker that is still in progress\nscreen:\n%s", stale, strings.Join(rows, "\n"))
+			}
+		})
+	}
 }
 
 func TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen(t *testing.T) {

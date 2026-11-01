@@ -150,6 +150,29 @@ func markPlanStopped(tr *progress.Tracker, p FolderSyncPlan, planIdx, planCount 
 	tr.MarkAsErrored()
 }
 
+// planStartText is the tracker text of a running plan. srcShown and dstShown are escaped already.
+func planStartText(planIdx, planCount int, srcShown, dstShown string) string {
+	return fmt.Sprintf("%d/%d %s → %s", planIdx+1, planCount, srcShown, dstShown)
+}
+
+// newPlanTracker builds the tracker that the dispatch loop appends when a worker takes the plan.
+func newPlanTracker(p FolderSyncPlan, planIdx, planCount int) *progress.Tracker {
+	tr := progress.NewTracker(planStartText(planIdx, planCount,
+		termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)), 100)
+	// runFolderSync marks every path itself. Auto-stop would let the last Increment end the row before the final text is set.
+	tr.AutoStopDisabled = true
+	return tr
+}
+
+// newStoppedPlanTracker builds the finished row of a plan that never started.
+func newStoppedPlanTracker(p FolderSyncPlan, planIdx, planCount int) *progress.Tracker {
+	tr := progress.NewTracker("", 100)
+	// AppendTracker restarts a tracker unless DeferStart is set, and the restart clears the done and error marks.
+	tr.DeferStart = true
+	markPlanStopped(tr, p, planIdx, planCount)
+	return tr
+}
+
 type pendingCause uint8
 
 const (
@@ -174,7 +197,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, stop *t
 	}
 
 	tr.UpdateTotal(int64(p.NewMessages))
-	tr.UpdateMessage(fmt.Sprintf("%d/%d %s → %s", planIdx+1, planCount, srcShown, dstShown))
+	tr.UpdateMessage(planStartText(planIdx, planCount, srcShown, dstShown))
 
 	// lastUpdate throttles the per-message message-string update - it lives
 	// on the worker goroutine, so an unsynchronized time.Time is fine.

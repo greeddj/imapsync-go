@@ -693,6 +693,48 @@ func TestTrackerReason(t *testing.T) {
 	}
 }
 
+func Test_newPlanTracker_When_PlanStarts_Then_TextHasNumberAndEscapedNames(t *testing.T) {
+	t.Parallel()
+
+	_, src, shownSrc := hostileFolder("A")
+	_, dst, shownDst := hostileFolder("B")
+
+	tr := newPlanTracker(FolderSyncPlan{SourceFolder: src, DestinationFolder: dst}, 1, 3)
+
+	if want := "2/3 " + shownSrc + " → " + shownDst; tr.Message != want {
+		t.Errorf("message = %q, want %q", tr.Message, want)
+	}
+	if tr.IsDone() {
+		t.Error("a new plan tracker is done, want it running")
+	}
+	tr.UpdateTotal(1)
+	tr.Increment(1)
+	if tr.IsDone() {
+		t.Error("the tracker is done after its last Increment, want it running until the worker marks it")
+	}
+	tr.MarkAsDone()
+	if !tr.IsDone() {
+		t.Error("the tracker is not done after MarkAsDone")
+	}
+}
+
+func Test_newStoppedPlanTracker_When_Appended_Then_StaysStoppedAndErrored(t *testing.T) {
+	t.Parallel()
+
+	_, src, shownSrc := hostileFolder("A")
+	_, dst, shownDst := hostileFolder("B")
+	tr := newStoppedPlanTracker(FolderSyncPlan{SourceFolder: src, DestinationFolder: dst}, 2, 5)
+
+	progress.NewWriter(1, true).AppendTracker(tr)
+
+	if !tr.IsDone() || !tr.IsErrored() {
+		t.Errorf("IsDone, IsErrored = %v, %v, want true, true: appending must not restart the tracker", tr.IsDone(), tr.IsErrored())
+	}
+	if want := "3/5 Stopped " + shownSrc + " → " + shownDst; tr.Message != want {
+		t.Errorf("message = %q, want %q", tr.Message, want)
+	}
+}
+
 // holdAppends parks each APPEND until the test sends on release. It announces the
 // APPEND number on arrived first, so the test reads worker state mid-command.
 func holdAppends(srv *fakeServer, reply string, arrived chan<- int, release <-chan struct{}) func(net.Conn) {
