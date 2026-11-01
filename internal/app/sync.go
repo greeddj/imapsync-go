@@ -676,6 +676,9 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		}
 	}
 
+	// Stop redraws the last frame over the active tracker rows, so a line printed before it would be erased. Unstarted plans are marked first, so their rows render.
+	syncPW.Stop()
+
 	totalSyncedN := int(totalSynced.Load())
 	totalErrorsN := int(totalErrors.Load())
 

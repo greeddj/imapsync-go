@@ -16456,3 +16456,156 @@ func TestRunSync_When_ContextEndsWithAThrottledReply_Then_ReturnsCanceledWithout
 		})
 	}
 }
+
+// waitForCopyFrame returns after the first frame of the copy trackers, so a later redraw has rows to rewind. It runs on a server goroutine, so it uses Errorf.
+func waitForCopyFrame(t *testing.T, out *syncBuffer) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, after, ok := strings.Cut(out.String(), "📥 Syncing messages..."); ok && strings.Contains(after, "→") {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("the progress writer drew no frame of the copy trackers within 5s")
+}
+
+func TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen(t *testing.T) {
+	t.Parallel()
+
+	const successLine = "✨ Sync completed successfully. ✨"
+	tests := []struct {
+		src          map[string][]fakeMsg
+		dst          map[string][]fakeMsg
+		setup        func(src, dst *fakeServer)
+		wantErr      error
+		name         string
+		firstAfter   string
+		last         string
+		mappings     []config.DirectoryMapping
+		trackerRows  [][]string
+		firstRows    int
+		firstFromEnd int
+		quiet        bool
+	}{
+		{
+			name:         "success",
+			src:          map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x", "m3@x", "m4@x")},
+			dst:          map[string][]fakeMsg{"INBOX": nil},
+			mappings:     []config.DirectoryMapping{mapping("INBOX", "INBOX")},
+			firstAfter:   successLine,
+			last:         successLine,
+			trackerRows:  [][]string{{"1/1 Synced messages 4 INBOX → INBOX", "✓ done"}},
+			firstRows:    1,
+			firstFromEnd: 1,
+		},
+		{
+			name: "refused appends and a failed folder",
+			src:  map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "Bad": fakeMsgs("b1@x")},
+			dst:  map[string][]fakeMsg{"INBOX": nil, "A": nil},
+			setup: func(src, dst *fakeServer) {
+				src.refuseOpenWith("Bad", "NO [SERVERBUG] Internal error")
+				dst.refuseAppend()
+			},
+			wantErr:      ErrSilentExit,
+			mappings:     []config.DirectoryMapping{mapping("A", "A"), mapping("Bad", "Bad")},
+			firstAfter:   folderFailuresHeader,
+			last:         "❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 1 folders failed",
+			trackerRows:  [][]string{{"1/1 Synced messages 0 (errors: 3) A → A", "✗ error"}},
+			firstRows:    2,
+			firstFromEnd: 3,
+		},
+		{
+			name:         "throttle stop",
+			src:          map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x")},
+			dst:          map[string][]fakeMsg{"A": nil, "B": nil},
+			setup:        func(_, dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
+			wantErr:      ErrSilentExit,
+			mappings:     []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")},
+			firstAfter:   destinationStopStart,
+			last:         "❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 0 folders failed",
+			trackerRows:  [][]string{{"1/2 Synced messages 0 (errors: 3) A → A", "✗ error"}, {"2/2 Stopped B → B", "✗ error"}},
+			firstRows:    1,
+			firstFromEnd: 2,
+		},
+		{
+			name:       "throttle stop with quiet",
+			src:        map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x")},
+			dst:        map[string][]fakeMsg{"A": nil, "B": nil},
+			setup:      func(_, dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
+			wantErr:    ErrSilentExit,
+			mappings:   []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")},
+			firstAfter: destinationStopStart,
+			last:       "❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 0 folders failed",
+			quiet:      true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, "/", tt.dst)
+			if tt.setup != nil {
+				tt.setup(src, dst)
+			}
+			out := &syncBuffer{}
+			if !tt.quiet {
+				dst.onCommand("APPEND", func() { waitForCopyFrame(t, out) })
+			}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet = true, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v\noutput: %q", err, tt.wantErr, out.String())
+			}
+			raw := out.String()
+			if !strings.HasSuffix(raw, tt.last+"\n") {
+				t.Errorf("output does not end with the summary line %q\noutput: %q", tt.last, raw)
+			}
+			if tt.quiet {
+				if strings.Contains(raw, "\x1b[") {
+					t.Errorf("quiet output holds an escape sequence\noutput: %q", raw)
+				}
+				if n := strings.Count(raw, tt.firstAfter); n != 1 {
+					t.Errorf("quiet output holds %q %d times, want 1\noutput: %q", tt.firstAfter, n, raw)
+				}
+				return
+			}
+			start := strings.LastIndex(raw, tt.firstAfter)
+			if start < 0 {
+				t.Fatalf("output does not hold %q\noutput: %q", tt.firstAfter, raw)
+			}
+			for _, rewind := range []string{"\x1b[A", "\x1b[K"} {
+				if strings.Contains(raw[start:], rewind) {
+					t.Errorf("output holds %q after %q\ntail: %q", rewind, tt.firstAfter, raw[start:])
+				}
+			}
+
+			rows := screenRows(t, raw)
+			if got := rows[len(rows)-1]; got != tt.last {
+				t.Errorf("last row = %q, want %q\nscreen:\n%s", got, tt.last, strings.Join(rows, "\n"))
+			}
+			assertOneRow(t, rows, tt.last)
+			firstRows := rowsHolding(rows, tt.firstAfter)
+			if len(firstRows) != tt.firstRows {
+				t.Fatalf("%d rows hold %q, want %d\nscreen:\n%s", len(firstRows), tt.firstAfter, tt.firstRows, strings.Join(rows, "\n"))
+			}
+			first := firstRows[len(firstRows)-1]
+			if want := len(rows) - tt.firstFromEnd; first != want {
+				t.Errorf("first line after the copy is row %d, want row %d\nscreen:\n%s", first, want, strings.Join(rows, "\n"))
+			}
+			for _, parts := range tt.trackerRows {
+				if i := assertOneRow(t, rows, parts...); i >= first {
+					t.Errorf("tracker row %d comes after the first line after the copy, row %d: %q", i, first, parts)
+				}
+			}
+			if stale := rowsHolding(rows, "→", "%"); len(stale) != 0 {
+				t.Errorf("rows %v hold a tracker that is still in progress\nscreen:\n%s", stale, strings.Join(rows, "\n"))
+			}
+		})
+	}
+}
