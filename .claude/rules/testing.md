@@ -228,6 +228,10 @@
   - `Test_New_When_SharedLimiterIsInDebtAndAuthIsCramMD5_Then_GreetingDoesNotWaitAndAuthenticateDoes` - the same check for CRAM-MD5, with a write limiter and with a read limiter. The greeting does not wait for the debt, and AUTHENTICATE waits;
   - `Test_connectAndLogin_When_ReadLimiterIsSet_Then_TheGreetingTakesTokensWithoutWaiting` - the limiter is in a debt of about 131000 tokens. The greeting takes its tokens, so the shared budget counts it. The greeting does not wait. The test stops at LOGIN;
   - `Test_New_When_ServerNeverGreetsAndLimitersAreSet_Then_FailsAndClosesTheSocket` - with both limiters set, a server that never greets makes `New` fail with `os.ErrDeadlineExceeded` after `dialTimeout`. The client closes the socket and sends no LOGIN.
+
+  The watchdog limit has these tests:
+  - `Test_New_When_Built_Then_WatchdogUsesIdleTimeout` - `New` sets `idleTimeout` and arms the watchdog, with and without rate limits;
+  - `Test_New_When_OptionsSetIdleTimeout_Then_WatchdogUsesIt` - a positive value below the default replaces it. Zero, a negative value and a value above the default keep `idleTimeout`. The watchdog is always armed.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
   The mode with no wait has these tests:
   - `TestConn_When_WaitIsOff_Then_ReadAndWriteTakeTokensWithoutWaiting` - on a limiter in debt, a `Write` and a `Read` return at once with no error. Each direction loses exactly the bytes that moved;

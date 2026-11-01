@@ -47,6 +47,7 @@ A change can be safe per-file and unsafe in combination. Look for:
   - `carriedFlag` keeps each keyword and `\Seen`, `\Answered`, `\Flagged` and `\Draft`. It drops `\Recent`, `\Deleted` and each other system flag.
   - A new path that sends a server flag to a server must keep this check.
 - A server value that reaches IMAP after escaping: a SELECT, EXAMINE, STATUS, CREATE or APPEND argument, plan data, a mapping, a map key, or an error value that `classifyError` or `isAlreadyExistsErr` reads. Escaping changes the bytes, so the name no longer matches the real folder.
+- A production caller that sets `Options.IdleTimeout` is a review point. Only tests set it. A change that lets the field make the limit longer than `idleTimeout`, or set it to zero, is also a review point. The watchdog is the defence against a silent server. A longer limit lets a server hold a command, and `c.mu` during a reconnect, for a longer time. `New` uses the field only when its value is more than zero and not more than `idleTimeout`.
 
 ## Known limitations
 

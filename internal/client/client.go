@@ -89,7 +89,7 @@ type Options struct {
 	Auth         string // "", "login" or "cram-md5" in any letter case; New refuses other values
 	Label        string // prefixes log lines, LIST, CAPABILITY, CREATE and APPEND errors, the sync scan and copy errors, and a reconnect give-up; dial, LOGIN and show statistics errors carry none
 	DialTimeout  time.Duration
-	IdleTimeout  time.Duration // zero or less means idleTimeout; tests lower it to see a watchdog trip
+	IdleTimeout  time.Duration // zero or less, or more than idleTimeout, means idleTimeout; only tests set it, to see a watchdog trip
 	UseTLS       bool
 	Verbose      bool
 }
@@ -185,7 +185,7 @@ func New(ctx context.Context, addr, username, password string, opts Options) (*C
 	}
 
 	idle := opts.IdleTimeout
-	if idle <= 0 {
+	if idle <= 0 || idle > idleTimeout {
 		idle = idleTimeout
 	}
 

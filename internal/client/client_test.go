@@ -2807,6 +2807,7 @@ func Test_New_When_OptionsSetIdleTimeout_Then_WatchdogUsesIt(t *testing.T) {
 		{name: "a positive value replaces the default", set: tripLimit, want: tripLimit},
 		{name: "zero keeps the default", set: 0, want: idleTimeout},
 		{name: "a negative value keeps the default", set: -time.Second, want: idleTimeout},
+		{name: "a value above the default keeps the default", set: idleTimeout + time.Minute, want: idleTimeout},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
