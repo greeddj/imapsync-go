@@ -27,6 +27,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v3"
 )
 
@@ -4575,30 +4576,50 @@ func TestRunSync_When_DestinationScanSendsNoUID_Then_CopiesOnlyTheMissingMessage
 func TestRunSync_When_CanceledDuringFolderCreation_Then_ReportsCancelNotCreateFailure(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(e2eContext(t))
-	t.Cleanup(cancel)
-	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
-	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
-	dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
-		if verb == "CREATE" {
-			cancel()
-			return "", true
-		}
-		return "", false
-	}))
-	opts := e2eOptions(&syncBuffer{}, "")
-	opts.autoConfirm = true
-
-	err := runSync(ctx, e2eConfig(src, dst, 1, mapping("Work", "Work")), opts)
-
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context.Canceled", err)
+	tests := []struct {
+		name        string
+		destination string
+		wantCounter string
+		wantCreates []string
+	}{
+		{name: "a destination with no missing parent", destination: "Work", wantCounter: "(1/1) Creating Work", wantCreates: []string{"Work"}},
+		// The counter counts the parents too: Old, Old/2020 and Old/2020/Work.
+		{name: "a destination with missing parents", destination: "Old/2020/Work", wantCounter: "(1/3) Creating Old/2020/Work", wantCreates: []string{"Old"}},
 	}
-	if strings.Contains(err.Error(), "failed to create") {
-		t.Errorf("error %q reports a creation failure for a Ctrl+C", err)
-	}
-	if n := dst.callCount("APPEND"); n != 0 {
-		t.Errorf("dst saw %d APPEND commands, want 0", n)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(e2eContext(t))
+			t.Cleanup(cancel)
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst.addConnHandler(scriptedHandler(dst, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+				if verb == "CREATE" {
+					cancel()
+					return "", true
+				}
+				return "", false
+			}))
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(ctx, e2eConfig(src, dst, 1, mapping("Work", tt.destination)), opts)
+
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if strings.Contains(err.Error(), "failed to create") {
+				t.Errorf("error %q reports a creation failure for a Ctrl+C", err)
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantCreates...)
+			assertContainsAll(t, out.String(), tt.wantCounter)
+			assertContainsNone(t, out.String(), folderFailuresHeader, "cannot create destination folder", "Failed to create folder", "Sync completed", "Sync stopped")
+			if n := dst.callCount("APPEND"); n != 0 {
+				t.Errorf("dst saw %d APPEND commands, want 0", n)
+			}
+		})
 	}
 }
 
@@ -4632,6 +4653,21 @@ func TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted(t *testin
 	assertContainsNone(t, out.String(), "Sync completed")
 	if n := dst.callCount("APPEND"); n != 1 {
 		t.Errorf("dst saw %d APPEND commands, want 1 (no plan starts after the cancel)", n)
+	}
+	atReturn := out.String()
+	// Four render ticks: a progress writer that outlived runSync would draw again.
+	time.Sleep(400 * time.Millisecond)
+	if later := out.String(); later != atReturn {
+		t.Errorf("runSync printed after it returned\nat return: %q\nlater: %q", atReturn, later)
+	}
+	assertContainsNone(t, atReturn, "errors occurred", "Sync stopped", folderFailuresHeader)
+	rows := screenRows(t, atReturn)
+	assertOneRow(t, rows, "1/2 Canceled A → A", "✗ error")
+	if started := rowsHolding(rows, "2/2 "); len(started) != 0 {
+		t.Errorf("rows %v belong to the plan that never started, want none\nscreen:\n%s", started, strings.Join(rows, "\n"))
+	}
+	if stale := rowsHolding(rows, "→", "%"); len(stale) != 0 {
+		t.Errorf("rows %v hold a tracker that is still in progress\nscreen:\n%s", stale, strings.Join(rows, "\n"))
 	}
 }
 
@@ -17027,7 +17063,7 @@ func waitForRedraws(t *testing.T, out *syncBuffer, from, n int) {
 	t.Errorf("the progress writer drew fewer than %d redraws within 5s", n)
 }
 
-func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTrackerPerWorker(t *testing.T) {
+func TestRunSync_When_PlanAndWorkerCountsDiffer_Then_EachRedrawHoldsAtMostOneTrackerPerBusyWorker(t *testing.T) {
 	t.Parallel()
 
 	const copyMarker = "📥 Syncing messages..."
@@ -17039,10 +17075,17 @@ func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTracker
 	}{
 		{name: "one worker, four plans", workers: 1, plans: 4},
 		{name: "two workers, six plans", workers: 2, plans: 6},
+		{name: "two plans and four workers", workers: 4, plans: 2},
 		{
 			name:    "throttle stop",
 			workers: 1,
 			plans:   5,
+			setup:   func(dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
+		},
+		{
+			name:    "throttle stop with two workers",
+			workers: 2,
+			plans:   6,
 			setup:   func(dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
 		},
 	}
@@ -17078,7 +17121,7 @@ func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTracker
 				if !errors.Is(err, ErrSilentExit) {
 					t.Fatalf("error = %v, want ErrSilentExit\noutput: %q", err, raw)
 				}
-				assertContainsAll(t, raw, "0 messages uploaded, 5 errors occurred, 0 folders failed")
+				assertContainsAll(t, raw, fmt.Sprintf("0 messages uploaded, %d errors occurred, 0 folders failed", tt.plans))
 			} else {
 				if err != nil {
 					t.Fatalf("runSync: %v\noutput: %q", err, raw)
@@ -17086,6 +17129,13 @@ func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTracker
 				assertContainsAll(t, raw, "Sync completed successfully")
 			}
 			assertContainsNone(t, raw, "Waiting")
+			// A worker connects only when the run has a plan for it.
+			bound := min(tt.workers, tt.plans)
+			for _, srv := range []*fakeServer{src, dst} {
+				if n := srv.callCount("LOGIN"); n != 1+bound {
+					t.Errorf("LOGIN count = %d, want %d: the planning connection and one for each worker", n, 1+bound)
+				}
+			}
 
 			start := strings.LastIndex(raw, copyMarker)
 			if start < 0 {
@@ -17095,8 +17145,11 @@ func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTracker
 			if len(runs) == 0 {
 				t.Fatalf("the copy drew no redraw\noutput: %q", raw[start:])
 			}
-			if largest := slices.Max(runs); largest > tt.workers {
-				t.Errorf("a redraw rewinds %d tracker rows, want at most %d (one for each worker); runs: %v", largest, tt.workers, runs)
+			if len(runs) < tt.plans/tt.workers && !throttled {
+				t.Errorf("the copy drew %d redraws, want at least %d: the bound would hold for the wrong reason", len(runs), tt.plans/tt.workers)
+			}
+			if largest := slices.Max(runs); largest > bound {
+				t.Errorf("a redraw rewinds %d tracker rows, want at most %d (one for each worker that has a plan); runs: %v", largest, bound, runs)
 			}
 
 			rows := screenRows(t, raw)
@@ -17106,14 +17159,17 @@ func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTracker
 				switch {
 				case !throttled:
 					final = []string{prefix + "Synced messages 1 " + name + " → " + name, "✓ done"}
-				case k == 0:
+				case k == 0 && tt.workers == 1:
 					final = []string{prefix + "Synced messages 0 (errors: 1) " + name + " → " + name, "✗ error"}
+				case k < tt.workers:
+					// Which of the first plans sees the stop before its APPEND depends on the workers, so only the mark is fixed.
+					final = []string{prefix, "✗ error"}
 				default:
 					final = []string{prefix + "Stopped " + name + " → " + name, "✗ error"}
 				}
 				assertOneRow(t, rows, prefix)
 				assertOneRow(t, rows, final...)
-				if throttled && k > 0 {
+				if throttled && k >= tt.workers {
 					if n := strings.Count(raw, prefix+"Stopped"); n != 1 {
 						t.Errorf("output holds %q %d times, want 1", prefix+"Stopped", n)
 					}
@@ -17129,31 +17185,69 @@ func TestRunSync_When_PlansOutnumberWorkers_Then_EachRedrawHoldsAtMostOneTracker
 func TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen(t *testing.T) {
 	t.Parallel()
 
-	const successLine = "✨ Sync completed successfully. ✨"
+	const (
+		successLine = "✨ Sync completed successfully. ✨"
+		failureLine = "• Bad → Bad: cannot scan source folder: [src] cannot select folder Bad: Internal error"
+	)
 	tests := []struct {
-		src          map[string][]fakeMsg
-		dst          map[string][]fakeMsg
-		setup        func(src, dst *fakeServer)
-		wantErr      error
-		name         string
-		firstAfter   string
-		last         string
-		mappings     []config.DirectoryMapping
-		trackerRows  [][]string
-		firstRows    int
-		firstFromEnd int
-		quiet        bool
+		src         map[string][]fakeMsg
+		dst         map[string][]fakeMsg
+		setup       func(src, dst *fakeServer)
+		wantErr     error
+		name        string
+		firstAfter  string
+		last        string
+		mappings    []config.DirectoryMapping
+		trackerRows [][]string
+		wantTail    []string
+		firstRows   int
+		quiet       bool
 	}{
 		{
-			name:         "success",
-			src:          map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x", "m3@x", "m4@x")},
-			dst:          map[string][]fakeMsg{"INBOX": nil},
-			mappings:     []config.DirectoryMapping{mapping("INBOX", "INBOX")},
-			firstAfter:   successLine,
-			last:         successLine,
-			trackerRows:  [][]string{{"1/1 Synced messages 4 INBOX → INBOX", "✓ done"}},
-			firstRows:    1,
-			firstFromEnd: 1,
+			name:        "success",
+			src:         map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x", "m3@x", "m4@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "INBOX")},
+			firstAfter:  successLine,
+			last:        successLine,
+			trackerRows: [][]string{{"1/1 Synced messages 4 INBOX → INBOX", "✓ done"}},
+			firstRows:   1,
+			wantTail:    []string{successLine},
+		},
+		{
+			name:       "refused appends",
+			src:        map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x")},
+			dst:        map[string][]fakeMsg{"INBOX": nil, "A": nil},
+			setup:      func(_, dst *fakeServer) { dst.refuseAppend() },
+			wantErr:    ErrSilentExit,
+			mappings:   []config.DirectoryMapping{mapping("A", "A")},
+			firstAfter: "❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 0 folders failed",
+			last:       "❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 0 folders failed",
+			trackerRows: [][]string{
+				{"1/1 Synced messages 0 (errors: 3) A → A", "✗ error"},
+			},
+			wantTail:  []string{"❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 0 folders failed"},
+			firstRows: 1,
+		},
+		{
+			name:       "a folder that cannot be scanned",
+			src:        map[string][]fakeMsg{"A": fakeMsgs("a1@x"), "Bad": fakeMsgs("z@x")},
+			dst:        map[string][]fakeMsg{"INBOX": nil, "A": nil},
+			setup:      func(src, _ *fakeServer) { src.refuseOpenWith("Bad", "NO [SERVERBUG] Internal error") },
+			wantErr:    ErrSilentExit,
+			mappings:   []config.DirectoryMapping{mapping("A", "A"), mapping("Bad", "Bad")},
+			firstAfter: folderFailuresHeader,
+			last:       "❌ Sync completed with errors. 1 messages uploaded, 0 errors occurred, 1 folders failed",
+			trackerRows: [][]string{
+				{"1/1 Synced messages 1 A → A", "✓ done"},
+			},
+			wantTail: []string{
+				"",
+				folderFailuresHeader,
+				failureLine,
+				"❌ Sync completed with errors. 1 messages uploaded, 0 errors occurred, 1 folders failed",
+			},
+			firstRows: 2,
 		},
 		{
 			name: "refused appends and a failed folder",
@@ -17163,26 +17257,61 @@ func TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen(t *testing.T)
 				src.refuseOpenWith("Bad", "NO [SERVERBUG] Internal error")
 				dst.refuseAppend()
 			},
-			wantErr:      ErrSilentExit,
-			mappings:     []config.DirectoryMapping{mapping("A", "A"), mapping("Bad", "Bad")},
-			firstAfter:   folderFailuresHeader,
-			last:         "❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 1 folders failed",
-			trackerRows:  [][]string{{"1/1 Synced messages 0 (errors: 3) A → A", "✗ error"}},
-			firstRows:    2,
-			firstFromEnd: 3,
+			wantErr:     ErrSilentExit,
+			mappings:    []config.DirectoryMapping{mapping("A", "A"), mapping("Bad", "Bad")},
+			firstAfter:  folderFailuresHeader,
+			last:        "❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 1 folders failed",
+			trackerRows: [][]string{{"1/1 Synced messages 0 (errors: 3) A → A", "✗ error"}},
+			wantTail: []string{
+				"",
+				folderFailuresHeader,
+				failureLine,
+				"❌ Sync completed with errors. 0 messages uploaded, 3 errors occurred, 1 folders failed",
+			},
+			firstRows: 2,
 		},
 		{
-			name:         "throttle stop",
-			src:          map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x")},
-			dst:          map[string][]fakeMsg{"A": nil, "B": nil},
-			setup:        func(_, dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
-			wantErr:      ErrSilentExit,
-			mappings:     []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")},
-			firstAfter:   destinationStopStart,
-			last:         "❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 0 folders failed",
-			trackerRows:  [][]string{{"1/2 Synced messages 0 (errors: 3) A → A", "✗ error"}, {"2/2 Stopped B → B", "✗ error"}},
-			firstRows:    1,
-			firstFromEnd: 2,
+			name:        "throttle stop",
+			src:         map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x")},
+			dst:         map[string][]fakeMsg{"A": nil, "B": nil},
+			setup:       func(_, dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) },
+			wantErr:     ErrSilentExit,
+			mappings:    []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")},
+			firstAfter:  destinationStopStart,
+			last:        "❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 0 folders failed",
+			trackerRows: [][]string{{"1/2 Synced messages 0 (errors: 3) A → A", "✗ error"}, {"2/2 Stopped B → B", "✗ error"}},
+			wantTail: []string{
+				destinationStopStart,
+				"❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 0 folders failed",
+			},
+			firstRows: 1,
+		},
+		{
+			name: "a throttle stop with an unstarted plan and a folder that cannot be scanned",
+			src: map[string][]fakeMsg{
+				"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x"), "Bad": fakeMsgs("z@x"),
+			},
+			dst: map[string][]fakeMsg{"A": nil, "B": nil},
+			setup: func(src, dst *fakeServer) {
+				src.refuseOpenWith("Bad", "NO [SERVERBUG] Internal error")
+				dst.refuseAppendWith(gmailThrottleReply)
+			},
+			wantErr:    ErrSilentExit,
+			mappings:   []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B"), mapping("Bad", "Bad")},
+			firstAfter: folderFailuresHeader,
+			last:       "❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 1 folders failed",
+			trackerRows: [][]string{
+				{"1/2 Synced messages 0 (errors: 3) A → A", "✗ error"},
+				{"2/2 Stopped B → B", "✗ error"},
+			},
+			wantTail: []string{
+				"",
+				folderFailuresHeader,
+				failureLine,
+				destinationStopStart,
+				"❌ Sync completed with errors. 0 messages uploaded, 5 errors occurred, 1 folders failed",
+			},
+			firstRows: 2,
 		},
 		{
 			name:       "throttle stop with quiet",
@@ -17245,17 +17374,24 @@ func TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen(t *testing.T)
 				t.Errorf("last row = %q, want %q\nscreen:\n%s", got, tt.last, strings.Join(rows, "\n"))
 			}
 			assertOneRow(t, rows, tt.last)
-			firstRows := rowsHolding(rows, tt.firstAfter)
-			if len(firstRows) != tt.firstRows {
-				t.Fatalf("%d rows hold %q, want %d\nscreen:\n%s", len(firstRows), tt.firstAfter, tt.firstRows, strings.Join(rows, "\n"))
+			if n := len(rowsHolding(rows, tt.firstAfter)); n != tt.firstRows {
+				t.Errorf("%d rows hold %q, want %d\nscreen:\n%s", n, tt.firstAfter, tt.firstRows, strings.Join(rows, "\n"))
 			}
-			first := firstRows[len(firstRows)-1]
-			if want := len(rows) - tt.firstFromEnd; first != want {
-				t.Errorf("first line after the copy is row %d, want row %d\nscreen:\n%s", first, want, strings.Join(rows, "\n"))
-			}
+			lastTracker := -1
 			for _, parts := range tt.trackerRows {
-				if i := assertOneRow(t, rows, parts...); i >= first {
-					t.Errorf("tracker row %d comes after the first line after the copy, row %d: %q", i, first, parts)
+				i := assertOneRow(t, rows, parts...)
+				if i < 0 {
+					return
+				}
+				lastTracker = max(lastTracker, i)
+			}
+			tail := rows[lastTracker+1:]
+			if len(tail) != len(tt.wantTail) {
+				t.Fatalf("%d rows follow the last tracker row, want %d\nscreen:\n%s", len(tail), len(tt.wantTail), strings.Join(rows, "\n"))
+			}
+			for i, want := range tt.wantTail {
+				if (want == "" && tail[i] != "") || !strings.Contains(tail[i], want) {
+					t.Errorf("row %d after the trackers = %q, want it to hold %q\nscreen:\n%s", i, tail[i], want, strings.Join(rows, "\n"))
 				}
 			}
 			if stale := rowsHolding(rows, "→", "%"); len(stale) != 0 {
@@ -17306,12 +17442,20 @@ func TestRunSync_When_WorkerSourceReconnects_Then_VerboseRunShowsTheWorkerLines(
 			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x", "m2@x")
 			assertContainsAll(t, out.String(), "Sync completed successfully")
 			if tt.verbose {
-				assertContainsAll(t, out.String(),
+				// Each line shows once, inside the copy section, so a writer that stops early would lose it.
+				rows := screenRows(t, out.String())
+				section := assertOneRow(t, rows, "📥 Syncing messages...")
+				summary := assertOneRow(t, rows, "✨ Sync completed successfully. ✨")
+				for _, line := range []string{
 					"[src-w1] 🔄 Reconnect attempt 1...",
 					"[src-w1] 🔄 Reconnected successfully",
 					`[dst-w1] Message "<m1@x>" appended to INBOX`,
 					`[dst-w1] Message "<m2@x>" appended to INBOX`,
-				)
+				} {
+					if i := assertOneRow(t, rows, line); i >= 0 && section >= 0 && summary >= 0 && (i <= section || i >= summary) {
+						t.Errorf("row %d (%q) is outside the copy section, rows %d to %d", i, line, section, summary)
+					}
+				}
 				return
 			}
 			assertContainsNone(t, out.String(), "Reconnect attempt", "[src-w1]", "[dst-w1]")
@@ -17548,4 +17692,517 @@ func Test_lineLog_When_Logged_Then_WritesOneLinePerCall(t *testing.T) {
 			t.Errorf("writes = %q, want %q", rec.writes, want)
 		}
 	})
+}
+
+// forceColours turns go-pretty colours on until the test ends. The flag is process-wide, so only a sequential test may call it.
+func forceColours(t *testing.T) {
+	t.Helper()
+	wereOn := text.Bold.Sprint("x") != "x"
+	text.EnableColors()
+	t.Cleanup(func() {
+		if !wereOn {
+			text.DisableColors()
+		}
+	})
+	if got := text.Bold.Sprint("x"); got != "\x1b[1mx\x1b[0m" {
+		t.Fatalf("forced colours give %q, want bold codes around x", got)
+	}
+}
+
+// Sequential on purpose: forceColours flips go-pretty's process-wide colour flag. Parallel tests stay paused until this one ends.
+func TestRunSync_When_ColoursAreForcedOn_Then_QuietOutputHoldsNoEscapeByte(t *testing.T) {
+	forceColours(t)
+
+	type servers func(t *testing.T) (src, dst *fakeServer, mappings []config.DirectoryMapping)
+	one := func(src, dst map[string][]fakeMsg, setup func(t *testing.T, src, dst *fakeServer), mappings ...config.DirectoryMapping) servers {
+		return func(t *testing.T) (*fakeServer, *fakeServer, []config.DirectoryMapping) {
+			t.Helper()
+			s, d := newStoreServer(t, "/", src), newStoreServer(t, "/", dst)
+			if setup != nil {
+				setup(t, s, d)
+			}
+			return s, d, mappings
+		}
+	}
+	twoPlans := map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x", "a3@x"), "B": fakeMsgs("b1@x", "b2@x")}
+	tests := []struct {
+		build   servers
+		wantErr error
+		name    string
+		want    []string
+		idle    time.Duration
+		verbose bool
+	}{
+		{
+			name:  "copy into new nested folders",
+			build: one(map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")}, map[string][]fakeMsg{"INBOX": nil}, nil, mapping("INBOX", "Old/2020/Inbox")),
+			want:  []string{"Sync completed successfully"},
+		},
+		{
+			name:    "copy into new nested folders with verbose",
+			build:   one(map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")}, map[string][]fakeMsg{"INBOX": nil}, nil, mapping("INBOX", "Old/2020/Inbox")),
+			verbose: true,
+			want:    []string{"Sync completed successfully"},
+		},
+		{
+			name:  "nothing to copy",
+			build: one(map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")}, map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")}, nil, mapping("INBOX", "INBOX")),
+		},
+		{
+			name: "every CREATE refused",
+			build: one(map[string][]fakeMsg{"Work": fakeMsgs("m1@x")}, map[string][]fakeMsg{"INBOX": nil},
+				func(_ *testing.T, _, dst *fakeServer) { dst.refuseCreate() }, mapping("Work", "Work")),
+			wantErr: ErrSilentExit,
+			want:    []string{"1 folders failed"},
+		},
+		{
+			name: "throttled CREATE of a parent",
+			build: one(map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")}, map[string][]fakeMsg{"INBOX": nil},
+				func(_ *testing.T, _, dst *fakeServer) { dst.refuseCreateOf("Old", gmailThrottleReply) }, mapping("A", "Old/A"), mapping("B", "B")),
+			wantErr: ErrSilentExit,
+			want:    []string{destinationStopStart},
+		},
+		{
+			name: "throttled APPEND with a plan that never starts",
+			build: one(twoPlans, map[string][]fakeMsg{"A": nil, "B": nil},
+				func(_ *testing.T, _, dst *fakeServer) { dst.refuseAppendWith(gmailThrottleReply) }, mapping("A", "A"), mapping("B", "B")),
+			wantErr: ErrSilentExit,
+			want:    []string{destinationStopStart, "0 messages uploaded, 5 errors occurred"},
+		},
+		{
+			name: "refused APPEND",
+			build: one(twoPlans, map[string][]fakeMsg{"A": nil, "B": nil},
+				func(_ *testing.T, _, dst *fakeServer) { dst.refuseAppend() }, mapping("A", "A"), mapping("B", "B")),
+			wantErr: ErrSilentExit,
+			want:    []string{"0 messages uploaded, 5 errors occurred"},
+		},
+		{
+			name: "folder failure",
+			build: one(map[string][]fakeMsg{"A": fakeMsgs("a@x"), "Bad": fakeMsgs("z@x")}, map[string][]fakeMsg{"A": nil},
+				func(_ *testing.T, src, _ *fakeServer) { src.refuseOpenWith("Bad", "NO [SERVERBUG] Internal error") }, mapping("A", "A"), mapping("Bad", "Bad")),
+			wantErr: ErrSilentExit,
+			want:    []string{folderFailuresHeader, "1 messages uploaded, 0 errors occurred, 1 folders failed"},
+		},
+		{
+			name: "folder that LIST hides and that already holds a message",
+			build: one(map[string][]fakeMsg{"A": fakeMsgs("m1@x", "m2@x")}, map[string][]fakeMsg{"INBOX": nil, "A": fakeMsgs("m1@x")},
+				func(_ *testing.T, _, dst *fakeServer) { dst.hideFromList("A") }, mapping("A", "A")),
+			want: []string{"Sync completed successfully"},
+		},
+		{
+			name: "worker source goes silent",
+			build: one(map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x", "m2@x")}, map[string][]fakeMsg{"INBOX": nil},
+				func(t *testing.T, src, _ *fakeServer) { src.stallNth(t, "UID", 1) }, mapping("INBOX", "INBOX")),
+			idle: time.Second,
+			want: []string{"Sync completed successfully"},
+		},
+	}
+
+	t.Run("control: output without quiet holds the colour codes", func(t *testing.T) {
+		t.Parallel()
+
+		src, dst, mappings := one(map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")}, map[string][]fakeMsg{"INBOX": nil}, nil, mapping("INBOX", "INBOX"))(t)
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+
+		if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mappings...), opts); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+
+		assertContainsAll(t, out.String(), "\x1b[96m", "\x1b[32m✓ done")
+	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, dst, mappings := tt.build(t)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.quiet, opts.verbose = true, true, tt.verbose
+			if tt.idle > 0 {
+				opts.clientOpts.IdleTimeout = tt.idle
+			}
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mappings...), opts)
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v\noutput: %q", err, tt.wantErr, out.String())
+			}
+			raw := out.String()
+			assertNoEscapeSequence(t, raw)
+			assertContainsAll(t, raw, tt.want...)
+			if tt.idle > 0 {
+				assertContainsNone(t, raw, "No data from server")
+			}
+		})
+	}
+}
+
+func TestRunSync_When_LastSourceFolderWarns_Then_WarningStaysOnScreenWhicheverSideFinishesLast(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		slowSide   string
+		firstTrack string
+		lastTrack  string
+	}{
+		{name: "the source side finishes last", slowSide: "src", firstTrack: "[dst] Scanned B (2/2)", lastTrack: "[src] Scanned B (2/2)"},
+		{name: "the source side finishes first", slowSide: "dst", firstTrack: "[src] Scanned B (2/2)", lastTrack: "[dst] Scanned B (2/2)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": {{body: bodyOfSize("", 900)}, {msgID: "a1@x"}},
+				"B": {{body: bodyOfSize("", 800)}, {msgID: "b1@x"}},
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "A": fakeMsgs("a1@x"), "B": fakeMsgs("b1@x")})
+			slow := map[string]*fakeServer{"src": src, "dst": dst}[tt.slowSide]
+			out := &syncBuffer{}
+			// The slow side's second scan FETCH is folder B. It waits until the other side shows B as done, so the slow side ends in a later frame.
+			slow.onCommand("FETCH", func() {
+				if slow.callCount("FETCH") == 2 {
+					waitForScreenRow(t, out, tt.firstTrack, "✓ done")
+				}
+			})
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			rows := screenRows(t, out.String())
+			summary := assertOneRow(t, rows, "✅ All folders already synced!")
+			for _, warning := range []string{
+				"[src] ⚠️  A: 1 message(s) without Message-Id will be skipped - sync cannot track them",
+				"[src] ⚠️  B: 1 message(s) without Message-Id will be skipped - sync cannot track them",
+			} {
+				if i := assertOneRow(t, rows, warning); i >= 0 && summary >= 0 && i > summary {
+					t.Errorf("warning row %d comes after the summary row %d: %q", i, summary, warning)
+				}
+			}
+			first := assertOneRow(t, rows, tt.firstTrack, "✓ done")
+			last := assertOneRow(t, rows, tt.lastTrack, "✓ done")
+			if first >= 0 && last >= 0 && first > last {
+				t.Errorf("row %q is row %d and row %q is row %d, want the side that finished first on top", tt.firstTrack, first, tt.lastTrack, last)
+			}
+			if stale := rowsHolding(rows, "Scanning"); len(stale) != 0 {
+				t.Errorf("rows %v hold a scan that is still in progress\nscreen:\n%s", stale, strings.Join(rows, "\n"))
+			}
+		})
+	}
+}
+
+// previewedFolders returns the names that the preview lists under "Folders to be created on destination".
+func previewedFolders(raw string) []string {
+	const header = "Folders to be created on destination:\n"
+	_, after, ok := strings.Cut(raw, header)
+	if !ok {
+		return nil
+	}
+	block, _, _ := strings.Cut(after, "\n\n")
+	var names []string
+	for line := range strings.SplitSeq(block, "\n") {
+		names = append(names, strings.TrimPrefix(line, "• "))
+	}
+	return names
+}
+
+func TestRunSync_When_DestinationParentsAreCreated_Then_PreviewWireCounterAndLogsAgree(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src         map[string][]fakeMsg
+		dst         map[string][]fakeMsg
+		setup       func(dst *fakeServer)
+		check       func(t *testing.T, dst *fakeServer)
+		name        string
+		dstDelim    string
+		mappings    []config.DirectoryMapping
+		wantFolders []string
+		wantRows    [][]string
+		wantLines   []string
+		noRows      [][]string
+	}{
+		{
+			name:        "a typed destination names the INBOX level in lower case",
+			src:         map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "inbox/Old/X")},
+			wantFolders: []string{"INBOX/Old", "INBOX/Old/X"},
+			wantRows:    [][]string{{"Created 2 folders", "✓ done"}},
+			wantLines: []string{
+				"[dst] Creating parent folder: INBOX/Old",
+				"[dst] Created parent folder: INBOX/Old",
+				`Created folder "INBOX/Old/X"`,
+			},
+			noRows: [][]string{{"Parent folder already exists"}},
+			check: func(t *testing.T, dst *fakeServer) {
+				t.Helper()
+				assertIDs(t, "dst INBOX/Old/X", dst.folderMsgIDs("INBOX/Old/X"), "m1@x")
+			},
+		},
+		{
+			name:        "the destination delimiter is a dot",
+			src:         map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    ".",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old.2020.Inbox")},
+			wantFolders: []string{"Old", "Old.2020", "Old.2020.Inbox"},
+			wantRows:    [][]string{{"Created 3 folders", "✓ done"}},
+			wantLines: []string{
+				"[dst] Created parent folder: Old",
+				"[dst] Created parent folder: Old.2020",
+				`Created folder "Old.2020.Inbox"`,
+			},
+			check: func(t *testing.T, dst *fakeServer) {
+				t.Helper()
+				assertIDs(t, "dst Old.2020.Inbox", dst.folderMsgIDs("Old.2020.Inbox"), "m1@x")
+			},
+		},
+		{
+			name: "a hidden parent answers Duplicate folder name",
+			src:  map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")},
+			dst:  map[string][]fakeMsg{"INBOX": nil},
+			setup: func(dst *fakeServer) {
+				dst.refuseCreateOf("Old", "NO [ALREADYEXISTS] Duplicate folder name Old (Failure)")
+			},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020")},
+			wantFolders: []string{"Old", "Old/2020"},
+			wantRows:    [][]string{{"Created 1 folders", "✓ done"}},
+			wantLines: []string{
+				"[dst] Creating parent folder: Old",
+				"[dst] Parent folder already exists: Old",
+				`Created folder "Old/2020"`,
+			},
+			noRows: [][]string{{"Created parent folder"}, {"✗ error"}, {"Failed to create folder"}},
+			check: func(t *testing.T, dst *fakeServer) {
+				t.Helper()
+				assertIDs(t, "dst Old/2020", dst.folderMsgIDs("Old/2020"), "m1@x")
+			},
+		},
+		{
+			name:        "parents of a folder that LIST hides",
+			src:         map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil, "Old": nil},
+			setup:       func(dst *fakeServer) { dst.hideFromList("Old") },
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("INBOX", "Old/2020")},
+			wantFolders: []string{"Old", "Old/2020"},
+			wantRows:    [][]string{{"Created 1 folders", "✓ done"}},
+			wantLines:   []string{"[dst] Parent folder already exists: Old"},
+			noRows:      [][]string{{"Created parent folder"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, tt.dstDelim, tt.dst)
+			if tt.setup != nil {
+				tt.setup(dst)
+			}
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			raw := out.String()
+			previewed := previewedFolders(raw)
+			if !slices.Equal(previewed, tt.wantFolders) {
+				t.Errorf("preview lists %q, want %q: parents before children, each name once", previewed, tt.wantFolders)
+			}
+			if wire := dst.capturedNames("CREATE"); !slices.Equal(wire, previewed) {
+				t.Errorf("CREATE names on the wire = %q, preview = %q, want the same names", wire, previewed)
+			}
+			if slices.Contains(dst.capturedNames("CREATE"), "INBOX") {
+				t.Error("dst received CREATE for INBOX, which it lists")
+			}
+			// The planning client and the one worker list once each: finding the missing levels reads the cache only.
+			for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+				if n := srv.callCount("LIST"); n != 2 {
+					t.Errorf("%s LIST count = %d, want 2", name, n)
+				}
+			}
+			rows := screenRows(t, raw)
+			for _, parts := range tt.wantRows {
+				assertOneRow(t, rows, parts...)
+			}
+			for _, line := range tt.wantLines {
+				n := len(slices.DeleteFunc(slices.Clone(rows), func(row string) bool { return row != line }))
+				if n != 1 {
+					t.Errorf("screen holds the row %q %d times, want 1\nscreen:\n%s", line, n, strings.Join(rows, "\n"))
+				}
+			}
+			for _, parts := range tt.noRows {
+				if found := rowsHolding(rows, parts...); len(found) != 0 {
+					t.Errorf("rows %v hold all of %q, want none\nscreen:\n%s", found, parts, strings.Join(rows, "\n"))
+				}
+			}
+			if tt.check != nil {
+				tt.check(t, dst)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_ParentCreateIsThrottled_Then_NoFurtherCreateAndCounterShowsTheRefusal(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.refuseCreateOf("Old", gmailThrottleReply)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "Old/A"), mapping("B", "B")), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	// B sorts before Old/A, so the throttled parent is the last CREATE.
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "B", "Old")
+	if n := dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d APPEND commands, want 0: the stop comes before the copy", n)
+	}
+	raw := out.String()
+	assertContainsNone(t, raw, "Syncing messages")
+	rows := screenRows(t, raw)
+	counter := assertOneRow(t, rows, "Created 1 of 3 folders, 1 refused", "✗ error")
+	assertOneRow(t, rows, `Failed to create folder "Old/A"`, "failed to create parent folder Old")
+	stopped := assertOneRow(t, rows, destinationStopStart)
+	summary := assertOneRow(t, rows, "❌ Sync completed with errors. 0 messages uploaded, 2 errors occurred, 0 folders failed")
+	if summary >= 0 && summary != len(rows)-1 {
+		t.Errorf("summary row = %d of %d, want the last row\nscreen:\n%s", summary, len(rows), strings.Join(rows, "\n"))
+	}
+	if stopped >= 0 && counter >= 0 && stopped < counter {
+		t.Errorf("stop line is row %d and the counter is row %d, want the counter first", stopped, counter)
+	}
+	if n := strings.Count(raw, destinationStopStart); n != 1 {
+		t.Errorf("output holds the stop line %d times, want 1", n)
+	}
+}
+
+func TestRunSync_When_FolderNameHoldsFormatVerbs_Then_EveryPhaseShowsItVerbatim(t *testing.T) {
+	t.Parallel()
+
+	const folder = "100%d %s"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{folder: {
+		{body: bodyOfSize("", 900)}, {msgID: "m1@x"}, {msgID: "m2@x", envelopeID: "<m2@x>"},
+	}})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, folder: fakeMsgs("m1@x")})
+	dst.hideFromList(folder)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(folder, folder)), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	raw := out.String()
+	assertContainsNone(t, raw, "%!")
+	rows := screenRows(t, raw)
+	if found := rowsHolding(rows, "[src] ⚠️  "+folder+": 1 message(s) without Message-Id will be skipped"); len(found) == 0 {
+		t.Errorf("screen has no warning row for %q\nscreen:\n%s", folder, strings.Join(rows, "\n"))
+	}
+	assertOneRow(t, rows, "[dst] Fetching folder "+folder+"...")
+	assertOneRow(t, rows, "Folder "+folder+" already exists")
+	assertOneRow(t, rows, "[src-w1] Streaming 1 messages from "+folder)
+	assertOneRow(t, rows, `[dst-w1] Message "<m2@x>" appended to `+folder)
+	assertIDs(t, "dst appends", dst.appended(folder), "m2@x")
+}
+
+func TestRunSync_When_PlanRuns_Then_ItsRowShowsEscapedNamesAndTheServerGetsTheExactOnes(t *testing.T) {
+	t.Parallel()
+
+	srcWire, srcName, srcShown := hostileFolder("A")
+	dstWire, dstName, dstShown := hostileFolder("B")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{srcWire: fakeMsgs("e1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	dst.onCommand("APPEND", func() { waitForCopyFrame(t, out) })
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping(srcName, dstName)), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	raw := out.String()
+	_, copyPart, _ := strings.Cut(raw, "📥 Syncing messages...")
+	firstFrame, _, _ := strings.Cut(copyPart, "\x1b[A")
+	if !strings.Contains(firstFrame, "1/1 "+srcShown+" → "+dstShown) {
+		t.Errorf("the first frame of the copy does not hold the running row with the escaped names\nframe: %q", firstFrame)
+	}
+	assertContainsNone(t, raw, srcName, dstName, "\x1b[2J")
+	assertOneRow(t, screenRows(t, raw), "1/1 Synced messages 1 "+srcShown, "✓ done")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), dstWire)
+	assertIDs(t, "dst APPENDs", dst.appended(dstWire), "e1@x")
+}
+
+// waitForScreenRow blocks until one row of the screen that out draws holds every part. It runs on a server goroutine, so it uses Errorf.
+func waitForScreenRow(t *testing.T, out *syncBuffer, parts ...string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// A read can end inside an escape sequence, which is an error and only means the frame is not whole yet.
+		if rows, err := renderScreen(out.String()); err == nil && len(rowsHolding(rows, parts...)) > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("the screen had no row with all of %q within 5s", parts)
+}
+
+// waitForOutput blocks until out holds want. It runs on a server goroutine, so it uses Errorf.
+func waitForOutput(t *testing.T, out *syncBuffer, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), want) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("the output did not hold %q within 5s", want)
+}
+
+func TestRunSync_When_ParentsAreCreatedBeforeALaterFolder_Then_TheCounterTextCountsThemToo(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a@x"), "B": fakeMsgs("b@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	// Old/A sorts first and makes Old and Old/A, so Z is the third of the three names that the preview lists.
+	dst.onCommand("CREATE", func() {
+		if dst.callCount("CREATE") == 3 {
+			waitForOutput(t, out, "(3/3) Creating Z")
+		}
+	})
+	opts := e2eOptions(out, "")
+	opts.autoConfirm = true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "Old/A"), mapping("B", "Z")), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	raw := out.String()
+	assertContainsAll(t, raw, "(3/3) Creating Z")
+	assertContainsNone(t, raw, "(2/3) Creating", "(3/4) Creating")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Old", "Old/A", "Z")
+	assertOneRow(t, screenRows(t, raw), "Created 3 folders", "✓ done")
 }

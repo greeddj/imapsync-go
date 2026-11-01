@@ -345,6 +345,61 @@ func TestRunShow_When_LoginRefused_Then_NamesTheFailingAccount(t *testing.T) {
 	}
 }
 
+func TestRunShow_When_AnAccountFails_Then_ItsRowShowsTheErrorMarkAndNoRowStaysInProgress(t *testing.T) {
+	t.Parallel()
+
+	refuseList := func(srv *fakeServer) {
+		srv.addConnHandler(scriptedHandler(srv, []string{"INBOX"}, func(verb string, _ int) (string, bool) {
+			if verb == "LIST" {
+				return "NO [CANNOT] list refused", true
+			}
+			return "", false
+		}))
+	}
+	tests := []struct {
+		setup   func(src, dst *fakeServer)
+		name    string
+		failing string
+	}{
+		{name: "source login refused", failing: "[src]", setup: func(src, _ *fakeServer) { src.refuseLogin() }},
+		{name: "destination login refused", failing: "[dst]", setup: func(_, dst *fakeServer) { dst.refuseLogin() }},
+		{name: "source LIST refused at connect", failing: "[src]", setup: func(src, _ *fakeServer) { refuseList(src) }},
+		{name: "destination LIST refused at connect", failing: "[dst]", setup: func(_, dst *fakeServer) { refuseList(dst) }},
+		{name: "source LIST fails after connect", failing: "[src]", setup: func(src, _ *fakeServer) { src.addConnHandler(listFailsAfterConnectHandler(src, "INBOX")) }},
+		{name: "destination LIST fails after connect", failing: "[dst]", setup: func(_, dst *fakeServer) { dst.addConnHandler(listFailsAfterConnectHandler(dst, "INBOX")) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("a@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("b@x")})
+			tt.setup(src, dst)
+			out := &syncBuffer{}
+
+			err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, false))
+
+			if err == nil {
+				t.Fatalf("runShow returned nil, want the account failure\noutput: %s", out.String())
+			}
+			rows := screenRows(t, out.String())
+			// The other account ends done or canceled, whichever lands first, and both are final rows.
+			assertOneRow(t, rows, tt.failing, "✗ error")
+			if len(rows) != 2 {
+				t.Errorf("screen has %d rows, want the two tracker rows and no table\nscreen:\n%s", len(rows), strings.Join(rows, "\n"))
+			}
+			for _, label := range []string{"[src]", "[dst]"} {
+				if n := len(rowsHolding(rows, label)); n != 1 {
+					t.Errorf("%d rows hold %s, want 1\nscreen:\n%s", n, label, strings.Join(rows, "\n"))
+				}
+			}
+			if stale := rowsHolding(rows, "%"); len(stale) != 0 {
+				t.Errorf("rows %v hold a tracker that is still in progress\nscreen:\n%s", stale, strings.Join(rows, "\n"))
+			}
+		})
+	}
+}
+
 func TestRunShow_When_ContextAlreadyCanceled_Then_ReturnsBeforeConnecting(t *testing.T) {
 	t.Parallel()
 
@@ -363,16 +418,7 @@ func TestRunShow_When_ContextAlreadyCanceled_Then_ReturnsBeforeConnecting(t *tes
 
 // Sequential on purpose: text.EnableColors flips go-pretty's process-wide colour flag, which parallel tests read. Parallel tests stay paused until this one ends.
 func TestRunShow_When_ColoursAreForcedOn_Then_OnlyOutputWithoutQuietHoldsEscapeSequences(t *testing.T) {
-	wereOn := text.Bold.Sprint("x") != "x"
-	text.EnableColors()
-	t.Cleanup(func() {
-		if !wereOn {
-			text.DisableColors()
-		}
-	})
-	if got := text.Bold.Sprint("x"); got != "\x1b[1mx\x1b[0m" {
-		t.Fatalf("forced colours give %q, want bold codes around x", got)
-	}
+	forceColours(t)
 
 	msgSize := uint64(len(imapFullBody("a@x")))
 	const (

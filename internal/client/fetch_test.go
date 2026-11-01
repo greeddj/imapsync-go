@@ -620,30 +620,146 @@ func Test_FetchMessageMap_When_MessagesShareMessageId_Then_KeepsEveryUIDInAscend
 	}
 }
 
-func Test_MessageIDScans_When_FolderHoldsMessagesWithoutMessageId_Then_OnlyTheSourceScanWarns(t *testing.T) {
+func Test_MessageIDScans_When_FoldersAreScanned_Then_OnlyTheSourceScanWarnsAboutMessagesWithoutAMessageId(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		scan        func(*Client) (map[string][]MessageRef, error)
-		name        string
-		prefix      string
-		wantWarning string
+	scans := []struct {
+		scan   func(ctx context.Context, c *Client) (map[string][]MessageRef, error)
+		name   string
+		prefix string
+		warns  bool
 	}{
 		{
 			name:   "source scan",
 			prefix: "src",
-			scan: func(c *Client) (map[string][]MessageRef, error) {
-				got, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+			scan: func(ctx context.Context, c *Client) (map[string][]MessageRef, error) {
+				got, _, err := c.FetchMessageMap(ctx, "INBOX")
 				return got, err
 			},
-			wantWarning: "[src] ⚠️  INBOX: 2 message(s) without Message-Id will be skipped - sync cannot track them",
+			warns: true,
 		},
 		{
 			name:   "destination scan",
 			prefix: "dst",
-			scan: func(c *Client) (map[string][]MessageRef, error) {
-				return c.FetchMessageCopies(t.Context(), "INBOX")
+			scan: func(ctx context.Context, c *Client) (map[string][]MessageRef, error) {
+				return c.FetchMessageCopies(ctx, "INBOX")
 			},
+		},
+	}
+	folders := []struct {
+		want        map[string][]MessageRef
+		name        string
+		wantWarning string
+		rows        []scanRow
+	}{
+		{
+			name: "some messages have no Message-Id",
+			rows: []scanRow{
+				{uid: 1, size: 10},
+				{msgID: "a@x", uid: 2, size: 20},
+				{uid: 3, size: 30},
+			},
+			want:        map[string][]MessageRef{"a@x": {{UID: 2, Size: 20}}},
+			wantWarning: "[src] ⚠️  INBOX: 2 message(s) without Message-Id will be skipped - sync cannot track them",
+		},
+		{
+			name: "every message has a Message-Id",
+			rows: []scanRow{
+				{msgID: "a@x", uid: 1, size: 10},
+				{msgID: "b@x", uid: 2, size: 20},
+			},
+			want: map[string][]MessageRef{"a@x": {{UID: 1, Size: 10}}, "b@x": {{UID: 2, Size: 20}}},
+		},
+	}
+	for _, sc := range scans {
+		t.Run(sc.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, folder := range folders {
+				t.Run(folder.name, func(t *testing.T) {
+					t.Parallel()
+
+					srv := newFakeServer(t)
+					srv.addConnHandler(interceptHandler(srv, scanIntercept(folder.rows)))
+					c := newClientWithFake(t, srv)
+					c.prefix = sc.prefix
+					c.verbose = true
+					var logged []string
+					c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+					got, err := sc.scan(t.Context(), c)
+
+					if err != nil {
+						t.Fatalf("scan: %v", err)
+					}
+					if !equalMessageMaps(got, folder.want) {
+						t.Errorf("map = %v, want %v", got, folder.want)
+					}
+					var want []string
+					if sc.warns && folder.wantWarning != "" {
+						want = []string{folder.wantWarning}
+					}
+					if warnings := missingIDWarnings(logged); !slices.Equal(warnings, want) {
+						t.Errorf("warnings = %q, want %q", warnings, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func missingIDWarnings(logged []string) []string {
+	var warnings []string
+	for _, msg := range logged {
+		if strings.Contains(msg, "without Message-Id") {
+			warnings = append(warnings, msg)
+		}
+	}
+	return warnings
+}
+
+func Test_FetchMessageMap_When_ScanFails_Then_NoMissingMessageIdWarningIsLogged(t *testing.T) {
+	t.Parallel()
+
+	noID := scanRow{uid: 1, size: 10}
+	tests := []struct {
+		setup     func(srv *fakeServer)
+		wantErr   error
+		name      string
+		wantClass ErrClass
+	}{
+		{
+			name: "a response with a Message-Id and no UID follows messages without a Message-Id",
+			setup: func(srv *fakeServer) {
+				srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+					noID, {uid: 2, size: 20}, {msgID: "a@x", noUID: true, size: 30}, {msgID: "b@x", uid: 4, size: 40},
+				})))
+			},
+			wantErr:   errMissingUID,
+			wantClass: ClassUnknown,
+		},
+		{
+			name: "the server refuses EXAMINE",
+			setup: func(srv *fakeServer) {
+				srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+					if cmd.verb != "EXAMINE" {
+						return false, true
+					}
+					writeLine(conn, "%s NO [NONEXISTENT] Mailbox does not exist", cmd.tag)
+					return true, true
+				}))
+			},
+			wantErr:   ErrSelectRefused,
+			wantClass: ClassUnknown,
+		},
+		{
+			name: "the connection drops after messages without a Message-Id and the reconnect is refused",
+			setup: func(srv *fakeServer) {
+				rows := []scanRow{noID, {uid: 2, size: 20}, {msgID: "a@x", uid: 3, size: 30}}
+				srv.addConnHandler(interceptHandler(srv, scanSession(rows, 2, 0)))
+				srv.addConnHandler(connHandlerWithLoginReply(srv, "NO [AUTHENTICATIONFAILED] Authentication failed."))
+			},
+			wantClass: ClassPermanent,
 		},
 	}
 	for _, tt := range tests {
@@ -651,38 +767,186 @@ func Test_MessageIDScans_When_FolderHoldsMessagesWithoutMessageId_Then_OnlyTheSo
 			t.Parallel()
 
 			srv := newFakeServer(t)
-			srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
-				{uid: 1, size: 10},
-				{msgID: "a@x", uid: 2, size: 20},
-				{uid: 3, size: 30},
-			})))
+			tt.setup(srv)
 			c := newClientWithFake(t, srv)
-			c.prefix = tt.prefix
+			c.prefix = "src"
 			c.verbose = true
 			var logged []string
 			c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
 
-			got, err := tt.scan(c)
+			got, _, err := c.FetchMessageMap(t.Context(), "Archive")
 
-			if err != nil {
-				t.Fatalf("scan: %v", err)
+			if err == nil {
+				t.Fatal("FetchMessageMap returned nil, want a failure")
 			}
-			if want := map[string][]MessageRef{"a@x": {{UID: 2, Size: 20}}}; !equalMessageMaps(got, want) {
-				t.Errorf("map = %v, want %v", got, want)
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("error = %v, want it to wrap %v", err, tt.wantErr)
 			}
-			var warnings []string
-			for _, msg := range logged {
-				if strings.Contains(msg, "without Message-Id") {
-					warnings = append(warnings, msg)
-				}
+			if class := classifyError(err); class != tt.wantClass {
+				t.Errorf("classifyError(err) = %s, want %s", class, tt.wantClass)
 			}
-			switch {
-			case tt.wantWarning == "" && len(warnings) != 0:
-				t.Errorf("got warnings %q, want none", warnings)
-			case tt.wantWarning != "" && !slices.Equal(warnings, []string{tt.wantWarning}):
-				t.Errorf("warnings = %q, want exactly %q", warnings, tt.wantWarning)
+			if got != nil {
+				t.Errorf("map = %v, want nil", got)
+			}
+			if warnings := missingIDWarnings(logged); len(warnings) != 0 {
+				t.Errorf("a failed scan logged %q, want no missing Message-Id warning", warnings)
 			}
 		})
+	}
+}
+
+func Test_FetchMessageMap_When_ContextEndsMidScan_Then_NoMissingMessageIdWarningIsLogged(t *testing.T) {
+	t.Parallel()
+
+	reached := make(chan struct{})
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, rd *bufio.Reader, cmd command) (handled, keep bool) {
+		switch cmd.verb {
+		case "EXAMINE":
+			writeLine(conn, "* 2 EXISTS")
+			writeLine(conn, "%s OK [READ-ONLY] EXAMINE completed", cmd.tag)
+			return true, true
+		case "FETCH":
+			writeScanRow(conn, 1, scanRow{uid: 1, size: 10})
+			writeScanRow(conn, 2, scanRow{uid: 2, size: 20})
+			close(reached)
+			// The client closes the socket when its context ends.
+			_, _ = rd.ReadByte()
+			return true, false
+		}
+		return false, true
+	}))
+	c := newClientWithFake(t, srv)
+	c.prefix = "src"
+	c.verbose = true
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := c.FetchMessageMap(ctx, "INBOX")
+		errc <- err
+	}()
+	awaitSignal(t, reached, "the server to send the rows")
+	// The scan reads the rows on its own goroutine. A slow reader only weakens this check.
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+
+	err := awaitError(t, errc, "FetchMessageMap after the context ended")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if warnings := missingIDWarnings(logged); len(warnings) != 0 {
+		t.Errorf("a canceled scan logged %q, want no missing Message-Id warning", warnings)
+	}
+}
+
+func Test_FetchMessageMap_When_RetryFindsOtherMissingIdCount_Then_WarningCountsTheSuccessfulAttempt(t *testing.T) {
+	t.Parallel()
+
+	rows := []scanRow{
+		{uid: 1, size: 10},
+		{msgID: "a@x", uid: 2, size: 20},
+		{msgID: "b@x", uid: 3, size: 30},
+		{uid: 4, size: 40},
+		{uid: 5, size: 50},
+	}
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanSession(rows, 3, 0)))
+	srv.addConnHandler(interceptHandler(srv, scanSession(rows, len(rows), 0)))
+	c := newClientWithFake(t, srv)
+	c.prefix = "src"
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	got, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v, want success after the reconnect", err)
+	}
+	if want := map[string][]MessageRef{"a@x": {{UID: 2, Size: 20}}, "b@x": {{UID: 3, Size: 30}}}; !equalMessageMaps(got, want) {
+		t.Errorf("map = %v, want %v", got, want)
+	}
+	want := []string{"[src] ⚠️  INBOX: 3 message(s) without Message-Id will be skipped - sync cannot track them"}
+	if warnings := missingIDWarnings(logged); !slices.Equal(warnings, want) {
+		t.Errorf("warnings = %q, want exactly %q: the count of the attempt that succeeded, once", warnings, want)
+	}
+}
+
+func Test_MessageIDScans_When_ContextAlreadyEnded_Then_SendNoCommand(t *testing.T) {
+	t.Parallel()
+
+	scans := []struct {
+		scan func(ctx context.Context, c *Client) error
+		name string
+	}{
+		{name: "source scan", scan: func(ctx context.Context, c *Client) error {
+			_, _, err := c.FetchMessageMap(ctx, "INBOX")
+			return err
+		}},
+		{name: "destination scan", scan: func(ctx context.Context, c *Client) error {
+			_, err := c.FetchMessageCopies(ctx, "INBOX")
+			return err
+		}},
+	}
+	for _, tt := range scans {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{{uid: 1, size: 10}})))
+			c := newClientWithFake(t, srv)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			err := tt.scan(ctx, c)
+
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want context.Canceled", err)
+			}
+			for _, verb := range []string{"EXAMINE", "SELECT", "FETCH", "STATUS"} {
+				if n := srv.callCount(verb); n != 0 {
+					t.Errorf("server saw %d %s commands, want 0", n, verb)
+				}
+			}
+		})
+	}
+}
+
+func Test_FetchMessageMap_When_FolderNameHoldsFormatVerbs_Then_EveryLineKeepsItVerbatim(t *testing.T) {
+	t.Parallel()
+
+	const folder = "100%d %s %v"
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+		{uid: 1, size: 10},
+		{msgID: "a@x", uid: 2, size: 20},
+	})))
+	c := newClientWithFake(t, srv)
+	c.prefix = "src"
+	c.verbose = true
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	if _, _, err := c.FetchMessageMap(t.Context(), folder); err != nil {
+		t.Fatalf("FetchMessageMap: %v", err)
+	}
+
+	for _, want := range []string{
+		"[src] Fetching folder " + folder + "...",
+		"[src] ⚠️  " + folder + ": 1 message(s) without Message-Id will be skipped - sync cannot track them",
+	} {
+		if !slices.Contains(logged, want) {
+			t.Errorf("log lines = %q, want one equal to %q", logged, want)
+		}
+	}
+	for _, msg := range logged {
+		if strings.Contains(msg, "%!") {
+			t.Errorf("log line %q holds a formatting error", msg)
+		}
 	}
 }
 

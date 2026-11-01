@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"strconv"
@@ -2178,6 +2179,92 @@ func Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOt
 				t.Errorf("MissingLevels after the create = %q, %v, want none", got, err)
 			}
 		})
+	}
+}
+
+func Test_MissingLevels_When_CacheAndNameAreRandom_Then_ItListsExactlyTheCreatesOfCreateMailbox(t *testing.T) {
+	t.Parallel()
+
+	srv, c := newScriptedClient(t, &mailboxScript{})
+	rng := rand.New(rand.NewPCG(7, 11))
+	words := []string{"INBOX", "Inbox", "inbox", "A", "a", "B", "[Gmail]"}
+	listed := []string{"INBOX", "Inbox", "A", "[Gmail]"}
+	build := func(delimiter string, levels int) string {
+		joiner := delimiter
+		if joiner == "" {
+			joiner = "/"
+		}
+		parts := make([]string, levels)
+		for i := range parts {
+			parts[i] = words[rng.IntN(len(words))]
+		}
+		return strings.Join(parts, joiner)
+	}
+	var heldCases, nestedCases int
+	for i := range 300 {
+		delimiter := []string{"/", ".", ""}[rng.IntN(3)]
+		cache := mailboxCache{folders: map[string]struct{}{}, noSelect: map[string]struct{}{}, delimiter: delimiter}
+		for range rng.IntN(7) {
+			name := build(delimiter, 1+rng.IntN(3))
+			if rng.IntN(len(listed)) == 0 {
+				name = listed[rng.IntN(len(listed))]
+			}
+			// go-imap folds a bare INBOX to upper case before the cache sees it.
+			if strings.EqualFold(name, "INBOX") {
+				name = "INBOX"
+			}
+			cache.folders[name] = struct{}{}
+			cache.inboxSpellings = noteSpelling(cache.inboxSpellings, name, delimiter)
+			if rng.IntN(4) == 0 {
+				cache.noSelect[name] = struct{}{}
+			}
+		}
+		target := build(delimiter, 1+rng.IntN(4))
+		c.delimiter = delimiter
+		c.mailboxCache = cache
+
+		levels, err := c.MissingLevels(t.Context(), target)
+		if err != nil {
+			t.Fatalf("case %d: MissingLevels(%q): %v", i, target, err)
+		}
+		held := c.hasMailbox(target)
+
+		switch {
+		case held && len(levels) != 0:
+			t.Fatalf("case %d: MissingLevels(%q) = %q for a listed name, want none (cache %v, delimiter %q)", i, target, levels, cache.folders, delimiter)
+		case !held && (len(levels) == 0 || levels[len(levels)-1] != target):
+			t.Fatalf("case %d: MissingLevels(%q) = %q for an unlisted name, want a non-empty list that ends with the name (cache %v, delimiter %q)", i, target, levels, cache.folders, delimiter)
+		}
+		for j, level := range levels {
+			if c.hasMailbox(level) {
+				t.Fatalf("case %d: level %q is listed, so no CREATE is due for it (levels %q)", i, level, levels)
+			}
+			if j > 0 && !strings.HasPrefix(level, levels[j-1]+delimiter) {
+				t.Fatalf("case %d: level %q does not extend the level before it, %q (levels %q)", i, level, levels[j-1], levels)
+			}
+		}
+
+		before := len(srv.capturedNames("CREATE"))
+		created, parents, err := c.CreateMailbox(t.Context(), target)
+		if err != nil {
+			t.Fatalf("case %d: CreateMailbox(%q): %v", i, target, err)
+		}
+		if sent := srv.capturedNames("CREATE")[before:]; !slices.Equal(sent, levels) {
+			t.Fatalf("case %d: CREATE names = %q, want the missing levels %q (cache %v, delimiter %q)", i, sent, levels, cache.folders, delimiter)
+		}
+		if created != !held || parents != max(len(levels)-1, 0) {
+			t.Fatalf("case %d: created, parents = %v, %d, want %v, %d for levels %q", i, created, parents, !held, max(len(levels)-1, 0), levels)
+		}
+		if held {
+			heldCases++
+		}
+		if parents > 0 {
+			nestedCases++
+		}
+	}
+	// The seed is fixed, so these counts only change when the generator does. They keep the loop from passing on trivial cases.
+	if heldCases < 10 || nestedCases < 50 {
+		t.Errorf("the generator made %d listed names and %d names with missing parents, want at least 10 and 50", heldCases, nestedCases)
 	}
 }
 

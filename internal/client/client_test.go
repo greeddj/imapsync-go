@@ -3157,6 +3157,28 @@ func Test_Client_log_When_MessageCarriesControlCharacters_Then_EverySinkGetsEsca
 	})
 }
 
+func Test_Client_log_When_TrackerIsReplacedByNil_Then_LinesReachTheWriterAndNotTheOldTracker(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient()
+	c.verbose = true
+	tr := &recordingTracker{}
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+	c.SetProgressTracker(tr)
+
+	c.log("with tracker")
+	c.SetProgressTracker(nil)
+	c.log("without tracker")
+
+	if want := []string{"with tracker"}; !slices.Equal(tr.messages, want) {
+		t.Errorf("tracker messages = %q, want %q: a cleared tracker gets no line", tr.messages, want)
+	}
+	if want := []string{"without tracker"}; !slices.Equal(logged, want) {
+		t.Errorf("writer lines = %q, want %q: the tracker took the first line, so the writer gets only the second", logged, want)
+	}
+}
+
 type silentLogger struct{}
 
 func (silentLogger) Printf(string, ...any) {}
