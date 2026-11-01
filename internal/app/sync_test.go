@@ -7386,6 +7386,52 @@ func TestRunSync_When_FolderHasSkippedAndExistingMessages_Then_PreviewSizeCounts
 	assertReadOnly(t, "source", src)
 }
 
+func TestRunSync_When_DestinationFoldersHoldMessagesWithoutMessageId_Then_OnlyTheSourceFolderIsWarned(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		hide string
+		name string
+	}{
+		{name: "listed destination folders"},
+		{name: "destination folder that LIST hides", hide: "A"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": {{body: bodyOfSize("", 900)}, {msgID: "a1@x"}},
+				"B": fakeMsgs("b1@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX": nil,
+				"A":     {{body: bodyOfSize("", 700)}},
+				"B":     {{body: bodyOfSize("", 600)}, {body: bodyOfSize("", 650)}},
+			})
+			if tt.hide != "" {
+				dst.hideFromList(tt.hide)
+			}
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A"), mapping("B", "B")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			if n := strings.Count(got, "without Message-Id"); n != 1 {
+				t.Errorf("output holds %d warnings about a missing Message-Id, want 1\noutput: %q", n, got)
+			}
+			assertContainsAll(t, got, "[src] ⚠️  A: 1 message(s) without Message-Id will be skipped - sync cannot track them")
+			assertIDs(t, "dst A appends", dst.appended("A"), "a1@x")
+			assertIDs(t, "dst B appends", dst.appended("B"), "b1@x")
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
 func TestRunSync_When_CreateReportsExistingFolderHoldingASharedMessageId_Then_CopiesTheRest(t *testing.T) {
 	t.Parallel()
 

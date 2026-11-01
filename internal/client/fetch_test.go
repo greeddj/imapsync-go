@@ -620,6 +620,72 @@ func Test_FetchMessageMap_When_MessagesShareMessageId_Then_KeepsEveryUIDInAscend
 	}
 }
 
+func Test_MessageIDScans_When_FolderHoldsMessagesWithoutMessageId_Then_OnlyTheSourceScanWarns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		scan        func(*Client) (map[string][]MessageRef, error)
+		name        string
+		prefix      string
+		wantWarning string
+	}{
+		{
+			name:   "source scan",
+			prefix: "src",
+			scan: func(c *Client) (map[string][]MessageRef, error) {
+				got, _, err := c.FetchMessageMap(t.Context(), "INBOX")
+				return got, err
+			},
+			wantWarning: "[src] ⚠️  INBOX: 2 message(s) without Message-Id will be skipped - sync cannot track them",
+		},
+		{
+			name:   "destination scan",
+			prefix: "dst",
+			scan: func(c *Client) (map[string][]MessageRef, error) {
+				return c.FetchMessageCopies(t.Context(), "INBOX")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newFakeServer(t)
+			srv.addConnHandler(interceptHandler(srv, scanIntercept([]scanRow{
+				{uid: 1, size: 10},
+				{msgID: "a@x", uid: 2, size: 20},
+				{uid: 3, size: 30},
+			})))
+			c := newClientWithFake(t, srv)
+			c.prefix = tt.prefix
+			c.verbose = true
+			var logged []string
+			c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+			got, err := tt.scan(c)
+
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if want := map[string][]MessageRef{"a@x": {{UID: 2, Size: 20}}}; !equalMessageMaps(got, want) {
+				t.Errorf("map = %v, want %v", got, want)
+			}
+			var warnings []string
+			for _, msg := range logged {
+				if strings.Contains(msg, "without Message-Id") {
+					warnings = append(warnings, msg)
+				}
+			}
+			switch {
+			case tt.wantWarning == "" && len(warnings) != 0:
+				t.Errorf("got warnings %q, want none", warnings)
+			case tt.wantWarning != "" && !slices.Equal(warnings, []string{tt.wantWarning}):
+				t.Errorf("warnings = %q, want exactly %q", warnings, tt.wantWarning)
+			}
+		})
+	}
+}
+
 func Test_FetchMessageMap_When_ServerRepeatsAResponse_Then_KeepsTheUIDOnce(t *testing.T) {
 	t.Parallel()
 

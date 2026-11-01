@@ -76,36 +76,53 @@ const (
 
 // FetchMessageMap scans the source: Message-Id -> copies in ascending UID order, and the UIDVALIDITY of the UIDs, or 0 when the server sent none.
 func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, uint32, error) {
-	return c.scanMessageIDs(ctx, folder, failOnMissingUID)
+	scan, err := c.scanMessageIDs(ctx, folder, failOnMissingUID)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Only the source skips a message without a Message-Id; the destination scan just leaves such a message out of the count.
+	if scan.missingIDs > 0 {
+		if pw := c.progressWriter(); pw != nil {
+			pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped - sync cannot track them",
+				c.prefix, termsafe.Escape(folder), scan.missingIDs)
+		}
+	}
+	return scan.ids, scan.uidValidity, nil
 }
 
 // FetchMessageCopies returns Message-Id -> copies in folder for the destination side, where only the count and sizes matter. A copy without a UID keeps UID 0 and counts alone.
 func (c *Client) FetchMessageCopies(ctx context.Context, folder string) (map[string][]MessageRef, error) {
-	ids, _, err := c.scanMessageIDs(ctx, folder, keepMissingUID)
-	return ids, err
+	scan, err := c.scanMessageIDs(ctx, folder, keepMissingUID)
+	return scan.ids, err
 }
 
-func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missingUIDRule) (map[string][]MessageRef, uint32, error) {
+type messageIDScan struct {
+	ids         map[string][]MessageRef
+	missingIDs  int
+	uidValidity uint32
+}
+
+func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missingUIDRule) (messageIDScan, error) {
 	stop := c.withCancel(ctx)
 	defer stop()
 
 	if err := ctx.Err(); err != nil {
-		return nil, 0, err
+		return messageIDScan{}, err
 	}
 
 	c.log("[%s] Fetching folder %s...", c.prefix, folder)
 
 	var (
-		ids          map[string][]MessageRef
-		missingCount int
-		missingUIDs  int
-		uidValidity  uint32
-		repeated     bool
+		ids         map[string][]MessageRef
+		missingIDs  int
+		missingUIDs int
+		uidValidity uint32
+		repeated    bool
 	)
 	err := c.safeCall(func(cli *imapclient.Client) error {
 		ids = nil
 		uidValidity = 0
-		missingCount = 0
+		missingIDs = 0
 		missingUIDs = 0
 		repeated = false
 		mbox, err := c.selectIfNeeded(cli, folder)
@@ -150,7 +167,7 @@ func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missing
 			}
 			id := readMessageIDHeader(msg)
 			if id == "" {
-				missingCount++
+				missingIDs++
 				continue
 			}
 			// go-imap sends UID 0 as "*" in a UID set, so the source cannot plan such a message; the destination only counts copies.
@@ -176,22 +193,16 @@ func (c *Client) scanMessageIDs(ctx context.Context, folder string, rule missing
 		return nil
 	})
 
-	if err == nil && missingCount > 0 {
-		if pw := c.progressWriter(); pw != nil {
-			pw.Log("[%s] ⚠️  %s: %d message(s) without Message-Id will be skipped - sync cannot track them",
-				c.prefix, termsafe.Escape(folder), missingCount)
-		}
-	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, 0, ctx.Err()
+			return messageIDScan{}, ctx.Err()
 		}
-		return nil, 0, err
+		return messageIDScan{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, 0, err
+		return messageIDScan{}, err
 	}
-	return ids, uidValidity, nil
+	return messageIDScan{ids: ids, missingIDs: missingIDs, uidValidity: uidValidity}, nil
 }
 
 // CheckUIDValidity returns ErrUIDValidityChanged when planned is not zero and current differs from it. A session that sends no UIDVALIDITY cannot prove that the planned UIDs still hold.
