@@ -29,8 +29,8 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 ## Connection resilience
 
 - Every IMAP op goes through `safeCall`. New ops must follow.
-- `classifyError` is the single source of error policy: `Transient` → reconnect+retry, `Throttled` → backoff `throttledBackoff = 5m`, `Permanent` → surface.
-- In the copy phase, `Throttled` stops the run. `throttledBackoff` applies only inside `reconnect`.
+- `classifyError` is the single source of error policy: `ClassTransient` → reconnect+retry, `ClassThrottled` → backoff `throttledBackoff = 5m`, `ClassPermanent` → surface.
+- In the copy phase, `ClassThrottled` stops the run. `throttledBackoff` applies only inside `reconnect`.
   - `client.IsThrottled(err)` is `classifyError(err) == ClassThrottled`. It is the only predicate that `internal/app` uses. `internal/app` never reads error text.
   - Pass the `Stop` error of a `StreamError` to `IsThrottled`, not the whole `StreamError`. A network error in `First` hides the throttled `Stop`.
   - A worker records the first throttled reply in the `throttleStop` of the run. The stop is not a context cancel and it does not call `Client.Cancel`. So Ctrl-C keeps its `Cancelled.` output and exit code 130.
@@ -39,12 +39,12 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 - `classifyError` matches text on the leaf error only. Text that our wrappers add, such as a folder name or a label, never sets the class. Wrap an error with `%w`. A `%v` of an error makes a new leaf that holds the wrapper text.
 - `safeCall` starts at most one `reconnect` for each call. After a `reconnect` that returns nil, `safeCall` and `AppendMessage` check again whether `Cancel()` ran. They return an error and send no command when `reconnect` leaves no session.
 - All sleeps in the reconnect path use `sleepCtx` so Ctrl-C is honoured.
-- The give-up and revive gate in `reconnect` holds the give-up of a Client. A `Permanent` or `Unknown` give-up is final. After a `Transient` or `Throttled` give-up, a Client makes at most one login attempt per `reviveInterval = 5m`.
+- The give-up and revive gate in `reconnect` holds the give-up of a Client. A `ClassPermanent` or `ClassUnknown` give-up is final. After a `ClassTransient` or `ClassThrottled` give-up, a Client makes at most one login attempt per `reviveInterval = 5m`.
   - The gate runs under `c.mu`, after the cancellation check and before any wait, logout or dial.
-  - Only `New` and `reconnect` call `connectAndLogin`. A new caller would bypass the gate.
+  - Only `New` and `reconnect` call `connectAndLogin`. A new caller bypasses the gate.
   - `EnsureSession` reaches `reconnect` only through `reconnectSession`. It sends no command on a working session, and it returns the stored give-up with no dial while the gate refuses.
-  - A reply that reports a locked, disabled, suspended or blocked account is `Permanent`.
-  - A login reply that reports a temporary outage of the authentication service is `Transient`. The locked-account rule comes first.
+  - A reply that reports a locked, disabled, suspended or blocked account is `ClassPermanent`.
+  - A login reply that reports a temporary outage of the authentication service is `ClassTransient`. The locked-account rule comes first.
   - A change to the gate is a security review point. See [security.md](security.md) item 10.
 - Every long-running public `Client` method runs `defer c.withCancel(ctx)()` and checks `ctx.Err()` after each blocking step.
 - `c.pw` / `c.tracker` are `atomic.Pointer`. Read via `progressWriter()` / `progressTracker()`. Direct field access is a bug.
@@ -55,7 +55,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 
 ## Rate limiting
 
-- One limiter per direction is shared across all `Client`s that talk to the same side. Per-connection limiters would defeat the global cap.
+- One limiter per direction is shared across all `Client`s that talk to the same side. Per-connection limiters defeat the global cap.
 - `ratelimit.NewLimiter(bps)` returning `nil` is the "unlimited" sentinel. Callers must nil-check, not call methods on it.
 - The greeting and the CAPABILITY probe of go-imap take tokens with no wait. `guardConn` starts the `ratelimit.Conn` in this mode, and `connectAndLogin` turns the waits on before LOGIN. LOGIN and all later traffic wait. So a debt that other Clients leave on a shared limiter never counts against `dialTimeout`.
 

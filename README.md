@@ -230,7 +230,7 @@ sync -w 4
 - `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the list `Folders that cannot be synced` still show. The notices of a renamed folder, of a left-out folder and of destination folders that differ only in letter case also still show. The final line also shows when the sync copies messages or has a failed folder. After a stop, the `Sync stopped` line and the final line also show. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
 - `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
 - `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`). The limit is shared by all workers. Below about 110 bytes/sec for each worker, an upload can wait so long that the 5-minute idle limit closes the connection, so `sync` prints a warning before the plan.
-- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N−1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
+- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N-1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
 
 The same `bps-down`, `bps-up`, and `max-connections` values can be set in config under a `rate_limit` block (`down_bps`, `up_bps`, `max_connections`). CLI flags take precedence when both are set. This is also true when the value is 0. For example, `--bps-down 0` or `IMAPSYNC_BPS_DOWN=0` removes the `down_bps` limit of the config file.
 
@@ -363,7 +363,7 @@ imapsync-go sync \
 
 `--max-connections 10` reserves one slot for the planning client, leaving 9
 slots for workers. `-w 9` matches that ceiling; setting `-w` higher than
-`maxConn−1` is harmless - the cap is enforced automatically.
+`maxConn-1` is harmless - the cap is enforced automatically.
 
 The defaults (no throttle) match `imapsync`'s default behaviour - they're
 appropriate for self-hosted IMAP servers on a LAN, not for big-provider
@@ -461,7 +461,7 @@ These limitations apply:
   - A destination server that advertises `X-GM-EXT-1` is the exception. The folder gets at most one copy of each `Message-Id`. The first mapping in the mapping order that lists the `Message-Id` copies it. The later mappings copy none.
   - The command creates the folder one time.
   - The command can fail to copy the planned message of the first mapping. For example, the copy has an empty body or no body. Or the source does not send the copy, or no longer holds it. Then the command copies the copy of a later mapping in the same run. With `X-GM-EXT-1`, the command first tries the other copies in the same source folder.
-- **A message with an empty body fails on each run when no other copy can replace it.** The command never uploads an empty message. An empty message has no `Message-Id`, so each later run would add one more. The command counts one error for the message, and the run ends with exit code 1. With `-V`, the command shows the reason: `source returned an empty body`. The message fails again on each run until the source sends a body.
+- **A message with an empty body fails on each run when no other copy can replace it.** The command never uploads an empty message. An empty message has no `Message-Id`, so a later run cannot find it on the destination. Without this rule, each run adds one more empty message. The command counts one error for the message, and the run ends with exit code 1. With `-V`, the command shows the reason: `source returned an empty body`. The message fails again on each run until the source sends a body.
 - **A message for which the source sends no body fails in the same way.** The command counts one error for the message. If the source ends the fetch without an error, the command prints no reason. The next run tries the message again.
 - **A planned message that the command cannot copy can download more copies than the command uses.** This applies only to a destination server that advertises `X-GM-EXT-1`.
   - The command cannot copy a planned message in these cases:
