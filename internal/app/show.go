@@ -134,9 +134,10 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 		return groupErr
 	}
 
-	printAccountInfo(out, "Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
+	colors := newShowColors(opts.quiet)
+	printAccountInfo(out, colors, "Source", cfg.Src.Server, cfg.Src.User, srcRes.mailboxes)
 	_, _ = fmt.Fprintln(out)
-	printAccountInfo(out, "Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
+	printAccountInfo(out, colors, "Destination", cfg.Dst.Server, cfg.Dst.User, dstRes.mailboxes)
 
 	if len(srcRes.invalid)+len(dstRes.invalid) > 0 {
 		_, _ = fmt.Fprintln(out)
@@ -173,15 +174,30 @@ func printUnreadableFolders(out io.Writer, title string, mailboxes []*client.Mai
 	}
 }
 
+// The zero value gives plain text, because an empty text.Colors never emits a sequence.
+type showColors struct {
+	title  text.Colors
+	totals text.Colors
+}
+
+// go-pretty reads colour from the environment only, so quiet output, which feeds pipes, drops the wrappers. Bold plus bright cyan matches the tracker palette.
+func newShowColors(quiet bool) showColors {
+	if quiet {
+		return showColors{}
+	}
+	return showColors{
+		title:  text.Colors{text.Bold, text.FgHiCyan},
+		totals: text.Colors{text.Bold},
+	}
+}
+
 // printAccountInfo displays mailbox information in a formatted table.
-func printAccountInfo(out io.Writer, title, server, user string, mailboxes []*client.MailboxInfo) {
+func printAccountInfo(out io.Writer, colors showColors, title, server, user string, mailboxes []*client.MailboxInfo) {
 	headerTable := table.NewWriter()
 	headerTable.SetOutputMirror(out)
 	headerTable.Style().Options.DrawBorder = false
 	headerTable.Style().Options.SeparateColumns = false
-	// Bold + bright cyan matches the tracker palette and visually breaks
-	// up two adjacent borderless tables without adding layout.
-	headerTable.SetTitle(text.Colors{text.Bold, text.FgHiCyan}.Sprint(title))
+	headerTable.SetTitle(colors.title.Sprint(title))
 
 	headerTable.AppendRows([]table.Row{
 		{"Server", server},
@@ -223,9 +239,9 @@ func printAccountInfo(out io.Writer, title, server, user string, mailboxes []*cl
 		label = fmt.Sprintf("total folders %d (%d unreadable)", len(mailboxes), unreadable)
 	}
 	t.AppendFooter(table.Row{
-		text.Bold.Sprint(label),
-		text.Bold.Sprintf("%d", totalMessages),
-		text.Bold.Sprint(utils.FormatSize(totalSize)),
+		colors.totals.Sprint(label),
+		colors.totals.Sprintf("%d", totalMessages),
+		colors.totals.Sprint(utils.FormatSize(totalSize)),
 	})
 
 	t.SetColumnConfigs([]table.ColumnConfig{

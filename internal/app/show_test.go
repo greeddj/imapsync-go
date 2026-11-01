@@ -18,6 +18,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/utils"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v3"
 )
 
@@ -25,6 +26,30 @@ var ansiSequence = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 // stripANSI removes colour codes so assertions see the text a user reads.
 func stripANSI(s string) string { return ansiSequence.ReplaceAllString(s, "") }
+
+// assertNoEscapeSequence fails when raw holds an ESC byte and logs each offending line.
+func assertNoEscapeSequence(t *testing.T, raw string) {
+	t.Helper()
+	if !strings.Contains(raw, "\x1b") {
+		return
+	}
+	t.Error("output holds an escape sequence")
+	for line := range strings.SplitSeq(raw, "\n") {
+		if strings.Contains(line, "\x1b") {
+			t.Logf("line with ESC: %q", line)
+		}
+	}
+}
+
+// shownText returns the text a user reads. Quiet output must hold no escape byte, so it is checked raw; other output loses its colour codes.
+func shownText(t *testing.T, raw string, quiet bool) string {
+	t.Helper()
+	if quiet {
+		assertNoEscapeSequence(t, raw)
+		return raw
+	}
+	return stripANSI(raw)
+}
 
 // e2eShowOptions aims runShow at plain-TCP servers.
 func e2eShowOptions(out io.Writer, quiet bool) showOptions {
@@ -100,7 +125,7 @@ func TestRunShow_When_BothAccountsReachable_Then_PrintsFolderTables(t *testing.T
 				t.Fatalf("runShow: %v", err)
 			}
 
-			got := stripANSI(out.String())
+			got := shownText(t, out.String(), quiet)
 			_, tables, ok := strings.Cut(got, "Source")
 			if !ok {
 				t.Fatalf("output has no Source title:\n%s", got)
@@ -184,7 +209,7 @@ func TestRunShow_When_FoldersCannotBeRead_Then_MarksRowsListsReasonsAndFails(t *
 			if !errors.Is(err, ErrSilentExit) {
 				t.Errorf("runShow error = %v, want ErrSilentExit", err)
 			}
-			got := stripANSI(out.String())
+			got := shownText(t, out.String(), quiet)
 			_, tables, ok := strings.Cut(got, "Source")
 			if !ok {
 				t.Fatalf("output has no Source title:\n%s", got)
@@ -240,7 +265,7 @@ func TestRunShow_When_AccountHasNoSelectContainer_Then_ShowsContainerAndSucceeds
 		t.Fatalf("runShow: %v", err)
 	}
 
-	got := stripANSI(out.String())
+	got := shownText(t, out.String(), true)
 	srcSection, _, ok := strings.Cut(got, "Destination")
 	if !ok {
 		t.Fatalf("output has no Destination title:\n%s", got)
@@ -336,6 +361,80 @@ func TestRunShow_When_ContextAlreadyCanceled_Then_ReturnsBeforeConnecting(t *tes
 	assertNoLogin(t, src, dst)
 }
 
+// Sequential on purpose: text.EnableColors flips go-pretty's process-wide colour flag, which parallel tests read. Parallel tests stay paused until this one ends.
+func TestRunShow_When_ColoursAreForcedOn_Then_OnlyOutputWithoutQuietHoldsEscapeSequences(t *testing.T) {
+	wereOn := text.Bold.Sprint("x") != "x"
+	text.EnableColors()
+	t.Cleanup(func() {
+		if !wereOn {
+			text.DisableColors()
+		}
+	})
+	if got := text.Bold.Sprint("x"); got != "\x1b[1mx\x1b[0m" {
+		t.Fatalf("forced colours give %q, want bold codes around x", got)
+	}
+
+	msgSize := uint64(len(imapFullBody("a@x")))
+	const (
+		unreadableLine = "\n• Source Work: read message count: Temporary failure\n"
+		footerLabel    = "TOTAL FOLDERS 4 (1 UNREADABLE)"
+	)
+	leftOut := "\n" + leftOutLine("dst", "Q&A")
+
+	runFixture := func(t *testing.T, quiet bool) string {
+		t.Helper()
+		src := newStoreServer(t, "/", map[string][]fakeMsg{
+			"INBOX":        fakeMsgs("a@x", "b@x"),
+			"Work":         fakeMsgs("c@x"),
+			"[Gmail]/Sent": fakeMsgs("d@x"),
+		})
+		src.markNoSelect("[Gmail]")
+		src.refuseStatusWith("Work", "NO [UNAVAILABLE] Temporary failure")
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{
+			"INBOX": fakeMsgs("e@x"),
+			"Q&A":   nil,
+		})
+		out := &syncBuffer{}
+
+		err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, quiet))
+
+		if !errors.Is(err, ErrSilentExit) {
+			t.Fatalf("runShow error = %v, want ErrSilentExit", err)
+		}
+		return out.String()
+	}
+
+	t.Run("quiet=true", func(t *testing.T) {
+		raw := runFixture(t, true)
+
+		assertNoEscapeSequence(t, raw)
+		assertContainsAll(t, raw, "Source", "Destination", "container", "unreadable", unreadableLine, leftOut)
+		_, tables, ok := strings.Cut(raw, "Source")
+		if !ok {
+			t.Fatalf("output has no Source title:\n%s", raw)
+		}
+		srcSection, _, ok := strings.Cut(tables, "Destination")
+		if !ok {
+			t.Fatalf("output has no Destination title:\n%s", raw)
+		}
+		assertTotalsLabel(t, srcSection, footerLabel, 3, 3*msgSize)
+	})
+
+	t.Run("quiet=false", func(t *testing.T) {
+		raw := runFixture(t, false)
+
+		assertContainsAll(t, raw,
+			"\x1b[1;96mSource\x1b[0m",
+			"\x1b[1;96mDestination\x1b[0m",
+			"\x1b[1m"+footerLabel+"\x1b[0m",
+			"\x1b[1m3\x1b[0m",
+			"\x1b[1m"+utils.FormatSize(3*msgSize)+"\x1b[0m",
+			unreadableLine,
+			leftOut,
+		)
+	})
+}
+
 func TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals(t *testing.T) {
 	t.Parallel()
 
@@ -366,38 +465,89 @@ func TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals(t 
 		},
 		{name: "no mailboxes"},
 	}
+	colourSets := []struct {
+		name   string
+		colors showColors
+		plain  bool
+	}{
+		{name: "plain colours", plain: true},
+		{name: "show colours", colors: newShowColors(false)},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var out bytes.Buffer
-			printAccountInfo(&out, "Source", "mail.example.test:993", "carol", tt.mailboxes)
+			for _, cs := range colourSets {
+				t.Run(cs.name, func(t *testing.T) {
+					t.Parallel()
 
-			got := stripANSI(out.String())
-			assertContainsAll(t, got, "Source", "Server  mail.example.test:993", "User    carol")
+					var out bytes.Buffer
+					printAccountInfo(&out, cs.colors, "Source", "mail.example.test:993", "carol", tt.mailboxes)
 
-			if len(tt.mailboxes) == 0 {
-				assertContainsNone(t, got, "FOLDER", "MESSAGES", "TOTAL")
-				return
+					got := out.String()
+					if cs.plain {
+						assertNoEscapeSequence(t, got)
+					} else {
+						got = stripANSI(got)
+					}
+					assertContainsAll(t, got, "Source", "Server  mail.example.test:993", "User    carol")
+
+					if len(tt.mailboxes) == 0 {
+						assertContainsNone(t, got, "FOLDER", "MESSAGES", "TOTAL")
+						return
+					}
+					assertContainsAll(t, got, "FOLDER", "MESSAGES", "SIZE")
+					var messages int
+					var size uint64
+					for _, mb := range tt.mailboxes {
+						if marker, ok := tt.markers[mb.Name]; ok {
+							assertMarkedRow(t, got, mb.Name, marker)
+							continue
+						}
+						assertFolderRow(t, got, mb.Name, int(mb.Messages), mb.Size)
+						messages += int(mb.Messages)
+						size += mb.Size
+					}
+					label := fmt.Sprintf("TOTAL FOLDERS %d", len(tt.mailboxes))
+					if tt.unreadable > 0 {
+						label += fmt.Sprintf(" (%d UNREADABLE)", tt.unreadable)
+					}
+					assertTotalsLabel(t, got, label, messages, size)
+					assertContainsNone(t, got, "status refused")
+				})
 			}
-			assertContainsAll(t, got, "FOLDER", "MESSAGES", "SIZE")
-			var messages int
-			var size uint64
-			for _, mb := range tt.mailboxes {
-				if marker, ok := tt.markers[mb.Name]; ok {
-					assertMarkedRow(t, got, mb.Name, marker)
-					continue
-				}
-				assertFolderRow(t, got, mb.Name, int(mb.Messages), mb.Size)
-				messages += int(mb.Messages)
-				size += mb.Size
+		})
+	}
+}
+
+func Test_newShowColors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		wantTitle  text.Colors
+		wantTotals text.Colors
+		quiet      bool
+	}{
+		{name: "quiet gives plain text", quiet: true},
+		{
+			name:       "not quiet gives a bold cyan title and bold totals",
+			wantTitle:  text.Colors{text.Bold, text.FgHiCyan},
+			wantTotals: text.Colors{text.Bold},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := newShowColors(tt.quiet)
+
+			if !slices.Equal(got.title, tt.wantTitle) {
+				t.Errorf("title colours = %v, want %v", got.title, tt.wantTitle)
 			}
-			label := fmt.Sprintf("TOTAL FOLDERS %d", len(tt.mailboxes))
-			if tt.unreadable > 0 {
-				label += fmt.Sprintf(" (%d UNREADABLE)", tt.unreadable)
+			if !slices.Equal(got.totals, tt.wantTotals) {
+				t.Errorf("totals colours = %v, want %v", got.totals, tt.wantTotals)
 			}
-			assertTotalsLabel(t, got, label, messages, size)
-			assertContainsNone(t, got, "status refused")
 		})
 	}
 }
@@ -692,7 +842,7 @@ func TestRunShow_When_FolderNameIsNotModifiedUTF7_Then_TableLeavesItOutAndWarns(
 				t.Fatalf("runShow: %v", err)
 			}
 
-			got := stripANSI(out.String())
+			got := shownText(t, out.String(), quiet)
 			tables, warnings, ok := strings.Cut(got, "⚠️")
 			if !ok {
 				t.Fatalf("output has no warning:\n%s", got)
@@ -749,7 +899,7 @@ func TestRunShow_When_FolderNameHoldsLatin1Byte_Then_TableLeavesItOutAndWarnsWit
 			if strings.Contains(raw, "\xfc") || !utf8.ValidString(raw) {
 				t.Errorf("output holds the raw byte or invalid UTF-8: %q", raw)
 			}
-			got := stripANSI(raw)
+			got := shownText(t, raw, quiet)
 			tables, warnings, ok := strings.Cut(got, "⚠️")
 			if !ok {
 				t.Fatalf("output has no warning:\n%s", got)
