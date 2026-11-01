@@ -105,23 +105,23 @@ func (c *Client) MissingLevels(ctx context.Context, name string) ([]string, erro
 	return append(missing, name), nil
 }
 
-// parentLevels yields each prefix of name that ends before a delimiter, shortest first. An empty delimiter marks a flat server, so it yields nothing.
+// parentLevels yields each prefix of name that ends before a delimiter and has a non-empty last level, shortest first. An empty level names no mailbox. An empty delimiter yields nothing.
 func parentLevels(name, delimiter string) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		if delimiter == "" {
 			return
 		}
-		end := 0
+		start := 0
 		for {
-			i := strings.Index(name[end:], delimiter)
+			i := strings.Index(name[start:], delimiter)
 			if i < 0 {
 				return
 			}
-			end += i
-			if !yield(name[:end]) {
+			end := start + i
+			if i > 0 && !yield(name[:end]) {
 				return
 			}
-			end += len(delimiter)
+			start = end + len(delimiter)
 		}
 	}
 }

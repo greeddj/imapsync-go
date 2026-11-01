@@ -34,7 +34,7 @@ const (
 // large plan (tens of thousands of UIDs) doesn't bury the confirm prompt.
 const verboseUIDLimit = 20
 
-// previewFolderLimit caps the folders-to-create list: one listed name of length L has up to L/2 missing parent levels, so a full list prints O(L^2) bytes.
+// previewFolderLimit caps the folders-to-create list: a name of L bytes has at most L/2 non-empty parent levels, so a full list prints O(L^2) bytes.
 const previewFolderLimit = 20
 
 // traceTracker writes a one-line diagnostic to stderr when IMAPSYNC_TRACE is

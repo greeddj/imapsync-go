@@ -4161,6 +4161,39 @@ func TestRunSync_When_NewDestinationHasMoreMissingLevelsThanThePreviewShows_Then
 	})
 }
 
+func TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_NoEmptyParentIsPreviewedCountedOrCreated(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		destination string
+		wantFolders []string
+	}{
+		{name: "empty first level", destination: "/X", wantFolders: []string{"/X"}},
+		{name: "empty level in the middle", destination: "a//b", wantFolders: []string{"a", "a//b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", tt.destination)), e2eOptions(out, "y\n")); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantFolders...)
+			assertIDs(t, "dst "+tt.destination, dst.folderMsgIDs(tt.destination), "m1@x")
+			assertInOrder(t, got, foldersToCreateHeader+folderBullets(tt.wantFolders...)+"\n📨 Total new messages to sync: 1", "Proceed with synchronization?", "Creating destination folders")
+			assertContainsNone(t, got, "• \n")
+			assertOneRow(t, screenRows(t, got), fmt.Sprintf("Created %d folders", len(tt.wantFolders)), "✓ done")
+		})
+	}
+}
+
 func TestRunSync_When_ContextEndsBeforeTheFoldersToCreateAreListed_Then_ReturnsCanceledWithoutPreview(t *testing.T) {
 	t.Parallel()
 

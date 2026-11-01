@@ -1872,11 +1872,16 @@ func Test_parentLevels(t *testing.T) {
 		{name: "slash path", input: "A/B/C", delimiter: "/", want: []string{"A", "A/B"}},
 		{name: "dot path", input: "A.B.C", delimiter: ".", want: []string{"A", "A.B"}},
 		{name: "the other character is name text", input: "A.B/C", delimiter: "/", want: []string{"A.B"}},
-		{name: "empty level in the middle", input: "a//b", delimiter: "/", want: []string{"a", "a/"}},
-		{name: "empty first level", input: "/x", delimiter: "/", want: []string{""}},
+		{name: "empty level in the middle", input: "a//b", delimiter: "/", want: []string{"a"}},
+		{name: "empty level after two named levels", input: "a/b//c", delimiter: "/", want: []string{"a", "a/b"}},
+		{name: "empty first level", input: "/x", delimiter: "/"},
+		{name: "empty first level before a named one", input: "/x/y", delimiter: "/", want: []string{"/x"}},
+		{name: "two empty first levels", input: "//x", delimiter: "/"},
 		{name: "empty last level", input: "x/", delimiter: "/", want: []string{"x"}},
+		{name: "only delimiters", input: "///", delimiter: "/"},
 		{name: "multi-byte delimiter", input: "a::b::c", delimiter: "::", want: []string{"a", "a::b"}},
-		{name: "delimiter occurrences do not overlap", input: "aXXXXb", delimiter: "XX", want: []string{"a", "aXX"}},
+		{name: "multi-byte delimiter with an empty level", input: "a::::b", delimiter: "::", want: []string{"a"}},
+		{name: "delimiter occurrences do not overlap", input: "aXYXYXbXYXc", delimiter: "XYX", want: []string{"a", "aXYXYXb"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1920,7 +1925,7 @@ func Test_parentLevels_When_Ranged_Then_AllocatesNothing(t *testing.T) {
 func FuzzParentLevels(f *testing.F) {
 	seeds := []struct{ name, delimiter string }{
 		{"A/B/C", "/"}, {"A.B.C", "."}, {"a//b", "/"}, {"/x", "/"}, {"x/", "/"}, {"A/B/C", ""}, {"Archive", "/"},
-		{"", "/"}, {"a::b::c", "::"}, {"aXXXXb", "XX"}, {"///", "/"}, {"a\xff/b", "/"},
+		{"", "/"}, {"a::b::c", "::"}, {"aXXXXb", "XX"}, {"aXYXYXbXYXc", "XYX"}, {"///", "/"}, {"a\xff/b", "/"}, {"a/b//c", "/"}, {"//x/y", "/"},
 	}
 	for _, s := range seeds {
 		f.Add(s.name, s.delimiter)
@@ -1937,10 +1942,16 @@ func FuzzParentLevels(f *testing.F) {
 		parts := strings.Split(name, delimiter)
 		var want []string
 		for i := 1; i < len(parts); i++ {
+			if parts[i-1] == "" {
+				continue
+			}
 			want = append(want, strings.Join(parts[:i], delimiter))
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("parentLevels(%q, %q) = %q, want %q", name, delimiter, got, want)
+		}
+		if len(got) > len(name)/2 {
+			t.Errorf("parentLevels(%q, %q) yields %d levels, want at most %d", name, delimiter, len(got), len(name)/2)
 		}
 	})
 }
@@ -2030,6 +2041,34 @@ func Test_MissingLevels(t *testing.T) {
 			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "Old/2020": {}}, delimiter: "/"},
 			delimiter: "/",
 			input:     "Old/2020",
+		},
+		{
+			name:      "an empty first level is no parent",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "/X",
+			want:      []string{"/X"},
+		},
+		{
+			name:      "an empty level in the middle is no parent",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "a//b",
+			want:      []string{"a", "a//b"},
+		},
+		{
+			name:      "an empty level in the middle with the named parent listed",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}, "a": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "a//b",
+			want:      []string{"a//b"},
+		},
+		{
+			name:      "a name that ends with the delimiter has its named parents only",
+			cache:     mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			delimiter: "/",
+			input:     "x/",
+			want:      []string{"x", "x/"},
 		},
 	}
 	for _, tt := range tests {
@@ -2165,6 +2204,11 @@ func Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOt
 			}
 			if got := srv.capturedNames("CREATE"); !slices.Equal(got, levels) {
 				t.Errorf("CREATE names = %q, want the missing levels %q in the same order", got, levels)
+			}
+			for _, level := range levels[:max(len(levels)-1, 0)] {
+				if level == "" || (tt.delimiter != "" && strings.HasSuffix(level, tt.delimiter)) {
+					t.Errorf("parent level %q has an empty last level, want no CREATE for it (levels %q)", level, levels)
+				}
 			}
 			if len(levels) == 0 {
 				if created || parents != 0 {
