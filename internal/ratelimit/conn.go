@@ -48,8 +48,7 @@ func New(c net.Conn, read, write *rate.Limiter) *Conn {
 	return &Conn{Conn: c, read: read, write: write, ctx: ctx, cancel: cancel}
 }
 
-// SetWait chooses whether Read and Write wait for tokens. With false they charge
-// the tokens at once, and the debt delays later callers that wait.
+// SetWait chooses whether Read and Write wait for tokens. With false they charge the tokens at once, and the debt delays later callers that wait.
 func (c *Conn) SetWait(wait bool) { c.noWait.Store(!wait) }
 
 // Close cancels any in-flight WaitN call and closes the underlying connection.
@@ -58,9 +57,7 @@ func (c *Conn) Close() error {
 	return c.Conn.Close()
 }
 
-// Read charges tokens for the bytes returned, after the read, because they are
-// already in flight. The mode loads after the inner Read, so a Read pending at
-// SetWait(true) waits.
+// Read charges tokens after the read, because the bytes are in flight already. The mode loads after the inner Read, so a Read pending at SetWait(true) waits.
 func (c *Conn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 && c.read != nil {
@@ -101,8 +98,7 @@ func waitN(ctx context.Context, lim *rate.Limiter, n int) error {
 	return nil
 }
 
-// chargeN takes n tokens without waiting. ReserveN charges nothing for a request
-// above the burst, so it splits large requests; a zero burst charges nothing.
+// chargeN splits a large request, because ReserveN charges nothing for a request above the burst. A zero burst charges nothing.
 func chargeN(lim *rate.Limiter, n int) {
 	burst := lim.Burst()
 	if burst <= 0 {

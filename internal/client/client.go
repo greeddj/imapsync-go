@@ -501,8 +501,7 @@ func (c *Client) connectAndLogin(ctx context.Context) error {
 	return nil
 }
 
-// guardConn keeps the watchdog innermost, so token waits never run inside it.
-// The watchdog and the limiter wrapper may be nil; the wrapper starts without waits.
+// guardConn keeps the watchdog innermost, so token waits never run inside it. Either wrapper may be nil; the limiter wrapper starts without waits.
 func (c *Client) guardConn(conn net.Conn) (net.Conn, *idleConn, *ratelimit.Conn) {
 	var w *idleConn
 	if c.idleDur > 0 {

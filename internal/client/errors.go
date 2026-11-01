@@ -45,8 +45,7 @@ func (c ErrClass) String() string {
 	}
 }
 
-// ErrSelectRefused marks a NO or BAD reply to SELECT or EXAMINE on a working session, in a Message-Id scan,
-// a body stream or an existence check.
+// ErrSelectRefused marks a NO or BAD reply to SELECT or EXAMINE on a working session, in a Message-Id scan, a body stream or an existence check.
 var ErrSelectRefused = errors.New("cannot select folder")
 
 // ErrEmptyBody marks a message whose source body is empty. AppendMessage returns it before it sends any command.

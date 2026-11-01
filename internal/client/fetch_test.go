@@ -921,9 +921,7 @@ func Test_StreamMessagesByUIDs_When_MessagesAreDelivered_Then_UIDIsTheRequestedO
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_CallbackBlocks_Then_AtMostOneBodyIsReadAhead asserts
-// the memory bound of the body stream: while onMessage holds one body, go-imap
-// reads one more and waits. Each further read holds one more body.
+// A worker holds two bodies at most: the one onMessage holds and the one go-imap reads while it waits.
 func Test_StreamMessagesByUIDs_When_CallbackBlocks_Then_AtMostOneBodyIsReadAhead(t *testing.T) {
 	t.Parallel()
 
@@ -1472,9 +1470,6 @@ func Test_StreamMessagesByUIDs_When_ServerRepeatsAUID_Then_CallbackRunsOnce(t *t
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageStillDelivered
-// asserts that a FETCH response without a body never reaches the callback, and
-// that the later response that carries the body does.
 func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageStillDelivered(t *testing.T) {
 	t.Parallel()
 
@@ -1515,9 +1510,6 @@ func Test_StreamMessagesByUIDs_When_BodylessResponseComesFirst_Then_FullMessageS
 	}
 }
 
-// Test_StreamMessagesByUIDs_When_UIDOnlyGetsBodylessResponses_Then_CallbackSkipsItAndStreamSucceeds
-// asserts that a UID whose body never arrives is not a stream error and never
-// reaches the callback.
 func Test_StreamMessagesByUIDs_When_UIDOnlyGetsBodylessResponses_Then_CallbackSkipsItAndStreamSucceeds(t *testing.T) {
 	t.Parallel()
 

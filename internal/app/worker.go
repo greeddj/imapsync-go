@@ -95,7 +95,6 @@ func newSyncWorkerPool(ctx context.Context, cfg *config.Config, srcOpts, dstOpts
 	return pool, nil
 }
 
-// stopSide names the server whose throttled reply stopped the run.
 type stopSide uint8
 
 const (
@@ -110,7 +109,6 @@ func (s stopSide) String() string {
 	return "destination"
 }
 
-// throttleCause is the first throttled reply of a run.
 type throttleCause struct {
 	err  error
 	side stopSide
@@ -125,7 +123,6 @@ func (s *throttleStop) record(side stopSide, err error) {
 	s.cause.CompareAndSwap(nil, &throttleCause{err: err, side: side})
 }
 
-// recordThrottled records err as the stop and reports true only when err is a throttled reply.
 func (s *throttleStop) recordThrottled(side stopSide, err error) bool {
 	if !client.IsThrottled(err) {
 		return false
@@ -138,7 +135,6 @@ func (s *throttleStop) get() *throttleCause { return s.cause.Load() }
 
 func (s *throttleStop) stopped() bool { return s.cause.Load() != nil }
 
-// halt is the halt hook of StreamMessagesByUIDs.
 func (s *throttleStop) halt() error {
 	if s.stopped() {
 		return errPlanStopped
@@ -148,14 +144,12 @@ func (s *throttleStop) halt() error {
 
 func isPlanStopped(err error) bool { return errors.Is(err, errPlanStopped) }
 
-// markPlanStopped shows a plan that the run stopped before it copied anything.
 func markPlanStopped(tr *progress.Tracker, p FolderSyncPlan, planIdx, planCount int) {
 	tr.UpdateMessage(fmt.Sprintf("%d/%d Stopped %s → %s",
 		planIdx+1, planCount, termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)))
 	tr.MarkAsErrored()
 }
 
-// pendingCause says why a planned UID waits for a standby copy.
 type pendingCause uint8
 
 const (
@@ -346,7 +340,6 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, stop *t
 		}
 	}
 
-	// A UID that the stream did not deliver ends here as an error or as gone.
 	var strandedErrors, strandedGone int
 	undeliveredCount := len(sortedUIDs) - deliveredCount
 	if undeliveredCount > 0 && stop.stopped() {
@@ -487,7 +480,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, stop *t
 	return synced, errors, gone
 }
 
-// streamFailure reads a StreamMessagesByUIDs error: the failed batches, the throttled reply that ended the stream, if any, and the first failure. Any other error counts as one batch.
+// An error that is not a *StreamError counts as one failed batch.
 func streamFailure(err error) (batches int, throttle error, first error) {
 	if se, ok := errors.AsType[*client.StreamError](err); ok {
 		if client.IsThrottled(se.Stop) {

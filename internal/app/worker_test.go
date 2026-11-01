@@ -252,8 +252,6 @@ func Test_runFolderSync_verboseSuccess(t *testing.T) {
 	}
 }
 
-// Test_runFolderSync_streamError asserts that a BAD reply to UID FETCH leaves
-// the planned UID undelivered, so it counts as one error.
 func Test_runFolderSync_streamError(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	dstSrv := newFakeServer(t)

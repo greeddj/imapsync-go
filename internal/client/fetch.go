@@ -356,10 +356,9 @@ func (c *Client) selectError(folder string, err error) error {
 	return fmt.Errorf("[%s] cannot select folder %s: %w", c.prefix, folder, err)
 }
 
-// selectChecked selects folder when the session has not selected it, then compares the UIDVALIDITY of the session with uidValidity. 0 skips the comparison.
+// A uidValidity of 0 skips the comparison, because the server sent no value when the plan was made.
 func (c *Client) selectChecked(cli *imapclient.Client, folder string, uidValidity uint32) error {
-	// A retry after a reconnect runs on a fresh session, which has no
-	// selection, so selectIfNeeded selects the folder again.
+	// A retry after a reconnect runs on a fresh session with no selection, so selectIfNeeded selects the folder again.
 	status, err := c.selectIfNeeded(cli, folder)
 	if err != nil {
 		return c.selectError(folder, err)

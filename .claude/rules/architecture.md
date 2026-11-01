@@ -21,6 +21,10 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state. Do not store the selected folder in the Client: a stored copy can differ from the real session.
 7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
 8. **`FetchMessageMap` limits the size hint of its map to `maxMessageMapHint`.** The server sets the message count, and a very large count must not cause a large allocation.
+9. **The body stream has no read-ahead buffer.** The message channel of `StreamMessagesByUIDs` has no buffer, because go-imap holds each body fully in memory. A worker then holds at most two bodies. `messageChanBuffer` is only for the scans that fetch no body.
+10. **Each planned UID ends once, as copied, as an error or as gone.** A response without a body never reaches the callback. `ExistingUIDs` tells a message that the source did not deliver from a message that the source no longer holds. A refused UID FETCH batch costs only that batch, and `StreamError` carries the failed batches.
+11. **A refused CREATE fails only the plans of that folder.** `splitRefusedDestinations` takes them out of the active plans and makes folder failures. A throttled reply to CREATE stops the run.
+12. **`AppendMessage` carries the flags and the INTERNALDATE of the source message.** `appendFlags` is the only filter for the flags. `validFlag` keeps a flag that is not an atom out of the command line.
 
 ## Connection resilience
 

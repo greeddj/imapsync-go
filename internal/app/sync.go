@@ -625,7 +625,6 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		totalErrors atomic.Int64
 	)
 
-	// A stop ends the dispatch: the plans from firstUnstarted on never begin.
 	firstUnstarted := len(activePlans)
 	for i, plan := range activePlans {
 		if ctx.Err() != nil || stop.stopped() {
@@ -681,7 +680,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	return nil
 }
 
-// endRunWithErrors ends a run that has errors, failed folders or a stop. Quiet mode lists the failed folders only once, because the caller printed them already.
+// Quiet mode lists the failed folders only once, because the caller printed them already.
 func endRunWithErrors(out io.Writer, cfg *config.Config, quiet bool, failures []FolderFailure, cause *throttleCause, synced, errs int) error {
 	if len(failures) > 0 && !quiet {
 		printFolderFailures(out, failures)
