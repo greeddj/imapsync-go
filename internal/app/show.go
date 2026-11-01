@@ -64,10 +64,11 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 	pw.Start()
 	defer pw.Stop()
 
-	// No pw.Log before AppendTracker: go-pretty counts only tracker rows when
-	// moving the cursor up, so an early log line leaves the top tracker un-erased.
 	srcTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Src.Label), 100)
 	dstTracker := progress.NewTracker(fmt.Sprintf("[%s] Loading mailboxes", cfg.Dst.Label), 100)
+	// loadAccount decides the final line. An auto-stop on the last folder would end the tracker before the Done message and race with the render tick.
+	srcTracker.AutoStopDisabled = true
+	dstTracker.AutoStopDisabled = true
 	traceTracker("show-src", srcTracker.Message)
 	pw.AppendTracker(srcTracker)
 	traceTracker("show-dst", dstTracker.Message)
@@ -122,7 +123,7 @@ func runShow(ctx context.Context, cfg *config.Config, opts showOptions) error {
 
 	groupErr := g.Wait()
 
-	pw.StopAndClear()
+	pw.Stop()
 
 	defer func() { logoutAll(srcRes.cli, dstRes.cli) }()
 

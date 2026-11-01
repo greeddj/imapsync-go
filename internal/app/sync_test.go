@@ -1965,6 +1965,160 @@ func assertContainsAll(t *testing.T, got string, wants ...string) {
 	}
 }
 
+// renderScreen models only the sequences that the progress writer emits. Any other escape is an error, so a test never passes on a misread screen.
+func renderScreen(raw string) ([]string, error) {
+	rows := [][]rune{nil}
+	row, col := 0, 0
+	runes := []rune(raw)
+	for i := 0; i < len(runes); i++ {
+		switch r := runes[i]; r {
+		case '\n':
+			row++
+			col = 0
+			if row == len(rows) {
+				rows = append(rows, nil)
+			}
+		case '\r':
+			col = 0
+		case '\x1b':
+			if i+1 >= len(runes) || runes[i+1] != '[' {
+				return nil, fmt.Errorf("escape at rune %d does not start a CSI sequence", i)
+			}
+			start := i + 2
+			end := start
+			for end < len(runes) && (runes[end] == ';' || runes[end] >= '0' && runes[end] <= '9') {
+				end++
+			}
+			if end == len(runes) {
+				return nil, fmt.Errorf("CSI sequence at rune %d has no final byte", i)
+			}
+			params := string(runes[start:end])
+			switch final := runes[end]; final {
+			case 'm':
+			case 'A':
+				n := 1
+				if params != "" {
+					var err error
+					if n, err = strconv.Atoi(params); err != nil {
+						return nil, fmt.Errorf("cursor-up at rune %d has parameters %q: %w", i, params, err)
+					}
+				}
+				row = max(row-n, 0)
+			case 'K':
+				if params != "" && params != "0" {
+					return nil, fmt.Errorf("erase at rune %d has parameters %q", i, params)
+				}
+				if col < len(rows[row]) {
+					rows[row] = rows[row][:col]
+				}
+			default:
+				return nil, fmt.Errorf("unsupported escape %q at rune %d", "\x1b["+params+string(final), i)
+			}
+			i = end
+		default:
+			for len(rows[row]) < col {
+				rows[row] = append(rows[row], ' ')
+			}
+			if col < len(rows[row]) {
+				rows[row][col] = r
+			} else {
+				rows[row] = append(rows[row], r)
+			}
+			col++
+		}
+	}
+	screen := make([]string, len(rows))
+	for i, cells := range rows {
+		screen[i] = strings.TrimRight(string(cells), " ")
+	}
+	// The cursor row is empty after a final newline and is not a line the user sees.
+	if last := len(screen) - 1; screen[last] == "" {
+		screen = screen[:last]
+	}
+	return screen, nil
+}
+
+func screenRows(t *testing.T, raw string) []string {
+	t.Helper()
+	rows, err := renderScreen(raw)
+	if err != nil {
+		t.Fatalf("render screen: %v\noutput: %q", err, raw)
+	}
+	return rows
+}
+
+func Test_renderScreen(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		raw     string
+		want    []string
+		wantErr bool
+	}{
+		{name: "plain rows", raw: "a\nb\n", want: []string{"a", "b"}},
+		{name: "last row without newline", raw: "a\nb", want: []string{"a", "b"}},
+		{name: "empty output", raw: "", want: []string{}},
+		{name: "blank row between rows", raw: "a\n\nb\n", want: []string{"a", "", "b"}},
+		{name: "cursor up and erase replace a row", raw: "a\nb\n\x1b[A\x1b[Kc\n", want: []string{"a", "c"}},
+		{name: "cursor up by a count", raw: "a\nb\nc\n\x1b[2A\x1b[Kx\n", want: []string{"a", "x", "c"}},
+		{name: "erase at column 0 empties the row", raw: "abcdef\r\x1b[K", want: []string{}},
+		{name: "erase from the cursor to the end of the row", raw: "abcdef\rab\x1b[0K", want: []string{"ab"}},
+		{name: "SGR is dropped", raw: "\x1b[92m\x1b[1;31mred\x1b[0m text\n", want: []string{"red text"}},
+		{name: "carriage return overwrites from column 0", raw: "abcdef\rxy\n", want: []string{"xycdef"}},
+		{name: "cursor up at row 0 stays at row 0", raw: "\x1b[A\x1b[5Aa\n", want: []string{"a"}},
+		{name: "trailing spaces are removed", raw: "a   \nb\n", want: []string{"a", "b"}},
+		{name: "wide runes advance by one column", raw: "⚠️ ✓ done\n", want: []string{"⚠️ ✓ done"}},
+		{name: "erase screen is refused", raw: "\x1b[2J", wantErr: true},
+		{name: "escape without a bracket is refused", raw: "a\x1bb", wantErr: true},
+		{name: "escape at the end is refused", raw: "a\x1b", wantErr: true},
+		{name: "unfinished CSI is refused", raw: "a\x1b[12", wantErr: true},
+		{name: "erase with an unknown parameter is refused", raw: "a\x1b[2K", wantErr: true},
+		{name: "cursor up with a list is refused", raw: "a\x1b[1;2A", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := renderScreen(tt.raw)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("renderScreen(%q) = %q, want an error", tt.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("renderScreen(%q): %v", tt.raw, err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("renderScreen(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func rowsHolding(rows []string, parts ...string) []int {
+	var found []int
+	for i, row := range rows {
+		if !slices.ContainsFunc(parts, func(part string) bool { return !strings.Contains(row, part) }) {
+			found = append(found, i)
+		}
+	}
+	return found
+}
+
+// assertOneRow checks that exactly one row holds every part and returns its index, or -1 when that is not so.
+func assertOneRow(t *testing.T, rows []string, parts ...string) int {
+	t.Helper()
+	found := rowsHolding(rows, parts...)
+	if len(found) != 1 {
+		t.Errorf("%d rows hold all of %q, want 1\nscreen:\n%s", len(found), parts, strings.Join(rows, "\n"))
+		return -1
+	}
+	return found[0]
+}
+
 func assertContainsNone(t *testing.T, got string, unwanted ...string) {
 	t.Helper()
 	for _, bad := range unwanted {
@@ -2697,6 +2851,128 @@ func TestRunSync_When_EveryCreateIsRefused_Then_FolderFailsAndNoWorkerConnects(t
 				assertContainsNone(t, got, "Messages to be copied", "Failed to create folder")
 			} else {
 				assertContainsAll(t, got, `Failed to create folder "Work"`)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_FolderCreationLogs_Then_EveryLogAndTheFinalTrackerLineStayOnScreen(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src      map[string][]fakeMsg
+		dst      map[string][]fakeMsg
+		setup    func(dst *fakeServer)
+		check    func(t *testing.T, dst *fakeServer)
+		name     string
+		mappings []config.DirectoryMapping
+		wantRows [][]string
+		noRows   [][]string
+		verbose  bool
+		wantExit bool
+	}{
+		{
+			name:     "every CREATE refused",
+			src:      map[string][]fakeMsg{"Work": fakeMsgs("m1@x")},
+			dst:      map[string][]fakeMsg{"INBOX": nil},
+			setup:    func(dst *fakeServer) { dst.refuseCreate() },
+			mappings: []config.DirectoryMapping{mapping("Work", "Work")},
+			wantExit: true,
+			wantRows: [][]string{
+				{`Failed to create folder "Work"`, "CREATE refused by policy"},
+				{"Created 0 of 1 folders, 1 refused", "✗ error"},
+			},
+			noRows: [][]string{{"Created", "✓ done"}},
+		},
+		{
+			name:     "one of two refused",
+			src:      map[string][]fakeMsg{"Good": fakeMsgs("m1@x"), "Bad": fakeMsgs("m2@x")},
+			dst:      map[string][]fakeMsg{"INBOX": nil},
+			setup:    func(dst *fakeServer) { dst.refuseCreateOf("Bad", "NO [CANNOT] Invalid folder name") },
+			mappings: []config.DirectoryMapping{mapping("Good", "Good"), mapping("Bad", "Bad")},
+			wantExit: true,
+			wantRows: [][]string{
+				{`Failed to create folder "Bad"`, "Invalid folder name"},
+				{"Created 1 of 2 folders, 1 refused", "✗ error"},
+			},
+			noRows: [][]string{{"Created", "✓ done"}},
+		},
+		{
+			name:     "throttled CREATE",
+			src:      map[string][]fakeMsg{"A": fakeMsgs("a1@x", "a2@x"), "B": fakeMsgs("b1@x")},
+			dst:      map[string][]fakeMsg{"INBOX": nil},
+			setup:    func(dst *fakeServer) { dst.refuseCreateOf("A", gmailThrottleReply) },
+			mappings: []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")},
+			wantExit: true,
+			wantRows: [][]string{
+				{`Failed to create folder "A"`},
+				{"Created 0 of 2 folders, 1 refused", "✗ error"},
+				{"⛔ Sync stopped"},
+			},
+			noRows: [][]string{{"Created", "✓ done"}},
+		},
+		{
+			name:     "created, verbose",
+			src:      map[string][]fakeMsg{"Good": fakeMsgs("m1@x")},
+			dst:      map[string][]fakeMsg{"INBOX": nil},
+			mappings: []config.DirectoryMapping{mapping("Good", "Good")},
+			verbose:  true,
+			wantRows: [][]string{
+				{`Created folder "Good"`},
+				{"Created 1 folders", "✓ done"},
+			},
+			noRows: [][]string{{"✗ error"}},
+		},
+		{
+			name:     "already exists, verbose",
+			src:      map[string][]fakeMsg{"A": fakeMsgs("a1@x")},
+			dst:      map[string][]fakeMsg{"INBOX": nil, "A": nil},
+			setup:    func(dst *fakeServer) { dst.hideFromList("A") },
+			mappings: []config.DirectoryMapping{mapping("A", "A")},
+			verbose:  true,
+			wantRows: [][]string{
+				{"Folder A already exists"},
+				{"Created 1 folders", "✓ done"},
+			},
+			noRows: [][]string{{"✗ error"}},
+			check: func(t *testing.T, dst *fakeServer) {
+				t.Helper()
+				assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, "/", tt.dst)
+			if tt.setup != nil {
+				tt.setup(dst)
+			}
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, tt.verbose
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			switch {
+			case tt.wantExit && !errors.Is(err, ErrSilentExit):
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			case !tt.wantExit && err != nil:
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+			rows := screenRows(t, out.String())
+			for _, parts := range tt.wantRows {
+				assertOneRow(t, rows, parts...)
+			}
+			for _, parts := range tt.noRows {
+				if found := rowsHolding(rows, parts...); len(found) != 0 {
+					t.Errorf("rows %v hold all of %q, want none\nscreen:\n%s", found, parts, strings.Join(rows, "\n"))
+				}
+			}
+			if tt.check != nil {
+				tt.check(t, dst)
 			}
 		})
 	}
@@ -7428,6 +7704,68 @@ func TestRunSync_When_DestinationFoldersHoldMessagesWithoutMessageId_Then_OnlyTh
 			assertIDs(t, "dst A appends", dst.appended("A"), "a1@x")
 			assertIDs(t, "dst B appends", dst.appended("B"), "b1@x")
 			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
+func TestRunSync_When_ScanWarnsAboutMessagesWithoutMessageId_Then_TheWarningAndBothScanLinesStayOnScreen(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src      map[string][]fakeMsg
+		dst      map[string][]fakeMsg
+		name     string
+		mappings []config.DirectoryMapping
+		warnings []string
+	}{
+		{
+			name:     "one folder",
+			src:      map[string][]fakeMsg{"INBOX": {{body: bodyOfSize("", 900)}, {body: bodyOfSize("", 800)}}},
+			dst:      map[string][]fakeMsg{"INBOX": nil},
+			mappings: []config.DirectoryMapping{mapping("INBOX", "INBOX")},
+			warnings: []string{"[src] ⚠️  INBOX: 2 message(s) without Message-Id will be skipped - sync cannot track them"},
+		},
+		{
+			name: "two folders",
+			src: map[string][]fakeMsg{
+				"A": {{body: bodyOfSize("", 900)}},
+				"B": {{body: bodyOfSize("", 800)}},
+			},
+			dst: map[string][]fakeMsg{
+				"INBOX": nil,
+				"A":     {{body: bodyOfSize("", 700)}},
+				"B":     {{body: bodyOfSize("", 600)}},
+			},
+			mappings: []config.DirectoryMapping{mapping("A", "A"), mapping("B", "B")},
+			warnings: []string{
+				"[src] ⚠️  A: 1 message(s) without Message-Id will be skipped - sync cannot track them",
+				"[src] ⚠️  B: 1 message(s) without Message-Id will be skipped - sync cannot track them",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			dst := newStoreServer(t, "/", tt.dst)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			rows := screenRows(t, out.String())
+			synced := assertOneRow(t, rows, "✅ All folders already synced!")
+			for _, warning := range tt.warnings {
+				if i := assertOneRow(t, rows, warning); i > synced {
+					t.Errorf("warning row %d comes after the summary row %d: %q", i, synced, warning)
+				}
+			}
+			assertOneRow(t, rows, "[src] Scanned", "✓ done")
+			assertOneRow(t, rows, "[dst] Scanned", "✓ done")
 		})
 	}
 }

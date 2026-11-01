@@ -9,33 +9,9 @@ import (
 	"testing"
 )
 
-// TestWriter_StopAndClear_emitsOneEscapePerTracker asserts that the count of
-// "\033[K" escape sequences matches the numTrackers passed to NewWriter, and
-// that they go to the configured output. The escape erases one terminal line;
-// one per tracker is what visually clears the rendered bars.
-func TestWriter_StopAndClear_emitsOneEscapePerTracker(t *testing.T) {
-	t.Parallel()
-
-	const want = 3
-
-	var out bytes.Buffer
-	pw := NewWriter(want, false)
-	pw.SetOutputWriter(&out)
-	pw.Start()
-	pw.StopAndClear()
-
-	got := out.String()
-	if n := strings.Count(got, "\033[A\033[K"); n != want {
-		t.Errorf("erase sequences = %d, want %d (output: %q)", n, want, got)
-	}
-	if !strings.HasSuffix(got, "\r") {
-		t.Errorf("output does not end with a carriage return: %q", got)
-	}
-}
-
 // Sequential: swaps the process-wide os.Stdout to catch writes that bypass
 // the configured output.
-func TestWriter_StopAndClear_whenQuiet_writesNothingToStdout(t *testing.T) {
+func TestWriter_Stop_whenQuiet_writesNothingToStdout(t *testing.T) {
 	orig := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -45,8 +21,12 @@ func TestWriter_StopAndClear_whenQuiet_writesNothingToStdout(t *testing.T) {
 	t.Cleanup(func() { os.Stdout = orig })
 
 	pw := NewWriter(3, true)
+	tr := NewTracker("quiet", 1)
+	pw.AppendTracker(tr)
+	pw.Log("queued")
+	tr.MarkAsDone()
 	pw.Start()
-	pw.StopAndClear()
+	pw.Stop()
 
 	if err := w.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -56,7 +36,7 @@ func TestWriter_StopAndClear_whenQuiet_writesNothingToStdout(t *testing.T) {
 		t.Fatalf("copy: %v", err)
 	}
 	if buf.Len() != 0 {
-		t.Errorf("quiet StopAndClear wrote %q to stdout, want nothing", buf.String())
+		t.Errorf("quiet Stop wrote %q to stdout, want nothing", buf.String())
 	}
 }
 
@@ -85,10 +65,35 @@ func TestWriter_Stop_isSafeBeforeStartAndWhenRepeated(t *testing.T) {
 	w.Stop()
 
 	w.Start()
-	w.StopAndClear()
+	w.Stop()
 	w.Stop()
 
 	if w.pw.IsRenderInProgress() {
-		t.Error("render loop still running after StopAndClear and Stop")
+		t.Error("render loop still running after Stop")
+	}
+}
+
+func TestWriter_Stop_When_LogIsQueuedBeforeTheLastTrackerEnds_Then_OutputEndsWithTheLog(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	pw := NewWriter(1, false)
+	pw.SetOutputWriter(&out)
+	tr := NewTracker("work", 1)
+	pw.AppendTracker(tr)
+	pw.Log("late log")
+	tr.MarkAsDone()
+	pw.Start()
+	pw.Stop()
+
+	got := out.String()
+	if !strings.HasSuffix(got, "late log\n") {
+		t.Errorf("output does not end with the log line: %q", got)
+	}
+	if !strings.Contains(got, "✓ done") {
+		t.Errorf("output does not show the finished tracker: %q", got)
+	}
+	if strings.Contains(got, "\x1b[A") {
+		t.Errorf("output moves the cursor up: %q", got)
 	}
 }

@@ -2,7 +2,6 @@
 package progress
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -15,11 +14,8 @@ import (
 
 // Writer is a wrapper around progress.Writer with pre-configured settings.
 type Writer struct {
-	pw          progress.Writer
-	out         io.Writer
-	rendered    chan struct{}
-	numTrackers int
-	quiet       bool
+	pw       progress.Writer
+	rendered chan struct{}
 }
 
 // getTerminalWidth returns the current terminal width, defaulting to 120 if detection fails.
@@ -47,7 +43,7 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	// If it equals terminalWidth, some terminals wrap the trailing space
 	// to the next line, and go-pretty's cursor-up + erase-line redraw
 	// cycle then strips only the wrapped portion - the original line
-	// becomes a "zombie" on screen that StopAndClear cannot erase.
+	// becomes a "zombie" on screen that the redraw cannot erase.
 	//
 	// The stats portion (percent + bar + time + separators) is bounded
 	// above by ~80 chars for a long sync ("99.99% ⡇...⢸ [1h12m1s; ~ETA: 12m34s]");
@@ -112,13 +108,11 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.Style().Options.TimeInProgressPrecision = time.Millisecond
 	pw.Style().Options.TimeDonePrecision = time.Millisecond
 
-	return &Writer{pw: pw, out: out, numTrackers: numTrackers, quiet: quiet}
+	return &Writer{pw: pw}
 }
 
-// SetOutputWriter redirects rendered output, and the escapes StopAndClear
-// writes, to out.
+// SetOutputWriter redirects rendered output to out.
 func (w *Writer) SetOutputWriter(out io.Writer) {
-	w.out = out
 	w.pw.SetOutputWriter(out)
 }
 
@@ -148,8 +142,8 @@ func (w *Writer) Start() {
 	}()
 }
 
-// Stop stops the progress writer without clearing. It returns once the render
-// goroutine has exited, and it is safe to call more than once.
+// Stop waits for the last render pass. Finished trackers and logs queued
+// before the last tracker ends stay on screen. Calling it again is safe.
 func (w *Writer) Stop() {
 	if w.rendered == nil {
 		return
@@ -166,33 +160,6 @@ func (w *Writer) Stop() {
 		case <-tick.C:
 		}
 	}
-}
-
-// StopAndClear stops the progress writer and erases the rendered trackers
-// from the terminal. Line count is taken from the NewWriter argument so
-// callers never have to keep that number in sync by hand.
-func (w *Writer) StopAndClear() {
-	// Quiet mode rendered nothing, so there is nothing to wait for or erase;
-	// cursor escapes here would corrupt piped output and earlier lines.
-	if w.quiet {
-		w.Stop()
-		return
-	}
-
-	// Wait for final rendering
-	time.Sleep(300 * time.Millisecond)
-
-	// Stop the writer
-	w.Stop()
-
-	// After Stop, the cursor sits on a blank line one below the last
-	// rendered tracker. Go up numTrackers times, erasing each tracker
-	// line as we pass, then return to column 0 of the topmost erased
-	// row so the next caller-printed line starts there cleanly.
-	for range w.numTrackers {
-		_, _ = fmt.Fprint(w.out, "\033[A\033[K")
-	}
-	_, _ = fmt.Fprint(w.out, "\r")
 }
 
 // NewTracker creates a new tracker with the given message and total.

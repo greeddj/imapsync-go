@@ -382,8 +382,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	srcTracker.MarkAsDone()
 	dstTracker.MarkAsDone()
 
-	// Stop and clear progress
-	pw.StopAndClear()
+	pw.Stop()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -494,10 +493,12 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		creationPW := newProgressWriter(1, quiet, out)
 		creationPW.Start()
 		creationTracker := progress.NewTracker("Creating folders", int64(len(foldersToCreate)))
+		// The loop decides the final state: an auto-stop on the last Increment would make MarkAsErrored do nothing and render the (k/k) Creating text.
+		creationTracker.AutoStopDisabled = true
 		traceTracker("folder-create", creationTracker.Message)
 		creationPW.AppendTracker(creationTracker)
 
-		createdCount := 0
+		createdCount, refusedCount := 0, 0
 		refused := make(map[string]error)
 		dstListIncomplete := len(dstClient.InvalidMailboxNames()) > 0
 
@@ -518,6 +519,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				return ctx.Err()
 			case err != nil:
 				creationPW.Log("Failed to create folder %q: %s", folder, termsafe.Escape(err.Error()))
+				refusedCount++
 				// A throttled reply limits the account, not this folder, so no more CREATE follows.
 				if stop.recordThrottled(sideDestination, err) {
 					break createFolders
@@ -542,9 +544,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 			creationTracker.Increment(1)
 		}
 
-		creationTracker.UpdateMessage(fmt.Sprintf("Created %d folders", createdCount))
-		creationTracker.MarkAsDone()
-		creationPW.StopAndClear()
+		if refusedCount > 0 {
+			creationTracker.UpdateMessage(fmt.Sprintf("Created %d of %d folders, %d refused", createdCount, len(foldersToCreate), refusedCount))
+			creationTracker.MarkAsErrored()
+		} else {
+			creationTracker.UpdateMessage(fmt.Sprintf("Created %d folders", createdCount))
+			creationTracker.MarkAsDone()
+		}
+		creationPW.Stop()
 
 		if len(refused) > 0 {
 			var refusals []FolderFailure

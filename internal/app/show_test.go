@@ -126,6 +126,36 @@ func TestRunShow_When_BothAccountsReachable_Then_PrintsFolderTables(t *testing.T
 	}
 }
 
+func TestRunShow_When_BothAccountsLoad_Then_TheirTrackerLinesStayAboveTheTables(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": fakeMsgs("a@x", "b@x"),
+		"Sent":  nil,
+		"Work":  fakeMsgs("c@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":   fakeMsgs("d@x"),
+		"Archive": nil,
+	})
+	out := &syncBuffer{}
+
+	if err := runShow(e2eContext(t), e2eConfig(src, dst, 1), e2eShowOptions(out, false)); err != nil {
+		t.Fatalf("runShow: %v\noutput: %s", err, out.String())
+	}
+
+	rows := screenRows(t, out.String())
+	srcRow := assertOneRow(t, rows, "[src] Done (3 mailboxes)", "✓ done")
+	dstRow := assertOneRow(t, rows, "[dst] Done (2 mailboxes)", "✓ done")
+	firstTable := rowsHolding(rows, "Source")
+	if len(firstTable) == 0 {
+		t.Fatalf("screen has no Source title:\n%s", strings.Join(rows, "\n"))
+	}
+	if srcRow > firstTable[0] || dstRow > firstTable[0] {
+		t.Errorf("tracker rows %d and %d come after the first table row %d\nscreen:\n%s", srcRow, dstRow, firstTable[0], strings.Join(rows, "\n"))
+	}
+}
+
 func TestRunShow_When_FoldersCannotBeRead_Then_MarksRowsListsReasonsAndFails(t *testing.T) {
 	t.Parallel()
 
