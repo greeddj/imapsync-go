@@ -1338,6 +1338,83 @@ func Test_runFolderSync_When_NamesCarryControlCharacters_Then_TheStandbyLineShow
 	assertIDs(t, "dst APPEND names", dst.appended(hostileWireName), "e1@x")
 }
 
+func Test_runFolderSync_When_AStandbyReplacesAPlannedUID_Then_TheVerboseLineGivesTheCause(t *testing.T) {
+	t.Parallel()
+
+	const (
+		refusedEnding      = "the copy in A has no usable body"
+		notDeliveredEnding = "A did not deliver the planned copy"
+		goneEnding         = "A no longer holds the planned copy"
+	)
+	bodyOfB := subjectBody("m1@x", "from B")
+	tests := []struct {
+		arrange      func(src *fakeServer)
+		name         string
+		wantEnding   string
+		wantSearches []string
+	}{
+		{
+			name:       "the planned body is refused",
+			arrange:    func(src *fakeServer) { src.answerBodyIn("A", "m1@x", "NIL") },
+			wantEnding: refusedEnding,
+		},
+		{
+			name:         "the source holds the planned message but leaves it out of the UID FETCH",
+			arrange:      func(src *fakeServer) { src.omitInUIDFetch("A", "m1@x") },
+			wantEnding:   notDeliveredEnding,
+			wantSearches: []string{"1"},
+		},
+		{
+			name:         "the planned message left the source after the plan",
+			arrange:      func(src *fakeServer) { src.removeMessage("A", "m1@x") },
+			wantEnding:   goneEnding,
+			wantSearches: []string{"1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"A": fakeMsgs("m1@x"),
+				"B": {{msgID: "other@x"}, {msgID: "m1@x", envelopeID: "<m1@x>", body: bodyOfB}},
+			})
+			tt.arrange(src)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"X": nil})
+
+			got := runStandbyPlan(t.Context(), t, src, dst, standbyPlan("B"), true)
+
+			if got.synced != 1 || got.errs != 0 || got.gone != 0 {
+				t.Errorf("synced, errors, gone = %d, %d, %d, want 1, 0, 0", got.synced, got.errs, got.gone)
+			}
+			if bodies := dst.folderBodies("X"); !slices.Equal(bodies, []string{bodyOfB}) {
+				t.Errorf("dst X bodies = %q, want only the copy of B %q", bodies, bodyOfB)
+			}
+			if n := dst.callCount("APPEND"); n != 1 {
+				t.Errorf("destination saw %d APPEND commands, want 1", n)
+			}
+			assertIDs(t, "source UID SEARCH sets", src.capturedNames("UID SEARCH"), tt.wantSearches...)
+			want := "Copied message <m1@x> to X from B: " + tt.wantEnding
+			var lines []string
+			for _, line := range strings.Split(got.log, "\n") {
+				// The writer puts its own erase-line sequence before each log line.
+				if _, text, found := strings.Cut(line, "Copied message"); found {
+					lines = append(lines, strings.TrimRight("Copied message"+text, " \r"))
+				}
+			}
+			if !slices.Equal(lines, []string{want}) {
+				t.Errorf("standby lines = %q, want only %q", lines, want)
+			}
+			for _, ending := range []string{refusedEnding, notDeliveredEnding, goneEnding} {
+				if ending != tt.wantEnding {
+					assertContainsNone(t, got.log, ending)
+				}
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
 func Test_runFolderSync_When_PlannedCopyIsEmptyAndItsOwnFolderHoldsAnotherCopy_Then_CopiesItWithoutASecondExamine(t *testing.T) {
 	t.Parallel()
 

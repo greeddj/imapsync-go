@@ -411,7 +411,8 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, stop *t
 				return errPlanStopped
 			}
 			planned := owner[msg.UID()]
-			if _, waiting := pending[planned]; !waiting {
+			cause, waiting := pending[planned]
+			if !waiting {
 				return nil
 			}
 			err := w.dst.AppendMessage(ctx, p.DestinationFolder, msg)
@@ -422,7 +423,7 @@ func runFolderSync(ctx context.Context, w *syncWorker, p FolderSyncPlan, stop *t
 				tr.Increment(1)
 				refreshTracker()
 				if verbose {
-					pw.Log("Copied message %s to %s from %s: the copy in %s has no usable body",
+					pw.Log("Copied message %s to %s from %s: "+standbyReason(cause),
 						termsafe.Escape(msg.MessageID()), dstShown, standbyShown, srcShown)
 				}
 				return ctx.Err()
@@ -495,6 +496,18 @@ func streamFailure(err error) (batches int, throttle error, first error) {
 		return se.FailedBatches, throttle, se.First
 	}
 	return 1, nil, err
+}
+
+// standbyReason is the ending of the verbose standby line. Its one %s is the escaped source folder of the plan.
+func standbyReason(cause pendingCause) string {
+	switch cause {
+	case causeNotDelivered:
+		return "%s did not deliver the planned copy"
+	case causeGone:
+		return "%s no longer holds the planned copy"
+	default:
+		return "the copy in %s has no usable body"
+	}
 }
 
 func refusedBody(err error) bool {
