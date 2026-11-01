@@ -6,8 +6,39 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+type lockedBuffer struct {
+	buf bytes.Buffer
+	mu  sync.Mutex
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func waitForRenders(t *testing.T, out *lockedBuffer, marker string, renders int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for strings.Count(out.String(), marker) < renders {
+		if time.Now().After(deadline) {
+			t.Fatalf("fewer than %d renders of %q within the deadline: %q", renders, marker, out.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
 
 // Sequential: swaps the process-wide os.Stdout to catch writes that bypass
 // the configured output.
@@ -95,5 +126,73 @@ func TestWriter_Stop_When_LogIsQueuedBeforeTheLastTrackerEnds_Then_OutputEndsWit
 	}
 	if strings.Contains(got, "\x1b[A") {
 		t.Errorf("output moves the cursor up: %q", got)
+	}
+}
+
+func TestNewWriter_When_Built_Then_StyleHasAnIndeterminateIndicator(t *testing.T) {
+	t.Parallel()
+
+	for _, quiet := range []bool{false, true} {
+		w := NewWriter(1, quiet)
+		if w.pw.Style().Chars.Indeterminate == nil {
+			t.Errorf("quiet=%v: Indeterminate is nil, go-pretty would panic on an indeterminate tracker", quiet)
+		}
+	}
+}
+
+func TestWriter_Start_When_TrackerIsIndeterminate_Then_DrawsTheIndicatorWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		setup            func(*Tracker)
+		name             string
+		message          string
+		wantPercent      string
+		total            int64
+		autoStopDisabled bool
+	}{
+		{
+			name:        "total is zero",
+			message:     "total-is-zero",
+			total:       0,
+			wantPercent: "???",
+		},
+		{
+			name:             "value is above total and auto stop is disabled",
+			message:          "value-above-total",
+			total:            5,
+			autoStopDisabled: true,
+			setup:            func(tr *Tracker) { tr.Increment(7) },
+			wantPercent:      "140.00%",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out lockedBuffer
+			pw := NewWriter(1, false)
+			pw.SetOutputWriter(&out)
+			t.Cleanup(pw.Stop)
+
+			tr := NewTracker(tt.message, tt.total)
+			tr.AutoStopDisabled = tt.autoStopDisabled
+			pw.AppendTracker(tr)
+			if tt.setup != nil {
+				tt.setup(tr)
+			}
+			pw.Start()
+
+			waitForRenders(t, &out, tt.message, 2)
+			pw.Stop()
+
+			got := out.String()
+			for _, want := range []string{tt.message, tt.wantPercent, "⡇", "⢸", "⣿⣿⣿"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("output lacks %q: %q", want, got)
+				}
+			}
+		})
 	}
 }

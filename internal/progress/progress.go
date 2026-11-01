@@ -12,6 +12,8 @@ import (
 	"golang.org/x/term"
 )
 
+const updateFrequency = 100 * time.Millisecond
+
 // Writer is a wrapper around progress.Writer with pre-configured settings.
 type Writer struct {
 	pw       progress.Writer
@@ -67,7 +69,7 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	pw.SetNumTrackersExpected(numTrackers)
 	pw.SetStyle(progress.StyleDefault)
 	pw.SetTrackerPosition(progress.PositionRight)
-	pw.SetUpdateFrequency(time.Millisecond * 100)
+	pw.SetUpdateFrequency(updateFrequency)
 
 	// Configure colors
 	pw.Style().Colors = progress.StyleColors{
@@ -88,7 +90,10 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 		Finished25: "⣀",
 		Finished50: "⣤",
 		Finished75: "⣶",
-		Unfinished: "⣀",
+		// go-pretty calls this for Total 0 or a value above Total; nil panics the
+		// render goroutine. The generator keeps state, so build one for each Writer.
+		Indeterminate: progress.IndeterminateIndicatorMovingBackAndForth("⣿⣿⣿", updateFrequency/2),
+		Unfinished:    "⣀",
 	}
 
 	// Configure visibility
