@@ -90,6 +90,15 @@ func (c *Client) FetchMessageMap(ctx context.Context, folder string) (map[string
 	return scan.ids, scan.uidValidity, nil
 }
 
+// RescanMessageMap is FetchMessageMap without the missing-Message-Id warning, for a folder that an earlier scan of the same run already reported.
+func (c *Client) RescanMessageMap(ctx context.Context, folder string) (map[string][]MessageRef, uint32, error) {
+	scan, err := c.scanMessageIDs(ctx, folder, failOnMissingUID)
+	if err != nil {
+		return nil, 0, err
+	}
+	return scan.ids, scan.uidValidity, nil
+}
+
 // FetchMessageCopies returns Message-Id -> copies in folder for the destination side, where only the count and sizes matter. A copy without a UID keeps UID 0 and counts alone.
 func (c *Client) FetchMessageCopies(ctx context.Context, folder string) (map[string][]MessageRef, error) {
 	scan, err := c.scanMessageIDs(ctx, folder, keepMissingUID)

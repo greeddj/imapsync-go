@@ -645,6 +645,14 @@ func Test_MessageIDScans_When_FoldersAreScanned_Then_OnlyTheSourceScanWarnsAbout
 				return c.FetchMessageCopies(ctx, "INBOX")
 			},
 		},
+		{
+			name:   "source rescan",
+			prefix: "src",
+			scan: func(ctx context.Context, c *Client) (map[string][]MessageRef, error) {
+				got, _, err := c.RescanMessageMap(ctx, "INBOX")
+				return got, err
+			},
+		},
 	}
 	folders := []struct {
 		want        map[string][]MessageRef
@@ -705,6 +713,78 @@ func Test_MessageIDScans_When_FoldersAreScanned_Then_OnlyTheSourceScanWarnsAbout
 				})
 			}
 		})
+	}
+}
+
+func Test_RescanMessageMap_When_FolderWasScannedBefore_Then_ReturnsTheSameScanWithoutAnotherWarning(t *testing.T) {
+	t.Parallel()
+
+	rows := []scanRow{
+		{uid: 1, size: 10},
+		{msgID: "a@x", uid: 2, size: 20},
+		{msgID: "a@x", uid: 3, size: 30},
+	}
+	srv := newFakeServer(t)
+	status := func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if cmd.verb != "STATUS" {
+			return false, true
+		}
+		writeLine(conn, `* STATUS "%s" (MESSAGES %d UIDVALIDITY 7)`, firstArg(cmd.arg), len(rows))
+		writeLine(conn, "%s OK STATUS completed", cmd.tag)
+		return true, true
+	}
+	srv.addConnHandler(interceptHandler(srv, chainHooks(scanSession(rows, len(rows), 7), status)))
+	c := newClientWithFake(t, srv)
+	c.prefix = "src"
+	c.verbose = true
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	first, firstValidity, err := c.FetchMessageMap(t.Context(), "INBOX")
+	if err != nil {
+		t.Fatalf("FetchMessageMap: %v", err)
+	}
+	second, secondValidity, err := c.RescanMessageMap(t.Context(), "INBOX")
+	if err != nil {
+		t.Fatalf("RescanMessageMap: %v", err)
+	}
+
+	if !equalMessageMaps(second, first) {
+		t.Errorf("rescan map = %v, want %v", second, first)
+	}
+	if firstValidity != 7 || secondValidity != 7 {
+		t.Errorf("UIDVALIDITY of the scan and the rescan = %d and %d, want 7 and 7", firstValidity, secondValidity)
+	}
+	want := []string{"[src] ⚠️  INBOX: 1 message(s) without Message-Id will be skipped - sync cannot track them"}
+	if warnings := missingIDWarnings(logged); !slices.Equal(warnings, want) {
+		t.Errorf("warnings = %q, want %q", warnings, want)
+	}
+	// The rescan still reports its progress lines: only the warning is left out.
+	if n := len(slices.DeleteFunc(slices.Clone(logged), func(msg string) bool { return msg != "[src] Fetching folder INBOX..." })); n != 2 {
+		t.Errorf("log holds %d \"Fetching folder\" lines, want 2 (one for each scan); log: %q", n, logged)
+	}
+}
+
+func Test_RescanMessageMap_When_ScanFails_Then_ReturnsTheErrorOfTheScan(t *testing.T) {
+	t.Parallel()
+
+	rows := []scanRow{{uid: 1, size: 10}, {msgID: "a@x", noUID: true, size: 20}}
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, scanIntercept(rows)))
+	c := newClientWithFake(t, srv)
+	var logged []string
+	c.SetProgressWriter(&logCapture{fn: func(msg string) { logged = append(logged, msg) }})
+
+	got, validity, err := c.RescanMessageMap(t.Context(), "INBOX")
+
+	if !errors.Is(err, errMissingUID) {
+		t.Fatalf("error = %v, want one that wraps errMissingUID", err)
+	}
+	if got != nil || validity != 0 {
+		t.Errorf("result = %v and %d, want nil and 0", got, validity)
+	}
+	if warnings := missingIDWarnings(logged); len(warnings) != 0 {
+		t.Errorf("warnings = %q, want none", warnings)
 	}
 }
 

@@ -8267,6 +8267,45 @@ func TestRunSync_When_DestinationFoldersHoldMessagesWithoutMessageId_Then_OnlyTh
 	}
 }
 
+func TestRunSync_When_ExistingDestinationForcesASourceRescan_Then_TheMissingMessageIdWarningShowsOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verbose bool
+	}{
+		{name: "default output"},
+		{name: "verbose output", verbose: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"A": {{body: bodyOfSize("", 900)}, {msgID: "a1@x"}, {msgID: "a2@x"}}})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "A": fakeMsgs("a1@x")})
+			dst.hideFromList("A")
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, tt.verbose
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("A", "A")), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			raw := out.String()
+			const warning = "[src] ⚠️  A: 1 message(s) without Message-Id will be skipped - sync cannot track them"
+			if n := strings.Count(raw, "without Message-Id"); n != 1 {
+				t.Errorf("raw output holds %d warnings about a missing Message-Id, want 1\noutput: %q", n, raw)
+			}
+			rows := screenRows(t, raw)
+			assertOneRow(t, rows, warning)
+			assertOneRow(t, rows, "Destination folder A already exists and holds 1 of the 2 planned messages from A")
+			assertIDs(t, "dst appends", dst.appended("A"), "a2@x")
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
 func TestRunSync_When_ScanWarnsAboutMessagesWithoutMessageId_Then_TheWarningAndBothScanLinesStayOnScreen(t *testing.T) {
 	t.Parallel()
 
@@ -18114,9 +18153,7 @@ func TestRunSync_When_FolderNameHoldsFormatVerbs_Then_EveryPhaseShowsItVerbatim(
 	raw := out.String()
 	assertContainsNone(t, raw, "%!")
 	rows := screenRows(t, raw)
-	if found := rowsHolding(rows, "[src] ⚠️  "+folder+": 1 message(s) without Message-Id will be skipped"); len(found) == 0 {
-		t.Errorf("screen has no warning row for %q\nscreen:\n%s", folder, strings.Join(rows, "\n"))
-	}
+	assertOneRow(t, rows, "[src] ⚠️  "+folder+": 1 message(s) without Message-Id will be skipped")
 	assertOneRow(t, rows, "[dst] Fetching folder "+folder+"...")
 	assertOneRow(t, rows, "Folder "+folder+" already exists")
 	assertOneRow(t, rows, "[src-w1] Streaming 1 messages from "+folder)

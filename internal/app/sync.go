@@ -897,8 +897,8 @@ func recheckDestination(ctx context.Context, srcClient, dstClient *client.Client
 	diff := newDestinationDiff(plans, dstMap)
 	added := make([]bool, len(plans))
 	for slot, plan := range plans {
-		// FetchMessageMap returns the context error before it sends a command.
-		srcMap, uidValidity, err := srcClient.FetchMessageMap(ctx, plan.SourceFolder)
+		// The planning scan already warned about messages without a Message-Id. RescanMessageMap returns the context error before it sends a command.
+		srcMap, uidValidity, err := srcClient.RescanMessageMap(ctx, plan.SourceFolder)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
