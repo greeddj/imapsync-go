@@ -3567,6 +3567,59 @@ func Test_StreamMessagesByUIDs_When_ABatchIsRefused_Then_LaterBatchesAreStillFet
 	}
 }
 
+func Test_StreamMessagesByUIDs_When_FetchResponseHasNoItemList_Then_OnlyItsBatchFails(t *testing.T) {
+	t.Parallel()
+
+	fetches := new(uidFetchLog)
+	var fetchCount atomic.Int32
+	srv := newFakeServer(t)
+	srv.addConnHandler(interceptHandler(srv, func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
+		if !isUIDFetch(cmd) {
+			return false, true
+		}
+		requested := requestedUIDs(cmd)
+		fetches.record(requested)
+		if fetchCount.Add(1) == 1 {
+			writeUIDMessage(conn, 1)
+			writeLine(conn, "* 7 FETCH")
+			writeUIDMessage(conn, 2)
+		} else {
+			for _, uid := range requested {
+				writeUIDMessage(conn, uid)
+			}
+		}
+		writeLine(conn, "%s OK UID FETCH completed", cmd.tag)
+		return true, true
+	}))
+	c := newClientWithFake(t, srv)
+	uids := sequentialUIDs(uidFetchBatchSize + 1)
+
+	got, err := streamedUIDs(t.Context(), c, "INBOX", 0, uids)
+
+	want := [][]uint32{uids[:uidFetchBatchSize], uids[uidFetchBatchSize:]}
+	if gotSets := fetches.all(); !slices.EqualFunc(gotSets, want, slices.Equal) {
+		t.Errorf("UID FETCH sets = %d, want the 2 batches [1..500], [501] and no retry of the first", len(gotSets))
+	}
+	if wantUIDs := []uint32{1, uint32(uidFetchBatchSize + 1)}; !slices.Equal(got, wantUIDs) {
+		t.Errorf("callback got %v, want %v: the message after the refused response is not delivered", got, wantUIDs)
+	}
+	se := streamErrorOf(t, err)
+	if se.FailedBatches != 1 || se.Stop != nil {
+		t.Errorf("FailedBatches, Stop = %d, %v, want 1, nil", se.FailedBatches, se.Stop)
+	}
+	if !errors.Is(se.First, errFetchNotEnoughFields) {
+		t.Errorf("First = %v, want errFetchNotEnoughFields", se.First)
+	}
+	if got := classifyError(err); got != ClassUnknown {
+		t.Errorf("classifyError(err) = %s, want %s", got, ClassUnknown)
+	}
+	for verb, wantCount := range map[string]int{"LOGIN": 1, "EXAMINE": 1} {
+		if n := srv.callCount(verb); n != wantCount {
+			t.Errorf("%s count = %d, want %d", verb, n, wantCount)
+		}
+	}
+}
+
 // throttleReply is how Gmail ends a command once the account is over its limits.
 const throttleReply = "NO [OVERQUOTA] Account exceeded command or bandwidth limits"
 

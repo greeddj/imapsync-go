@@ -35,6 +35,7 @@
   - `FetchMessageMap`, which marks only a server refusal of EXAMINE with `ErrSelectRefused` and does not mark a dropped session;
   - `FetchMessageMap` for a response with a Message-Id and no UID or UID 0, which fails the scan with no reconnect (`Test_FetchMessageMap_When_ResponseHasMessageIdButNoUID_Then_ScanFails`);
   - `FetchMessageCopies` for the same responses, which keeps each one as a copy with UID 0. Two such responses with one Message-Id count as two copies (`Test_FetchMessageCopies_When_ResponseHasMessageIdButNoUID_Then_KeepsTheCopy` and `Test_FetchMessageCopies_When_UIDlessResponsesShareMessageId_Then_CountsEachCopy`);
+  - `StreamMessagesByUIDs` for a FETCH response with a message number and no item after the word `FETCH` (`* 7 FETCH`) (`Test_StreamMessagesByUIDs_When_FetchResponseHasNoItemList_Then_OnlyItsBatchFails`). Only the batch of that response fails, and the client does not reconnect. The stream fetches the next batch. Without the length check in `bodyFetchHandler`, the go-imap reader goroutine panics;
   - a very large message count from EXAMINE or STATUS, which must not cause a large allocation (`Test_FetchMessageMap_When_ServerReportsHugeMessageCount_Then_AllocationStaysSmall`);
   - `withCancel` after stop, and shared limiters that draw from one budget.
 
