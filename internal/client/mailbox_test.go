@@ -2039,10 +2039,45 @@ func Test_MissingLevels(t *testing.T) {
 			c.delimiter = tt.delimiter
 			c.mailboxCache = tt.cache
 
-			got := c.MissingLevels(tt.input)
+			got, err := c.MissingLevels(t.Context(), tt.input)
 
+			if err != nil {
+				t.Fatalf("MissingLevels(%q): %v", tt.input, err)
+			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("MissingLevels(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_MissingLevels_When_ContextEnded_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		cache map[string]struct{}
+		name  string
+	}{
+		{name: "a parent is missing", cache: map[string]struct{}{"INBOX": {}}},
+		{name: "every parent is listed and the name is missing", cache: map[string]struct{}{"Old": {}, "Old/2020": {}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := newTestClient()
+			c.delimiter = "/"
+			c.mailboxCache = mailboxCache{folders: tt.cache, delimiter: "/"}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			got, err := c.MissingLevels(ctx, "Old/2020/Inbox")
+
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("MissingLevels error = %v, want context.Canceled", err)
+			}
+			if got != nil {
+				t.Errorf("MissingLevels = %q, want nil", got)
 			}
 		})
 	}
@@ -2056,8 +2091,10 @@ func Test_MissingLevels_When_NothingIsMissing_Then_AllocatesNothing(t *testing.T
 		delimiter: "/",
 	}
 
+	ctx := context.Background()
+
 	allocs := testing.AllocsPerRun(100, func() {
-		_ = c.MissingLevels("Old/2020/Inbox")
+		_, _ = c.MissingLevels(ctx, "Old/2020/Inbox")
 	})
 
 	if allocs != 0 {
@@ -2115,7 +2152,10 @@ func Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOt
 			srv, c := newScriptedClient(t, &mailboxScript{})
 			c.delimiter = tt.delimiter
 			c.mailboxCache = tt.cache
-			levels := c.MissingLevels(tt.target)
+			levels, err := c.MissingLevels(t.Context(), tt.target)
+			if err != nil {
+				t.Fatalf("MissingLevels(%q): %v", tt.target, err)
+			}
 
 			created, parents, err := c.CreateMailbox(t.Context(), tt.target)
 
@@ -2134,8 +2174,8 @@ func Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOt
 			if !created || parents+1 != len(levels) {
 				t.Errorf("created, parents = %v, %d, want true and %d for levels %q", created, parents, len(levels)-1, levels)
 			}
-			if got := c.MissingLevels(tt.target); len(got) != 0 {
-				t.Errorf("MissingLevels after the create = %q, want none", got)
+			if got, err := c.MissingLevels(t.Context(), tt.target); err != nil || len(got) != 0 {
+				t.Errorf("MissingLevels after the create = %q, %v, want none", got, err)
 			}
 		})
 	}

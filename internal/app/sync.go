@@ -34,6 +34,9 @@ const (
 // large plan (tens of thousands of UIDs) doesn't bury the confirm prompt.
 const verboseUIDLimit = 20
 
+// previewFolderLimit caps the folders-to-create list: one listed name of length L has up to L/2 missing parent levels, so a full list prints O(L^2) bytes.
+const previewFolderLimit = 20
+
 // traceTracker writes a one-line diagnostic to stderr when IMAPSYNC_TRACE is
 // set, to surface duplicate Tracker allocations for the same plan.
 func traceTracker(site, message string) {
@@ -422,7 +425,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		printFolderFailures(out, summary.Failures)
 	}
 
-	newFolders := foldersToCreate(summary.Plans, dstClient)
+	newFolders, err := foldersToCreate(ctx, summary.Plans, dstClient)
+	if err != nil {
+		return err
+	}
 
 	if summary.TotalNew > 0 {
 		if !quiet {
@@ -456,12 +462,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 				}
 			}
 
-			if len(newFolders) > 0 {
-				_, _ = fmt.Fprintf(out, "\n🗂️ Folders to be created on destination:\n")
-				for _, folder := range newFolders {
-					_, _ = fmt.Fprintf(out, "• %s\n", termsafe.Escape(folder))
-				}
-			}
+			printFoldersToCreate(out, newFolders)
 			_, _ = fmt.Fprintf(out, "\n📨 Total new messages to sync: %d (≈ %s)\n", summary.TotalNew, utils.FormatSize(summary.TotalNewSize))
 
 			if !autoConfirm {
@@ -732,15 +733,22 @@ func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
 	return nil
 }
 
-// Names that the creation stage sends a CREATE for: plan order, parents before children, each name once. The client owns the cut rule.
-func foldersToCreate(plans []FolderSyncPlan, dst *client.Client) []string {
+// Names that the creation stage sends a CREATE for: plan order, parents before children, each name once. The client owns the cut rule. An ended ctx returns its error.
+func foldersToCreate(ctx context.Context, plans []FolderSyncPlan, dst *client.Client) ([]string, error) {
 	names := make([]string, 0, len(plans))
 	listed := make(map[string]struct{}, len(plans))
 	for _, plan := range plans {
 		if plan.NewMessages == 0 || plan.DestinationFolderExists {
 			continue
 		}
-		for _, level := range dst.MissingLevels(plan.DestinationFolder) {
+		levels, err := dst.MissingLevels(ctx, plan.DestinationFolder)
+		if err != nil {
+			return nil, err
+		}
+		for _, level := range levels {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if _, dup := listed[level]; dup {
 				continue
 			}
@@ -748,7 +756,21 @@ func foldersToCreate(plans []FolderSyncPlan, dst *client.Client) []string {
 			names = append(names, level)
 		}
 	}
-	return names
+	return names, nil
+}
+
+// printFoldersToCreate lists the first previewFolderLimit names and counts the rest. Nothing prints for an empty list.
+func printFoldersToCreate(out io.Writer, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(out, "\n🗂️ Folders to be created on destination:\n")
+	for _, folder := range names[:min(len(names), previewFolderLimit)] {
+		_, _ = fmt.Fprintf(out, "• %s\n", termsafe.Escape(folder))
+	}
+	if len(names) > previewFolderLimit {
+		_, _ = fmt.Fprintf(out, "• … and %d more\n", len(names)-previewFolderLimit)
+	}
 }
 
 // The folder that would receive their messages does not exist, so each plan of a refused destination fails and the others stay.

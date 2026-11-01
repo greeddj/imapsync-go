@@ -86,20 +86,23 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (created bool, 
 	return true, parents, nil
 }
 
-// MissingLevels returns the names that CreateMailbox(name) sends a CREATE for while the cache stays unchanged: missing parents first, then name, or nothing when the cache holds name.
-func (c *Client) MissingLevels(name string) []string {
+// MissingLevels returns the names that CreateMailbox(name) sends a CREATE for: missing parents first, then name, or nothing for a cached name. An ended ctx stops the walk with its error.
+func (c *Client) MissingLevels(ctx context.Context, name string) ([]string, error) {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
 	if _, ok := c.mailboxCache.resolve(name); ok {
-		return nil
+		return nil, nil
 	}
 	var missing []string
 	for level := range parentLevels(name, c.delimiter) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if _, ok := c.mailboxCache.resolve(level); !ok {
 			missing = append(missing, level)
 		}
 	}
-	return append(missing, name)
+	return append(missing, name), nil
 }
 
 // parentLevels yields each prefix of name that ends before a delimiter, shortest first. An empty delimiter marks a flat server, so it yields nothing.

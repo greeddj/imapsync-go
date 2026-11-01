@@ -4105,6 +4105,83 @@ func TestRunSync_When_DestinationParentsAreMissing_Then_PreviewCounterAndWireAgr
 	}
 }
 
+func TestRunSync_When_NewDestinationHasMoreMissingLevelsThanThePreviewShows_Then_PreviewIsCappedAndEveryLevelIsCreated(t *testing.T) {
+	t.Parallel()
+
+	const levels = previewFolderLimit + 3
+	parts := numberedFolders(levels)
+	missing := make([]string, levels)
+	for i := range missing {
+		missing[i] = strings.Join(parts[:i+1], "/")
+	}
+	deepest := missing[levels-1]
+	wantBlock := foldersToCreateHeader + folderBullets(missing[:previewFolderLimit]...) +
+		fmt.Sprintf("• … and %d more\n", levels-previewFolderLimit) + "\n📨 Total new messages to sync"
+	newServers := func(t *testing.T) (src, dst *fakeServer) {
+		t.Helper()
+		src = newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+		dst = newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+		return src, dst
+	}
+
+	t.Run("declined", func(t *testing.T) {
+		t.Parallel()
+
+		src, dst := newServers(t)
+		out := &syncBuffer{}
+
+		err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", deepest)), e2eOptions(out, "n\n"))
+
+		if err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+		assertContainsAll(t, out.String(), wantBlock, "Sync canceled by user")
+		if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+			t.Errorf("dst saw %d CREATE or APPEND commands after the answer n, want 0", n)
+		}
+	})
+
+	t.Run("confirmed", func(t *testing.T) {
+		t.Parallel()
+
+		src, dst := newServers(t)
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = true
+
+		if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", deepest)), opts); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+
+		assertContainsAll(t, out.String(), wantBlock)
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), missing...)
+		assertOneRow(t, screenRows(t, out.String()), fmt.Sprintf("Created %d folders", levels), "✓ done")
+		assertIDs(t, "dst "+deepest, dst.folderMsgIDs(deepest), "m1@x")
+	})
+}
+
+func TestRunSync_When_ContextEndsBeforeTheFoldersToCreateAreListed_Then_ReturnsCanceledWithoutPreview(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	ctx, cancel := context.WithCancel(e2eContext(t))
+	t.Cleanup(cancel)
+	out := &cancelOnWrite{syncBuffer: &syncBuffer{}, cancel: cancel, marker: "Folders that cannot be synced"}
+	cfg := e2eConfig(src, dst, 1, mapping("Work", "Old/2020/Work"), mapping("Missing", "Missing"))
+
+	err := runSync(ctx, cfg, e2eOptions(out, "y\n"))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	assertContainsAll(t, out.String(), "Folders that cannot be synced")
+	assertContainsNone(t, out.String(), "Messages to be copied to destination", "Folders to be created on destination", "Proceed with synchronization?")
+	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d CREATE or APPEND commands after the cancel, want 0", n)
+	}
+}
+
 func TestRunSync_When_ParentLevelNameCarriesControlCharacters_Then_PreviewShowsEscapesAndServerGetsExactNames(t *testing.T) {
 	t.Parallel()
 
@@ -4263,13 +4340,133 @@ func Test_foldersToCreate(t *testing.T) {
 			}
 			dstClient := newAppClient(t, dst, "dst")
 
-			got := foldersToCreate(tt.plans, dstClient)
+			got, err := foldersToCreate(t.Context(), tt.plans, dstClient)
 
+			if err != nil {
+				t.Fatalf("foldersToCreate: %v", err)
+			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("foldersToCreate = %q, want %q", got, tt.want)
 			}
 		})
 	}
+}
+
+func Test_foldersToCreate_When_ContextEnded_Then_ReturnsContextError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		plan FolderSyncPlan
+	}{
+		{name: "nested destination", plan: FolderSyncPlan{DestinationFolder: "Old/2020", NewMessages: 1}},
+		{name: "destination without a delimiter", plan: FolderSyncPlan{DestinationFolder: "Archive", NewMessages: 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dstClient := newDestinationClient(t, "/")
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			got, err := foldersToCreate(ctx, []FolderSyncPlan{tt.plan}, dstClient)
+
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("foldersToCreate error = %v, want context.Canceled", err)
+			}
+			if got != nil {
+				t.Errorf("foldersToCreate = %q, want no names", got)
+			}
+		})
+	}
+}
+
+const foldersToCreateHeader = "\n\U0001F5C2\uFE0F Folders to be created on destination:\n"
+
+func numberedFolders(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("F%02d", i)
+	}
+	return names
+}
+
+func folderBullets(names ...string) string {
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString("• " + name + "\n")
+	}
+	return b.String()
+}
+
+func Test_printFoldersToCreate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		want  string
+		names []string
+	}{
+		{name: "no names", names: nil, want: ""},
+		{name: "one name", names: []string{"Old"}, want: foldersToCreateHeader + folderBullets("Old")},
+		{
+			name:  "exactly the limit",
+			names: numberedFolders(previewFolderLimit),
+			want:  foldersToCreateHeader + folderBullets(numberedFolders(previewFolderLimit)...),
+		},
+		{
+			name:  "one name over the limit",
+			names: numberedFolders(previewFolderLimit + 1),
+			want:  foldersToCreateHeader + folderBullets(numberedFolders(previewFolderLimit)...) + "• … and 1 more\n",
+		},
+		{
+			name:  "names with control and bidi characters",
+			names: []string{hostileName, hostileName + "/Sub"},
+			want:  foldersToCreateHeader + folderBullets(hostileShownName, hostileShownName+"/Sub"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out strings.Builder
+
+			printFoldersToCreate(&out, tt.names)
+
+			if got := out.String(); got != tt.want {
+				t.Errorf("printFoldersToCreate output = %q, want %q", got, tt.want)
+			}
+			assertContainsNone(t, out.String(), hostileName, "\u202e", "\x1b[2J", "\rx")
+		})
+	}
+}
+
+func Test_printFoldersToCreate_When_OneNameHasThousandsOfLevels_Then_OutputStaysBounded(t *testing.T) {
+	t.Parallel()
+
+	const levels = 5000
+	deep := strings.Repeat("a/", levels-1) + "a"
+	names := make([]string, 0, levels)
+	for i := range levels - 1 {
+		names = append(names, deep[:2*i+1])
+	}
+	names = append(names, deep)
+	var out strings.Builder
+
+	printFoldersToCreate(&out, names)
+
+	got := out.String()
+	if n := strings.Count(got, "\n• "); n != previewFolderLimit+1 {
+		t.Errorf("output has %d bullet lines, want %d", n, previewFolderLimit+1)
+	}
+	if want := fmt.Sprintf("• … and %d more\n", levels-previewFolderLimit); !strings.HasSuffix(got, want) {
+		t.Errorf("output does not end with %q\noutput: %q", want, got)
+	}
+	if limit := previewFolderLimit*len(deep) + 128; len(got) > limit {
+		t.Errorf("output is %d bytes, want at most %d", len(got), limit)
+	}
+	assertContainsNone(t, got, deep)
 }
 
 func TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting(t *testing.T) {
