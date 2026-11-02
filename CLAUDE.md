@@ -93,7 +93,7 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - The expansion skips each source name that `Client.IsNoSelect` reports. This applies to the mapped name and to each subfolder.
    - `IsNoSelect` reads the mailbox cache. The cache marks a name when the same `LIST "" "*"` gives it the `\Noselect` or `\NonExistent` attribute. The attribute can have any letter case.
    - The expansion keeps the subfolders of a skipped name.
-   - With `--verbose` and without `--quiet`, the expansion prints one escaped "Folder ... skipped" line for each skipped name, in name order.
+   - `expandMappingsWithSubfolders` prints nothing. It returns the expanded mappings and an `expansionReport`. The report holds the entries, the winner of each entry and the skipped names.
    - A mapped source name that LIST does not show stays in the expansion, also when LIST shows its subfolders. Step 3 scans it.
    - A flat source has an empty delimiter. The expansion lists no subfolder for it, so each mapping gives one folder.
    - The expansion sorts the subfolders of each mapping in byte order, because the cache lists names in map order. So the plans and the failure lines are the same on each run.
@@ -103,10 +103,6 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - `mostSpecific` gives each source name one entry. The entry of the mapping whose source is the name itself, or its nearest ancestor, wins. This is the longest root.
      - When two roots have the same length (two listed spellings of one INBOX level), the smaller root in byte order wins.
      - The order of the map items does not change the result. In a mirror run, the own mapping of each folder wins.
-   - With `--verbose` and without `--quiet`, `printExpansion` prints one line for each entry that lost:
-     - an entry with another destination gives the escaped line `  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s`;
-     - an entry with the same destination gives the existing `%q` line `Mapping ... skipped - already covered by a parent mapping's expansion`.
-   - The found-subfolder line shows only a destination that the sync plan uses.
    - `splitDestinationClashes` groups the expanded mappings by destination. When a group holds two or more mappings and at least one is renamed, every mapping of the group fails. Its `FolderFailure` wraps `errDestinationClash` and names one other source folder of the group. A group with no renamed mapping stays unchanged.
    - `splitEmptyLevelDestinations` runs after `splitDestinationClashes` and before the scan. It checks the destination name of each planned mapping. So it covers the names that the code builds, for example the subfolders of a mapping and the names of a mirror run. A mapping fails when all these conditions are true:
      - the destination has a delimiter. A flat destination has no levels, so it never gives this failure;
@@ -119,6 +115,25 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - In step 1, `checkDestinationLevels` refuses each typed name that fails this rule. So only a derived name fails here. The other mappings go on.
      - A name with no empty level gets no `MailboxExists` call. So an ended context gives its error only for a name with an empty level, and `runSync` returns that error.
    - `runSync` puts the clash failures first, then the empty-level failures, then the failures of the scan in `SyncSummary.Failures`. A clash or an empty level gives no plan, so the run creates no destination folder for it. `printFolderFailures` shows the failure after the scan, also with `--quiet`. The run ends with exit code 1 (`ErrSilentExit`), as for each folder failure (step 3).
+   - With `--verbose` and without `--quiet`, `runSync` prints the line `Checking for subfolders...` before the expansion. `printExpansion` prints the other lines of the expansion. It prints them only with `--verbose` and without `--quiet`.
+   - `runSync` calls `printExpansion` after `splitDestinationClashes` and `splitEmptyLevelDestinations`, and before `printFolderRenames`. The function gets the planned mappings, which are the mappings that remain after both splits. It prints these groups in this order:
+     - one escaped line `  📁 Found subfolder: %s → %s` for each entry, in the order of the entries, when all these conditions are true:
+       - the entry is a subfolder of its root, so its source name differs from its root;
+       - a planned mapping names the source folder of the entry;
+       - the destination of the entry is the destination of its winner;
+     - one escaped line `  ℹ️  Folder %s skipped - %s` for each skipped name, in name order;
+     - one line for each entry that lost, in the order of the entries:
+       - an entry with another destination gives the escaped line `  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s`;
+       - an entry with the same destination gives the existing `%q` line `Mapping ... skipped - already covered by a parent mapping's expansion`;
+     - the line `📂 Found %d subfolders, total folders to sync: %d`, only when the first number is more than 0.
+   - The planned mappings change only the found-subfolder lines and the count line. The other lines do not use them. A failure after the splits, such as a failed scan, changes no line, because `printExpansion` runs before the scan.
+   - So a found-subfolder line never names a destination that lost, or a subfolder that failed in a split.
+   - The first number of the count line is the number of entries for which all these conditions are true:
+     - the entry wins (`mostSpecific`);
+     - the entry is a subfolder of its root;
+     - a planned mapping names the source folder of the entry.
+   - The second number of the count line is the number of planned mappings. A subfolder with a mapping of its own is a root, so the first number leaves it out.
+   - The code counts these entries. It does not subtract the number of roots from the number of mappings. A `\Noselect` root has no entry. A repeated `map` item gives two roots for one mapping. If the code subtracts, the count is wrong when a root is `\Noselect` or when a `map` item repeats.
    - `printFolderRenames` prints one escaped warning line for each renamed mapping that remains after both splits, before the scan. The line shows the two names and the destination delimiter. It shows also without `--verbose` and with `--quiet`.
    - `printCaseVariantDestinations` prints one escaped warning line for each group of destination names that differ only in letter case. It runs after `printFolderRenames` and before the scan, in typed runs and in mirror runs. It reads the planned mappings, which come after `splitDestinationClashes` and `splitEmptyLevelDestinations`.
      - A group holds destination names that are equal after `strings.ToLower` but have different bytes. INBOX levels already have the listed spelling, so INBOX spellings are not variants.
@@ -580,7 +595,7 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
   - the scan trackers;
   - the found-subfolder line;
   - the folder-failure list (`printFolderFailures`), which shows the source folder, the destination folder and the reason. `runSync` prints it after the scan, also with `--quiet`. Without `--quiet`, `runSync` prints it again after the copy;
-  - the "Folder ... skipped" line in `expandMappingsWithSubfolders`, for each source name that the mailbox cache marks `\Noselect` or `\NonExistent`. Only the name is server text. `expandMappingsWithSubfolders` prints the line only with `--verbose` and without `--quiet`;
+  - the "Folder ... skipped" line of `printExpansion`, for each source name that the mailbox cache marks `\Noselect` or `\NonExistent`. Only the name is server text. `printExpansion` prints the line only with `--verbose` and without `--quiet`;
   - the skip line for an unlisted parent that refuses to open (`printFolderSkips`). It shows the name, a fixed reason and the error text with the server reply. `runSync` prints it also without `--verbose`, but only without `--quiet`;
   - the "already exists and holds" line and the "no longer holds" line of `recheckExistingDestinations`. Each line shows the destination folder and the source folder. `runSync` prints each line only without `--quiet`. The failures of the same check go through `printFolderFailures`;
   - the "is left out" line of `printInvalidNames`, which shows the raw name from LIST. `runSync` prints it also with `--quiet`;
@@ -590,7 +605,7 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
   - the CREATE refusals of `splitRefusedDestinations`. They go through `printFolderFailures`, and the reason holds the reply of the server;
   - the stop line of `printThrottleStop`, which shows the escaped error text. The labels in the line are operator text. `runSync` prints it also with `--quiet`;
   - the case-variant warning of `printCaseVariantDestinations`, which shows the destination names. `runSync` prints it also without `--verbose` and with `--quiet`;
-  - the "goes to ..., not to ..." line of `printExpansion`, which shows the source folder, two destination names and two root names. `expandMappingsWithSubfolders` prints it only with `--verbose` and without `--quiet`.
+  - the "goes to ..., not to ..." line of `printExpansion`, which shows the source folder, two destination names and two root names. `printExpansion` prints it only with `--verbose` and without `--quiet`.
 - `internal/app/show.go` escapes these sites:
   - the folder cell of each table row, also on the "unreadable" and "container" rows;
   - each line of the unreadable-folder list (`printUnreadableFolders`), which shows the folder name and the reason;

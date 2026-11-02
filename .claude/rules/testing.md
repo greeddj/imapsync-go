@@ -537,16 +537,27 @@
   - `Test_mostSpecific` - the longest root wins in any order. Equal roots keep the first entry. Two spellings of one INBOX level give the smaller root in byte order;
   - `Test_checkSourceConflicts` - equal items and distinct sources pass, and two destinations for one source give an error that names both items;
   - `Test_expandMappingsWithSubfolders_When_ExplicitMappingsNest_Then_MostSpecificWinsInEveryOrder` and `TestRunSync_When_ThreeNestedMappingsAreGiven_Then_MostSpecificWinsInEveryOrder` - the nearest mapping decides, whatever the order of the items;
-  - `Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_VerboseNamesBothDestinations` - with `--verbose`, the line "goes to ..., not to ..." names both destinations;
+  - `Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_VerboseNamesBothDestinations` - with `--verbose`, `printExpansion` prints the line "goes to ..., not to ..." that names both destinations. It prints one found-subfolder line, with the destination of the winner. The two orders of the items give one output. Without `--verbose`, it prints nothing;
   - `Test_expandMappingsWithSubfolders_When_ExplicitChildIsNoSelectOrUnlisted_Then_ItsChildrenFollowIt` - the children of a mapped `\Noselect` or unlisted folder follow the mapping of that folder;
   - `Test_expandMappingsWithSubfolders_When_ExplicitDestinationEqualsRenamedDerivedName_Then_ExplicitEntryIsKept` - an explicit mapping keeps its typed destination when it equals a renamed derived name, and its entry is not marked renamed;
   - `Test_expandMappingsWithSubfolders_When_OverrideNamesCarryControlCharacters_Then_LineShowsEscapes` - the override line escapes the names;
-  - `Test_expandMappingsWithSubfolders_When_QuietAndVerboseAreBothSet_Then_NothingIsPrinted` - `--quiet` hides the override lines;
+  - `Test_expandMappingsWithSubfolders_When_QuietAndVerboseAreBothSet_Then_NothingIsPrinted` - with `--verbose` and `--quiet` together, `printExpansion` prints nothing, and the expansion still holds three folders;
   - `TestRunSync_When_ParentAndChildFoldersAreBothMapped_Then_ChildMappingWinsInEitherOrder` - the child mapping decides, and a second run sends no APPEND;
   - `TestRunSync_When_TwoMappingsNameOneSourceWithDifferentDestinations_Then_RunStopsBeforeThePlan` - two spellings of INBOX, or a rewritten delimiter, make one source and stop the run before the scan;
   - `TestRunSync_When_MapRepeatsAnItemExactly_Then_RunMatchesASingleItem` - a repeated item causes no extra scan, CREATE or APPEND;
   - `TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother` - in a mirror run, the own mapping of each folder wins;
   - `TestRunSync_When_ExplicitChildDestinationEqualsRenamedSiblingDestination_Then_BothFailAsAClash` - a typed destination that equals a renamed destination gives a clash, and both folders fail.
+
+  The verbose expansion lines have these tests:
+  - `TestRunSync_When_SubfoldersFailBeforeThePlan_Then_VerboseExpansionNamesOnlyThePlannedFolders` - the mapping `Projects` to `Old.Projects` has three subfolders that fail before the scan. Two of the subfolders get the same destination after a rename. The destination name of the third subfolder has an empty level. The run ends with `ErrSilentExit`. No source EXAMINE names a failed folder. The destination gets none of these folders. In each case, the list `Folders that cannot be synced` names the three failed folders. The final line counts 3 failed folders. Five cases run:
+    - with `--verbose`, the subfolders `Projects/ok` and `Projects/Box/in` remain, and `Projects/Box` is `\Noselect`. The found-subfolder lines name `Projects/Box/in` and `Projects/ok`, and none of the failed subfolders. The "Folder ... skipped" line names `Projects/Box`. The count line shows the numbers 2 and 3. The lines come in this order: found-subfolder lines, the "Folder ... skipped" line and the count line. All of them come after `Checking for subfolders...` and before the list of failed folders;
+    - with `--verbose`, no subfolder remains. The output has no found-subfolder line, no "Folder ... skipped" line and no count line;
+    - with `--verbose`, the subfolder `Projects/ok` has a mapping of its own to `Special`. This mapping wins over `Projects`. The line "goes to ..., not to ..." shows. The count line does not show;
+    - without `--verbose`, the output has no expansion line;
+    - with `--verbose` and `--quiet` together, the output has no expansion line. The list of failed folders still shows;
+  - `TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSubfolders` - with `--verbose`, the count line shows one time in each of two cases:
+    - the root `Box` is `\Noselect` and has two subfolders. The line shows the numbers 2 and 2. The found-subfolder lines name both subfolders. The run copies each of them;
+    - a `map` item repeats. The line shows the numbers 1 and 2. The run copies the root and its subfolder.
 
   The typed destination name with an empty level has these tests:
   - `TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_RunIsRefusedBeforeAnyCommandThatChangesTheDestination` - on a `/` server, the names `/X`, `a//b`, `x/` and `/` give `errEmptyLevel`. On a `.` server, the names `.X`, `a..b` and `x.` give it. The text is `map entry 2: destination folder has an empty level: "NAME", destination delimiter "D"`. The number is the position of the failing item, and the item before it is valid. The output is empty. Each server sees only LOGIN, CAPABILITY, LIST and LOGOUT (`assertNoCommandsAfterSetup`);
