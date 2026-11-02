@@ -148,6 +148,9 @@ The command checks the configuration file when it loads the file.
 - Two identical items are valid. Two items with the same `dst` are also valid.
 - `sync` makes this check again after it finds the folder names on the server.
   For example, `inbox` and `INBOX` are one source folder.
+- `sync` also refuses a `dst` name that has an empty level and that the
+  destination server does not list. Refer to
+  [Names that you type](#names-that-you-type).
 - In a JSON file, the letter case of a key is not important. For example,
   `SRC` and `src` are the same key. In a YAML file, a key must have the same
   letter case as in this list. For example, `Src` causes an error.
@@ -223,14 +226,14 @@ sync -w 4
 **Sync command:**
 
 - `-s, --src-folder` - Source folder (overrides config) (env: `IMAPSYNC_SOURCE_FOLDER`)
-- `-d, --dest-folder` - Destination folder (overrides config) (env: `IMAPSYNC_DESTINATION_FOLDER`)
+- `-d, --dest-folder` - Destination folder (overrides config). The command refuses a name with an empty level that the destination server does not list (refer to [Names that you type](#names-that-you-type)). (env: `IMAPSYNC_DESTINATION_FOLDER`)
 - `-w, --workers` - Number of parallel workers (default: 4, max: 10) (env: `IMAPSYNC_WORKERS`)
 - `-y, --confirm, --yes` - Auto-confirm without prompt. The `-q` option needs this option. (env: `IMAPSYNC_CONFIRM`)
 - `-V, --verbose` - Enable verbose output (env: `IMAPSYNC_VERBOSE`)
 - `-q, --quiet` - Hide the progress bars, the sync plan and the status messages. Returned errors, the delimiter notice and the list `Folders that cannot be synced` still show. The notices of a renamed folder, of a left-out folder and of destination folders that differ only in letter case also still show. The final line also shows when the sync copies messages or has a failed folder. After a stop, the `Sync stopped` line and the final line also show. The reason for a failed message does not show. This option needs `-y`. Without `-y`, the sync stops with an error before it connects to a server. (env: `IMAPSYNC_QUIET`)
 - `--bps-down` - Max bytes/sec read from the source server (0 = unlimited) (env: `IMAPSYNC_BPS_DOWN`)
 - `--bps-up` - Max bytes/sec written to the destination server (0 = unlimited) (env: `IMAPSYNC_BPS_UP`). The limit is shared by all workers. Below about 110 bytes/sec for each worker, an upload can wait so long that the 5-minute idle limit closes the connection, so `sync` prints a warning before the plan.
-- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` allows at most N-1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
+- `--max-connections` - Hard cap on simultaneous IMAP connections per side (0 = use the `--workers` value). One slot is reserved for the planning client, so `--max-connections=N` gives at most N-1 sync workers. (env: `IMAPSYNC_MAX_CONNECTIONS`)
 
 The same `bps-down`, `bps-up`, and `max-connections` values can be set in config under a `rate_limit` block (`down_bps`, `up_bps`, `max_connections`). CLI flags take precedence when both are set. This is also true when the value is 0. For example, `--bps-down 0` or `IMAPSYNC_BPS_DOWN=0` removes the `down_bps` limit of the config file.
 
@@ -252,7 +255,20 @@ The command never changes a name that the server lists. For example, a folder `e
 
 If the server does not list a typed source name, and the server lists no changed name, the command keeps the typed name. The command sends this name to the server. If the server refuses it, the folder appears in the list `Folders that cannot be synced`.
 
-If the server does not list a typed destination name, and the server lists no changed name, the command keeps the typed name. It creates the folder with this name. For example, if a `.` server lists neither `Archive/2024` nor `Archive.2024`, the command sends CREATE for `Archive/2024`.
+If the server does not list a typed destination name, and the server lists no changed name, the command keeps the typed name. It creates the folder with this name, unless the name has an empty level. For example, if a `.` server lists neither `Archive/2024` nor `Archive.2024`, the command sends CREATE for `Archive/2024`.
+
+The command refuses a typed destination name when all these conditions are true:
+
+- The destination server has a delimiter. A flat server has no levels, so the command never refuses a name there.
+- The name has an empty level. This means that the name starts with the delimiter, ends with the delimiter, or holds the delimiter two times in a row. For example, `/X`, `x/` and `a//b` have an empty level on a `/` server.
+- The destination server does not list the name. The command does not refuse a listed name, because it creates no folder for it.
+
+If the command refuses a name, it stops with an error before it scans the folders. The error shows the name and the delimiter. It also shows the number of the `map` item, counted from 1, or the option `--dest-folder`:
+
+- `map entry 2: destination folder has an empty level: "a//b", destination delimiter "/"`
+- `--dest-folder: destination folder has an empty level: "x/", destination delimiter "/"`
+
+The command sends no EXAMINE, STATUS, FETCH, CREATE or APPEND to a server. It shows no plan. If more than one `map` item has such a name, the error shows the first of these items. This rule is for the names that you type. The command does not refuse a destination name that it builds. Refer to [Names that the command converts](#names-that-the-command-converts).
 
 ### Names that the command converts
 
@@ -278,9 +294,10 @@ If the server answers NIL for the delimiter of each folder, or lists no folder, 
 If a destination folder has a parent that the destination server does not list, the command creates the parent before the folder.
 
 - The plan shows these parents in the list `Folders to be created on destination`. Each folder shows one time.
+- The list, the counter `Creating folders` and the CREATE commands use one order. The command sorts the destination folders by the bytes of their names, so an upper-case letter comes before a lower-case letter. For each folder, it lists the missing parents from the top, and then the folder. For example, `Old/Z` and `New/A` give `New`, `New/A`, `Old` and `Old/Z`, also when `map` lists `Old/Z` first.
 - The list shows a maximum of 20 names. If there are more than 20 folders, the list then shows the line `• … and N more`. The command sends a CREATE for each folder.
 - A parent that the server marks `\Noselect` counts as listed. The command does not create it.
-- An empty level is not a parent. For the name `a//b`, the command creates `a` and then `a//b`.
+- An empty level is not a parent. For a destination name `a//b` that the command builds, it creates `a` and then `a//b`. A typed destination name with an empty level is a different case (refer to [Names that you type](#names-that-you-type)).
 - The counter `Creating folders` counts the parents and the folders. At the end, it shows `Created N folders`. If the server refuses a folder, it shows `Created N of M folders, R refused`.
 
 ### INBOX
