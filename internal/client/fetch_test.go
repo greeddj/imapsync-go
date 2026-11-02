@@ -4404,14 +4404,20 @@ func Test_StreamMessagesByUIDs_When_UIDValidityChangesAfterARefusedBatch_Then_Th
 
 	fetches := new(uidFetchLog)
 	srv := newFakeServer(t)
+	refused := false
+	// The NO leaves the session open, so go-imap cannot pick a close over the ready reply. The BYE answers the next UID FETCH.
 	srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(5), func(conn net.Conn, _ *bufio.Reader, cmd command) (handled, keep bool) {
 		if !isUIDFetch(cmd) {
 			return false, true
 		}
 		fetches.record(requestedUIDs(cmd))
+		if refused {
+			writeLine(conn, "* BYE Autologout; idle for too long")
+			return true, false
+		}
+		refused = true
 		writeLine(conn, "%s NO [CANNOT] fetch refused", cmd.tag)
-		writeLine(conn, "* BYE Autologout; idle for too long")
-		return true, false
+		return true, true
 	})))
 	srv.addConnHandler(interceptHandler(srv, chainHooks(examineAs(6), answerUIDFetch(fetches, requestedAsSent))))
 	c := newWatchedClient(t, srv, 0)
@@ -4440,8 +4446,11 @@ func Test_StreamMessagesByUIDs_When_UIDValidityChangesAfterARefusedBatch_Then_Th
 	if len(got) != 0 {
 		t.Errorf("callback got %d UIDs, want none", len(got))
 	}
-	if n := srv.callCount("UID FETCH"); n != 1 {
-		t.Errorf("UID FETCH count = %d, want 1: the third batch is never requested", n)
+	if n := srv.callCount("UID FETCH"); n != 2 {
+		t.Errorf("UID FETCH count = %d, want 2: the refused batch and the batch that the BYE cut", n)
+	}
+	if want := [][]uint32{uids[:uidFetchBatchSize], uids[uidFetchBatchSize : 2*uidFetchBatchSize]}; !slices.EqualFunc(fetches.all(), want, slices.Equal) {
+		t.Errorf("UID FETCH asked for %d sets, want the first two batches only: the third batch is never requested", len(fetches.all()))
 	}
 	if n := srv.callCount("LOGIN"); n != 2 {
 		t.Errorf("LOGIN count = %d, want 2: one new session after the BYE", n)
