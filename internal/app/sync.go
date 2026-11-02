@@ -432,7 +432,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		printFolderFailures(out, summary.Failures)
 	}
 
-	newFolders, err := foldersToCreate(ctx, summary.Plans, dstClient)
+	createTargets := destinationsToCreate(summary.Plans)
+	newFolders, err := foldersToCreate(ctx, createTargets, dstClient)
 	if err != nil {
 		return err
 	}
@@ -498,20 +499,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		}
 	}
 
-	// Pre-creation MUST stay a pre-stage: each worker holds its own mailbox
-	// cache, so a worker-side CreateMailbox would race against other workers'
-	// stale caches.
-	planFolders := make(map[string]bool)
-	for _, plan := range activePlans {
-		if !plan.DestinationFolderExists {
-			planFolders[plan.DestinationFolder] = true
-		}
-	}
 	// Folders whose plan may have no diff against the real folder: CREATE said it exists, or the destination LIST left out names, so an OK proves nothing.
 	existing := make(map[string]struct{})
 	var stop throttleStop
 
-	if len(planFolders) > 0 {
+	// Pre-creation MUST stay a pre-stage: each worker holds its own mailbox
+	// cache, so a worker-side CreateMailbox would race against other workers'
+	// stale caches.
+	if len(createTargets) > 0 {
 		if !quiet {
 			_, _ = fmt.Fprintln(out, "\n📁 Creating destination folders...")
 		}
@@ -529,10 +524,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		refused := make(map[string]error)
 		dstListIncomplete := len(dstClient.InvalidMailboxNames()) > 0
 
-		// Sorted, so a parent path is created before its children and the log
-		// order is stable.
 	createFolders:
-		for _, folder := range slices.Sorted(maps.Keys(planFolders)) {
+		for _, folder := range createTargets {
 			if err := ctx.Err(); err != nil {
 				creationPW.Stop()
 				return err
@@ -740,15 +733,24 @@ func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
 	return nil
 }
 
-// MissingLevels decides the names, so the preview and the creation counter match the CREATE commands while the server accepts each one.
-func foldersToCreate(ctx context.Context, plans []FolderSyncPlan, dst *client.Client) ([]string, error) {
-	names := make([]string, 0, len(plans))
-	listed := make(map[string]struct{}, len(plans))
+// Byte order puts a parent path before its children. The preview, the creation counter and the CREATE loop share this one order.
+func destinationsToCreate(plans []FolderSyncPlan) []string {
+	folders := make([]string, 0, len(plans))
 	for _, plan := range plans {
-		if plan.NewMessages == 0 || plan.DestinationFolderExists {
-			continue
+		if plan.NewMessages > 0 && !plan.DestinationFolderExists {
+			folders = append(folders, plan.DestinationFolder)
 		}
-		levels, err := dst.MissingLevels(ctx, plan.DestinationFolder)
+	}
+	slices.Sort(folders)
+	return slices.Compact(folders)
+}
+
+// MissingLevels decides the names, so the preview and the creation counter match the CREATE commands while the server accepts each one.
+func foldersToCreate(ctx context.Context, destinations []string, dst *client.Client) ([]string, error) {
+	names := make([]string, 0, len(destinations))
+	listed := make(map[string]struct{}, len(destinations))
+	for _, destination := range destinations {
+		levels, err := dst.MissingLevels(ctx, destination)
 		if err != nil {
 			return nil, err
 		}

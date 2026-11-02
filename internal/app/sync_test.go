@@ -4551,6 +4551,16 @@ func Test_foldersToCreate(t *testing.T) {
 			want: []string{"Top", "Top/Sub"},
 		},
 		{
+			name:       "plans in another order than the byte order of their destinations",
+			delimiter:  "/",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "Old/Z", NewMessages: 1},
+				{DestinationFolder: "New/A", NewMessages: 1},
+			},
+			want: []string{"New", "New/A", "Old", "Old/Z"},
+		},
+		{
 			name:       "a listed parent is left out",
 			delimiter:  "/",
 			dstFolders: map[string][]fakeMsg{"INBOX": nil, "Old": nil},
@@ -4586,7 +4596,7 @@ func Test_foldersToCreate(t *testing.T) {
 			}
 			dstClient := newAppClient(t, dst, "dst")
 
-			got, err := foldersToCreate(t.Context(), tt.plans, dstClient)
+			got, err := foldersToCreate(t.Context(), destinationsToCreate(tt.plans), dstClient)
 
 			if err != nil {
 				t.Fatalf("foldersToCreate: %v", err)
@@ -4616,13 +4626,63 @@ func Test_foldersToCreate_When_ContextEnded_Then_ReturnsContextError(t *testing.
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 
-			got, err := foldersToCreate(ctx, []FolderSyncPlan{tt.plan}, dstClient)
+			got, err := foldersToCreate(ctx, destinationsToCreate([]FolderSyncPlan{tt.plan}), dstClient)
 
 			if !errors.Is(err, context.Canceled) {
 				t.Errorf("foldersToCreate error = %v, want context.Canceled", err)
 			}
 			if got != nil {
 				t.Errorf("foldersToCreate = %q, want no names", got)
+			}
+		})
+	}
+}
+
+func Test_destinationsToCreate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		plans []FolderSyncPlan
+		want  []string
+	}{
+		{name: "no plan", want: []string{}},
+		{
+			name: "plans that exist or copy nothing are left out",
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "A", NewMessages: 1, DestinationFolderExists: true},
+				{DestinationFolder: "B"},
+				{DestinationFolder: "C", NewMessages: 2},
+			},
+			want: []string{"C"},
+		},
+		{
+			name: "byte order, not plan order",
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "Old/Z", NewMessages: 1},
+				{DestinationFolder: "New/A", NewMessages: 1},
+				{DestinationFolder: "New", NewMessages: 1},
+			},
+			want: []string{"New", "New/A", "Old/Z"},
+		},
+		{
+			name: "a shared destination shows one time",
+			plans: []FolderSyncPlan{
+				{DestinationFolder: "B", NewMessages: 1},
+				{DestinationFolder: "A", NewMessages: 1},
+				{DestinationFolder: "B", NewMessages: 3},
+			},
+			want: []string{"A", "B"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := destinationsToCreate(tt.plans)
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("destinationsToCreate = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -18247,6 +18307,26 @@ func TestRunSync_When_DestinationParentsAreCreated_Then_PreviewWireCounterAndLog
 			check: func(t *testing.T, dst *fakeServer) {
 				t.Helper()
 				assertIDs(t, "dst Old.2020.Inbox", dst.folderMsgIDs("Old.2020.Inbox"), "m1@x")
+			},
+		},
+		{
+			name:        "mappings in another order than the byte order of the destinations",
+			src:         map[string][]fakeMsg{"Z": fakeMsgs("z1@x"), "A": fakeMsgs("a1@x")},
+			dst:         map[string][]fakeMsg{"INBOX": nil},
+			dstDelim:    "/",
+			mappings:    []config.DirectoryMapping{mapping("Z", "Old/Z"), mapping("A", "New/A")},
+			wantFolders: []string{"New", "New/A", "Old", "Old/Z"},
+			wantRows:    [][]string{{"Created 4 folders", "✓ done"}},
+			wantLines: []string{
+				"[dst] Created parent folder: New",
+				"[dst] Created parent folder: Old",
+				`Created folder "New/A"`,
+				`Created folder "Old/Z"`,
+			},
+			check: func(t *testing.T, dst *fakeServer) {
+				t.Helper()
+				assertIDs(t, "dst New/A", dst.folderMsgIDs("New/A"), "a1@x")
+				assertIDs(t, "dst Old/Z", dst.folderMsgIDs("Old/Z"), "z1@x")
 			},
 		},
 		{
