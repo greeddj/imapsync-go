@@ -733,7 +733,7 @@ func endRunWithoutCopy(out io.Writer, quiet bool, failedFolders int) error {
 	return nil
 }
 
-// Names that the creation stage sends a CREATE for: plan order, parents before children, each name once. The client owns the cut rule. An ended ctx returns its error.
+// MissingLevels decides the names, so the preview and the creation counter match the CREATE commands while the server accepts each one.
 func foldersToCreate(ctx context.Context, plans []FolderSyncPlan, dst *client.Client) ([]string, error) {
 	names := make([]string, 0, len(plans))
 	listed := make(map[string]struct{}, len(plans))
@@ -759,7 +759,6 @@ func foldersToCreate(ctx context.Context, plans []FolderSyncPlan, dst *client.Cl
 	return names, nil
 }
 
-// printFoldersToCreate lists the first previewFolderLimit names and counts the rest. Nothing prints for an empty list.
 func printFoldersToCreate(out io.Writer, names []string) {
 	if len(names) == 0 {
 		return

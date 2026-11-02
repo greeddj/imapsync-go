@@ -150,12 +150,11 @@ func markPlanStopped(tr *progress.Tracker, p FolderSyncPlan, planIdx, planCount 
 	tr.MarkAsErrored()
 }
 
-// planStartText is the tracker text of a running plan. srcShown and dstShown are escaped already.
+// srcShown and dstShown arrive escaped, so this function does not escape them again.
 func planStartText(planIdx, planCount int, srcShown, dstShown string) string {
 	return fmt.Sprintf("%d/%d %s → %s", planIdx+1, planCount, srcShown, dstShown)
 }
 
-// newPlanTracker builds the tracker that the dispatch loop appends when a worker takes the plan.
 func newPlanTracker(p FolderSyncPlan, planIdx, planCount int) *progress.Tracker {
 	tr := progress.NewTracker(planStartText(planIdx, planCount,
 		termsafe.Escape(p.SourceFolder), termsafe.Escape(p.DestinationFolder)), 100)
@@ -164,7 +163,6 @@ func newPlanTracker(p FolderSyncPlan, planIdx, planCount int) *progress.Tracker 
 	return tr
 }
 
-// newStoppedPlanTracker builds the finished row of a plan that never started.
 func newStoppedPlanTracker(p FolderSyncPlan, planIdx, planCount int) *progress.Tracker {
 	tr := progress.NewTracker("", 100)
 	// AppendTracker restarts a tracker unless DeferStart is set, and the restart clears the done and error marks.

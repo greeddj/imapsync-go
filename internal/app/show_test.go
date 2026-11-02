@@ -27,7 +27,6 @@ var ansiSequence = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 // stripANSI removes colour codes so assertions see the text a user reads.
 func stripANSI(s string) string { return ansiSequence.ReplaceAllString(s, "") }
 
-// assertNoEscapeSequence fails when raw holds an ESC byte and logs each offending line.
 func assertNoEscapeSequence(t *testing.T, raw string) {
 	t.Helper()
 	if !strings.Contains(raw, "\x1b") {
@@ -41,7 +40,7 @@ func assertNoEscapeSequence(t *testing.T, raw string) {
 	}
 }
 
-// shownText returns the text a user reads. Quiet output must hold no escape byte, so it is checked raw; other output loses its colour codes.
+// Quiet output must hold no escape byte, so it is checked raw; other output loses its colour codes.
 func shownText(t *testing.T, raw string, quiet bool) string {
 	t.Helper()
 	if quiet {

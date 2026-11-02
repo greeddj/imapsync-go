@@ -180,7 +180,7 @@ type showColors struct {
 	totals text.Colors
 }
 
-// go-pretty reads colour from the environment only, so quiet output, which feeds pipes, drops the wrappers. Bold plus bright cyan matches the tracker palette.
+// go-pretty keeps one process-wide colour flag that the environment sets, so quiet output, which feeds pipes, drops the wrappers instead. Bold plus bright cyan matches the tracker palette.
 func newShowColors(quiet bool) showColors {
 	if quiet {
 		return showColors{}

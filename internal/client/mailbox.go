@@ -126,7 +126,7 @@ func parentLevels(name, delimiter string) iter.Seq[string] {
 	}
 }
 
-// createParentFolders walks down the hierarchy, creating any missing parent folder. made counts the CREATE commands that the server accepted, also when err is set.
+// made counts the CREATE commands that the server accepted, also when err is set.
 func (c *Client) createParentFolders(ctx context.Context, name, delimiter string) (made int, err error) {
 	for parentPath := range parentLevels(name, delimiter) {
 		if ctxErr := ctx.Err(); ctxErr != nil {

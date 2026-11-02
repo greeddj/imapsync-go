@@ -218,7 +218,7 @@ sync -w 4
 **Show command:**
 
 - `-V, --verbose` - Show additional detail (env: `IMAPSYNC_VERBOSE`)
-- `-q, --quiet` - Suppress progress bars; output is plain text suitable for piping (env: `IMAPSYNC_QUIET`)
+- `-q, --quiet` - Hide the progress bars. The output holds no colour codes, so a pipe can read it (env: `IMAPSYNC_QUIET`)
 
 **Sync command:**
 
@@ -272,6 +272,16 @@ If the server answers NIL for the delimiter of each folder, or lists no folder, 
 - The command creates no parent folder on a flat destination.
 - A flat source has no subfolders. Each mapped folder gives one folder.
 - On a flat destination, a subfolder keeps the delimiter of the source as part of its name.
+
+### Parent folders that the command creates
+
+If a destination folder has a parent that the destination server does not list, the command creates the parent before the folder.
+
+- The plan shows these parents in the list `Folders to be created on destination`. Each folder shows one time.
+- The list shows a maximum of 20 names. If there are more than 20 folders, the list then shows the line `• … and N more`. The command sends a CREATE for each folder.
+- A parent that the server marks `\Noselect` counts as listed. The command does not create it.
+- An empty level is not a parent. For the name `a//b`, the command creates `a` and then `a//b`.
+- The counter `Creating folders` counts the parents and the folders. At the end, it shows `Created N folders`. If the server refuses a folder, it shows `Created N of M folders, R refused`.
 
 ### INBOX
 
@@ -385,6 +395,7 @@ A refusal that repeats a folder name can stop `sync`. Some servers repeat the fo
 
 - **Exit code 1** - `sync` ends with code 1 when a message or a folder fails. If you answer no to the question before the copy, `sync` ends with code 0, also when a folder failed. `show` ends with code 1 when it cannot read a folder. Any other error, except a cancel with Ctrl-C, prints `Error:` and ends with code 1.
 - **Memory** - Each worker holds at most two messages in memory at one time. These are the message that it uploads and the message that it reads next. So the memory use grows with the number of workers and with the size of the largest messages.
+- **Progress rows** - During the copy, the screen shows one progress row for each worker that copies a plan. A finished plan keeps its last line on screen. The final summary line also stays on screen.
 - **Ctrl-C** exits with code 130 and prints `Cancelled.` - this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
 - **Ctrl+\\** (SIGQUIT) writes the stacks of all goroutines to stderr and exits with code 131.
 - **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default. Other commands and `--help` make no request.
@@ -421,8 +432,10 @@ These limitations apply:
 
 - **Messages without a `Message-Id` are skipped.** Drafts, some bulk mail and
   messages from broken senders may not have one. They cannot be tracked across
-  servers, so they are never copied. The CLI prints a warning per folder when
-  this happens so you know how many were skipped.
+  servers, so they are never copied. `sync` prints a warning for each source
+  folder that holds such messages, so you know how many it skips. The warning
+  shows one time for each folder. A destination folder gets no warning, because
+  `sync` copies nothing from it.
 - **Servers that rewrite `Message-Id` on `APPEND` will cause duplicates on
   re-run.** A few IMAP servers (notably some Exchange configurations) replace
   the inbound `Message-Id` with their own value. The diff on the next run will
@@ -507,6 +520,7 @@ These limits apply to the connection steps, to the commands and to the exit of t
 - If a server accepts a connection but sends no greeting, the connection attempt fails after 30 seconds.
 - If no data moves for 5 minutes during the login, the connection attempt fails.
 - During a command, the program watches for data in both directions. If no data moves for 5 minutes, the program closes the connection and connects again. Then it sends the command one more time.
+- While `sync` scans folders, creates folders and copies messages, the program prints one line before it connects again: `[label] No data from server for 5m0s, reconnecting`. The line shows also without `-V`. The `-q` option hides it.
 - If the program closes the connection during the upload of a message, it does not send that message again. The next run copies it.
 - A transfer that moves data has no time limit. The program does not close a connection that is idle between commands.
 - When the program exits, it logs out all connections at the same time. A `sync` waits a maximum of 4 seconds for this, and a `show` waits a maximum of 2 seconds.

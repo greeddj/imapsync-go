@@ -1099,7 +1099,7 @@ func (s *fakeServer) takeDropOnOpen(name string) bool {
 	return true
 }
 
-// stallNth holds the reply to the nth command with verb until the test ends. Later commands are served, so a client that reconnects goes on.
+// Later commands are served, so a client that reconnects goes on.
 func (s *fakeServer) stallNth(t *testing.T, verb string, n int) {
 	t.Helper()
 	release := make(chan struct{})

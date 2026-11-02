@@ -38,24 +38,12 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 	}
 	pw.SetOutputWriter(out)
 
-	// Calculate optimal lengths based on terminal width.
-	//
-	// The line layout is "message  PCT  bar  [time; ~ETA: time]" and the
-	// total rendered width MUST stay strictly below the terminal width.
-	// If it equals terminalWidth, some terminals wrap the trailing space
-	// to the next line, and go-pretty's cursor-up + erase-line redraw
-	// cycle then strips only the wrapped portion - the original line
-	// becomes a "zombie" on screen that the redraw cannot erase.
-	//
-	// The stats portion (percent + bar + time + separators) is bounded
-	// above by ~80 chars for a long sync ("99.99% ⡇...⢸ [1h12m1s; ~ETA: 12m34s]");
-	// reserve a margin on top of that so colour codes, double-width braille
-	// glyphs on misconfigured fonts, and any future format changes cannot
-	// push us over.
+	// A line that fills the terminal width wraps; the redraw erases only the wrapped part, so the first row stays on screen as a "zombie".
 	terminalWidth := getTerminalWidth()
 	trackerBarLength := 30
 	statsReserved := 80 // bar + percent + time + ETA + separators, generous
 
+	// The margin for colour codes, double-width glyphs and format changes keeps the line below the terminal width.
 	const safetyMargin = 4
 
 	messageLength := terminalWidth - statsReserved - safetyMargin
@@ -90,8 +78,7 @@ func NewWriter(numTrackers int, quiet bool) *Writer {
 		Finished25: "⣀",
 		Finished50: "⣤",
 		Finished75: "⣶",
-		// go-pretty calls this for Total 0 or a value above Total; nil panics the
-		// render goroutine. The generator keeps state, so build one for each Writer.
+		// go-pretty calls this for Total 0 or a value above Total, and nil panics the render goroutine. The generator keeps state, so each Writer builds its own.
 		Indeterminate: progress.IndeterminateIndicatorMovingBackAndForth("⣿⣿⣿", updateFrequency/2),
 		Unfinished:    "⣀",
 	}
@@ -147,8 +134,7 @@ func (w *Writer) Start() {
 	}()
 }
 
-// Stop waits for the last render pass. Finished trackers and logs queued
-// before the last tracker ends stay on screen. Calling it again is safe.
+// Stop waits for the last render pass: finished trackers and logs queued before the last tracker ends stay on screen. Safe to call again.
 func (w *Writer) Stop() {
 	if w.rendered == nil {
 		return

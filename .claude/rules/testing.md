@@ -232,6 +232,28 @@
   The watchdog limit has these tests:
   - `Test_New_When_Built_Then_WatchdogUsesIdleTimeout` - `New` sets `idleTimeout` and arms the watchdog, with and without rate limits;
   - `Test_New_When_OptionsSetIdleTimeout_Then_WatchdogUsesIt` - a positive value below the default replaces it. Zero, a negative value and a value above the default keep `idleTimeout`. The watchdog is always armed.
+
+  The warning for messages with no Message-Id has these tests:
+  - `Test_MessageIDScans_When_FoldersAreScanned_Then_OnlyTheSourceScanWarnsAboutMessagesWithoutAMessageId` - for a folder with messages that have no Message-Id, `FetchMessageMap` logs one warning with the label, the folder and the count. `FetchMessageCopies` and `RescanMessageMap` log none. A folder where each message has a Message-Id gives no warning. Each scan returns the map of the folder;
+  - `Test_RescanMessageMap_When_FolderWasScannedBefore_Then_ReturnsTheSameScanWithoutAnotherWarning` - after `FetchMessageMap` of a folder, `RescanMessageMap` returns the same map and the same UIDVALIDITY. The log holds one warning and two `Fetching folder` lines;
+  - `Test_RescanMessageMap_When_ScanFails_Then_ReturnsTheErrorOfTheScan` - a response with a Message-Id and no UID gives an error that wraps `errMissingUID`. The call returns no map, UIDVALIDITY 0 and no warning;
+  - `Test_FetchMessageMap_When_ScanFails_Then_NoMissingMessageIdWarningIsLogged` - a scan that fails logs no warning, also after it read messages with no Message-Id. The cases are a response with a Message-Id and no UID, a refused EXAMINE, and a dropped connection with a refused reconnect;
+  - `Test_FetchMessageMap_When_ContextEndsMidScan_Then_NoMissingMessageIdWarningIsLogged` - a context that ends while the scan reads rows gives `context.Canceled` and no warning;
+  - `Test_FetchMessageMap_When_RetryFindsOtherMissingIdCount_Then_WarningCountsTheSuccessfulAttempt` - after a dropped connection, the retry logs one warning. The warning shows the count of the attempt that succeeded, not the count of the cut attempt;
+  - `Test_MessageIDScans_When_ContextAlreadyEnded_Then_SendNoCommand` - a context that ended before the call gives `context.Canceled`. The source scan and the destination scan send no EXAMINE, SELECT, FETCH or STATUS;
+  - `Test_FetchMessageMap_When_FolderNameHoldsFormatVerbs_Then_EveryLineKeepsItVerbatim` - a folder named `100%d %s %v` shows unchanged in the fetch line and in the warning. No line holds a formatting error.
+
+  The sink of a Client log line has this test:
+  - `Test_Client_log_When_TrackerIsReplacedByNil_Then_LinesReachTheWriterAndNotTheOldTracker` - with `--verbose` and a tracker set, `Client.log` gives the line to the tracker and the writer gets none. After `SetProgressTracker(nil)`, the writer gets the line.
+
+  The creation of parent folders has these tests:
+  - `Test_CreateMailbox_walksParents`, `Test_CreateMailbox_idempotent`, `Test_CreateMailbox_serverReplies`, `Test_CreateMailbox_whenContextCanceled` and `Test_CreateMailbox_whenContextExpiresInFlight` - the second result of `CreateMailbox` counts the parent folders for which the server accepted a CREATE (2 for `A/B/C`). It is 0 for a cached name and for a context that ended before the call. It is also set when the call fails after the server made a parent;
+  - `Test_CreateMailbox_When_ParentAnswersAlreadyExists_Then_VerboseLogSaysSo` - with `--verbose`, a parent that the server reports as existing logs `Parent folder already exists`. A parent that the server creates logs `Created parent folder`;
+  - `Test_parentLevels`, `Test_parentLevels_When_Ranged_Then_AllocatesNothing` and `FuzzParentLevels` - the iterator yields each prefix that ends before a delimiter, shortest first. The last level of the prefix must not be empty. An empty delimiter yields nothing. An empty level is never the last level of a parent level, so `/x` and `//x` give none, `a//b` gives `a`, and `/x/y` gives `/x`. A name that ends with the delimiter gives its named parents only. A delimiter of more than one byte gives the right prefixes, also when two of its occurrences overlap in the name. The iteration allocates nothing. The fuzz target compares the result with a split model that skips empty levels. It also checks that a name of L bytes gives at most L/2 levels;
+  - `Test_MissingLevels` and `Test_MissingLevels_When_ContextEnded_Then_ReturnsContextError` - the answer holds the parent levels that the cache does not list, and then the name. A cached name gives nothing. A `\Noselect` parent, an INBOX level in another letter case and a listed spelling count as listed. A flat server gives the name only. An empty level is no parent level: `/X` gives `/X`, `a//b` gives `a` and `a//b`, and `x/` gives `x` and `x/`. A context that ended gives its error and no names;
+  - `Test_MissingLevels_When_NothingIsMissing_Then_AllocatesNothing` - a lookup of a name with every level listed allocates nothing;
+  - `Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOtherNameDoes` - the names that `MissingLevels` returns are the names for which `CreateMailbox` sends a CREATE. This holds for empty levels, an INBOX level in another letter case, a `\Noselect` parent and a flat cache. No parent level has an empty last level;
+  - `Test_MissingLevels_When_CacheAndNameAreRandom_Then_ItListsExactlyTheCreatesOfCreateMailbox` - 300 random caches and names, with the delimiter `/`, `.` or none, give the same result. `MissingLevels` is empty exactly for a listed name. Each level is unlisted and extends the level before it, and the last level is the name. The CREATE commands of `CreateMailbox` carry the same names in the same order. The seed is fixed, and the test checks that the generator makes enough listed names and names with missing parents.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
   The mode with no wait has these tests:
   - `TestConn_When_WaitIsOff_Then_ReadAndWriteTakeTokensWithoutWaiting` - on a limiter in debt, a `Write` and a `Read` return at once with no error. Each direction loses exactly the bytes that moved;
@@ -561,9 +583,111 @@
   - `Test_printCaseVariantDestinations` - the groups, their order, the escapes and the rule that a group with every name listed gets no line. Four cases repeat a spelling. In two cases, the line names the repeated spelling one time. In one case, two mappings name one destination with no other spelling, so no line shows. In one case, the LIST holds every spelling, so the group gets no line;
   - `Test_printCaseVariantDestinations_When_GroupHoldsEveryLetterCaseVariant_Then_ListsEachNameOnce` - the test gives the warning all 16384 letter-case spellings of one name, in reverse order, with three of them repeated. When the LIST misses one spelling, the line names each spelling one time, in byte order. When the LIST holds every spelling, the line does not show. The call changes neither the mappings nor the LIST;
   - `TestRunSync_When_DestinationsDifferOnlyInLetterCase_Then_WarningShowsAndEachFolderCopies` - the warning shows before the prompt, also with `--quiet`, and each folder gets its messages.
-- **`internal/progress`** - interface compliance against the contract `internal/client` expects.
+
+  The screen model has this test:
+  - `Test_renderScreen` - `renderScreen` replays the output of a run as a terminal does. It handles cursor up (with a count), erase to the end of the row, carriage return, SGR sequences (dropped), wide runes and the final newline. Any other escape sequence is an error, so a test never passes on a misread screen. The tests below read the output through `screenRows`.
+
+  The progress display has these tests:
+  - `TestRunSync_When_FolderCreationLogs_Then_EveryLogAndTheFinalTrackerLineStayOnScreen` - after the creation, each log line shows on the screen one time, and the creation tracker shows its final line. If the server refuses no folder, the line is `Created N folders` with the done mark. If the server refuses a folder, the line is `Created N of T folders, R refused` with the error mark. This holds for a throttled refusal and for a parent below which a folder fails. The cases also cover a created folder and an existing folder with `--verbose`;
+  - `TestRunSync_When_ScanWarnsAboutMessagesWithoutMessageId_Then_TheWarningAndBothScanLinesStayOnScreen` - the warning for each source folder and the two done lines of the scan stay on the screen. They come before the summary line;
+  - `TestRunSync_When_DestinationFoldersHoldMessagesWithoutMessageId_Then_OnlyTheSourceFolderIsWarned` - destination folders that hold messages with no Message-Id give no warning, also when LIST hides the folder and the check after CREATE reads it. The run prints one warning, for the source folder, and copies the other messages;
+  - `TestRunSync_When_ExistingDestinationForcesASourceRescan_Then_TheMissingMessageIdWarningShowsOnce` - a destination folder that LIST hides makes the check after CREATE scan the source folder again. The output holds one warning for that folder, with and without `--verbose`. The run prints the "already exists and holds" line and appends only the missing message;
+  - `TestRunSync_When_TheCopyEnds_Then_TheLinesAfterItStayOnScreen` - the output after the copy holds no cursor-up sequence and no erase sequence. The summary line is the last row, and it shows one time. No row shows a plan in progress.
+    - Without `--quiet`, only these rows follow the last tracker row, in this order, when the case has them:
+      - an empty row, the header of the folder-failure list and one line for each failure;
+      - the stop line;
+      - the summary line.
+    - The cases are:
+      - a success;
+      - refused appends;
+      - a folder that cannot be scanned;
+      - refused appends with a failed folder;
+      - a throttle stop;
+      - a throttle stop with an unstarted plan and a folder that cannot be scanned;
+      - a throttle stop with `--quiet`: the output holds no escape sequence, and the stop line shows one time;
+  - `TestRunSync_When_PlanAndWorkerCountsDiffer_Then_EachRedrawHoldsAtMostOneTrackerPerBusyWorker` - no redraw of the copy rewinds more rows than the number of workers that have a plan. Each server sees one LOGIN for the planning Client and one for each worker that has a plan. Each plan shows one numbered row, and the final row of each plan shows done, error or `Stopped`. No `Waiting` row shows. The cases are:
+    - one worker, four plans;
+    - two workers, six plans;
+    - four workers, two plans;
+    - a throttle stop with one worker and five plans;
+    - a throttle stop with two workers and six plans;
+  - `TestRunSync_When_CanceledBeforeSecondPlanStarts_Then_OnlyTheStartedPlanHasATracker` - after a cancel, the output shows the escaped row `Canceled` of the started plan and no row for the plan that did not start;
+  - `TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted` - after a cancel during an APPEND, `runSync` prints nothing once it returned, because the copy writer stopped (the test waits four render ticks). The screen shows the row `1/2 Canceled A → A` with the error mark and no row for the second plan. No row shows a plan in progress, and the output holds no summary of errors, no stop line and no folder-failure list;
+  - `TestRunSync_When_PlanRuns_Then_ItsRowShowsEscapedNamesAndTheServerGetsTheExactOnes` - the first frame of the copy holds the running row of the plan with the escaped names. The output holds neither raw name and no clear-screen sequence, and the final row shows done. The CREATE and the APPEND carry the exact destination name;
+  - `TestRunSync_When_ColoursAreForcedOn_Then_QuietOutputHoldsNoEscapeByte` - the test turns the colours of go-pretty on (`forceColours`). It runs in sequence, because the colour flag is process-wide. With `--quiet`, the output holds no ESC byte and shows the expected result lines. A control run without `--quiet` holds colour codes. The cases are:
+    - a copy into new nested folders, also with `--verbose`;
+    - nothing to copy;
+    - every CREATE refused;
+    - a throttled CREATE of a parent;
+    - a throttled APPEND with a plan that never starts;
+    - a refused APPEND;
+    - a folder failure;
+    - a folder that LIST hides and that holds a message;
+    - a worker source that goes silent, where no trip line shows;
+  - `TestRunSync_When_LastSourceFolderWarns_Then_WarningStaysOnScreenWhicheverSideFinishesLast` - the warnings of both source folders stay on the screen above the summary line, whichever side ends its scan last. The scan row of the side that ends first is above the row of the other side, and no row shows a scan in progress;
+  - `TestRunSync_When_FolderNameHoldsFormatVerbs_Then_EveryPhaseShowsItVerbatim` - a folder named `100%d %s` shows unchanged in each phase of a `--verbose` run.
+    - The name shows one time in each of these rows:
+      - the warning for the missing Message-Id;
+      - the fetch line of the destination;
+      - the line that the folder exists;
+      - the stream line;
+      - the append line.
+    - The output holds no `%!`, and the destination gets only the missing message;
+  - `Test_newPlanTracker_When_PlanStarts_Then_TextHasNumberAndEscapedNames` - the text has the number of the plan and the escaped names. The tracker is not done after its last `Increment`. It is done after `MarkAsDone`;
+  - `Test_newStoppedPlanTracker_When_Appended_Then_StaysStoppedAndErrored` - the text starts with the number and `Stopped`, and the tracker stays done and errored after `AppendTracker`;
+  - `Test_lineLog_When_Logged_Then_WritesOneLinePerCall` - each call writes one line with one `Write`. `lineLog` formats the message only when the call has arguments, so a percent sign stays. `lineLog` does not escape the line. An empty message gives an empty line.
+
+  The lines of the Clients have these tests:
+  - `TestRunSync_When_DestinationGoesSilentDuringCreate_Then_TheTripLineShows` - the destination holds the reply to its first CREATE, and the watchdog trips (the test sets `Options.IdleTimeout` to 1 s). The line `[dst] No data from server for 1s, reconnecting` shows one time on the screen, before the copy, also without `--verbose`. The reconnect lines show only with `--verbose`. Both messages arrive;
+  - `TestRunSync_When_DestinationGoesSilentDuringTheCheckAfterCreate_Then_TheTripLineShows` and `TestRunSync_When_SourceGoesSilentDuringTheCheckAfterCreate_Then_TheTripLineShows` - the trip line shows during the check after CREATE. This holds for the destination read and for the source read. The line comes before the "already exists and holds" line. The check goes on. With `--quiet`, no trip line shows;
+  - `TestRunSync_When_WorkerSourceGoesSilent_Then_TheTripLineShowsWithoutVerbose` - the line `[src-w1] No data from server for 1s, reconnecting` shows also without `--verbose`. With `--quiet`, it does not show. The run copies all messages;
+  - `TestRunSync_When_WorkerSourceReconnects_Then_VerboseRunShowsTheWorkerLines` - after a dropped connection of a worker, `--verbose` shows the reconnect lines and the append lines of the worker. Each line shows one time, between the line `📥 Syncing messages...` and the summary line, so a writer that stops early loses it. Without `--verbose`, none of these lines shows.
+
+  The folders to create have these tests:
+  - `Test_foldersToCreate` - a plan that copies nothing, or whose folder exists, adds no name. A level that two plans share shows one time. A parent with its own later plan comes before its child. A listed parent and a `\Noselect` parent are not in the list. A flat destination gives the plan folders only;
+  - `Test_foldersToCreate_When_ContextEnded_Then_ReturnsContextError` - a context that ended gives its error and no names, for a nested name and for a name with no delimiter;
+  - `Test_printFoldersToCreate` and `Test_printFoldersToCreate_When_OneNameHasThousandsOfLevels_Then_OutputStaysBounded` - an empty list prints nothing. A list of up to `previewFolderLimit` names prints all of them. A longer list prints the first names and `• … and N more`. The list escapes control and bidi characters. A name with 5000 levels gives output of bounded size;
+  - `TestRunSync_When_DestinationParentsAreMissing_Then_PreviewCounterAndWireAgree` - the preview, the CREATE commands and the counter `Created N folders` agree, and the messages arrive in the folder. With `--quiet`, no preview and no counter show. The cases are:
+    - missing parents;
+    - a listed first parent;
+    - a `\Noselect` first parent;
+    - a flat destination;
+    - two folders with one parent;
+    - a parent with its own later plan;
+    - a quiet run.
+  - `TestRunSync_When_DestinationParentsAreCreated_Then_PreviewWireCounterAndLogsAgree` - with `--verbose`, the preview lists the missing levels, parents first, each name one time. The CREATE commands carry the same names, and the INBOX gets none. Each server sees two LIST commands, because finding the missing levels reads the cache only. The counter row and each log row show one time. The cases are:
+    - a typed destination with the INBOX level in lower case: `inbox/Old/X` gives `INBOX/Old` and `INBOX/Old/X`;
+    - a destination with a dot as delimiter;
+    - a hidden parent that answers `Duplicate folder name`: the counter does not count it, and the log says `Parent folder already exists`;
+    - the parents of a folder that LIST hides;
+  - `TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_NoEmptyParentIsPreviewedCountedOrCreated` - the destination `/X` gets one CREATE for `/X`. The destination `a//b` gets a CREATE for `a` and then for `a//b`. The preview lists these names with no empty bullet, and the counter shows `Created N folders` for the number of names. The message arrives in the folder;
+  - `TestRunSync_When_ParentsAreCreatedBeforeALaterFolder_Then_TheCounterTextCountsThemToo` - for the plans `Old/A` and `Z`, the CREATE of `Z` is the third CREATE, and its text is `(3/3) Creating Z`. No text shows `(2/3) Creating` or `(3/4) Creating`. The CREATE commands are `Old`, `Old/A` and `Z`, and the final row is `Created 3 folders` with the done mark;
+  - `TestRunSync_When_ParentCreateIsThrottled_Then_NoFurtherCreateAndCounterShowsTheRefusal` - a throttled reply to the CREATE of the parent `Old` stops the run. The CREATE of `B` comes first, then the CREATE of `Old`, and no other CREATE and no APPEND follows. The counter row shows `Created 1 of 3 folders, 1 refused` with the error mark. The stop line shows one time, after the counter, and the summary line is the last row;
+  - `TestRunSync_When_CanceledDuringFolderCreation_Then_ReportsCancelNotCreateFailure` - a cancel at the first CREATE gives `context.Canceled`, not a creation failure. The output holds no folder-failure list and no summary, and the destination gets no APPEND. The cases are a destination with no missing parent (`(1/1) Creating Work`) and a destination with missing parents. For the second case, the text is `(1/3) Creating Old/2020/Work`, and only the CREATE of `Old` reaches the server;
+  - `TestRunSync_When_NewDestinationHasMoreMissingLevelsThanThePreviewShows_Then_PreviewIsCappedAndEveryLevelIsCreated` - the preview shows the first levels and the count of the rest. If you answer no, the destination gets no CREATE and no APPEND. With `-y`, the destination gets a CREATE for every level, and the counter counts all of them;
+  - `TestRunSync_When_ContextEndsBeforeTheFoldersToCreateAreListed_Then_ReturnsCanceledWithoutPreview` - a context that ends after the folder-failure list gives `context.Canceled`. The run prints no preview and no question, and the destination gets no CREATE and no APPEND;
+  - `TestRunSync_When_ParentLevelNameCarriesControlCharacters_Then_PreviewShowsEscapesAndServerGetsExactNames` - the preview escapes a parent level and its child. The CREATE commands carry the exact names;
+  - `TestRunSync_When_HiddenParentAnswersAlreadyExists_Then_CounterLeavesItOut` - a parent that LIST hides and CREATE reports as existing is in the preview, but the counter does not count it (`Created 1 folders`);
+  - `TestRunSync_When_HiddenFolderAnswersAlreadyExistsAfterItsParentIsMade_Then_OnlyTheMissingMessageIsCopied` - a folder that LIST hides, below a parent that CREATE makes, gets only the missing message. The counter shows `Created 1 folders`, and a second run sends no APPEND.
+
+  The `show` command has these tests for colour codes and tracker lines:
+  - `TestRunShow_When_BothAccountsLoad_Then_TheirTrackerLinesStayAboveTheTables` - the two lines `Done (N mailboxes)` with the done mark stay on the screen, above the first table;
+  - `TestRunShow_When_ColoursAreForcedOn_Then_OnlyOutputWithoutQuietHoldsEscapeSequences` - the test turns the colours of go-pretty on. It runs in sequence, because the colour flag is process-wide. With `--quiet`, the output holds no ESC byte, and the totals are right. Without `--quiet`, the title has bold bright-cyan codes and the totals have bold codes;
+  - `TestRunShow_When_AnAccountFails_Then_ItsRowShowsTheErrorMarkAndNoRowStaysInProgress` - a refused LOGIN, a refused LIST at connect and a LIST that fails after connect each fail one account. The test runs each case for the source and for the destination. The row of the failing account shows the error mark. The screen holds the two tracker rows and no table, one row for each label, and no row of a tracker in progress;
+  - `Test_newShowColors` - quiet mode gives plain colours. Normal mode gives a bold bright-cyan title and bold totals;
+  - `TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals` - plain colours give output with no escape sequence. The `show` colours give the same text after the test removes the sequences;
+  - the other `show` tests read quiet output raw (`shownText`), so any ESC byte fails them. They remove colour codes only from output that is not quiet.
+- **`internal/progress`** - interface compliance against the contract `internal/client` expects. The `Stop` tests cover the render loop:
+  - `TestWriter_Stop_whenCalledRightAfterStart_endsTheRenderGoroutine` - a `Stop` right after `Start` ends the render loop, in 500 runs;
+  - `TestWriter_Stop_isSafeBeforeStartAndWhenRepeated` - `Stop` is safe before `Start` and when repeated, and no render loop runs after it;
+  - `TestWriter_Stop_whenQuiet_writesNothingToStdout` - a quiet writer with a tracker and a queued log writes nothing to stdout;
+  - `TestWriter_Stop_When_LogIsQueuedBeforeTheLastTrackerEnds_Then_OutputEndsWithTheLog` - the output ends with the log line and shows the finished tracker. It holds no cursor-up sequence, so `Stop` erases nothing.
+
+  The bar indicator has these tests:
+  - `TestNewWriter_When_Built_Then_StyleHasAnIndeterminateIndicator` - a writer, quiet or not, has an `Indeterminate` generator in its style. A nil generator panics the render goroutine of go-pretty;
+  - `TestWriter_Start_When_TrackerIsIndeterminate_Then_DrawsTheIndicatorWithoutPanic` - a tracker with total 0, and a tracker with a value above its total, render for two ticks without a panic. The output holds the message, the percent text (`???` and `140.00%`), the box characters and the indicator `⣿⣿⣿`.
 - **`internal/termsafe`** - `Escape` and `Writer` have 100% coverage. The tests are table tests, a fuzz target, `Writer` tests and a test that `Escape` does not allocate memory when nothing needs escaping.
-- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read. They also include the left-out lines, the rename notice and the "already exists and holds" lines (`TestRunSync_When_ExistingDestinationNamesCarryControlCharacters_Then_InfoLineShowsEscapesAndServersGetExactNames`). They include the case-variant warning, the mapping override line and the standby line. They also include the list of folders to create for a shared destination and the failure lines of a rebuilt source folder.
+- **Terminal output in `internal/client` and `internal/app`** - end-to-end tests with fake servers use a folder name, a reply and a Message-Id that contain control and bidi characters. They check the escaped output, and they check that the names on the wire stay byte-exact. These tests include the list of folders that cannot be synced, the skip line, and the list of folders that `show` cannot read. They also include the left-out lines, the rename notice and the "already exists and holds" lines (`TestRunSync_When_ExistingDestinationNamesCarryControlCharacters_Then_InfoLineShowsEscapesAndServersGetExactNames`). They include the case-variant warning, the mapping override line and the standby line. They also include the list of folders to create for a shared destination and the failure lines of a rebuilt source folder. The list of folders to create also escapes the parent levels (`TestRunSync_When_ParentLevelNameCarriesControlCharacters_Then_PreviewShowsEscapesAndServerGetsExactNames`).
 - **`cmd/imapsync-go`** - `TestReportError` covers the exit code and the escaped `Error:` line. `TestFetchTag` covers `helpers.fetchTag` against an `httptest` server.
 
 ## What we deliberately don't test
