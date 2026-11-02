@@ -929,6 +929,150 @@ func Test_splitDestinationClashes(t *testing.T) {
 	}
 }
 
+func Test_splitEmptyLevelDestinations(t *testing.T) {
+	t.Parallel()
+
+	plain := func(src, dst string) folderMapping { return folderMapping{DirectoryMapping: mapping(src, dst)} }
+	type failure struct{ source, destination, text string }
+	levelText := func(name, delimiter string) string {
+		return fmt.Sprintf(`destination folder has an empty level: "%s", destination delimiter "%s"`, name, delimiter)
+	}
+	tests := []struct {
+		name         string
+		delimiter    string
+		listed       []string
+		noSelect     []string
+		in           []folderMapping
+		wantKept     []string
+		wantFailures []failure
+	}{
+		{
+			name:      "no empty level keeps every mapping",
+			delimiter: "/",
+			in:        []folderMapping{plain("A", "A"), plain("A/b", "A/b"), plain("c.d", "c.d")},
+			wantKept:  []string{"A", "A/b", "c.d"},
+		},
+		{
+			name:      "unlisted names with an empty level fail in order and the others stay",
+			delimiter: "/",
+			in:        []folderMapping{plain("A", "A"), plain("x/", "x/"), plain("B", "B"), plain("p", "a//b"), plain("q", "/X")},
+			wantKept:  []string{"A", "B"},
+			wantFailures: []failure{
+				{"x/", "x/", levelText("x/", "/")},
+				{"p", "a//b", levelText("a//b", "/")},
+				{"q", "/X", levelText("/X", "/")},
+			},
+		},
+		{
+			name:      "listed name keeps its mapping",
+			delimiter: "/",
+			listed:    []string{"x/", "a//b"},
+			in:        []folderMapping{plain("p", "x/"), plain("q", "a//b"), plain("r", "/X")},
+			wantKept:  []string{"p", "q"},
+			wantFailures: []failure{
+				{"r", "/X", levelText("/X", "/")},
+			},
+		},
+		{
+			name:      "name that LIST marks as Noselect counts as listed",
+			delimiter: "/",
+			noSelect:  []string{"x/"},
+			in:        []folderMapping{plain("p", "x/")},
+			wantKept:  []string{"p"},
+		},
+		{
+			name:      "dot server reads the dot as the delimiter",
+			delimiter: ".",
+			in:        []folderMapping{plain("p", "x."), plain("q", "a..b"), plain("r", "a/b//c")},
+			wantKept:  []string{"r"},
+			wantFailures: []failure{
+				{"p", "x.", levelText("x.", ".")},
+				{"q", "a..b", levelText("a..b", ".")},
+			},
+		},
+		{
+			name:      "flat server has no levels",
+			delimiter: "",
+			in:        []folderMapping{plain("p", "x/"), plain("q", "a//b"), plain("r", "/X"), plain("s", "x.")},
+			wantKept:  []string{"p", "q", "r", "s"},
+		},
+		{
+			name:      "names with control characters stay raw in the failure",
+			delimiter: "/",
+			in:        []folderMapping{plain("v\x1b[2J/", "v\x1b[2J/")},
+			wantFailures: []failure{
+				{"v\x1b[2J/", "v\x1b[2J/", levelText("v\x1b[2J/", "/")},
+			},
+		},
+		{
+			name:      "renamed flag does not change the check",
+			delimiter: "/",
+			in:        []folderMapping{{DirectoryMapping: mapping("p/q..r", "p_q//r"), renamed: true}},
+			wantFailures: []failure{
+				{"p/q..r", "p_q//r", levelText("p_q//r", "/")},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			folders := map[string][]fakeMsg{"INBOX": nil}
+			for _, name := range tt.listed {
+				folders[name] = nil
+			}
+			dst := newStoreServer(t, tt.delimiter, folders)
+			dst.markNoSelect(tt.noSelect...)
+			dstC := newAppClient(t, dst, "dst")
+
+			kept, failures, err := splitEmptyLevelDestinations(t.Context(), dstC, tt.in, tt.delimiter)
+
+			if err != nil {
+				t.Fatalf("splitEmptyLevelDestinations: %v", err)
+			}
+			keptSources := make([]string, len(kept))
+			for i, m := range kept {
+				keptSources[i] = m.Source
+			}
+			if !slices.Equal(keptSources, tt.wantKept) {
+				t.Errorf("kept sources = %q, want %q", keptSources, tt.wantKept)
+			}
+			if len(failures) != len(tt.wantFailures) {
+				t.Fatalf("failures = %v, want %d", failures, len(tt.wantFailures))
+			}
+			for i, want := range tt.wantFailures {
+				got := failures[i]
+				if got.SourceFolder != want.source || got.DestinationFolder != want.destination {
+					t.Errorf("failure %d = %q -> %q, want %q -> %q", i, got.SourceFolder, got.DestinationFolder, want.source, want.destination)
+				}
+				if !errors.Is(got.Err, errEmptyLevel) {
+					t.Errorf("failure %d error = %v, want errEmptyLevel", i, got.Err)
+				}
+				if got.Err.Error() != want.text {
+					t.Errorf("failure %d error text = %q, want %q", i, got.Err.Error(), want.text)
+				}
+			}
+		})
+	}
+}
+
+func Test_splitEmptyLevelDestinations_When_ContextEnded_Then_ReturnsContextErrorOnlyForANameThatNeedsTheCheck(t *testing.T) {
+	t.Parallel()
+
+	dstC := newDestinationClient(t, "/")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	kept, failures, err := splitEmptyLevelDestinations(ctx, dstC, []folderMapping{{DirectoryMapping: mapping("A", "a/b")}}, "/")
+	if err != nil || len(kept) != 1 || len(failures) != 0 {
+		t.Errorf("name with no empty level = %v, %v, %v, want one kept mapping and no error", kept, failures, err)
+	}
+	kept, failures, err = splitEmptyLevelDestinations(ctx, dstC, []folderMapping{{DirectoryMapping: mapping("A", "a//b")}}, "/")
+	if !errors.Is(err, context.Canceled) || kept != nil || failures != nil {
+		t.Errorf("name with an empty level = %v, %v, %v, want context.Canceled and no result", kept, failures, err)
+	}
+}
+
 func Test_splitRefusedDestinations(t *testing.T) {
 	t.Parallel()
 
@@ -4404,6 +4548,253 @@ func assertNoCommandsAfterSetup(t *testing.T, side string, srv *fakeServer) {
 			t.Errorf("%s saw %d %s commands, want only LOGIN, CAPABILITY, LIST and LOGOUT", side, n, verb)
 		}
 	}
+}
+
+// assertNoCommandNamesFolder checks that the server saw no command that opens, reads the size of or creates folder, and that no APPEND filled it.
+func assertNoCommandNamesFolder(t *testing.T, side string, srv *fakeServer, folder string) {
+	t.Helper()
+
+	for _, verb := range []string{"SELECT", "EXAMINE", "STATUS", "CREATE"} {
+		if slices.Contains(srv.capturedNames(verb), folder) {
+			t.Errorf("%s saw %s %q, want no command for it", side, verb, folder)
+		}
+	}
+	if ids := srv.appended(folder); len(ids) != 0 {
+		t.Errorf("%s APPENDs to %q = %v, want none", side, folder, ids)
+	}
+}
+
+func TestRunSync_When_MirroredNameHasAnEmptyLevel_Then_OnlyThatFolderFailsAndNoCommandNamesIt(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"x/", "a//b", "/X"} {
+		for _, quiet := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s quiet=%t", name, quiet), func(t *testing.T) {
+				t.Parallel()
+
+				src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), "A": fakeMsgs("a1@x", "a2@x"), name: fakeMsgs("f1@x")})
+				dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+				out := &syncBuffer{}
+				opts := e2eOptions(out, "y\n")
+				if quiet {
+					opts.quiet, opts.autoConfirm = true, true
+				}
+
+				err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+				if !errors.Is(err, ErrSilentExit) {
+					t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+				}
+				got := out.String()
+				failureLine := fmt.Sprintf("• %s → %s: destination folder has an empty level: \"%s\", destination delimiter \"/\"\n", name, name, name)
+				assertContainsAll(t, got, "Folders that cannot be synced", failureLine, "3 messages uploaded, 0 errors occurred, 1 folders failed")
+				if quiet {
+					if n := strings.Count(got, failureLine); n != 1 {
+						t.Errorf("failure line shown %d times with --quiet, want 1\noutput: %s", n, got)
+					}
+				}
+				assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "i1@x")
+				assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x", "a2@x")
+				assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A")
+				if n := dst.callCount("APPEND"); n != 3 {
+					t.Errorf("dst saw %d APPEND commands, want 3", n)
+				}
+				if got := slices.Sorted(slices.Values(src.capturedNames("EXAMINE"))); !slices.Contains(got, "A") || !slices.Contains(got, "INBOX") {
+					t.Errorf("src EXAMINE names = %q, want INBOX and A among them", got)
+				}
+				assertNoCommandNamesFolder(t, "src", src, name)
+				assertNoCommandNamesFolder(t, "dst", dst, name)
+			})
+		}
+	}
+}
+
+func TestRunSync_When_MirroredNameHasAnEmptyLevelAndNothingElseIsNew_Then_NoQuestionAndTheRunFails(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), "x/": fakeMsgs("f1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x")})
+	out := &syncBuffer{}
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), e2eOptions(out, ""))
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"• x/ → x/: destination folder has an empty level",
+		"Sync completed with errors. 0 messages uploaded, 0 errors occurred, 1 folders failed",
+	)
+	assertContainsNone(t, got, "Proceed with synchronization?", "All folders already synced!")
+	if n := dst.callCount("CREATE") + dst.callCount("APPEND"); n != 0 {
+		t.Errorf("dst saw %d CREATE or APPEND commands, want 0", n)
+	}
+	assertNoCommandNamesFolder(t, "src", src, "x/")
+	assertNoCommandNamesFolder(t, "dst", dst, "x/")
+}
+
+func TestRunSync_When_ExpandedSubfolderHasAnEmptyLevel_Then_OnlyThatSubfolderFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		source      string
+		destination string
+	}{
+		{name: "empty level in the middle", source: "Work//bad", destination: "Fine//bad"},
+		{name: "empty last level", source: "Work/sub/", destination: "Fine/sub/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX":   fakeMsgs("i1@x"),
+				"Work":    fakeMsgs("w1@x"),
+				"Work/ok": fakeMsgs("o1@x"),
+				tt.source: fakeMsgs("f1@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Fine")), e2eOptions(out, "y\n"))
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			assertContainsAll(t, out.String(),
+				fmt.Sprintf("• %s → %s: destination folder has an empty level: \"%s\", destination delimiter \"/\"\n", tt.source, tt.destination, tt.destination),
+				"2 messages uploaded, 0 errors occurred, 1 folders failed",
+			)
+			assertIDs(t, "dst Fine", dst.folderMsgIDs("Fine"), "w1@x")
+			assertIDs(t, "dst Fine/ok", dst.folderMsgIDs("Fine/ok"), "o1@x")
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Fine", "Fine/ok")
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"))
+			assertNoCommandNamesFolder(t, "src", src, tt.source)
+			assertNoCommandNamesFolder(t, "dst", dst, tt.destination)
+		})
+	}
+}
+
+func TestRunSync_When_DerivedNameWithAnEmptyLevelIsListedOnTheDestination_Then_ItIsNotRefused(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), "x/": fakeMsgs("f1@x"), "a//b": fakeMsgs("f2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "x/": nil, "a//b": nil})
+	out := &syncBuffer{}
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), e2eOptions(out, "y\n")); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertContainsNone(t, out.String(), "empty level", "Folders that cannot be synced")
+	assertIDs(t, "dst x/", dst.folderMsgIDs("x/"), "f1@x")
+	assertIDs(t, "dst a//b", dst.folderMsgIDs("a//b"), "f2@x")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "i1@x")
+	if names := dst.capturedNames("CREATE"); len(names) != 0 {
+		t.Errorf("dst CREATE names = %q, want none for listed folders", names)
+	}
+}
+
+func TestRunSync_When_DerivedNameWithAnEmptyLevelIsListedAsNoSelect_Then_ItFailsAsNoSelectNotAsAnEmptyLevel(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "x/": fakeMsgs("f1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.markNoSelect("x/")
+	out := &syncBuffer{}
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), e2eOptions(out, ""))
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got, `• x/ → x/: 1 messages not copied: destination folder cannot hold messages (\Noselect)`)
+	assertContainsNone(t, got, "empty level")
+}
+
+func TestRunSync_When_DestinationIsFlat_Then_NamesWithDelimiterTextAreNotRefusedAsEmptyLevels(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), "x/": fakeMsgs("f1@x"), "a//b": fakeMsgs("f2@x")})
+	dst := newStoreServer(t, "", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), e2eOptions(out, "y\n")); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	assertContainsNone(t, out.String(), "empty level", "Folders that cannot be synced")
+	assertIDs(t, "dst x/", dst.folderMsgIDs("x/"), "f1@x")
+	assertIDs(t, "dst a//b", dst.folderMsgIDs("a//b"), "f2@x")
+	assertIDs(t, "dst CREATE names", slices.Sorted(slices.Values(dst.capturedNames("CREATE"))), "a//b", "x/")
+}
+
+func TestRunSync_When_RenamedMirrorNameHasAnEmptyLevel_Then_NoRenameNoticeShows(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), "p/q..r": fakeMsgs("f1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got, `• p/q..r → p_q//r: destination folder has an empty level: "p_q//r", destination delimiter "/"`+"\n")
+	assertContainsNone(t, got, "is renamed to")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "i1@x")
+	assertNoCommandNamesFolder(t, "src", src, "p/q..r")
+	assertNoCommandNamesFolder(t, "dst", dst, "p_q//r")
+}
+
+func TestRunSync_When_FailedDestinationsDifferOnlyInLetterCase_Then_NoCaseWarningShows(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), "x/": fakeMsgs("f1@x"), "X/": fakeMsgs("f2@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got, "• x/ → x/: destination folder has an empty level", "• X/ → X/: destination folder has an empty level")
+	assertContainsNone(t, got, "differ only in letter case")
+}
+
+func TestRunSync_When_MirroredNameWithAnEmptyLevelCarriesControlCharacters_Then_FailureLineShowsEscapesAndNoCommandNamesIt(t *testing.T) {
+	t.Parallel()
+
+	const wireName = hostileWireName + "/"
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("i1@x"), wireName: fakeMsgs("f1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	// Quiet mode silences the progress writer, so the whole output can be checked for raw control characters.
+	opts := e2eOptions(out, "")
+	opts.quiet, opts.autoConfirm = true, true
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got, fmt.Sprintf("• %s/ → %s/: destination folder has an empty level: \"%s/\", destination delimiter \"/\"\n", hostileShownName, hostileShownName, hostileShownName))
+	assertContainsNone(t, got, "\x1b", hostileName, "\u202e")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "i1@x")
+	assertNoCommandNamesFolder(t, "src", src, wireName)
+	assertNoCommandNamesFolder(t, "dst", dst, wireName)
 }
 
 func TestRunSync_When_ContextEndsBeforeTheFoldersToCreateAreListed_Then_ReturnsCanceledWithoutPreview(t *testing.T) {

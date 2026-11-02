@@ -378,6 +378,10 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expanded)-len(roots), len(expanded))
 	}
 	planned, clashes := splitDestinationClashes(expanded)
+	planned, emptyLevels, err := splitEmptyLevelDestinations(ctx, dstClient, planned, dstDelimiter)
+	if err != nil {
+		return err
+	}
 	printFolderRenames(out, planned, dstDelimiter)
 	mappings = directoryMappings(planned)
 	printCaseVariantDestinations(out, mappings, dstClient.MailboxNames())
@@ -421,7 +425,7 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	summary.Failures = slices.Concat(clashes, summary.Failures)
+	summary.Failures = slices.Concat(clashes, emptyLevels, summary.Failures)
 
 	if !quiet && len(summary.Skipped) > 0 {
 		printFolderSkips(out, summary.Skipped)
@@ -1720,6 +1724,35 @@ func splitDestinationClashes(in []folderMapping) (kept []folderMapping, clashes 
 		})
 	}
 	return kept, clashes
+}
+
+// CREATE reads a trailing delimiter as the parent, so APPENDs would go to a folder CREATE did not make. A listed name needs no CREATE.
+func splitEmptyLevelDestinations(ctx context.Context, dst *client.Client, in []folderMapping, delimiter string) ([]folderMapping, []FolderFailure, error) {
+	if delimiter == "" {
+		return in, nil, nil
+	}
+	kept := make([]folderMapping, 0, len(in))
+	var failures []FolderFailure
+	for _, m := range in {
+		if !hasEmptyLevel(m.Destination, delimiter) {
+			kept = append(kept, m)
+			continue
+		}
+		listed, err := dst.MailboxExists(ctx, m.Destination)
+		if err != nil {
+			return nil, nil, err
+		}
+		if listed {
+			kept = append(kept, m)
+			continue
+		}
+		failures = append(failures, FolderFailure{
+			SourceFolder:      m.Source,
+			DestinationFolder: m.Destination,
+			Err:               fmt.Errorf(`%w: "%s", destination delimiter "%s"`, errEmptyLevel, m.Destination, delimiter),
+		})
+	}
+	return kept, failures, nil
 }
 
 // Each name is raw server text, so it goes through termsafe.Escape.
