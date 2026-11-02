@@ -1666,9 +1666,7 @@ func Test_cramMD5Auth(t *testing.T) {
 
 // --- per-connection handler helpers ---
 
-// connHandlerWithLoginReply returns a handler that sends the greeting, replies
-// to LOGIN with the given reply string, and then handles LOGOUT. For non-OK
-// login replies it closes immediately after the reply.
+// connHandlerWithLoginReply greets, answers LOGIN with loginReply and answers LOGOUT. It keeps the socket open after a refusal, because go-imap may read a close ahead of a ready status reply.
 func connHandlerWithLoginReply(srv *fakeServer, loginReply string) func(net.Conn) {
 	return func(conn net.Conn) {
 		defer func() { _ = conn.Close() }()
@@ -1690,9 +1688,6 @@ func connHandlerWithLoginReply(srv *fakeServer, loginReply string) func(net.Conn
 			switch verb {
 			case "LOGIN":
 				_, _ = fmt.Fprintf(conn, "%s %s\r\n", tag, loginReply)
-				if !strings.HasPrefix(strings.ToUpper(loginReply), "OK") {
-					return
-				}
 			case "LOGOUT":
 				_, _ = fmt.Fprintf(conn, "* BYE Logging out\r\n")
 				_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
