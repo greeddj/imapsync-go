@@ -30,5 +30,8 @@ var errDestinationCreate = errors.New("cannot create destination folder")
 // errSourceConflict stops the run before the plan, because the order of the map items must not choose the destination.
 var errSourceConflict = errors.New("different destination folders for source folder")
 
+// errEmptyLevel stops the run before the scan: CREATE cannot make a folder with an empty level.
+var errEmptyLevel = errors.New("destination folder has an empty level")
+
 // errPlanStopped ends one plan after a throttled reply or a destination that gave up. It stays inside the worker, so its text never reaches the user.
 var errPlanStopped = errors.New("plan stopped")

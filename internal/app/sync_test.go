@@ -27,6 +27,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/greeddj/imapsync-go/internal/progress"
 	"github.com/greeddj/imapsync-go/internal/ratelimit"
+	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v3"
 )
@@ -4161,36 +4162,247 @@ func TestRunSync_When_NewDestinationHasMoreMissingLevelsThanThePreviewShows_Then
 	})
 }
 
-func TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_NoEmptyParentIsPreviewedCountedOrCreated(t *testing.T) {
+func TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_RunIsRefusedBeforeAnyCommandThatChangesTheDestination(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name        string
+		delimiter   string
 		destination string
-		wantFolders []string
 	}{
-		{name: "empty first level", destination: "/X", wantFolders: []string{"/X"}},
-		{name: "empty level in the middle", destination: "a//b", wantFolders: []string{"a", "a//b"}},
+		{name: "empty first level", delimiter: "/", destination: "/X"},
+		{name: "empty level in the middle", delimiter: "/", destination: "a//b"},
+		{name: "empty last level", delimiter: "/", destination: "x/"},
+		{name: "only the delimiter", delimiter: "/", destination: "/"},
+		{name: "empty first level on a dot server", delimiter: ".", destination: ".X"},
+		{name: "empty level in the middle on a dot server", delimiter: ".", destination: "a..b"},
+		{name: "empty last level on a dot server", delimiter: ".", destination: "x."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "Work": fakeMsgs("w1@x")})
+			dst := newStoreServer(t, tt.delimiter, map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Work", "Fine"), mapping("INBOX", tt.destination)), e2eOptions(out, "y\n"))
+
+			if !errors.Is(err, errEmptyLevel) {
+				t.Fatalf("error = %v, want errEmptyLevel\noutput: %s", err, out.String())
+			}
+			want := fmt.Sprintf(`map entry 2: destination folder has an empty level: "%s", destination delimiter "%s"`, tt.destination, tt.delimiter)
+			if err.Error() != want {
+				t.Errorf("error = %q, want %q", err.Error(), want)
+			}
+			if got := out.String(); got != "" {
+				t.Errorf("output = %q, want none: no preview and no question", got)
+			}
+			assertNoCommandsAfterSetup(t, "src", src)
+			assertNoCommandsAfterSetup(t, "dst", dst)
+		})
+	}
+}
+
+func TestRunSync_When_DestinationFlagHasAnEmptyLevel_Then_ErrorNamesTheFlag(t *testing.T) {
+	t.Parallel()
+
+	for _, destination := range []string{"/X", "a//b", "x/"} {
+		t.Run(destination, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "y\n")
+			opts.srcFolder, opts.dstFolder = "INBOX", destination
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "Ignored")), opts)
+
+			if !errors.Is(err, errEmptyLevel) {
+				t.Fatalf("error = %v, want errEmptyLevel\noutput: %s", err, out.String())
+			}
+			want := fmt.Sprintf(`--dest-folder: destination folder has an empty level: "%s", destination delimiter "/"`, destination)
+			if err.Error() != want {
+				t.Errorf("error = %q, want %q", err.Error(), want)
+			}
+			if got := out.String(); got != "" {
+				t.Errorf("output = %q, want none: no preview and no question", got)
+			}
+			assertNoCommandsAfterSetup(t, "src", src)
+			assertNoCommandsAfterSetup(t, "dst", dst)
+		})
+	}
+}
+
+func TestRunSync_When_DestinationNameWithEmptyLevelCarriesControlCharacters_Then_ErrorHoldsTheRawNameAndEscapeMakesItSafe(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", hostileName+"//b")), e2eOptions(&syncBuffer{}, "y\n"))
+
+	if !errors.Is(err, errEmptyLevel) {
+		t.Fatalf("error = %v, want errEmptyLevel", err)
+	}
+	if !strings.Contains(err.Error(), hostileName+"//b") {
+		t.Errorf("error = %q, want the raw name %q", err.Error(), hostileName+"//b")
+	}
+	shown := termsafe.Escape(err.Error())
+	assertContainsAll(t, shown, hostileShownName+"//b")
+	assertContainsNone(t, shown, hostileName, "\u202e", "\x1b[2J", "\rx")
+	assertNoCommandsAfterSetup(t, "dst", dst)
+}
+
+func TestRunSync_When_DestinationListsTheNameWithAnEmptyLevel_Then_ItIsNotRefusedAndSyncs(t *testing.T) {
+	t.Parallel()
+
+	for _, destination := range []string{"/X", "a//b", "x/"} {
+		t.Run(destination, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, destination: nil})
+			out := &syncBuffer{}
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", destination)), e2eOptions(out, "y\n")); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			assertIDs(t, "dst "+destination, dst.folderMsgIDs(destination), "m1@x")
+			if n := dst.callCount("CREATE"); n != 0 {
+				t.Errorf("dst saw %d CREATE commands, want 0 for a listed folder", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_DestinationListsTheNameWithAnEmptyLevelAsNoSelect_Then_ItIsNotRefusedAsAnEmptyLevel(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	dst.markNoSelect("a//b")
+	out := &syncBuffer{}
+
+	err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "a//b")), e2eOptions(out, "y\n"))
+
+	if errors.Is(err, errEmptyLevel) {
+		t.Fatalf("error = %v, want no errEmptyLevel for a listed name", err)
+	}
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit for the \\Noselect destination\noutput: %s", err, out.String())
+	}
+	assertContainsAll(t, out.String(), `destination folder cannot hold messages (\Noselect)`)
+}
+
+func TestRunSync_When_DestinationDelimiterIsNotTheRepeatedCharacter_Then_TheNameIsNotRefused(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		delimiter   string
+		destination string
+	}{
+		{name: "slash names on a dot server, first level", delimiter: ".", destination: "/X"},
+		{name: "slash names on a dot server, middle", delimiter: ".", destination: "a//b"},
+		{name: "slash names on a dot server, last level", delimiter: ".", destination: "x/"},
+		{name: "dot names on a slash server", delimiter: "/", destination: "a..b"},
+		{name: "slash names on a flat server, first level", delimiter: "", destination: "/X"},
+		{name: "slash names on a flat server, middle", delimiter: "", destination: "a//b"},
+		{name: "slash names on a flat server, last level", delimiter: "", destination: "x/"},
+		{name: "dot names on a flat server", delimiter: "", destination: ".X..y."},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
 			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
-			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			dst := newStoreServer(t, tt.delimiter, map[string][]fakeMsg{"INBOX": nil})
 			out := &syncBuffer{}
 
 			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", tt.destination)), e2eOptions(out, "y\n")); err != nil {
 				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
 			}
 
-			got := out.String()
-			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantFolders...)
 			assertIDs(t, "dst "+tt.destination, dst.folderMsgIDs(tt.destination), "m1@x")
-			assertInOrder(t, got, foldersToCreateHeader+folderBullets(tt.wantFolders...)+"\n📨 Total new messages to sync: 1", "Proceed with synchronization?", "Creating destination folders")
-			assertContainsNone(t, got, "• \n")
-			assertOneRow(t, screenRows(t, got), fmt.Sprintf("Created %d folders", len(tt.wantFolders)), "✓ done")
+			if !slices.Contains(dst.capturedNames("CREATE"), tt.destination) {
+				t.Errorf("dst CREATE names = %q, want %q among them", dst.capturedNames("CREATE"), tt.destination)
+			}
 		})
+	}
+}
+
+func Test_checkDestinationLevels_When_ContextEnded_Then_ReturnsContextErrorOnlyForANameWithAnEmptyLevel(t *testing.T) {
+	t.Parallel()
+
+	dst := newDestinationClient(t, "/")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := checkDestinationLevels(ctx, dst, []config.DirectoryMapping{mapping("INBOX", "a/b")}, ""); err != nil {
+		t.Errorf("checkDestinationLevels for a name with no empty level = %v, want nil", err)
+	}
+	if err := checkDestinationLevels(ctx, dst, []config.DirectoryMapping{mapping("INBOX", "a//b")}, ""); !errors.Is(err, context.Canceled) {
+		t.Errorf("checkDestinationLevels for a name with an empty level = %v, want context.Canceled", err)
+	}
+}
+
+func Test_hasEmptyLevel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		delimiter string
+		want      bool
+	}{
+		{name: "plain name", input: "Work", delimiter: "/", want: false},
+		{name: "nested name", input: "Work/2023/Q1", delimiter: "/", want: false},
+		{name: "leading delimiter", input: "/X", delimiter: "/", want: true},
+		{name: "trailing delimiter", input: "x/", delimiter: "/", want: true},
+		{name: "repeated delimiter", input: "a//b", delimiter: "/", want: true},
+		{name: "three delimiters", input: "a///b", delimiter: "/", want: true},
+		{name: "only the delimiter", input: "/", delimiter: "/", want: true},
+		{name: "other character repeated", input: "a..b", delimiter: "/", want: false},
+		{name: "dot repeated on a dot server", input: "a..b", delimiter: ".", want: true},
+		{name: "backslash and slash on a dot server", input: `\X/`, delimiter: ".", want: false},
+		{name: "multi-byte delimiter", input: "a::b", delimiter: "::", want: false},
+		{name: "multi-byte delimiter repeated", input: "a::::b", delimiter: "::", want: true},
+		{name: "plain name on a flat server", input: "Work", delimiter: "", want: false},
+		{name: "leading slash on a flat server", input: "/X", delimiter: "", want: false},
+		{name: "repeated slash on a flat server", input: "a//b", delimiter: "", want: false},
+		{name: "empty name on a flat server", input: "", delimiter: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := hasEmptyLevel(tt.input, tt.delimiter); got != tt.want {
+				t.Errorf("hasEmptyLevel(%q, %q) = %t, want %t", tt.input, tt.delimiter, got, tt.want)
+			}
+		})
+	}
+}
+
+// assertNoCommandsAfterSetup checks that the server saw only the commands of the connect phase.
+func assertNoCommandsAfterSetup(t *testing.T, side string, srv *fakeServer) {
+	t.Helper()
+
+	for _, verb := range []string{"SELECT", "EXAMINE", "STATUS", "FETCH", "UID", "UID FETCH", "UID SEARCH", "CREATE", "APPEND"} {
+		if n := srv.callCount(verb); n != 0 {
+			t.Errorf("%s saw %d %s commands, want 0", side, n, verb)
+		}
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for verb, n := range srv.counts {
+		switch verb {
+		case "LOGIN", "CAPABILITY", "LIST", "LOGOUT":
+		default:
+			t.Errorf("%s saw %d %s commands, want only LOGIN, CAPABILITY, LIST and LOGOUT", side, n, verb)
+		}
 	}
 }
 

@@ -353,6 +353,13 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err := checkSourceConflicts(mappings); err != nil {
 			return err
 		}
+		destinationFlag := ""
+		if opts.dstFolder != "" {
+			destinationFlag = "--dest-folder"
+		}
+		if err := checkDestinationLevels(ctx, dstClient, mappings, destinationFlag); err != nil {
+			return err
+		}
 		roots = typedMappings(mappings)
 	} else {
 		// The names come from the planning client's mailbox cache, so no extra session opens.
@@ -1593,6 +1600,33 @@ func checkSourceConflicts(mappings []config.DirectoryMapping) error {
 		}
 	}
 	return nil
+}
+
+// checkDestinationLevels refuses a typed destination that CREATE would split at an empty level; a listed name needs no CREATE. flag names the mapping source, empty for the config map.
+func checkDestinationLevels(ctx context.Context, dst *client.Client, mappings []config.DirectoryMapping, flag string) error {
+	delimiter := dst.GetDelimiter()
+	for i, m := range mappings {
+		if !hasEmptyLevel(m.Destination, delimiter) {
+			continue
+		}
+		listed, err := dst.MailboxExists(ctx, m.Destination)
+		if err != nil {
+			return err
+		}
+		if listed {
+			continue
+		}
+		where := flag
+		if where == "" {
+			where = fmt.Sprintf("map entry %d", i+1)
+		}
+		return fmt.Errorf(`%s: %w: "%s", destination delimiter "%s"`, where, errEmptyLevel, m.Destination, delimiter)
+	}
+	return nil
+}
+
+func hasEmptyLevel(name, delimiter string) bool {
+	return delimiter != "" && (strings.HasPrefix(name, delimiter) || strings.HasSuffix(name, delimiter) || strings.Contains(name, delimiter+delimiter))
 }
 
 func typedMappings(in []config.DirectoryMapping) []folderMapping {
