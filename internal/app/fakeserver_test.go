@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -30,7 +31,7 @@ type fakeServer struct {
 	store          *mailStore
 	counts         map[string]int
 	names          map[string][]string
-	hooks          map[string][]func()
+	hooks          map[string][]func(n int)
 	connHandlers   []func(net.Conn)
 	connHandlerIdx int
 	mu             sync.Mutex
@@ -76,20 +77,25 @@ func (s *fakeServer) addConnHandler(fn func(net.Conn)) {
 
 // onCommand makes a store-backed server run fn whenever a connection sends verb: after the server records the command and before it answers. fn runs outside s.mu.
 func (s *fakeServer) onCommand(verb string, fn func()) {
+	s.onNthCommand(verb, func(int) { fn() })
+}
+
+// onNthCommand is onCommand with the 1-based number of the command within its verb. recordCommand takes it under s.mu, so parallel connections cannot shift it.
+func (s *fakeServer) onNthCommand(verb string, fn func(n int)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.hooks == nil {
-		s.hooks = make(map[string][]func())
+		s.hooks = make(map[string][]func(int))
 	}
 	s.hooks[verb] = append(s.hooks[verb], fn)
 }
 
-func (s *fakeServer) runHooks(verb string) {
+func (s *fakeServer) runHooks(verb string, n int) {
 	s.mu.Lock()
 	hooks := slices.Clone(s.hooks[verb])
 	s.mu.Unlock()
 	for _, fn := range hooks {
-		fn()
+		fn(n)
 	}
 }
 
@@ -1103,10 +1109,9 @@ func (s *fakeServer) takeDropOnOpen(name string) bool {
 func (s *fakeServer) stallNth(t *testing.T, verb string, n int) {
 	t.Helper()
 	release := make(chan struct{})
-	var stalled atomic.Bool
 	t.Cleanup(func() { close(release) })
-	s.onCommand(verb, func() {
-		if s.callCount(verb) == n && stalled.CompareAndSwap(false, true) {
+	s.onNthCommand(verb, func(got int) {
+		if got == n {
 			<-release
 		}
 	})
@@ -1273,12 +1278,12 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 			continue
 		}
 		tag, verb, arg := splitCommand(raw)
-		s.recordCommand(verb, arg)
-		s.runHooks(verb)
+		n := s.recordCommand(verb, arg)
+		s.runHooks(verb, n)
 
 		switch verb {
 		case "LOGIN":
-			s.storeLogin(rw, tag)
+			s.storeLogin(rw, tag, n)
 		case "LOGOUT":
 			rw.line("* BYE Logging out")
 			rw.line("%s OK LOGOUT completed", tag)
@@ -1314,7 +1319,7 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 		case "CREATE":
 			s.storeCreate(rw, tag, arg)
 		case "APPEND":
-			if !s.storeAppend(rw, rd, tag, arg) {
+			if !s.storeAppend(rw, rd, tag, arg, n) {
 				return
 			}
 		default:
@@ -1331,10 +1336,11 @@ func splitCommand(line string) (tag, verb, arg string) {
 }
 
 // CREATE, EXAMINE, SELECT and STATUS names and the UID set of each UID FETCH and UID SEARCH are recorded on arrival, whether or not the server accepts them.
-func (s *fakeServer) recordCommand(verb, arg string) {
+func (s *fakeServer) recordCommand(verb, arg string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.counts[verb]++
+	n := s.counts[verb]
 	switch verb {
 	case "UID":
 		sub, rest, _ := strings.Cut(arg, " ")
@@ -1350,12 +1356,14 @@ func (s *fakeServer) recordCommand(verb, arg string) {
 		name, _ := parseMailboxArg(arg)
 		s.names[verb] = append(s.names[verb], name)
 	}
+	return n
 }
 
-func (s *fakeServer) storeLogin(rw replyWriter, tag string) {
+// n is the number recordCommand gave this LOGIN.
+func (s *fakeServer) storeLogin(rw replyWriter, tag string, n int) {
 	s.mu.Lock()
 	reply := s.store.loginReply
-	if reply == "" && s.store.loginRefusal > 0 && s.counts["LOGIN"] == s.store.loginRefusal {
+	if reply == "" && s.store.loginRefusal > 0 && n == s.store.loginRefusal {
 		reply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
 	}
 	s.mu.Unlock()
@@ -1621,9 +1629,9 @@ func (s *fakeServer) storeCreate(rw replyWriter, tag, arg string) {
 }
 
 // storeAppend drains the literal before any tagged reply, refusals included:
-// replying NO before the continuation races go-imap's literal writer. It
-// reports false when the connection died mid-literal.
-func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg string) bool {
+// replying NO before the continuation races go-imap's literal writer. False
+// means the connection died mid-literal. n comes from recordCommand.
+func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg string, n int) bool {
 	name, rest := parseMailboxArg(arg)
 	size := parseLiteralSize(arg)
 	flagList, flags, tail := parseAppendFlags(rest)
@@ -1641,7 +1649,7 @@ func (s *fakeServer) storeAppend(rw replyWriter, rd *bufio.Reader, tag, arg stri
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.store.dropAtAppend > 0 && s.counts["APPEND"] == s.store.dropAtAppend {
+	if s.store.dropAtAppend > 0 && n == s.store.dropAtAppend {
 		s.store.loginReply = "NO [AUTHENTICATIONFAILED] Invalid credentials"
 		return false
 	}
@@ -1882,11 +1890,11 @@ func refuseLoginAfterAppendHandler(srv *fakeServer) func(net.Conn) {
 				continue
 			}
 			tag, verb, arg := splitCommand(raw)
-			srv.recordCommand(verb, arg)
+			n := srv.recordCommand(verb, arg)
 
 			switch verb {
 			case "LOGIN":
-				srv.storeLogin(rw, tag)
+				srv.storeLogin(rw, tag, n)
 			case "LIST":
 				srv.storeList(rw, tag)
 			case "APPEND":
@@ -1952,5 +1960,217 @@ func stallOnSizeFetchHandler(srv *fakeServer, onFetch func()) func(net.Conn) {
 				rw.line("%s OK %s completed", tag, verb)
 			}
 		}
+	}
+}
+
+// storeConn is a raw client connection to a fake server whose greeting has been read.
+type storeConn struct {
+	conn net.Conn
+	rd   *bufio.Reader
+}
+
+func dialStoreConn(t *testing.T, srv *fakeServer) *storeConn {
+	t.Helper()
+	var d net.Dialer
+	conn, err := d.DialContext(t.Context(), "tcp", srv.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial fake server: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := &storeConn{conn: conn, rd: bufio.NewReader(conn)}
+	if _, err := c.readLine(); err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+	return c
+}
+
+func (c *storeConn) readLine() (string, error) {
+	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := c.rd.ReadString('\n')
+	return strings.TrimRight(line, "\r\n"), err
+}
+
+func (c *storeConn) write(text string) error {
+	_, err := io.WriteString(c.conn, text)
+	return err
+}
+
+// atOnce starts fn on every connection from its own goroutine, releases them together and returns the results in connection order.
+func atOnce(conns []*storeConn, fn func(c *storeConn) string) []string {
+	start := make(chan struct{})
+	results := make([]string, len(conns))
+	var wg sync.WaitGroup
+	for i, c := range conns {
+		wg.Go(func() {
+			<-start
+			results[i] = fn(c)
+		})
+	}
+	close(start)
+	wg.Wait()
+	return results
+}
+
+// gatherCommands holds each verb command, before later hooks and the reply, until count of them are recorded, so a check that reads the shared count sees them all.
+func gatherCommands(srv *fakeServer, verb string, count int) {
+	var arrived atomic.Int32
+	all := make(chan struct{})
+	srv.onNthCommand(verb, func(int) {
+		if int(arrived.Add(1)) == count {
+			close(all)
+		}
+		select {
+		case <-all:
+		case <-time.After(5 * time.Second):
+		}
+	})
+}
+
+func dialStoreConns(t *testing.T, srv *fakeServer, count int) []*storeConn {
+	t.Helper()
+	conns := make([]*storeConn, count)
+	for i := range conns {
+		conns[i] = dialStoreConn(t, srv)
+	}
+	return conns
+}
+
+func TestFakeServer_stallNth_When_ConnectionsSendTheVerbAtOnce_Then_OnlyTheNthCommandIsHeld(t *testing.T) {
+	t.Parallel()
+
+	const rounds = 50
+	for _, n := range []int{1, 2} {
+		t.Run(fmt.Sprintf("holds command %d of 2", n), func(t *testing.T) {
+			t.Parallel()
+
+			for round := range rounds {
+				t.Run(fmt.Sprintf("round %d", round), func(t *testing.T) {
+					t.Parallel()
+
+					srv := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+					gatherCommands(srv, "NOOP", 2)
+					srv.stallNth(t, "NOOP", n)
+					passed := make(chan int, 2)
+					srv.onNthCommand("NOOP", func(got int) { passed <- got })
+					conns := dialStoreConns(t, srv, 2)
+
+					atOnce(conns, func(c *storeConn) string {
+						_ = c.write("a1 NOOP\r\n")
+						return ""
+					})
+
+					select {
+					case got := <-passed:
+						if want := 3 - n; got != want {
+							t.Fatalf("command %d passed the stall, want command %d", got, want)
+						}
+					case <-time.After(5 * time.Second):
+						t.Fatal("no command passed the stall")
+					}
+					select {
+					case got := <-passed:
+						t.Fatalf("command %d passed the stall too, want only one", got)
+					case <-time.After(50 * time.Millisecond):
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestFakeServer_refuseLoginAt_When_ConnectionsLoginAtOnce_Then_OnlyTheNthLoginIsRefused(t *testing.T) {
+	t.Parallel()
+
+	const rounds = 30
+	for _, n := range []int{1, 2} {
+		t.Run(fmt.Sprintf("refuses login %d of 2", n), func(t *testing.T) {
+			t.Parallel()
+
+			for round := range rounds {
+				srv := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+				gatherCommands(srv, "LOGIN", 2)
+				srv.refuseLoginAt(n)
+				conns := dialStoreConns(t, srv, 2)
+
+				replies := atOnce(conns, func(c *storeConn) string {
+					if err := c.write("a1 LOGIN user pass\r\n"); err != nil {
+						return "write: " + err.Error()
+					}
+					line, err := c.readLine()
+					if err != nil {
+						return "read: " + err.Error()
+					}
+					return line
+				})
+
+				refused := 0
+				for _, reply := range replies {
+					switch {
+					case strings.HasPrefix(reply, "a1 NO "):
+						refused++
+					case reply != "a1 OK LOGIN completed":
+						t.Fatalf("round %d: unexpected reply %q", round, reply)
+					}
+				}
+				if refused != 1 {
+					t.Fatalf("round %d: %d of 2 LOGIN commands were refused, want 1; replies %q", round, refused, replies)
+				}
+			}
+		})
+	}
+}
+
+func TestFakeServer_dropAtAppendAndRefuseLogin_When_ConnectionsAppendAtOnce_Then_OnlyTheNthAppendIsDropped(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rounds  = 30
+		literal = "Message-Id: <m@x>\r\n\r\nbody\r\n"
+	)
+	for _, n := range []int{1, 2} {
+		t.Run(fmt.Sprintf("drops append %d of 2", n), func(t *testing.T) {
+			t.Parallel()
+
+			for round := range rounds {
+				srv := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+				gatherCommands(srv, "APPEND", 2)
+				srv.dropAtAppendAndRefuseLogin(n)
+				conns := dialStoreConns(t, srv, 2)
+
+				outcomes := atOnce(conns, func(c *storeConn) string {
+					if err := c.write(fmt.Sprintf("a1 APPEND INBOX {%d}\r\n", len(literal))); err != nil {
+						return "write: " + err.Error()
+					}
+					if line, err := c.readLine(); err != nil || !strings.HasPrefix(line, "+") {
+						return fmt.Sprintf("continuation: %q %v", line, err)
+					}
+					if err := c.write(literal + "\r\n"); err != nil {
+						return "write literal: " + err.Error()
+					}
+					line, err := c.readLine()
+					if errors.Is(err, io.EOF) {
+						return "dropped"
+					}
+					if err != nil {
+						return "read: " + err.Error()
+					}
+					return line
+				})
+
+				dropped := 0
+				for _, outcome := range outcomes {
+					switch outcome {
+					case "dropped":
+						dropped++
+					case "a1 OK APPEND completed":
+					default:
+						t.Fatalf("round %d: unexpected outcome %q", round, outcome)
+					}
+				}
+				if dropped != 1 {
+					t.Fatalf("round %d: %d of 2 APPEND commands were dropped, want 1; outcomes %q", round, dropped, outcomes)
+				}
+			}
+		})
 	}
 }
