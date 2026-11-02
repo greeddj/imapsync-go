@@ -18241,7 +18241,6 @@ func TestRunSync_When_LastSourceFolderWarns_Then_WarningStaysOnScreenWhicheverSi
 	}
 }
 
-// previewedFolders returns the names that the preview lists under "Folders to be created on destination".
 func previewedFolders(raw string) []string {
 	const header = "Folders to be created on destination:\n"
 	_, after, ok := strings.Cut(raw, header)
