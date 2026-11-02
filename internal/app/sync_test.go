@@ -486,7 +486,7 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 
 	mappings1 := rootMappings(mapping("jira", "jira"))
 	dstC := newDestinationClient(t, delimiter)
-	got1, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, dstC, mappings1, delimiter, delimiter, false, true)
+	got1, _, err := expandMappingsWithSubfolders(context.Background(), srcC, dstC, mappings1, delimiter, delimiter)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders run1: %v", err)
 	}
@@ -503,7 +503,7 @@ func Test_expandMappingsWithSubfolders_addsChildrenAndDedups(t *testing.T) {
 	}
 
 	mappings2 := rootMappings(mapping("jira", "jira"), mapping("jira/DEVOPS", "DEVOPS"))
-	got2, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, dstC, mappings2, delimiter, delimiter, false, true)
+	got2, _, err := expandMappingsWithSubfolders(context.Background(), srcC, dstC, mappings2, delimiter, delimiter)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders run2: %v", err)
 	}
@@ -727,10 +727,11 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	mappings := rootMappings(mapping("INBOX", "INBOX"), mapping("INBOX/Sub", "INBOX/Sub"))
 	var out strings.Builder
 	dstC := newDestinationClient(t, delimiter)
-	got, err := expandMappingsWithSubfolders(context.Background(), &out, srcC, dstC, mappings, delimiter, delimiter, true, false)
+	got, report, err := expandMappingsWithSubfolders(context.Background(), srcC, dstC, mappings, delimiter, delimiter)
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
+	printExpansion(&out, report, got, true, false)
 	if len(got) != 2 {
 		t.Fatalf("len=%d, want 2 (INBOX + INBOX/Sub), got %v", len(got), got)
 	}
@@ -752,7 +753,7 @@ func Test_expandMappingsWithSubfolders_canceledContext(t *testing.T) {
 	cancel()
 
 	dstC := newDestinationClient(t, "/")
-	_, err := expandMappingsWithSubfolders(ctx, io.Discard, srcC, dstC, rootMappings(mapping("INBOX", "INBOX")), "/", "/", false, true)
+	_, _, err := expandMappingsWithSubfolders(ctx, srcC, dstC, rootMappings(mapping("INBOX", "INBOX")), "/", "/")
 	if err == nil {
 		t.Fatal("expected error from canceled context, got nil")
 	}
@@ -806,7 +807,7 @@ func Test_expandMappingsWithSubfolders_When_DelimiterIsEmpty_Then_FlatSideHasNoH
 			srcC := newAppClient(t, srcSrv, "src")
 
 			dstC := newDestinationClient(t, tt.dstDelimiter)
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(mapping("INBOX", "TARGET")), tt.srcDelimiter, tt.dstDelimiter, false, true)
+			got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(mapping("INBOX", "TARGET")), tt.srcDelimiter, tt.dstDelimiter)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -828,7 +829,7 @@ func Test_expandMappingsWithSubfolders_delimiterConversion(t *testing.T) {
 
 	mappings := rootMappings(mapping("jira", "jira"))
 	dstC := newDestinationClient(t, ".")
-	got, err := expandMappingsWithSubfolders(context.Background(), io.Discard, srcC, dstC, mappings, "/", ".", false, true)
+	got, _, err := expandMappingsWithSubfolders(context.Background(), srcC, dstC, mappings, "/", ".")
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
@@ -1187,11 +1188,12 @@ func Test_expandMappingsWithSubfolders_When_SegmentHoldsDestinationDelimiter_The
 	var out strings.Builder
 
 	dstC := newDestinationClient(t, ".")
-	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("Projects", "Old.Projects")), "/", ".", true, false)
+	got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(mapping("Projects", "Old.Projects")), "/", ".")
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
+	printExpansion(&out, report, got, true, false)
 	want := []folderMapping{
 		{DirectoryMapping: mapping("Projects", "Old.Projects")},
 		{DirectoryMapping: mapping("Projects/v1.2", "Old.Projects.v1_2"), renamed: true},
@@ -1212,7 +1214,7 @@ func Test_expandMappingsWithSubfolders_When_RootIsRenamed_Then_SubfoldersAreRena
 	roots := []folderMapping{{DirectoryMapping: mapping("acme.com", "acme_com"), renamed: true}}
 
 	dstC := newDestinationClient(t, ".")
-	got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, roots, "/", ".", false, true)
+	got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, roots, "/", ".")
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -1238,7 +1240,7 @@ func Test_expandMappingsWithSubfolders_When_ListOrderVaries_Then_SubfoldersFollo
 	srcC := newAppClient(t, src, "src")
 
 	dstC := newDestinationClient(t, "/")
-	got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(mapping("r", "r")), "/", "/", false, true)
+	got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(mapping("r", "r")), "/", "/")
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -4676,6 +4678,211 @@ func TestRunSync_When_ExpandedSubfolderHasAnEmptyLevel_Then_OnlyThatSubfolderFai
 	}
 }
 
+func TestRunSync_When_SubfoldersFailBeforeThePlan_Then_VerboseExpansionNamesOnlyThePlannedFolders(t *testing.T) {
+	t.Parallel()
+
+	const (
+		clashDots   = "• Projects/v1.2 → Old.Projects.v1_2: same destination folder as source folder Projects/v1_2\n"
+		clashPlain  = "• Projects/v1_2 → Old.Projects.v1_2: same destination folder as source folder Projects/v1.2\n"
+		emptyLevel  = "• Projects//bad → Old.Projects..bad: destination folder has an empty level: \"Old.Projects..bad\", destination delimiter \".\"\n"
+		foundInside = "  📁 Found subfolder: Projects/Box/in → Old.Projects.Box.in\n"
+		foundOK     = "  📁 Found subfolder: Projects/ok → Old.Projects.ok\n"
+		skipBox     = "  ℹ️  Folder Projects/Box skipped - the source server marks it \\Noselect\n"
+		override    = "  ℹ️  Folder Projects/ok goes to Special, not to Old.Projects.ok: the mapping of Projects/ok wins over the mapping of Projects\n"
+		countLine   = "📂 Found 2 subfolders, total folders to sync: 3\n"
+	)
+	failingTree := map[string][]fakeMsg{
+		"INBOX":         nil,
+		"Projects":      fakeMsgs("p1@x"),
+		"Projects/v1.2": fakeMsgs("a1@x"),
+		"Projects/v1_2": fakeMsgs("b1@x"),
+		"Projects//bad": fakeMsgs("f1@x"),
+	}
+	withKeptChildren := maps.Clone(failingTree)
+	withKeptChildren["Projects/ok"] = fakeMsgs("o1@x")
+	withKeptChildren["Projects/Box/in"] = fakeMsgs("i1@x")
+	withOverride := maps.Clone(failingTree)
+	withOverride["Projects/ok"] = fakeMsgs("o1@x")
+	keptDst := map[string][]string{"Old.Projects": {"p1@x"}, "Old.Projects.ok": {"o1@x"}, "Old.Projects.Box.in": {"i1@x"}}
+	allFound := []string{"Found subfolder: Projects/v1.2", "Found subfolder: Projects/v1_2", "Found subfolder: Projects//bad", "Found 5 subfolders", "Found 4 subfolders"}
+	tests := []struct {
+		src          map[string][]fakeMsg
+		wantDst      map[string][]string
+		name         string
+		wantSummary  string
+		noSelect     []string
+		mappings     []config.DirectoryMapping
+		wantInOrder  []string
+		wantFailures []string
+		wantNone     []string
+		wantFound    int
+		verbose      bool
+		quiet        bool
+	}{
+		{
+			name:         "some subfolders remain after the splits",
+			src:          withKeptChildren,
+			noSelect:     []string{"Projects/Box"},
+			mappings:     []config.DirectoryMapping{mapping("Projects", "Old.Projects")},
+			verbose:      true,
+			wantDst:      keptDst,
+			wantInOrder:  []string{"Checking for subfolders...\n", foundInside, foundOK, skipBox, countLine, folderFailuresHeader},
+			wantFailures: []string{clashDots, clashPlain, emptyLevel},
+			wantFound:    2,
+			wantNone:     allFound,
+			wantSummary:  "3 messages uploaded, 0 errors occurred, 3 folders failed",
+		},
+		{
+			name:         "no subfolder remains after the splits",
+			src:          failingTree,
+			mappings:     []config.DirectoryMapping{mapping("Projects", "Old.Projects")},
+			verbose:      true,
+			wantDst:      map[string][]string{"Old.Projects": {"p1@x"}},
+			wantInOrder:  []string{"Checking for subfolders...\n", folderFailuresHeader},
+			wantFailures: []string{clashDots, clashPlain, emptyLevel},
+			wantNone:     append([]string{"subfolders, total folders to sync", "skipped"}, allFound...),
+			wantSummary:  "1 messages uploaded, 0 errors occurred, 3 folders failed",
+		},
+		{
+			name:         "a mapping that wins over its parent stays named",
+			src:          withOverride,
+			mappings:     []config.DirectoryMapping{mapping("Projects", "Old.Projects"), mapping("Projects/ok", "Special")},
+			verbose:      true,
+			wantDst:      map[string][]string{"Old.Projects": {"p1@x"}, "Special": {"o1@x"}},
+			wantInOrder:  []string{override, folderFailuresHeader},
+			wantFailures: []string{clashDots, clashPlain, emptyLevel},
+			wantNone:     append([]string{"subfolders, total folders to sync"}, allFound...),
+			wantSummary:  "2 messages uploaded, 0 errors occurred, 3 folders failed",
+		},
+		{
+			name:         "without verbose",
+			src:          withKeptChildren,
+			noSelect:     []string{"Projects/Box"},
+			mappings:     []config.DirectoryMapping{mapping("Projects", "Old.Projects")},
+			wantDst:      keptDst,
+			wantInOrder:  []string{folderFailuresHeader},
+			wantFailures: []string{clashDots, clashPlain, emptyLevel},
+			wantNone:     append([]string{"Checking for subfolders", "Found subfolder", "subfolders, total folders to sync", "skipped"}, allFound...),
+			wantSummary:  "3 messages uploaded, 0 errors occurred, 3 folders failed",
+		},
+		{
+			name:         "verbose and quiet",
+			src:          withKeptChildren,
+			noSelect:     []string{"Projects/Box"},
+			mappings:     []config.DirectoryMapping{mapping("Projects", "Old.Projects")},
+			verbose:      true,
+			quiet:        true,
+			wantDst:      keptDst,
+			wantInOrder:  []string{folderFailuresHeader},
+			wantFailures: []string{clashDots, clashPlain, emptyLevel},
+			wantNone:     append([]string{"Checking for subfolders", "Found subfolder", "subfolders, total folders to sync", "skipped"}, allFound...),
+			wantSummary:  "3 messages uploaded, 0 errors occurred, 3 folders failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			src.markNoSelect(tt.noSelect...)
+			dst := newStoreServer(t, ".", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose, opts.quiet = true, tt.verbose, tt.quiet
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			got := out.String()
+			assertInOrder(t, got, tt.wantInOrder...)
+			_, failures, ok := strings.Cut(got, folderFailuresHeader)
+			if !ok {
+				t.Fatalf("output does not contain %q\noutput: %s", folderFailuresHeader, got)
+			}
+			assertInOrder(t, failures, tt.wantFailures...)
+			assertContainsAll(t, got, tt.wantSummary)
+			assertContainsNone(t, got, tt.wantNone...)
+			if n := strings.Count(got, "Found subfolder"); n != tt.wantFound {
+				t.Errorf("output holds %d found-subfolder lines, want %d\noutput: %s", n, tt.wantFound, got)
+			}
+			for folder, ids := range tt.wantDst {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), ids...)
+			}
+			for _, folder := range []string{"Old.Projects.v1_2", "Old.Projects..bad"} {
+				if dst.hasFolder(folder) {
+					t.Errorf("destination holds folder %q, want none", folder)
+				}
+			}
+			examined := src.capturedNames("EXAMINE")
+			for _, folder := range []string{"Projects/v1.2", "Projects/v1_2", "Projects//bad"} {
+				if slices.Contains(examined, folder) {
+					t.Errorf("source EXAMINE names = %q, want no %q: a failed folder must not be scanned", examined, folder)
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSubfolders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src       map[string][]fakeMsg
+		name      string
+		wantLine  string
+		noSelect  []string
+		mappings  []config.DirectoryMapping
+		wantDst   map[string][]string
+		wantFound []string
+	}{
+		{
+			name:      "root is \\Noselect",
+			src:       map[string][]fakeMsg{"INBOX": nil, "Box/a": fakeMsgs("a1@x"), "Box/b": fakeMsgs("b1@x")},
+			noSelect:  []string{"Box"},
+			mappings:  []config.DirectoryMapping{mapping("Box", "Moved")},
+			wantLine:  "📂 Found 2 subfolders, total folders to sync: 2\n",
+			wantFound: []string{"Found subfolder: Box/a → Moved/a\n", "Found subfolder: Box/b → Moved/b\n"},
+			wantDst:   map[string][]string{"Moved/a": {"a1@x"}, "Moved/b": {"b1@x"}},
+		},
+		{
+			name:      "map item is repeated",
+			src:       map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("w1@x"), "Work/a": fakeMsgs("a1@x")},
+			mappings:  []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Work", "Moved")},
+			wantLine:  "📂 Found 1 subfolders, total folders to sync: 2\n",
+			wantFound: []string{"Found subfolder: Work/a → Moved/a\n"},
+			wantDst:   map[string][]string{"Moved": {"w1@x"}, "Moved/a": {"a1@x"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", tt.src)
+			src.markNoSelect(tt.noSelect...)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			assertContainsAll(t, got, tt.wantFound...)
+			if n := strings.Count(got, "subfolders, total folders to sync"); n != 1 {
+				t.Errorf("output holds %d count lines, want 1\noutput: %s", n, got)
+			}
+			assertContainsAll(t, got, tt.wantLine)
+			for folder, ids := range tt.wantDst {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), ids...)
+			}
+		})
+	}
+}
+
 func TestRunSync_When_DerivedNameWithAnEmptyLevelIsListedOnTheDestination_Then_ItIsNotRefused(t *testing.T) {
 	t.Parallel()
 
@@ -6329,11 +6536,12 @@ func Test_expandMappingsWithSubfolders_When_SourceIsNoSelect_Then_SkipsItAndKeep
 			var out strings.Builder
 
 			dstC := newDestinationClient(t, "/")
-			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, mappings, "/", "/", tt.verbose, false)
+			got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, mappings, "/", "/")
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
 			}
+			printExpansion(&out, report, got, tt.verbose, false)
 			// The cache iteration order is random, so compare as a set.
 			pairs := make([]string, len(got))
 			for i, m := range got {
@@ -6379,11 +6587,12 @@ func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedParent_Then_KeepsItW
 			var out strings.Builder
 
 			dstC := newDestinationClient(t, "/")
-			got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("Archive", "Old")), "/", "/", tt.verbose, false)
+			got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(mapping("Archive", "Old")), "/", "/")
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
 			}
+			printExpansion(&out, report, got, tt.verbose, false)
 			pairs := make([]string, len(got))
 			for i, m := range got {
 				pairs[i] = m.Source + "->" + m.Destination
@@ -6482,7 +6691,7 @@ func Test_expandMappingsWithSubfolders_When_InboxIsUnlistedButHasSubfolders_Then
 			typed := []config.DirectoryMapping{mapping(tt.inbox, tt.inbox)}
 			resolveMappings(typed, srcC, srcC)
 			dstC := newDestinationClient(t, "/")
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, typedMappings(typed), "/", "/", false, false)
+			got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, typedMappings(typed), "/", "/")
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -6525,7 +6734,7 @@ func Test_expandMappingsWithSubfolders_When_ListedChildSpellsInboxInAnotherCase_
 			srcC := newAppClient(t, src, "src")
 
 			dstC := newDestinationClient(t, tt.dstDelimiter)
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(tt.root), "/", tt.dstDelimiter, false, false)
+			got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(tt.root), "/", tt.dstDelimiter)
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -6550,11 +6759,12 @@ func Test_expandMappingsWithSubfolders_When_SourceIsUnlistedWithoutSubfolders_Th
 	var out strings.Builder
 
 	dstC := newDestinationClient(t, "/")
-	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("Sentt", "Sent")), "/", "/", true, false)
+	got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(mapping("Sentt", "Sent")), "/", "/")
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
+	printExpansion(&out, report, got, true, false)
 	if want := rootMappings(mapping("Sentt", "Sent")); !slices.Equal(got, want) {
 		t.Errorf("expanded = %v, want %v: the scan must report the missing folder", got, want)
 	}
@@ -11474,7 +11684,7 @@ func Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfol
 			for _, destination := range delimiterCases {
 				dstDelimiter := destination.delimiter
 				dstC := newDestinationClient(t, dstDelimiter)
-				all, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, dstC, mirrorMappings(names, srcDelimiter, dstDelimiter), srcDelimiter, dstDelimiter, false, true)
+				all, _, err := expandMappingsWithSubfolders(e2eContext(t), srcC, dstC, mirrorMappings(names, srcDelimiter, dstDelimiter), srcDelimiter, dstDelimiter)
 				if err != nil {
 					t.Fatalf("expandMappingsWithSubfolders(all names, dst %q): %v", dstDelimiter, err)
 				}
@@ -11488,7 +11698,7 @@ func Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfol
 				}
 				for _, name := range names {
 					roots := mirrorMappings([]string{name}, srcDelimiter, dstDelimiter)
-					expanded, err := expandMappingsWithSubfolders(e2eContext(t), io.Discard, srcC, dstC, roots, srcDelimiter, dstDelimiter, false, true)
+					expanded, _, err := expandMappingsWithSubfolders(e2eContext(t), srcC, dstC, roots, srcDelimiter, dstDelimiter)
 					if err != nil {
 						t.Fatalf("expandMappingsWithSubfolders(%q, dst %q): %v", name, dstDelimiter, err)
 					}
@@ -12020,7 +12230,7 @@ func Test_expandMappingsWithSubfolders_When_ExplicitMappingsNest_Then_MostSpecif
 		t.Run(fmt.Sprint(order), func(t *testing.T) {
 			roots := rootMappings(explicit[order[0]], explicit[order[1]], explicit[order[2]])
 
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, roots, "/", "/", false, true)
+			got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, roots, "/", "/")
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -12054,10 +12264,11 @@ func Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_Ver
 
 	for _, tt := range orders {
 		var out strings.Builder
-		got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(tt.mappings...), "/", "/", true, false)
+		got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(tt.mappings...), "/", "/")
 		if err != nil {
 			t.Fatalf("%s: expandMappingsWithSubfolders: %v", tt.name, err)
 		}
+		printExpansion(&out, report, got, true, false)
 		if len(got) != 3 {
 			t.Errorf("%s: expanded = %v, want three folders", tt.name, got)
 		}
@@ -12073,9 +12284,7 @@ func Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_Ver
 		outputs = append(outputs, out.String())
 
 		var quiet strings.Builder
-		if _, err := expandMappingsWithSubfolders(t.Context(), &quiet, srcC, dstC, rootMappings(tt.mappings...), "/", "/", false, false); err != nil {
-			t.Fatalf("%s: expandMappingsWithSubfolders without verbose: %v", tt.name, err)
-		}
+		printExpansion(&quiet, report, got, false, false)
 		if quiet.Len() != 0 {
 			t.Errorf("%s: output without --verbose = %q, want none", tt.name, quiet.String())
 		}
@@ -12095,11 +12304,12 @@ func Test_expandMappingsWithSubfolders_When_OverrideNamesCarryControlCharacters_
 	roots := rootMappings(mapping("P", "Old"), mapping("P/K", "New"))
 	var out strings.Builder
 
-	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, roots, "/", "/", true, false)
+	got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, roots, "/", "/")
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
+	printExpansion(&out, report, got, true, false)
 	assertContainsAll(t, out.String(),
 		"  ℹ️  Folder P/K/"+hostileShownName+" goes to New/"+hostileShownName+", not to Old/K/"+hostileShownName+": the mapping of P/K wins over the mapping of P\n")
 	assertContainsNone(t, out.String(), hostileName, "\u202e", "\x1b[2J")
@@ -12147,7 +12357,7 @@ func Test_expandMappingsWithSubfolders_When_ExplicitChildIsNoSelectOrUnlisted_Th
 					slices.Reverse(explicit)
 				}
 
-				got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(explicit...), "/", "/", false, true)
+				got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(explicit...), "/", "/")
 
 				if err != nil {
 					t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -12180,7 +12390,7 @@ func Test_expandMappingsWithSubfolders_When_ExplicitDestinationEqualsRenamedDeri
 				slices.Reverse(roots)
 			}
 
-			got, err := expandMappingsWithSubfolders(t.Context(), io.Discard, srcC, dstC, rootMappings(roots...), "/", ".", false, true)
+			got, _, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(roots...), "/", ".")
 
 			if err != nil {
 				t.Fatalf("expandMappingsWithSubfolders: %v", err)
@@ -12945,11 +13155,12 @@ func Test_expandMappingsWithSubfolders_When_QuietAndVerboseAreBothSet_Then_Nothi
 	dstC := newDestinationClient(t, "/")
 	var out strings.Builder
 
-	got, err := expandMappingsWithSubfolders(t.Context(), &out, srcC, dstC, rootMappings(mapping("INBOX", "Old"), mapping("INBOX/Work", "Work")), "/", "/", true, true)
+	got, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(mapping("INBOX", "Old"), mapping("INBOX/Work", "Work")), "/", "/")
 
 	if err != nil {
 		t.Fatalf("expandMappingsWithSubfolders: %v", err)
 	}
+	printExpansion(&out, report, got, true, true)
 	if out.Len() != 0 {
 		t.Errorf("output = %q, want none with --quiet", out.String())
 	}

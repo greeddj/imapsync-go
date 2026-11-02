@@ -370,18 +370,16 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 	if !quiet && verbose {
 		_, _ = fmt.Fprintln(out, "Checking for subfolders...")
 	}
-	expanded, err := expandMappingsWithSubfolders(ctx, out, srcClient, dstClient, roots, srcDelimiter, dstDelimiter, verbose, quiet)
+	expanded, found, err := expandMappingsWithSubfolders(ctx, srcClient, dstClient, roots, srcDelimiter, dstDelimiter)
 	if err != nil {
 		return fmt.Errorf("failed to expand mappings: %w", err)
-	}
-	if len(expanded) > len(roots) && !quiet && verbose {
-		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", len(expanded)-len(roots), len(expanded))
 	}
 	planned, clashes := splitDestinationClashes(expanded)
 	planned, emptyLevels, err := splitEmptyLevelDestinations(ctx, dstClient, planned, dstDelimiter)
 	if err != nil {
 		return err
 	}
+	printExpansion(out, found, planned, verbose, quiet)
 	printFolderRenames(out, planned, dstDelimiter)
 	mappings = directoryMappings(planned)
 	printCaseVariantDestinations(out, mappings, dstClient.MailboxNames())
@@ -1585,6 +1583,13 @@ type expansionEntry struct {
 	folderMapping
 }
 
+// expansionReport keeps what printExpansion needs, so the caller prints after the splits have removed the mappings that fail.
+type expansionReport struct {
+	skipped map[string]string
+	entries []expansionEntry
+	winners []int
+}
+
 func resolveMappings(mappings []config.DirectoryMapping, srcClient, dstClient *client.Client) {
 	for i := range mappings {
 		mappings[i].Source = srcClient.ResolveName(mappings[i].Source)
@@ -1726,7 +1731,7 @@ func splitDestinationClashes(in []folderMapping) (kept []folderMapping, clashes 
 	return kept, clashes
 }
 
-// CREATE reads a trailing delimiter as the parent, so APPENDs would go to a folder CREATE did not make. A listed name needs no CREATE.
+// An empty level names no mailbox, and CREATE reads a trailing delimiter as the parent, so APPENDs would miss the named folder. A listed name needs no CREATE.
 func splitEmptyLevelDestinations(ctx context.Context, dst *client.Client, in []folderMapping, delimiter string) ([]folderMapping, []FolderFailure, error) {
 	if delimiter == "" {
 		return in, nil, nil
@@ -1937,10 +1942,10 @@ func offerDelimiterFixes(ctx context.Context, out io.Writer, in *bufio.Reader, s
 }
 
 // expandMappingsWithSubfolders lets the most specific mapping decide where a folder goes, so the order of the map items does not change the plan.
-func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient, dstClient *client.Client, roots []folderMapping, srcDelimiter, dstDelimiter string, verbose, quiet bool) ([]folderMapping, error) {
+func expandMappingsWithSubfolders(ctx context.Context, srcClient, dstClient *client.Client, roots []folderMapping, srcDelimiter, dstDelimiter string) ([]folderMapping, expansionReport, error) {
 	entries := make([]expansionEntry, 0, len(roots))
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, expansionReport{}, err
 	}
 
 	// A \Noselect source cannot be scanned. Its subfolders still can be scanned.
@@ -1954,7 +1959,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient,
 
 	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, expansionReport{}, err
 		}
 		// A flat source has no subfolders: ListSubfolders would swap an empty delimiter for the client's own.
 		var subfolders []string
@@ -1963,7 +1968,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient,
 			var err error
 			subfolders, err = getSubfolders(ctx, srcClient, root.Source, srcDelimiter)
 			if err != nil {
-				return nil, err
+				return nil, expansionReport{}, err
 			}
 			// The cache lists names in map order. A fixed order keeps the plans and the failure lines the same on each run.
 			slices.Sort(subfolders)
@@ -1979,7 +1984,7 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient,
 		// Add mapping for each subfolder
 		for _, subfolder := range subfolders {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return nil, expansionReport{}, err
 			}
 			if srcClient.IsNoSelect(subfolder) {
 				skip(subfolder, skipReasonNoSelect)
@@ -2018,27 +2023,31 @@ func expandMappingsWithSubfolders(ctx context.Context, out io.Writer, srcClient,
 			expanded = append(expanded, e.folderMapping)
 		}
 	}
-	if verbose && !quiet {
-		printExpansion(out, entries, winners, skipped)
-	}
-	return expanded, nil
+	return expanded, expansionReport{skipped: skipped, entries: entries, winners: winners}, nil
 }
 
-// A found line shows only a destination that the plan uses, so verbose never names one that lost.
-func printExpansion(out io.Writer, entries []expansionEntry, winners []int, skipped map[string]string) {
-	for i, e := range entries {
-		if e.root != e.Source && e.Destination == entries[winners[i]].Destination {
+// A found line shows only a destination that the plan uses, so verbose never names one that lost or one that failed in a split.
+func printExpansion(out io.Writer, r expansionReport, planned []folderMapping, verbose, quiet bool) {
+	if !verbose || quiet {
+		return
+	}
+	used := make(map[string]struct{}, len(planned))
+	for _, m := range planned {
+		used[m.Source] = struct{}{}
+	}
+	for i, e := range r.entries {
+		if _, ok := used[e.Source]; ok && e.root != e.Source && e.Destination == r.entries[r.winners[i]].Destination {
 			_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", termsafe.Escape(e.Source), termsafe.Escape(e.Destination))
 		}
 	}
-	for _, name := range slices.Sorted(maps.Keys(skipped)) {
-		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), skipped[name])
+	for _, name := range slices.Sorted(maps.Keys(r.skipped)) {
+		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), r.skipped[name])
 	}
-	for i, e := range entries {
-		if winners[i] == i {
+	for i, e := range r.entries {
+		if r.winners[i] == i {
 			continue
 		}
-		kept := entries[winners[i]]
+		kept := r.entries[r.winners[i]]
 		if e.Destination == kept.Destination {
 			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", e.Source)
 			continue
@@ -2046,6 +2055,16 @@ func printExpansion(out io.Writer, entries []expansionEntry, winners []int, skip
 		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s\n",
 			termsafe.Escape(e.Source), termsafe.Escape(kept.Destination), termsafe.Escape(e.Destination),
 			termsafe.Escape(kept.root), termsafe.Escape(e.root))
+	}
+	// A root has no entry of its own when its source is \Noselect, so the planned entries are counted, not subtracted from the roots.
+	subfolders := 0
+	for i, e := range r.entries {
+		if _, ok := used[e.Source]; ok && r.winners[i] == i && e.root != e.Source {
+			subfolders++
+		}
+	}
+	if subfolders > 0 {
+		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", subfolders, len(planned))
 	}
 }
 
