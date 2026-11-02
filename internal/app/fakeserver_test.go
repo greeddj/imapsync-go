@@ -1359,7 +1359,7 @@ func (s *fakeServer) recordCommand(verb, arg string) int {
 	return n
 }
 
-// n is the number recordCommand gave this LOGIN.
+// n comes from recordCommand, so a parallel LOGIN cannot shift it.
 func (s *fakeServer) storeLogin(rw replyWriter, tag string, n int) {
 	s.mu.Lock()
 	reply := s.store.loginReply
@@ -1995,7 +1995,7 @@ func (c *storeConn) write(text string) error {
 	return err
 }
 
-// atOnce starts fn on every connection from its own goroutine, releases them together and returns the results in connection order.
+// atOnce releases all connections on one signal, so their commands race. Results come back in connection order.
 func atOnce(conns []*storeConn, fn func(c *storeConn) string) []string {
 	start := make(chan struct{})
 	results := make([]string, len(conns))

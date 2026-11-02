@@ -268,7 +268,7 @@ If the command refuses a name, it stops with an error before it scans the folder
 - `map entry 2: destination folder has an empty level: "a//b", destination delimiter "/"`
 - `--dest-folder: destination folder has an empty level: "x/", destination delimiter "/"`
 
-The command sends no EXAMINE, STATUS, FETCH, CREATE or APPEND to a server. It shows no plan. If more than one `map` item has such a name, the error shows the first of these items. This rule is for the names that you type. The command does not refuse a destination name that it builds. Refer to [Names that the command converts](#names-that-the-command-converts).
+The command sends no EXAMINE, STATUS, FETCH, CREATE or APPEND to a server. It shows no plan. If more than one `map` item has such a name, the error shows the first of these items. This rule is for the names that you type. A destination name that the command builds can also have an empty level. Refer to [Names that the command converts](#names-that-the-command-converts).
 
 ### Names that the command converts
 
@@ -280,6 +280,18 @@ If a level of the source name holds the delimiter of the destination server as t
 - If a renamed folder gets the same destination name as another folder, the command copies none of these folders. Each of these folders appears in the list `Folders that cannot be synced`.
 
 The command never converts a destination name that you type.
+
+A built destination name can have an empty level. For example, if both servers use `/`, a source folder `x/` or `a//b` gives such a name. The command does not copy this folder when all these conditions are true:
+
+- The destination server has a delimiter. A flat server has no levels, so the command never refuses a name there.
+- The name starts with the delimiter, ends with the delimiter, or holds the delimiter two times in a row.
+- The destination server does not list the name. The command does not refuse a listed name, because it creates no folder for it.
+
+A server can read the CREATE of `x/` as the CREATE of `x`. Then the upload goes to a folder that the command did not create. So the folder fails before the scan. The command copies the other folders.
+
+- The folder appears in the list `Folders that cannot be synced`. The reason is `destination folder has an empty level: "NAME", destination delimiter "D"`.
+- The command sends no EXAMINE, STATUS, CREATE or APPEND for this folder.
+- The `-q` option does not hide the list. Refer to [Failed folders in `sync`](#failed-folders-in-sync).
 
 ### Flat servers
 
@@ -297,7 +309,7 @@ If a destination folder has a parent that the destination server does not list, 
 - The list, the counter `Creating folders` and the CREATE commands use one order. The command sorts the destination folders by the bytes of their names, so an upper-case letter comes before a lower-case letter. For each folder, it lists the missing parents from the top, and then the folder. For example, `Old/Z` and `New/A` give `New`, `New/A`, `Old` and `Old/Z`, also when `map` lists `Old/Z` first.
 - The list shows a maximum of 20 names. If there are more than 20 folders, the list then shows the line `• … and N more`. The command sends a CREATE for each folder.
 - A parent that the server marks `\Noselect` counts as listed. The command does not create it.
-- An empty level is not a parent. For a destination name `a//b` that the command builds, it creates `a` and then `a//b`. A typed destination name with an empty level is a different case (refer to [Names that you type](#names-that-you-type)).
+- On a destination server with a delimiter, the command sends no CREATE for a name that has an empty level. Refer to [Names that you type](#names-that-you-type) and [Names that the command converts](#names-that-the-command-converts).
 - The counter `Creating folders` counts the parents and the folders. At the end, it shows `Created N folders`. If the server refuses a folder, it shows `Created N of M folders, R refused`.
 
 ### INBOX
@@ -331,6 +343,7 @@ If `sync` cannot scan a source folder, it does not stop. It copies the other fol
 - If no folder has new messages and a folder failed, the command asks no question. It prints the list and ends with exit code 1.
 - If you answer no to the question before the copy, the command copies no messages and ends with exit code 0. This is also true when a folder failed.
 - A destination folder that the command reads again after CREATE can fail in the same way. This happens when the command cannot scan this folder or its source folder again. It also happens when the server changed the UIDVALIDITY of the source folder or did not send it. The command prints the list at once. Refer to [Idempotency caveats](#idempotency-caveats).
+- If the command builds a destination name with an empty level and the destination server does not list it, the folder fails before the scan. The reason is `destination folder has an empty level`. Refer to [Names that the command converts](#names-that-the-command-converts).
 - If the destination server refuses CREATE for a folder, `sync` does not stop. The list shows each mapping that needs this folder, with the reply of the server. The command copies the other folders. If the server refuses a parent folder, each folder below it fails. A reply that reports a rate limit stops `sync`. Refer to [Provider quotas (Gmail)](#provider-quotas-gmail).
 
 Some servers list the subfolders of a folder, but not the folder. If such a folder refuses to open, `sync` skips it and copies the subfolders. The command prints one line for the folder, and the `-q` option hides this line. The exit code does not change. `sync` never skips INBOX in this way.

@@ -4550,7 +4550,6 @@ func assertNoCommandsAfterSetup(t *testing.T, side string, srv *fakeServer) {
 	}
 }
 
-// assertNoCommandNamesFolder checks that the server saw no command that opens, reads the size of or creates folder, and that no APPEND filled it.
 func assertNoCommandNamesFolder(t *testing.T, side string, srv *fakeServer, folder string) {
 	t.Helper()
 
