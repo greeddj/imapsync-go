@@ -1,6 +1,6 @@
 PROJECT := "imapsync-go"
-VERSION := `sh -c 'git describe --tags --abbrev=0 2>/dev/null || git rev-parse --abbrev-ref HEAD'`
-COMMIT := `git rev-parse --short HEAD`
+VERSION := `sh -c 'git describe --tags --always --dirty 2>/dev/null || echo dev'`
+COMMIT := `sh -c 'git rev-parse --short HEAD 2>/dev/null || true'`
 DATE := `date -u +%Y-%m-%dT%H:%M:%SZ`
 LDFLAGS := "-s -w" \
   + " -X main.Version=" + VERSION \

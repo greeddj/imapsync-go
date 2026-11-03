@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -551,6 +552,205 @@ func Test_execute_When_FirstArgumentNamesACommand_Then_TheCommandHandlesTheRest(
 			}
 			if strings.Contains(stderr, "unknown command") {
 				t.Errorf("stderr = %q, want no unknown command error", stderr)
+			}
+		})
+	}
+}
+
+type scratchRepo struct {
+	t    *testing.T
+	dir  string
+	just string
+	git  string
+	env  []string
+}
+
+func newScratchRepo(t *testing.T, just, git string) *scratchRepo {
+	t.Helper()
+
+	dir := t.TempDir()
+	env := make([]string, 0, len(os.Environ())+8)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_") {
+			env = append(env, kv)
+		}
+	}
+	// A git hook sets GIT_DIR or GIT_INDEX_FILE, user config can sign commits,
+	// and a parent repository could be found. None of these may reach the commands.
+	env = append(env,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CEILING_DIRECTORIES="+filepath.Dir(dir),
+		"GIT_AUTHOR_NAME=example",
+		"GIT_AUTHOR_EMAIL=example@example.invalid",
+		"GIT_COMMITTER_NAME=example",
+		"GIT_COMMITTER_EMAIL=example@example.invalid",
+	)
+	return &scratchRepo{t: t, dir: dir, env: env, just: just, git: git}
+}
+
+func (r *scratchRepo) run(name string, args ...string) string {
+	r.t.Helper()
+
+	cmd := exec.CommandContext(r.t.Context(), name, args...)
+	cmd.Dir = r.dir
+	cmd.Env = r.env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		r.t.Fatalf("%s %q: %v, stderr: %s", name, args, err, stderr.String())
+	}
+	return stdout.String()
+}
+
+func (r *scratchRepo) runGit(args ...string) string {
+	r.t.Helper()
+
+	return strings.TrimSpace(r.run(r.git, args...))
+}
+
+func (r *scratchRepo) write(content string) {
+	r.t.Helper()
+
+	if err := os.WriteFile(filepath.Join(r.dir, "tracked.txt"), []byte(content), 0o600); err != nil {
+		r.t.Fatalf("write tracked file: %v", err)
+	}
+}
+
+func (r *scratchRepo) initWithCommit() {
+	r.t.Helper()
+
+	r.runGit("init", "-q")
+	r.commit("first")
+}
+
+func (r *scratchRepo) commit(content string) {
+	r.t.Helper()
+
+	r.write(content)
+	r.runGit("add", "tracked.txt")
+	r.runGit("commit", "-q", "-m", content)
+}
+
+func (r *scratchRepo) hash() string {
+	r.t.Helper()
+
+	return r.runGit("rev-parse", "--short", "HEAD")
+}
+
+func (r *scratchRepo) evaluate(justfile, name string) string {
+	r.t.Helper()
+
+	return r.run(r.just, "--justfile", justfile, "--working-directory", r.dir, "--evaluate", name)
+}
+
+func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing.T) {
+	t.Parallel()
+
+	justPath, err := exec.LookPath("just")
+	if err != nil {
+		t.Skipf("just is not in PATH: %v", err)
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is not in PATH: %v", err)
+	}
+	justfile, err := filepath.Abs(filepath.Join("..", "..", "Justfile"))
+	if err != nil {
+		t.Fatalf("resolve the Justfile path: %v", err)
+	}
+	// The stat makes the go test cache notice an edited Justfile, because reads by a subprocess are not tracked.
+	if _, err := os.Stat(justfile); err != nil {
+		t.Fatalf("the Justfile is missing: %v", err)
+	}
+
+	tests := []struct {
+		setup func(r *scratchRepo) (wantVersion, wantCommit string)
+		name  string
+	}{
+		{
+			name:  "directory outside any repository",
+			setup: func(*scratchRepo) (string, string) { return "dev", "" },
+		},
+		{
+			name: "repository with no commit",
+			setup: func(r *scratchRepo) (string, string) {
+				r.runGit("init", "-q")
+				return "dev", ""
+			},
+		},
+		{
+			name: "commit with no tag",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "commit with no tag and a local change",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.write("a local change")
+				return r.hash() + "-dirty", r.hash()
+			},
+		},
+		{
+			name: "tagged commit",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				return "v1.2.3", r.hash()
+			},
+		},
+		{
+			name: "tagged commit with a local change",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				r.write("a local change")
+				return "v1.2.3-dirty", r.hash()
+			},
+		},
+		{
+			name: "one commit after the tag",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				r.commit("second")
+				return "v1.2.3-1-g" + r.hash(), r.hash()
+			},
+		},
+		{
+			name: "one commit after the tag with a local change",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				r.commit("second")
+				r.write("a local change")
+				return "v1.2.3-1-g" + r.hash() + "-dirty", r.hash()
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newScratchRepo(t, justPath, gitPath)
+			wantVersion, wantCommit := tt.setup(r)
+
+			if got := r.evaluate(justfile, "VERSION"); got != wantVersion {
+				t.Errorf("VERSION = %q, want %q", got, wantVersion)
+			}
+			if got := r.evaluate(justfile, "COMMIT"); got != wantCommit {
+				t.Errorf("COMMIT = %q, want %q", got, wantCommit)
+			}
+			ldflags := r.evaluate(justfile, "LDFLAGS")
+			wantFlags := " -X main.Version=" + wantVersion + " -X main.Commit=" + wantCommit + " -X main.Date="
+			if !strings.Contains(ldflags, wantFlags) {
+				t.Errorf("LDFLAGS = %q, want it to contain %q", ldflags, wantFlags)
+			}
+			if !strings.HasSuffix(ldflags, " -X main.BuiltBy=just") {
+				t.Errorf("LDFLAGS = %q, want it to end with %q", ldflags, " -X main.BuiltBy=just")
 			}
 		})
 	}

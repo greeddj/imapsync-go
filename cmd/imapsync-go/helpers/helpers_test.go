@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,12 @@ func TestLatestVersion(t *testing.T) {
 		want    string
 	}{
 		{name: "preset version wins without a lookup", version: "v1.2.3", want: "v1.2.3"},
+		{
+			name:    "describe-style version passes unchanged",
+			version: "v1.2.3-4-gabcdef0-dirty",
+			want:    "v1.2.3-4-gabcdef0-dirty",
+		},
+		{name: "dev fallback passes unchanged", version: "dev", want: "dev"},
 		{name: "offline flag skips the network", offline: "1", want: defaultVersion},
 		{name: "CI skips the network", ci: "true", want: defaultVersion},
 	}
@@ -40,6 +47,17 @@ func TestLatestVersion(t *testing.T) {
 				t.Errorf("LatestVersion(%q) = %q, want %q", tt.version, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestVersion_When_CommitIsEmpty_Then_LeavesTheCommitOut(t *testing.T) {
+	t.Parallel()
+
+	got := Version("dev", "", "2026-11-03T00:00:00Z", "just")
+
+	want := "dev (built by just @ 2026-11-03T00:00:00Z) // " + runtime.Version()
+	if got != want {
+		t.Errorf("Version() = %q, want %q", got, want)
 	}
 }
 
