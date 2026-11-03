@@ -27,7 +27,7 @@ const rateLimitedConfig = `{
   "rate_limit": {"down_bps": 300000, "up_bps": 300000, "max_connections": 5}
 }`
 
-// rootWith mirrors the root command in cmd/imapsync-go/main.go.
+// rootWith mirrors the flags and the help settings of the root command in cmd/imapsync-go/main.go.
 func rootWith(cmds ...*cli.Command) *cli.Command {
 	return &cli.Command{
 		Name:            "imapsync-go",

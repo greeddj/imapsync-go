@@ -34,17 +34,31 @@ func main() {
 
 // run configures and executes the imapsync-go CLI application.
 func run() int {
-	// Customize the version printer to show only the version.
-	cli.VersionPrinter = func(c *cli.Command) {
-		_, _ = fmt.Fprintln(c.Writer, helpers.LatestVersion(Version))
-	}
+	cli.VersionPrinter = printVersion
 
-	app := &cli.Command{
+	installQuitDump(os.Stderr, os.Exit)
+
+	ctx, stop := notifySignals()
+	defer stop()
+
+	return execute(ctx, os.Args, os.Stdout, os.Stderr)
+}
+
+// printVersion shows only the version.
+func printVersion(c *cli.Command) {
+	_, _ = fmt.Fprintln(c.Writer, helpers.LatestVersion(Version))
+}
+
+func newApp(stdout, stderr io.Writer) *cli.Command {
+	return &cli.Command{
 		Name:                   "imapsync-go",
 		Usage:                  "IMAP to IMAP synchronization tool",
 		HideHelpCommand:        true,
 		UseShortOptionHandling: true,
 		Version:                helpers.Version(Version, Commit, Date, BuiltBy),
+		Writer:                 stdout,
+		ErrWriter:              stderr,
+		Action:                 rootAction,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "config",
@@ -59,16 +73,43 @@ func run() int {
 			commands.Show(),
 		},
 	}
+}
 
-	installQuitDump(os.Stderr, os.Exit)
-
-	ctx, stop := notifySignals()
-	defer stop()
-
-	if err := app.Run(ctx, os.Args); err != nil {
-		return reportError(os.Stderr, err, context.Cause(ctx))
+// execute runs the root command and returns the exit code, so that no code path
+// exits inside Run and skips the deferred stop of the signal context.
+func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if err := newApp(stdout, stderr).Run(ctx, args); err != nil {
+		return reportError(stderr, err, context.Cause(ctx))
 	}
 	return 0
+}
+
+const helpWord = "help"
+
+// HideHelpCommand removes urfave's help command, and without an Action urfave
+// exits with code 3 inside Run. So this action serves help [command] and
+// refuses other words.
+func rootAction(ctx context.Context, c *cli.Command) error {
+	args := c.Args()
+	if args.Len() == 0 {
+		return cli.ShowRootCommandHelp(c)
+	}
+
+	name := args.First()
+	if name == helpWord {
+		if args.Len() == 1 {
+			return cli.ShowRootCommandHelp(c)
+		}
+		topic := args.Get(1)
+		if c.Command(topic) != nil {
+			if args.Len() > 2 {
+				return fmt.Errorf("unexpected argument %q, run %q for usage", args.Get(2), c.FullName()+" --help")
+			}
+			return cli.ShowCommandHelp(ctx, c, topic)
+		}
+		name = topic
+	}
+	return fmt.Errorf("unknown command %q, run %q for usage", name, c.FullName()+" --help")
 }
 
 type signalError struct{ sig os.Signal }

@@ -29,7 +29,7 @@ Single-binary IMAP-to-IMAP sync tool. Six things to internalize before making ch
 ### 1. Layering
 
 ```
-cmd/imapsync-go/main.go         - urfave/cli/v3 wiring, version flags, signal-to-context (the signal becomes the cancel cause, and the exit code of a cancel reads it)
+cmd/imapsync-go/main.go         - urfave/cli/v3 wiring, version flags, signal-to-context (the signal becomes the cancel cause, and the exit code of a cancel reads it), the root action (it shows the help for `help [command]` and refuses an unknown command through `reportError`)
 cmd/imapsync-go/commands/       - thin subcommand definitions (sync, show); they only declare flags and call into internal/app
 internal/app/sync.go            - sync orchestration: ActionSync reads flags and config, runSync connects, fixes typed delimiters, refuses a typed destination name with an empty level, converts folder names, fails each derived destination name with an empty level, warns about destination names that differ only in letter case, builds the plan (matches copies by count and size, or takes one copy for each Message-Id when the destination advertises X-GM-EXT-1), confirms (the preview lists the parent folders that the run creates), creates the destination folders (a refused CREATE fails only the plans of that folder), dispatches to worker pool, routes the Client log lines to the screen in each phase (`routeClientLogs`, `lineLog`)
 internal/app/show.go            - show orchestration: ActionShow reads flags and config, runShow runs parallel ListMailboxes via errgroup, formatted table (no colour codes with `--quiet`; the two tracker lines stay above the tables), the LIST names that are not valid modified UTF-7, then a list of the folders it cannot read (ErrSilentExit)
