@@ -383,32 +383,39 @@ A source server can refuse to send some messages. For example, one fetch of up t
 
 ## Provider quotas (Gmail)
 
-When either side is `imap.gmail.com`, `imapsync-go` prints a warning before
-the confirm prompt with the relevant Workspace IMAP limits:
+When the source or the destination is `imap.gmail.com`, `sync` shows a warning before the question. The `-q` option hides the warning. The warning shows these limits:
 
-- 15 simultaneous IMAP connections per account
-- 2,500 MB/day download, 500 MB/day upload via IMAP
-- Exceeding the bandwidth limit suspends the account for 1-24 hours
+- 15 IMAP sessions at the same time for each account.
+- 2,500 MB of download and 500 MB of upload for each account each day.
+- If an account goes above a limit, Gmail can stop its IMAP access for 1 to 24 hours.
 
-For Gmail, run with explicit throttling so the daily quotas don't trigger an
-account lockout mid-migration:
+For each Gmail side, the warning also names the daily quota of the direction that `sync` uses. This is the upload quota for a destination and the download quota for a source.
+
+A rate limit does not decrease the total quantity of data. It only spreads the transfer over a longer time. The daily quota limits the total for each day.
+
+A higher rate gets to the quota sooner. For example, at 300000 bytes per second the upload gets to 500 MB in approximately 28 minutes. Then the server refuses the transfer, and `sync` stops with the `Sync stopped` line. A later run continues where this run stopped.
+
+These rates keep a non-stop run below the daily quotas, with a margin of at least 5%:
 
 ```bash
 imapsync-go sync \
-  --bps-down 300000 \
-  --bps-up 300000 \
+  --bps-down 27000 \
+  --bps-up 5000 \
   --max-connections 10 \
   -w 10
 ```
+
+- At 27000 bytes per second, one day moves a maximum of approximately 2,333 MB from the source.
+- At 5000 bytes per second, one day moves a maximum of approximately 432 MB to the destination.
+- A mailbox that is larger than the daily quota needs more than one day. For example, 3 GB at 5000 bytes per second needs approximately 7 days.
+- All workers share one limit, so more workers do not move more data in one day.
 
 `--max-connections 10` limits each side to 10 sessions at the same time. The
 planning session closes before the workers connect, so all 10 sessions are for
 workers. `-w 10` uses all of them. A `-w` value above `--max-connections` is
 safe, because the command applies the cap automatically.
 
-The defaults (no throttle) match `imapsync`'s default behaviour - they're
-appropriate for self-hosted IMAP servers on a LAN, not for big-provider
-mailboxes.
+By default, `sync` has no rate limit, as `imapsync` has. This is correct for a self-hosted server on a LAN. It is not correct for a large provider.
 
 When a server reports a rate limit or a full quota, `sync` stops. This can happen in three steps. These steps are the creation of the destination folders, the second read of a destination folder or its source folder after CREATE, and the copy. The command prints this line one time, also with `-q`:
 

@@ -2177,6 +2177,14 @@ func buildProviderWarning(cfg *config.Config, srcReadLim, dstWriteLim *rate.Limi
 		if h.provider.DailyDownMB > 0 || h.provider.DailyUpMB > 0 {
 			fmt.Fprintf(&b, "     • daily quota: %d MB down, %d MB up\n",
 				h.provider.DailyDownMB, h.provider.DailyUpMB)
+			quotaMB, direction := h.provider.DailyDownMB, "from"
+			if h.isUpload {
+				quotaMB, direction = h.provider.DailyUpMB, "to"
+			}
+			if quotaMB > 0 {
+				fmt.Fprintf(&b, "     • a run moves at most %d MB a day %s this account; a larger mailbox takes more than one day\n",
+					quotaMB, direction)
+			}
 		}
 		if h.limiter == nil {
 			recommended := h.provider.DownBPS

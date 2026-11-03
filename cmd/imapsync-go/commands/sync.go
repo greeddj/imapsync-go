@@ -47,13 +47,13 @@ func Sync() *cli.Command {
 			},
 			&cli.IntFlag{
 				Name:    "bps-down",
-				Usage:   "max bytes/sec read from the source server (0 = unlimited; for Gmail try 300000)",
+				Usage:   "max bytes/sec read from the source server (0 = unlimited; for Gmail try 27000)",
 				Value:   0,
 				Sources: cli.EnvVars("IMAPSYNC_BPS_DOWN"),
 			},
 			&cli.IntFlag{
 				Name:    "bps-up",
-				Usage:   "max bytes/sec written to the destination server (0 = unlimited; for Gmail try 300000)",
+				Usage:   "max bytes/sec written to the destination server (0 = unlimited; for Gmail try 5000)",
 				Value:   0,
 				Sources: cli.EnvVars("IMAPSYNC_BPS_UP"),
 			},

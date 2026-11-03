@@ -2,16 +2,12 @@ package client
 
 import "strings"
 
-// Provider describes a known IMAP service and the practical limits clients
-// should respect to avoid hitting server-side throttling.
-//
-// Numbers come from imapsync's empirical recommendations (FAQ.Gmail.txt) and
-// from the official Workspace bandwidth documentation. They are guidance, not
-// hard constants - a server may tighten or relax them at any time.
+// Provider describes a known IMAP service. DailyDownMB and DailyUpMB are the IMAP
+// quotas of one account. DownBPS and UpBPS keep a non-stop run at least 5% under them.
 type Provider struct {
 	Name           string
 	Notes          string
-	DownBPS        int // recommended ceiling, bytes/sec
+	DownBPS        int
 	UpBPS          int
 	DailyDownMB    int
 	DailyUpMB      int
@@ -25,8 +21,8 @@ var knownProviders = map[string]Provider{
 	"imap.gmail.com": {
 		Name:           "Gmail",
 		Notes:          "Workspace IMAP bandwidth limits & 15 simultaneous connections per account",
-		DownBPS:        300_000,
-		UpBPS:          300_000,
+		DownBPS:        27_000,
+		UpBPS:          5_000,
 		DailyDownMB:    2500,
 		DailyUpMB:      500,
 		MaxConnections: 15,

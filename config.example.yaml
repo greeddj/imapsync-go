@@ -20,11 +20,15 @@ map:
   - src: Archive.2023
     dst: Archive/2023
 
-# Optional throttle. Zero / omitted means unlimited.
-# For Gmail accounts, set both to 300000 to stay safely under the
-# 2.5 GB/day download and 500 MB/day upload IMAP quotas, and cap
-# max_connections at ~10 (Gmail's hard cap is 15 simultaneous IMAP
-# sessions per account).
+# Optional throttle. A value of 0, or no value, removes the limit.
+# A rate limit only spreads the transfer over time.
+# Gmail has daily IMAP quotas of 2500 MB download and 500 MB upload
+# for each account. For Gmail, set down_bps to 27000 and up_bps to
+# 5000, so a non-stop run stays below the quotas. A higher rate gets
+# to a quota sooner. The server then refuses and sync stops. A later
+# run continues where it stopped.
+# Set max_connections to 10 or less. Gmail allows 15 IMAP sessions
+# at the same time for each account.
 rate_limit:
   down_bps: 0
   up_bps: 0

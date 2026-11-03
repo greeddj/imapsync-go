@@ -254,6 +254,10 @@
   - `Test_MissingLevels_When_NothingIsMissing_Then_AllocatesNothing` - a lookup of a name with every level listed allocates nothing;
   - `Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOtherNameDoes` - the names that `MissingLevels` returns are the names for which `CreateMailbox` sends a CREATE. This holds for empty levels, an INBOX level in another letter case, a `\Noselect` parent and a flat cache. No parent level has an empty last level;
   - `Test_MissingLevels_When_CacheAndNameAreRandom_Then_ItListsExactlyTheCreatesOfCreateMailbox` - 300 random caches and names, with the delimiter `/`, `.` or none, give the same result. `MissingLevels` is empty exactly for a listed name. Each level is unlisted and extends the level before it, and the last level is the name. The CREATE commands of `CreateMailbox` carry the same names in the same order. The seed is fixed, and the test checks that the generator makes enough listed names and names with missing parents.
+
+  The provider profiles have these tests:
+  - `TestDetectProvider` - a Gmail address gives the whole profile, also with a port, capital letters or spaces. An unknown address gives no profile;
+  - `TestKnownProviders_When_RecommendedRateRunsForADay_Then_StaysUnderTheDailyQuota` - the test checks each provider and each direction with a daily quota. The recommended rate is 95% of the quota, divided by the seconds in one day and rounded down to a multiple of 500. One day at this rate, with the burst of the limiter, moves at most 95% of the quota. The test reads the table and does not change it.
 - **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
   The mode with no wait has these tests:
   - `TestConn_When_WaitIsOff_Then_ReadAndWriteTakeTokensWithoutWaiting` - on a limiter in debt, a `Write` and a `Read` return at once with no error. Each direction loses exactly the bytes that moved;
@@ -617,6 +621,11 @@
   - `Test_printCaseVariantDestinations` - the groups, their order, the escapes and the rule that a group with every name listed gets no line. Four cases repeat a spelling. In two cases, the line names the repeated spelling one time. In one case, two mappings name one destination with no other spelling, so no line shows. In one case, the LIST holds every spelling, so the group gets no line;
   - `Test_printCaseVariantDestinations_When_GroupHoldsEveryLetterCaseVariant_Then_ListsEachNameOnce` - the test gives the warning all 16384 letter-case spellings of one name, in reverse order, with three of them repeated. When the LIST misses one spelling, the line names each spelling one time, in byte order. When the LIST holds every spelling, the line does not show. The call changes neither the mappings nor the LIST;
   - `TestRunSync_When_DestinationsDifferOnlyInLetterCase_Then_WarningShowsAndEachFolderCopies` - the warning shows before the prompt, also with `--quiet`, and each folder gets its messages.
+
+  The provider warning has these tests:
+  - `Test_buildProviderWarning_When_SideHasADailyQuota_Then_NamesTheDailyCap` - the full text for a Gmail destination, a Gmail source and Gmail on both sides, with and without a limiter. Each Gmail side gets one line with the daily quota of its direction: upload for a destination and download for a source. The line shows also when a limiter is set. The recommended rates are 5000 and 27000;
+  - `Test_buildUploadLimitWarning_When_GmailRecommendationRunsWithMostWorkers_Then_ReturnsEmpty` - the recommended upload rate of Gmail gives no upload-limit warning with 10 workers;
+  - `TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting` - the warning shows before any dial and holds the daily quota line and the recommended rate. With `--quiet`, the run writes nothing.
 
   The session cap has these tests:
   - `TestComputeEffectiveWorkers` - the worker count is the smallest of the workers, `max_connections` (when it is more than 0) and the plans, and at least 1. A cap of 10 with 10 workers gives 10, a cap of 2 with 4 workers gives 2, and a cap of 0 or less has no effect;

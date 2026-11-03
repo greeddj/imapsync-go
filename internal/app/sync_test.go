@@ -30,6 +30,7 @@ import (
 	"github.com/greeddj/imapsync-go/internal/termsafe"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/time/rate"
 )
 
 func TestBuildProviderWarning_noKnownProvider_returnsEmpty(t *testing.T) {
@@ -61,9 +62,9 @@ func TestBuildProviderWarning_gmailSrc_recommendsBPS(t *testing.T) {
 	if !strings.Contains(got, "max simultaneous connections: 15") {
 		t.Errorf("warning missing connection cap: %q", got)
 	}
-	// Limiter is nil → recommend a concrete --bps-down value (300000 from
+	// Limiter is nil → recommend a concrete --bps-down value (27000 from
 	// the Gmail provider profile).
-	if !strings.Contains(got, "--bps-down 300000") {
+	if !strings.Contains(got, "--bps-down 27000") {
 		t.Errorf("warning missing bps-down recommendation: %q", got)
 	}
 }
@@ -109,8 +110,83 @@ func TestBuildProviderWarning_gmailDst_nilLimiter_recommendsBPSUp(t *testing.T) 
 	}
 	// nil limiter for dst → the isUpload=true branch sets flag to "--bps-up".
 	got := buildProviderWarning(cfg, nil, nil)
-	if !strings.Contains(got, "--bps-up") {
+	if !strings.Contains(got, "--bps-up 5000") {
 		t.Errorf("warning missing --bps-up recommendation: %q", got)
+	}
+}
+
+func Test_buildProviderWarning_When_SideHasADailyQuota_Then_NamesTheDailyCap(t *testing.T) {
+	t.Parallel()
+
+	const (
+		header   = "\n⚠️  Provider with known IMAP limits detected:\n"
+		conns    = "     • max simultaneous connections: 15\n"
+		quota    = "     • daily quota: 2500 MB down, 500 MB up\n"
+		notes    = "     • notes: Workspace IMAP bandwidth limits & 15 simultaneous connections per account\n"
+		dstBlock = "   destination [imap.gmail.com:993] - Gmail\n"
+		srcBlock = "   source [imap.gmail.com:993] - Gmail\n"
+		dstCap   = "     • a run moves at most 500 MB a day to this account; a larger mailbox takes more than one day\n"
+		srcCap   = "     • a run moves at most 2500 MB a day from this account; a larger mailbox takes more than one day\n"
+		dstRec   = "     • no rate limit set - recommended: --bps-up 5000\n"
+		srcRec   = "     • no rate limit set - recommended: --bps-down 27000\n"
+	)
+	tests := []struct {
+		srcLim, dstLim *rate.Limiter
+		name           string
+		srcServer      string
+		dstServer      string
+		want           string
+	}{
+		{
+			name: "Gmail destination without a limiter", srcServer: "mail.privatehost.example:993", dstServer: "imap.gmail.com:993",
+			want: header + dstBlock + conns + quota + dstCap + dstRec + notes + "\n",
+		},
+		{
+			name: "Gmail source without a limiter", srcServer: "imap.gmail.com:993", dstServer: "mail.privatehost.example:993",
+			want: header + srcBlock + conns + quota + srcCap + srcRec + notes + "\n",
+		},
+		{
+			name: "Gmail destination with a limiter", srcServer: "mail.privatehost.example:993", dstServer: "imap.gmail.com:993",
+			dstLim: ratelimit.NewLimiter(5_000),
+			want:   header + dstBlock + conns + quota + dstCap + notes + "\n",
+		},
+		{
+			name: "Gmail source with a limiter", srcServer: "imap.gmail.com:993", dstServer: "mail.privatehost.example:993",
+			srcLim: ratelimit.NewLimiter(27_000),
+			want:   header + srcBlock + conns + quota + srcCap + notes + "\n",
+		},
+		{
+			name: "Gmail on both sides without limiters", srcServer: "imap.gmail.com:993", dstServer: "imap.gmail.com:993",
+			want: header + srcBlock + conns + quota + srcCap + srcRec + notes +
+				dstBlock + conns + quota + dstCap + dstRec + notes + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config.Config{
+				Src:     config.Credentials{Server: tt.srcServer},
+				Dst:     config.Credentials{Server: tt.dstServer},
+				Workers: 4,
+			}
+			if got := buildProviderWarning(cfg, tt.srcLim, tt.dstLim); got != tt.want {
+				t.Errorf("warning = %q\nwant      %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_buildUploadLimitWarning_When_GmailRecommendationRunsWithMostWorkers_Then_ReturnsEmpty(t *testing.T) {
+	t.Parallel()
+
+	p, ok := client.DetectProvider("imap.gmail.com:993")
+	if !ok {
+		t.Fatal("imap.gmail.com is not a known provider")
+	}
+	// 10 is the upper bound of the worker clamp in config.New.
+	if got := buildUploadLimitWarning(p.UpBPS, 10); got != "" {
+		t.Errorf("warning for the recommended upload rate = %q, want empty", got)
 	}
 }
 
@@ -5414,7 +5490,8 @@ func TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting(t *testing.T) {
 				}
 				return
 			}
-			assertContainsAll(t, out.String(), "Provider with known IMAP limits detected", "imap.gmail.com:993", "Gmail")
+			assertContainsAll(t, out.String(), "Provider with known IMAP limits detected", "imap.gmail.com:993", "Gmail",
+				"a run moves at most 2500 MB a day from this account", "--bps-down 27000")
 			assertContainsNone(t, out.String(), e2ePassword)
 		})
 	}
