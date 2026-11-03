@@ -62,21 +62,64 @@ func run() int {
 
 	installQuitDump(os.Stderr, os.Exit)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := notifySignals()
 	defer stop()
 
 	if err := app.Run(ctx, os.Args); err != nil {
-		return reportError(os.Stderr, err)
+		return reportError(os.Stderr, err, context.Cause(ctx))
 	}
 	return 0
 }
 
+type signalError struct{ sig os.Signal }
+
+func (e signalError) Error() string { return e.sig.String() + " signal received" }
+
+// exitInterrupt is 128 + SIGINT. A cancel that no signal names also exits with it.
+const exitInterrupt = 128 + int(syscall.SIGINT)
+
+// cancelExitCode gives 128 + the signal number, so the exit code tells SIGTERM from Ctrl-C.
+func cancelExitCode(cause error) int {
+	if se, ok := errors.AsType[signalError](cause); ok {
+		if n, ok := se.sig.(syscall.Signal); ok {
+			return 128 + int(n)
+		}
+	}
+	return exitInterrupt
+}
+
+func notifySignals() (context.Context, context.CancelFunc) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := cancelOnSignal(context.Background(), sigs)
+	return ctx, func() {
+		cancel()
+		signal.Stop(sigs)
+	}
+}
+
+// cancelOnSignal replaces signal.NotifyContext, whose cause is an unexported
+// type. A signalError cause, set before Done closes, lets the exit code read
+// the signal number.
+func cancelOnSignal(parent context.Context, signals <-chan os.Signal) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	go func() {
+		select {
+		case s := <-signals:
+			cancel(signalError{sig: s})
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { cancel(nil) }
+}
+
 // The error can quote a reply the IMAP server sent, so the text is escaped.
-func reportError(w io.Writer, err error) int {
+// The cause sets only the exit code of the cancel branch.
+func reportError(w io.Writer, err, cause error) int {
 	switch {
 	case errors.Is(err, context.Canceled):
 		_, _ = fmt.Fprintln(w, "Cancelled.")
-		return 130
+		return cancelExitCode(cause)
 	case errors.Is(err, appkg.ErrSilentExit):
 		// The command has already printed its failures on stdout.
 		return 1

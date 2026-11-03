@@ -424,10 +424,11 @@ A refusal that repeats a folder name can stop `sync`. Some servers repeat the fo
 
 ## Notes
 
-- **Exit code 1** - `sync` ends with code 1 when a message or a folder fails. If you answer no to the question before the copy, `sync` ends with code 0, also when a folder failed. `show` ends with code 1 when it cannot read a folder. Any other error, except a cancel with Ctrl-C, prints `Error:` and ends with code 1.
+- **Exit code 1** - `sync` ends with code 1 when a message or a folder fails. If you answer no to the question before the copy, `sync` ends with code 0, also when a folder failed. `show` ends with code 1 when it cannot read a folder. Any other error, except a cancel with Ctrl-C or SIGTERM, prints `Error:` and ends with code 1.
 - **Memory** - Each worker holds at most two messages in memory at one time. These are the message that it uploads and the message that it reads next. So the memory use grows with the number of workers and with the size of the largest messages.
 - **Progress rows** - During the copy, the screen shows one progress row for each worker that copies a plan. A finished plan keeps its last line on screen. The final summary line also stays on screen.
 - **Ctrl-C** exits with code 130 and prints `Cancelled.` - this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
+- **SIGTERM** (for example from `kill` or `podman stop`) prints `Cancelled.` and exits with code 143, which is 128 plus the signal number.
 - **Ctrl+\\** (SIGQUIT) writes the stacks of all goroutines to stderr and exits with code 131.
 - **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default. Other commands and `--help` make no request.
 
