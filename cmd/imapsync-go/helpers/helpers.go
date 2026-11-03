@@ -84,6 +84,6 @@ func fetchTag(url string) string {
 	if payload.Tag == "" {
 		return defaultVersion
 	}
-	// The tag is remote text printed in --help, and git allows C1 and bidi characters in tag names.
+	// Only --version shows the tag, and git allows C1 and bidi characters in tag names.
 	return termsafe.Escape(payload.Tag)
 }

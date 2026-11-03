@@ -612,7 +612,7 @@ A tracker line carries our own SGR colour codes. Escape the server parts before 
   - the "is left out" line of `printInvalidNames`. `runShow` prints it after the two tables, also with `--quiet`.
 - `internal/app/worker.go` escapes every tracker line and log, also the plan rows of `newPlanTracker` and `newStoppedPlanTracker`, and the verbose Message-Id line. `trackerReason` escapes the inline error reason first, then cuts it to 40 bytes on a rune boundary.
 - `reportError` in `cmd/imapsync-go/main.go` escapes the final `Error:` line, line breaks too. So a multi-line error prints on one line. Without the escape, a raw line break lets a server make a false line after `Error:`.
-- `cmd/imapsync-go/helpers` escapes the GitHub release tag that the root `--help` shows for builds without `-X main.Version`.
+- `fetchTag` in `cmd/imapsync-go/helpers` escapes the GitHub release tag. Only `--version` and `-v` show this tag, for a build without `-X main.Version`. `printVersion` gets the tag through `LatestVersion`. The VERSION section of the root `--help` shows the text from `helpers.Version`. This function sends no request, so the help holds no text from GitHub.
 
 **Known limitation - go-imap logs before `routeErrorLog` runs.** `routeErrorLog` (Section 3) covers the go-imap error log. But `imapclient.New` creates its logger on `os.Stderr`. It also reads the greeting and the implicit CAPABILITY probe before `routeErrorLog` can run. A line that go-imap logs in that window reaches stderr unescaped, in every mode.
 

@@ -478,6 +478,25 @@ func Test_execute_When_FormIsValid_Then_KeepsItsOutputAndExits0(t *testing.T) {
 	}
 }
 
+// Not parallel: runCLI replaces the urfave/cli globals OsExiter and ErrWriter,
+// and the test sets an environment variable.
+func Test_execute_When_RootHelpIsShown_Then_VersionSectionHoldsTheOfflineBuildString(t *testing.T) {
+	t.Setenv("IMAPSYNC_OFFLINE", "1")
+
+	code, stdout, stderr := runCLI(t, "--help")
+
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
+	want := "\nVERSION:\n   " + helpers.Version(Version, Commit, Date, BuiltBy) + "\n"
+	if !strings.Contains(stdout, want) {
+		t.Errorf("root help does not hold %q:\n%s", want, stdout)
+	}
+}
+
 // Not parallel: runCLI replaces the urfave/cli globals OsExiter and ErrWriter.
 // The text comes from urfave/cli, so the test pins the shape and not the words.
 func Test_execute_When_HelpFlagNamesNoCommand_Then_PrintsOneErrorLineAndExits1(t *testing.T) {
