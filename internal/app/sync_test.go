@@ -245,11 +245,14 @@ func TestComputeEffectiveWorkers(t *testing.T) {
 		want    int
 	}{
 		{name: "underBudget", workers: 4, maxConn: 15, planCnt: 20, want: 4},
-		{name: "atBudgetReservesOneForPlanner", workers: 15, maxConn: 15, planCnt: 20, want: 14},
-		{name: "overBudgetClampedToMaxConnMinusOne", workers: 20, maxConn: 15, planCnt: 20, want: 14},
-		{name: "maxConnOneFloorsToOne", workers: 1, maxConn: 1, planCnt: 20, want: 1},
+		{name: "workersEqualMaxConn", workers: 10, maxConn: 10, planCnt: 20, want: 10},
+		{name: "overBudgetClampedToMaxConn", workers: 10, maxConn: 3, planCnt: 20, want: 3},
+		{name: "maxConnBelowWorkers", workers: 4, maxConn: 2, planCnt: 20, want: 2},
+		{name: "maxConnOne", workers: 4, maxConn: 1, planCnt: 20, want: 1},
 		{name: "unlimitedMaxConn", workers: 4, maxConn: 0, planCnt: 20, want: 4},
+		{name: "negativeMaxConnIsUnlimited", workers: 4, maxConn: -1, planCnt: 20, want: 4},
 		{name: "fewerPlansThanWorkers", workers: 4, maxConn: 15, planCnt: 2, want: 2},
+		{name: "fewerPlansThanMaxConn", workers: 4, maxConn: 3, planCnt: 2, want: 2},
 		{name: "zeroPlansFloorsToOne", workers: 4, maxConn: 15, planCnt: 0, want: 1},
 	}
 	for _, tt := range tests {
@@ -19167,4 +19170,153 @@ func TestRunSync_When_ParentsAreCreatedBeforeALaterFolder_Then_TheCounterTextCou
 	assertContainsNone(t, raw, "(2/3) Creating", "(3/4) Creating")
 	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Old", "Old/A", "Z")
 	assertOneRow(t, screenRows(t, raw), "Created 3 folders", "✓ done")
+}
+
+func TestRunSync_When_MaxConnectionsIsSet_Then_NoSideHoldsMoreSessionsThanTheCap(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		workers     int
+		maxConn     int
+		plans       int
+		wantWorkers int
+	}{
+		{name: "cap of one", workers: 4, maxConn: 1, plans: 3, wantWorkers: 1},
+		{name: "cap of three with more plans than workers", workers: 4, maxConn: 3, plans: 5, wantWorkers: 3},
+		{name: "no cap", workers: 2, maxConn: 0, plans: 3, wantWorkers: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			names := []string{"A", "B", "C", "D", "E"}[:tt.plans]
+			srcFolders := make(map[string][]fakeMsg, len(names))
+			mappings := make([]config.DirectoryMapping, 0, len(names))
+			for _, name := range names {
+				srcFolders[name] = fakeMsgs(strings.ToLower(name) + "1@x")
+				mappings = append(mappings, mapping(name, name))
+			}
+			src := newStoreServer(t, "/", srcFolders)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			// The limit is the cap of a provider that refuses the session above it.
+			sides := []struct {
+				srv      *fakeServer
+				sessions *sessionLog
+				name     string
+			}{
+				{srv: src, sessions: src.watchSessions(tt.wantWorkers), name: "source"},
+				{srv: dst, sessions: dst.watchSessions(tt.wantWorkers), name: "destination"},
+			}
+			cfg := e2eConfig(src, dst, tt.workers, mappings...)
+			cfg.RateLimit.MaxConnections = tt.maxConn
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), cfg, opts)
+
+			if err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+			assertContainsAll(t, out.String(), "Sync completed successfully")
+			for _, name := range names {
+				assertIDs(t, "dst "+name, dst.folderMsgIDs(name), strings.ToLower(name)+"1@x")
+			}
+			for _, side := range sides {
+				if n := side.sessions.refusedLogins(); n != 0 {
+					t.Errorf("%s refused %d LOGIN commands, want 0", side.name, n)
+				}
+				if n := side.sessions.peakOpen(); n != tt.wantWorkers {
+					t.Errorf("%s peak of open sessions = %d, want %d", side.name, n, tt.wantWorkers)
+				}
+				if n, want := side.srv.callCount("LOGIN"), 1+tt.wantWorkers; n != want {
+					t.Errorf("%s saw %d LOGIN commands, want %d: one planning client and %d workers, no reconnect", side.name, n, want, tt.wantWorkers)
+				}
+				if logins, logouts := side.srv.callCount("LOGIN"), side.srv.callCount("LOGOUT"); logouts != logins {
+					t.Errorf("%s saw %d LOGOUT commands for %d LOGIN commands, want one each", side.name, logouts, logins)
+				}
+				if events := side.sessions.eventList(); len(events) < 2 || events[0] != "LOGIN" || events[1] != "LOGOUT" {
+					t.Errorf("%s events = %v, want the planning session to end before the first worker logs in", side.name, events)
+				}
+			}
+		})
+	}
+}
+
+func TestRunSync_When_RunEndsBeforeTheCopy_Then_EachPlanningSessionLogsOutOnce(t *testing.T) {
+	t.Parallel()
+
+	planningOnly := []string{"LOGIN", "LOGOUT"}
+	tests := []struct {
+		name        string
+		dstFolders  map[string][]fakeMsg
+		setup       func(dst *fakeServer)
+		input       string
+		wantIs      error
+		wantErrText string
+		wantOutput  string
+		wantEvents  []string
+	}{
+		{
+			name:       "the destination holds every message",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x")},
+			wantOutput: "All folders already synced!",
+			wantEvents: planningOnly,
+		},
+		{
+			name:       "the user declines the prompt",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			input:      "n\n",
+			wantOutput: "Sync canceled by user",
+			wantEvents: planningOnly,
+		},
+		{
+			name:       "a throttled CREATE stops the run",
+			dstFolders: map[string][]fakeMsg{"INBOX": nil},
+			setup:      func(dst *fakeServer) { dst.refuseCreateWith(gmailThrottleReply) },
+			wantIs:     ErrSilentExit,
+			wantOutput: "Sync stopped",
+			wantEvents: planningOnly,
+		},
+		{
+			name:        "the worker pool cannot connect",
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil, "Work": nil},
+			setup:       func(dst *fakeServer) { dst.refuseLoginAt(2) },
+			wantErrText: "worker 1 destination connect",
+			wantEvents:  []string{"LOGIN", "LOGOUT", "LOGIN", "LOGOUT"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", tt.dstFolders)
+			if tt.setup != nil {
+				tt.setup(dst)
+			}
+			srcSessions, dstSessions := src.watchSessions(0), dst.watchSessions(0)
+			out := &syncBuffer{}
+			opts := e2eOptions(out, tt.input)
+			opts.autoConfirm = tt.input == ""
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 2, mapping("Work", "Work")), opts)
+
+			switch {
+			case tt.wantIs != nil && !errors.Is(err, tt.wantIs):
+				t.Fatalf("error = %v, want %v\noutput: %s", err, tt.wantIs, out.String())
+			case tt.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErrText)):
+				t.Fatalf("error = %v, want text %q", err, tt.wantErrText)
+			case tt.wantIs == nil && tt.wantErrText == "" && err != nil:
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+			if tt.wantOutput != "" {
+				assertContainsAll(t, out.String(), tt.wantOutput)
+			}
+			assertContainsNone(t, out.String(), "Sync completed successfully")
+			assertIDs(t, "source events", srcSessions.eventList(), tt.wantEvents...)
+			assertIDs(t, "destination events", dstSessions.eventList(), tt.wantEvents...)
+		})
+	}
 }

@@ -1037,6 +1037,59 @@ func (s *fakeServer) refuseLoginAt(n int) {
 	s.store.loginRefusal = n
 }
 
+// sessionLog records the LOGIN and LOGOUT commands of one server in arrival order, and how many sessions are open at once.
+type sessionLog struct {
+	events  []string
+	mu      sync.Mutex
+	open    int
+	peak    int
+	refused int
+}
+
+// watchSessions logs the sessions of a store-backed server. A positive limit refuses each LOGIN above it, like a per-account cap. It needs sequential LOGINs, because refuseLoginAt holds one number.
+func (s *fakeServer) watchSessions(limit int) *sessionLog {
+	l := &sessionLog{}
+	s.onNthCommand("LOGIN", func(n int) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.events = append(l.events, "LOGIN")
+		if limit > 0 && l.open >= limit {
+			s.refuseLoginAt(n)
+			l.refused++
+			return
+		}
+		l.open++
+		l.peak = max(l.peak, l.open)
+	})
+	s.onCommand("LOGOUT", func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.events = append(l.events, "LOGOUT")
+		if l.open > 0 {
+			l.open--
+		}
+	})
+	return l
+}
+
+func (l *sessionLog) eventList() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.events)
+}
+
+func (l *sessionLog) peakOpen() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.peak
+}
+
+func (l *sessionLog) refusedLogins() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.refused
+}
+
 // dropAtAppendAndRefuseLogin makes the nth APPEND over the life of the server read its literal and close the connection with no reply. Every LOGIN after that is refused.
 func (s *fakeServer) dropAtAppendAndRefuseLogin(n int) {
 	s.mu.Lock()
@@ -2117,6 +2170,50 @@ func TestFakeServer_refuseLoginAt_When_ConnectionsLoginAtOnce_Then_OnlyTheNthLog
 				}
 			}
 		})
+	}
+}
+
+func TestFakeServer_watchSessions_When_LoginsExceedTheLimit_Then_OnlyThoseLoginsAreRefused(t *testing.T) {
+	t.Parallel()
+
+	srv := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	sessions := srv.watchSessions(2)
+	conns := dialStoreConns(t, srv, 4)
+	command := func(c *storeConn, tag, text string) string {
+		t.Helper()
+		if err := c.write(tag + " " + text + "\r\n"); err != nil {
+			t.Fatalf("write %s: %v", text, err)
+		}
+		for {
+			line, err := c.readLine()
+			if err != nil {
+				t.Fatalf("read the reply to %s: %v", text, err)
+			}
+			if strings.HasPrefix(line, tag+" ") {
+				return line
+			}
+		}
+	}
+
+	replies := []string{
+		command(conns[0], "a1", "LOGIN user pass"),
+		command(conns[1], "a2", "LOGIN user pass"),
+		command(conns[2], "a3", "LOGIN user pass"),
+		command(conns[0], "a4", "LOGOUT"),
+		command(conns[3], "a5", "LOGIN user pass"),
+	}
+
+	for i, want := range []string{"OK", "OK", "NO", "OK", "OK"} {
+		if got := strings.Fields(replies[i])[1]; got != want {
+			t.Errorf("reply %d = %q, want status %s", i+1, replies[i], want)
+		}
+	}
+	assertIDs(t, "events", sessions.eventList(), "LOGIN", "LOGIN", "LOGIN", "LOGOUT", "LOGIN")
+	if n := sessions.peakOpen(); n != 2 {
+		t.Errorf("peak = %d, want 2", n)
+	}
+	if n := sessions.refusedLogins(); n != 1 {
+		t.Errorf("refused = %d, want 1", n)
 	}
 }
 

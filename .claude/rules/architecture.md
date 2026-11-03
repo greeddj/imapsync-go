@@ -73,6 +73,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 - Workers are clamped `[1, 10]` in `config.New`. A value out of range changes to the nearest limit. Do not surface this as a runtime panic.
 - Folder creation uses per-path `sync.Mutex` from `Client.folderLocks`. Do not replace with a global mutex - concurrent creates of unrelated paths must not serialise.
 - The worker pool is **persistent**: each worker owns one src + one dst `Client` for the whole sync. Do not reconnect per plan.
+- `runSync` logs out both planning clients before `newSyncWorkerPool`, and no later phase uses them. So `max_connections` counts only worker sessions. A `sync.OnceFunc` gives each planning session one LOGOUT, also when an earlier return ends the run. A worker never reuses a planning client.
 
 ## Tooling invariants
 

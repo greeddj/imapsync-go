@@ -319,7 +319,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		return nil
 	})
 	groupErr := g.Wait()
-	defer func() { logoutAll(srcClient, dstClient) }()
+	logoutPlanning := sync.OnceFunc(func() { logoutAll(srcClient, dstClient) })
+	defer logoutPlanning()
 	if groupErr != nil {
 		return groupErr
 	}
@@ -619,6 +620,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 
 	effectiveWorkers := computeEffectiveWorkers(cfg.Workers, cfg.RateLimit.MaxConnections, len(activePlans))
 
+	// max_connections counts sessions, and nothing after the check after CREATE uses the planning clients, so they log out before any worker connects.
+	logoutPlanning()
 	workers, err := newSyncWorkerPool(ctx, cfg, srcOpts, dstOpts, effectiveWorkers)
 	if err != nil {
 		return err
@@ -2068,14 +2071,11 @@ func printExpansion(out io.Writer, r expansionReport, planned []folderMapping, v
 	}
 }
 
-// computeEffectiveWorkers caps the worker count by both the configured cap
-// and the number of plans actually scheduled. maxConn is the per-side IMAP
-// connection budget; the planning client is still open when workers start,
-// so we reserve one slot for it (maxConn-1). Returns at least 1.
+// runSync logs the planning clients out before the workers connect, so every maxConn slot goes to a worker. The result is at least 1.
 func computeEffectiveWorkers(workers, maxConn, planCount int) int {
 	eff := workers
-	if maxConn > 0 && maxConn-1 < eff {
-		eff = maxConn - 1
+	if maxConn > 0 && maxConn < eff {
+		eff = maxConn
 	}
 	if eff > planCount {
 		eff = planCount
