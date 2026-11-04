@@ -593,6 +593,14 @@
   - `TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSubfolders` - with `--verbose`, the count line shows one time in each of two cases. In both cases, each found-subfolder line shows one time, and no `already covered` line shows:
     - the root `Box` is `\Noselect` and has two subfolders. The line shows the numbers 2 and 2. The found-subfolder lines name both subfolders. The run copies each of them;
     - a `map` item repeats. The line shows the numbers 1 and 2. The run copies the root and its subfolder.
+  - `Test_printExpansion_When_WinnerFailsInASplit_Then_ItsLostEntriesGetNoLine` - the test runs the expansion, both splits and `printExpansion` with `--verbose`. Four cases run:
+    - a rename clash, where the mapping of `Work/sub` has another destination than the mapping of `Work`;
+    - a rename clash, where the mapping of `Work/sub` has the destination of the parent expansion;
+    - an empty level, with another destination;
+    - an empty level, with the destination of the parent expansion.
+
+    In each case, the output is exact, and no line names a failed folder. The lines of `Work/sub` still show. In the two cases with another destination, the lines of `Work/sub/ok` also show. A control call gets the expansion before the splits as the planned mappings. Its output holds the lost line of each failed folder, so the plan decides the output;
+  - `TestRunSync_When_WinningMappingFailsInASplit_Then_VerboseNamesNoLostEntryOfIt` - the same four cases run end to end with `--verbose` and `-y`. The run ends with `ErrSilentExit`. The output holds the exact expansion text after `Checking for subfolders...`, and no line names a failed folder. The lines of `Work/sub` still show. In the two cases with another destination, the lines of `Work/sub/ok` also show. The failure list holds the exact line of each failed folder. The summary line counts the copied messages and the failed folders. No command on either server names a failed folder.
 
   The typed destination name with an empty level has these tests:
   - `TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_RunIsRefusedBeforeAnyCommandThatChangesTheDestination` - on a `/` server, the names `/X`, `a//b`, `x/` and `/` give `errEmptyLevel`. On a `.` server, the names `.X`, `a..b` and `x.` give it. The text is `map entry 2: destination folder has an empty level: "NAME", destination delimiter "D"`. The number is the position of the failing item, and the item before it is valid. The output is empty. Each server sees only LOGIN, CAPABILITY, LIST and LOGOUT (`assertNoCommandsAfterSetup`);

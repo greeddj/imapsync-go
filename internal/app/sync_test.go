@@ -5079,6 +5079,53 @@ func TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSub
 	}
 }
 
+func TestRunSync_When_WinningMappingFailsInASplit_Then_VerboseNamesNoLostEntryOfIt(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range winnerFailsCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", winnerFailsTree(tt.folders))
+			dst := newStoreServer(t, tt.dstDelimiter, map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, ErrSilentExit) {
+				t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+			}
+			got := out.String()
+			assertContainsAll(t, got, "Checking for subfolders...\n"+tt.wantExpansion, tt.wantSummary)
+			assertContainsAll(t, got, tt.wantLines...)
+			for _, line := range []string{"Found subfolder", "goes to", "already covered by a parent mapping's expansion"} {
+				if n, want := strings.Count(got, line), strings.Count(tt.wantExpansion, line); n != want {
+					t.Errorf("output holds %d times %q, want %d\noutput: %s", n, line, want, got)
+				}
+			}
+			for _, source := range tt.failedSources {
+				assertContainsNone(t, got, "Folder "+source+" goes to", fmt.Sprintf("Mapping %q skipped", source))
+			}
+			_, failures, ok := strings.Cut(got, folderFailuresHeader)
+			if !ok {
+				t.Fatalf("output does not contain %q\noutput: %s", folderFailuresHeader, got)
+			}
+			assertInOrder(t, failures, tt.wantFailures...)
+			for folder, id := range tt.wantDst {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), id)
+			}
+			for _, source := range tt.failedSources {
+				assertNoCommandNamesFolder(t, "src", src, source)
+			}
+			for _, destination := range tt.failedDests {
+				assertNoCommandNamesFolder(t, "dst", dst, destination)
+			}
+		})
+	}
+}
+
 func TestRunSync_When_DerivedNameWithAnEmptyLevelIsListedOnTheDestination_Then_ItIsNotRefused(t *testing.T) {
 	t.Parallel()
 
@@ -12801,6 +12848,172 @@ func Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_Ver
 
 	if outputs[0] != outputs[1] {
 		t.Errorf("the order of the map items changes the output\nparent first: %q\nchild first:  %q", outputs[0], outputs[1])
+	}
+}
+
+// winnerFailsCase is a mapping that wins over its parent and then fails in a split, so its lost entries must get no verbose line.
+type winnerFailsCase struct {
+	folders       map[string]string
+	wantDst       map[string]string
+	name          string
+	dstDelimiter  string
+	wantExpansion string
+	wantSummary   string
+	mappings      []config.DirectoryMapping
+	wantLines     []string
+	wantLost      []string
+	wantFailures  []string
+	failedSources []string
+	failedDests   []string
+}
+
+func winnerFailsCases() []winnerFailsCase {
+	return []winnerFailsCase{
+		{
+			name:         "rename clash with another destination",
+			dstDelimiter: ".",
+			folders: map[string]string{
+				"INBOX": "inbox@x", "Work": "work@x", "Work/sub": "sub@x",
+				"Work/sub/a.b": "dot@x", "Work/sub/a_b": "under@x", "Work/sub/ok": "ok@x",
+			},
+			mappings: []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Special")},
+			wantExpansion: "  📁 Found subfolder: Work/sub/ok → Special.ok\n" +
+				"  ℹ️  Folder Work/sub goes to Special, not to Fine.sub: the mapping of Work/sub wins over the mapping of Work\n" +
+				"  ℹ️  Folder Work/sub/ok goes to Special.ok, not to Fine.sub.ok: the mapping of Work/sub wins over the mapping of Work\n" +
+				"📂 Found 1 subfolders, total folders to sync: 3\n",
+			wantLines: []string{
+				"  ℹ️  Folder Work/sub goes to Special, not to Fine.sub:",
+				"  ℹ️  Folder Work/sub/ok goes to Special.ok, not to Fine.sub.ok:",
+			},
+			wantLost: []string{
+				"Folder Work/sub/a.b goes to Special.a_b, not to Fine.sub.a_b",
+				"Folder Work/sub/a_b goes to Special.a_b, not to Fine.sub.a_b",
+			},
+			wantFailures: []string{
+				"• Work/sub/a.b → Special.a_b: same destination folder as source folder Work/sub/a_b\n",
+				"• Work/sub/a_b → Special.a_b: same destination folder as source folder Work/sub/a.b\n",
+			},
+			failedSources: []string{"Work/sub/a.b", "Work/sub/a_b"},
+			failedDests:   []string{"Special.a_b"},
+			wantDst:       map[string]string{"Fine": "work@x", "Special": "sub@x", "Special.ok": "ok@x"},
+			wantSummary:   "3 messages uploaded, 0 errors occurred, 2 folders failed",
+		},
+		{
+			name:         "rename clash with the destination of the parent expansion",
+			dstDelimiter: ".",
+			folders: map[string]string{
+				"INBOX": "inbox@x", "Work": "work@x", "Work/sub": "sub@x",
+				"Work/sub/a.b": "dot@x", "Work/sub/a_b": "under@x",
+			},
+			mappings: []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine.sub")},
+			wantExpansion: "  📁 Found subfolder: Work/sub → Fine.sub\n" +
+				"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n",
+			wantLines: []string{"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n"},
+			wantLost: []string{
+				"Mapping \"Work/sub/a.b\" skipped - already covered by a parent mapping's expansion",
+				"Mapping \"Work/sub/a_b\" skipped - already covered by a parent mapping's expansion",
+			},
+			wantFailures: []string{
+				"• Work/sub/a.b → Fine.sub.a_b: same destination folder as source folder Work/sub/a_b\n",
+				"• Work/sub/a_b → Fine.sub.a_b: same destination folder as source folder Work/sub/a.b\n",
+			},
+			failedSources: []string{"Work/sub/a.b", "Work/sub/a_b"},
+			failedDests:   []string{"Fine.sub.a_b"},
+			wantDst:       map[string]string{"Fine": "work@x", "Fine.sub": "sub@x"},
+			wantSummary:   "2 messages uploaded, 0 errors occurred, 2 folders failed",
+		},
+		{
+			name:         "empty level with another destination",
+			dstDelimiter: "/",
+			folders: map[string]string{
+				"INBOX": "inbox@x", "Work": "work@x", "Work/sub": "sub@x",
+				"Work/sub//bad": "bad@x", "Work/sub/ok": "ok@x",
+			},
+			mappings: []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Special")},
+			wantExpansion: "  📁 Found subfolder: Work/sub/ok → Special/ok\n" +
+				"  ℹ️  Folder Work/sub goes to Special, not to Fine/sub: the mapping of Work/sub wins over the mapping of Work\n" +
+				"  ℹ️  Folder Work/sub/ok goes to Special/ok, not to Fine/sub/ok: the mapping of Work/sub wins over the mapping of Work\n" +
+				"📂 Found 1 subfolders, total folders to sync: 3\n",
+			wantLines: []string{
+				"  ℹ️  Folder Work/sub goes to Special, not to Fine/sub:",
+				"  ℹ️  Folder Work/sub/ok goes to Special/ok, not to Fine/sub/ok:",
+			},
+			wantLost: []string{"Folder Work/sub//bad goes to Special//bad, not to Fine/sub//bad"},
+			wantFailures: []string{
+				"• Work/sub//bad → Special//bad: destination folder has an empty level: \"Special//bad\", destination delimiter \"/\"\n",
+			},
+			failedSources: []string{"Work/sub//bad"},
+			failedDests:   []string{"Special//bad"},
+			wantDst:       map[string]string{"Fine": "work@x", "Special": "sub@x", "Special/ok": "ok@x"},
+			wantSummary:   "3 messages uploaded, 0 errors occurred, 1 folders failed",
+		},
+		{
+			name:         "empty level with the destination of the parent expansion",
+			dstDelimiter: "/",
+			folders: map[string]string{
+				"INBOX": "inbox@x", "Work": "work@x", "Work/sub": "sub@x", "Work/sub//bad": "bad@x",
+			},
+			mappings: []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine/sub")},
+			wantExpansion: "  📁 Found subfolder: Work/sub → Fine/sub\n" +
+				"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n",
+			wantLines: []string{"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n"},
+			wantLost:  []string{"Mapping \"Work/sub//bad\" skipped - already covered by a parent mapping's expansion"},
+			wantFailures: []string{
+				"• Work/sub//bad → Fine/sub//bad: destination folder has an empty level: \"Fine/sub//bad\", destination delimiter \"/\"\n",
+			},
+			failedSources: []string{"Work/sub//bad"},
+			failedDests:   []string{"Fine/sub//bad"},
+			wantDst:       map[string]string{"Fine": "work@x", "Fine/sub": "sub@x"},
+			wantSummary:   "2 messages uploaded, 0 errors occurred, 1 folders failed",
+		},
+	}
+}
+
+func winnerFailsTree(folders map[string]string) map[string][]fakeMsg {
+	tree := make(map[string][]fakeMsg, len(folders))
+	for folder, id := range folders {
+		tree[folder] = fakeMsgs(id)
+	}
+	return tree
+}
+
+func Test_printExpansion_When_WinnerFailsInASplit_Then_ItsLostEntriesGetNoLine(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range winnerFailsCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srcC := newAppClient(t, newStoreServer(t, "/", winnerFailsTree(tt.folders)), "src")
+			dstC := newDestinationClient(t, tt.dstDelimiter)
+			expanded, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(tt.mappings...), "/", tt.dstDelimiter)
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			planned, clashes := splitDestinationClashes(expanded)
+			planned, emptyLevels, err := splitEmptyLevelDestinations(t.Context(), dstC, planned, tt.dstDelimiter)
+			if err != nil {
+				t.Fatalf("splitEmptyLevelDestinations: %v", err)
+			}
+			var failed []string
+			for _, failure := range slices.Concat(clashes, emptyLevels) {
+				failed = append(failed, failure.SourceFolder)
+			}
+			slices.Sort(failed)
+			if want := slices.Sorted(slices.Values(tt.failedSources)); !slices.Equal(failed, want) {
+				t.Fatalf("failed sources = %q, want %q", failed, want)
+			}
+
+			var out strings.Builder
+			printExpansion(&out, report, planned, true, false)
+
+			if out.String() != tt.wantExpansion {
+				t.Errorf("printExpansion output = %q, want %q", out.String(), tt.wantExpansion)
+			}
+			var control strings.Builder
+			printExpansion(&control, report, expanded, true, false)
+			assertContainsAll(t, control.String(), tt.wantLost...)
+		})
 	}
 }
 

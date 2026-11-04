@@ -2067,7 +2067,7 @@ func expandMirrorRoots(ctx context.Context, srcClient, dstClient *client.Client,
 	return expanded, expansionReport{skipped: skipped}, nil
 }
 
-// A found line shows only a destination that the plan uses, so verbose never names one that lost or one that failed in a split.
+// An entry line needs its Source in the plan: a folder that failed in a split goes nowhere, and the failure list names it.
 func printExpansion(out io.Writer, r expansionReport, planned []folderMapping, verbose, quiet bool) {
 	if !verbose || quiet {
 		return
@@ -2085,7 +2085,7 @@ func printExpansion(out io.Writer, r expansionReport, planned []folderMapping, v
 		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), r.skipped[name])
 	}
 	for i, e := range r.entries {
-		if r.winners[i] == i {
+		if _, ok := used[e.Source]; !ok || r.winners[i] == i {
 			continue
 		}
 		kept := r.entries[r.winners[i]]

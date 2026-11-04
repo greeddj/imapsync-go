@@ -135,12 +135,14 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
        - a planned mapping names the source folder of the entry;
        - the destination of the entry is the destination of its winner;
      - one escaped line, two spaces and then `ℹ️  Folder %s skipped - %s`, for each skipped name, in name order;
-     - one line for each entry that lost, in the order of the entries:
+     - one line for each entry that lost, in the order of the entries, when a planned mapping names the source folder of the entry:
        - an entry with another destination gives the escaped line two spaces and then `ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s`;
        - an entry with the same destination gives the existing `%q` line `Mapping ... skipped - already covered by a parent mapping's expansion`;
      - the line `📂 Found %d subfolders, total folders to sync: %d`, only when the first number is more than 0.
-   - The planned mappings change only the found-subfolder lines and the count line. The other lines do not use them. A failure after the splits, such as a failed scan, changes no line, because `printExpansion` runs before the scan.
-   - So a found-subfolder line never names a destination that lost, or a subfolder that failed in a split.
+   - The planned mappings change the found-subfolder lines, the lines of the entries that lost and the count line. The `Folder ... skipped` lines do not use them. A failure after the splits, such as a failed scan, changes no line, because `printExpansion` runs before the scan.
+   - An entry that lost has the same source folder as its winner, and the expansion keeps one mapping for each source folder. So the condition is true only when the winner is in the plan.
+   - So a found-subfolder line never names a destination that lost. In a found-subfolder line, a `goes to` line and a `Mapping ... skipped` line, the first folder never failed in a split. The folder-failure list names that folder and the reason.
+   - A `goes to` line can name a root whose own mapping failed in a split, in a part `the mapping of %s`. That mapping still gives the destination of each subfolder for which it wins.
    - A mirror run has no entry in its report. So `printExpansion` prints no found-subfolder line, no `goes to` line, no `Mapping ... skipped` line and no count line. It prints only the `Folder ... skipped` lines.
    - The first number of the count line is the number of entries for which all these conditions are true:
      - the entry wins (`mostSpecific`);
