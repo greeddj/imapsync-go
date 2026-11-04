@@ -256,7 +256,7 @@
   - `Test_MissingLevels_When_CacheAndNameAreRandom_Then_ItListsExactlyTheCreatesOfCreateMailbox` - 300 random caches and names, with the delimiter `/`, `.` or none, give the same result. `MissingLevels` is empty exactly for a listed name. Each level is unlisted and extends the level before it, and the last level is the name. The CREATE commands of `CreateMailbox` carry the same names in the same order. The test uses a fixed seed, and it checks that the generator makes enough listed names and names with missing parents.
 
   The provider profiles have these tests:
-  - `TestDetectProvider` - a Gmail address gives the whole profile, also with a port, capital letters or spaces. An unknown address gives no profile;
+  - `TestDetectProvider` - a Gmail address gives the whole profile, also with a port, capital letters or spaces. An unknown address gives no profile. A port that is empty or holds a letter stays part of the host, so the address gives no profile;
   - `TestKnownProviders_When_RecommendedRateRunsForADay_Then_StaysUnderTheDailyQuota` - the test checks each provider and each direction with a daily quota. The recommended rate is 95% of the quota, divided by the seconds in one day and rounded down to a multiple of 500. One day at this rate, with the burst of the limiter, moves at most 95% of the quota. The test reads the table and does not change it.
 - **`internal/ratelimit`** - the rate limit of a connection. The tests cover a limiter with no tokens, a nil limiter that lets all bytes through, and read and write limits that are independent.
   The mode with no wait has these tests:
@@ -789,6 +789,7 @@
   The version stamp of the Justfile has these tests. Both skip when `just` or `git` is not in PATH:
   - `TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild` - the test evaluates `VERSION`, `COMMIT` and `LDFLAGS` of the real Justfile in scratch git repositories. A directory outside a repository, and a repository with no commit, give `dev` and an empty commit. A commit with no tag gives the hash. A tagged commit, also an annotated tag, gives the tag. One commit after a tag gives `v1.2.3-1-g<hash>`. A change to a tracked file or a staged change adds `-dirty`, and an untracked file does not. A tag with a slash and a plus sign passes unchanged;
   - the same test uses hostile tag names: shell syntax, quotes, a semicolon, a bidi control and a C1 control. It also uses an annotated tag object that names an unsafe tag under a safe ref, and an unsafe text after a slash. These cases give the commit hash, with `-dirty` for a local change, or the `git describe` text of a safe tag. A canary file proves that the shell never runs the text;
+  - the same test uses a tag with the name `-n`, which gives the version `-n`. The `echo` of dash reads this word as an option and prints nothing, so the recipe uses `printf`;
   - `TestJustfile_When_VersionHoldsShellSyntax_Then_BuildRecipesPassLdflagsAsOneArgument` - `build` and `build_linux` run with fake `go` and `golangci-lint` programs. When `VERSION` holds `$(...)`, backticks or quotes, `go build` gets exactly one `-ldflags=` argument with the exact value, and the canary file does not exist.
 
   The version text and the provider rates have these tests:

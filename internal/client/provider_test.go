@@ -28,6 +28,8 @@ func TestDetectProvider(t *testing.T) {
 		{"IMAP.gmail.com:993", gmail, true},
 		{"  imap.gmail.com  :993", gmail, true},
 		{"imap.example.org:993", Provider{}, false},
+		{"imap.gmail.com:abc", Provider{}, false},
+		{"imap.gmail.com:", Provider{}, false},
 		{"", Provider{}, false},
 	}
 	for _, tt := range tests {

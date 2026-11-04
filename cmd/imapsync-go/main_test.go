@@ -931,6 +931,15 @@ func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing
 			},
 		},
 		{
+			// The dash echo reads a lone -n as an option and prints nothing, so the recipe prints the version with printf.
+			name: "tag is the word -n",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("update-ref", "refs/tags/-n", "HEAD")
+				return "-n", r.hash()
+			},
+		},
+		{
 			name: "tag holds a slash and a plus sign",
 			setup: func(r *scratchRepo) (string, string) {
 				r.initWithCommit()
