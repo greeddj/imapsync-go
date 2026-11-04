@@ -2,9 +2,9 @@
 
 ## What "covered" means here
 
-- A change is covered when every behavioural branch the change introduced is exercised by a test that would fail if the branch broke.
-- Coverage % is a guideline, not a gate. Coverage of error paths and invariants matters more than total %.
-- `go test -cover -coverprofile=cover.out ./...` and `go tool cover -func=cover.out` are the source of truth.
+- The tests cover a change when each new branch that changes the behaviour has a test that fails if the branch breaks.
+- The coverage percentage is only a guide. A low percentage does not block a change. Tests of error paths and invariants are more important than the total percentage.
+- The commands `go test -cover -coverprofile=cover.out ./...` and `go tool cover -func=cover.out` give the correct coverage numbers.
 
 ## What we test
 
@@ -16,11 +16,11 @@
   - empty files, and the load of both example files;
   - rejected `map` items (an empty or missing `src` or `dst`, and a null YAML item), where the error names the item and the key;
   - two `map` items with one `src` and different `dst` values, which `config.New` rejects with `ErrMapSrcConflict`. The error names both items, also when other items or an equal item come between them (`TestNew_When_MapRepeatsSourceWithAnotherDestination_Then_ReturnsErrorNamingBothEntries`);
-  - two equal `map` items, two items with one `dst` and two `src` values that differ only in letter case, which all load (`TestNew_When_MapItemsRepeatOrShareADestination_Then_Loads`);
+  - two equal `map` items, two items with one `dst` and two `src` values that are different only in letter case, which all load (`TestNew_When_MapItemsRepeatOrShareADestination_Then_Loads`);
   - a folder name with spaces, which loads without change, and an empty or null `map`, which loads with no items;
   - a rate-limit flag that the user sets, which replaces the config value also when the flag is 0;
   - a rate-limit flag that the user does not set, which keeps the config value.
-- **`internal/client`** - error classification, mailbox cache update on create (no new LIST), fetch batching boundaries and AppendMessage streaming (no ReadAll).
+- **`internal/client`** - the IMAP client. The tests cover the error classes and the update of the mailbox cache after CREATE (no new LIST). They also cover the limits of the fetch batches and the APPEND stream (no `ReadAll`).
   Error paths and cancellation run against scripted fake servers. These tests cover:
   - a refusal of each command;
   - a context that ends while LIST, STATUS, FETCH, CREATE or APPEND waits for a reply;
@@ -52,7 +52,7 @@
   - `Test_FetchMessageMap_When_FolderStaysSelected_Then_StatusReportsUIDValidity` - when the folder stays selected, the scan sends no EXAMINE and reads the value from `STATUS (MESSAGES UIDVALIDITY)`;
   - `Test_FetchMessageMap_When_RetriedOnANewSession_Then_ReturnsTheNewSessionValue` - after a reconnect, the result holds the value of the new session;
   - `Test_StreamMessagesByUIDs_When_UIDValidityDiffers_Then_FetchesNothing` - a session with another value gets no UID FETCH and no reconnect. The error has the class `ClassUnknown`, also when the folder name holds a transient phrase;
-  - `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` - the check also reads the value of a kept selection. A plan value that differs fetches nothing. A plan value that matches fetches the UID, and the stream sends no EXAMINE: the one EXAMINE of the session comes from the scan;
+  - `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` - the check also reads the value of a kept selection. A plan value that is different fetches nothing. A plan value that matches fetches the UID, and the stream sends no EXAMINE: the one EXAMINE of the session comes from the scan;
   - `Test_StreamMessagesByUIDs_When_UIDValidityChangesAcrossReconnect_Then_StopsWithoutFetching` - a change after a BYE between two batches stops the stream. The first batch stays delivered, and the new session fetches nothing;
   - `Test_StreamMessagesByUIDs_When_UIDValidityChangesOnRetryInsideFirstBatch_Then_FetchesNoUndeliveredUID` - the retry inside one batch runs the check too, so the stream fetches no UID that it did not deliver;
   - `Test_StreamMessagesByUIDs_When_SessionReportsNoUIDValidity_Then_FetchesNothing` - a session that sends none fails the check when the plan holds a value. This holds after a new EXAMINE and after a kept selection;
@@ -145,7 +145,7 @@
   - `Test_StreamMessagesByUIDs_When_ExamineOfAnotherFolderFailed_Then_SelectsAgain` - after a failed EXAMINE of another folder, the earlier folder gets a new EXAMINE;
   - `Test_selectIfNeeded_afterReconnect_reSelects` - the session after a reconnect gets a new EXAMINE;
   - `Test_safeCall_When_ByeLandsBetweenSelectAndFetch_Then_ReconnectsAndRetries` - a BYE between the EXAMINE and the FETCH gets a reconnect, and the retry selects again;
-  - `Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest` - a BYE after the first batch gets a reconnect, the next batch selects the folder on the new session, and the stream does not fetch a delivered UID again;
+  - `Test_StreamMessagesByUIDs_When_ServerSendsByeBetweenBatches_Then_ReconnectsAndDeliversTheRest` - a BYE after the first batch gets a reconnect. The next batch selects the folder on the new session, and the stream does not fetch a delivered UID again;
   - `Test_StreamMessagesByUIDs_When_StreamSpansBatches_Then_SelectsFolderOnce` - all batches of one stream share one EXAMINE, also for a non-ASCII name that go-imap sends in modified UTF-7;
   - `Test_StreamMessagesByUIDs_When_SessionEndedAfterEarlierSelect_Then_ReselectsOnANewSession` - the new session does not keep a selection made before a BYE: the stream logs in again, selects again and delivers each UID once.
 
@@ -231,7 +231,7 @@
 
   The watchdog limit has these tests:
   - `Test_New_When_Built_Then_WatchdogUsesIdleTimeout` - `New` sets `idleTimeout` and arms the watchdog, with and without rate limits;
-  - `Test_New_When_OptionsSetIdleTimeout_Then_WatchdogUsesIt` - a positive value below the default replaces it. Zero, a negative value and a value above the default keep `idleTimeout`. The watchdog is always armed.
+  - `Test_New_When_OptionsSetIdleTimeout_Then_WatchdogUsesIt` - a positive value below the default replaces it. Zero, a negative value and a value above the default keep `idleTimeout`. `New` always arms the watchdog.
 
   The warning for messages with no Message-Id has these tests:
   - `Test_MessageIDScans_When_FoldersAreScanned_Then_OnlyTheSourceScanWarnsAboutMessagesWithoutAMessageId` - for a folder with messages that have no Message-Id, `FetchMessageMap` logs one warning with the label, the folder and the count. `FetchMessageCopies` and `RescanMessageMap` log none. A folder where each message has a Message-Id gives no warning. Each scan returns the map of the folder;
@@ -247,18 +247,18 @@
   - `Test_Client_log_When_TrackerIsReplacedByNil_Then_LinesReachTheWriterAndNotTheOldTracker` - with `--verbose` and a tracker set, `Client.log` gives the line to the tracker and the writer gets none. After `SetProgressTracker(nil)`, the writer gets the line.
 
   The creation of parent folders has these tests:
-  - `Test_CreateMailbox_walksParents`, `Test_CreateMailbox_idempotent`, `Test_CreateMailbox_serverReplies`, `Test_CreateMailbox_whenContextCanceled` and `Test_CreateMailbox_whenContextExpiresInFlight` - the second result of `CreateMailbox` counts the parent folders for which the server accepted a CREATE (2 for `A/B/C`). It is 0 for a cached name and for a context that ended before the call. It is also set when the call fails after the server made a parent;
+  - `Test_CreateMailbox_walksParents`, `Test_CreateMailbox_idempotent`, `Test_CreateMailbox_serverReplies`, `Test_CreateMailbox_whenContextCanceled` and `Test_CreateMailbox_whenContextExpiresInFlight` - the second result of `CreateMailbox` counts the parent folders for which the server accepted a CREATE (2 for `A/B/C`). The result is 0 for a cached name and for a context that ended before the call. The call also gives the count when it fails after the server made a parent;
   - `Test_CreateMailbox_When_ParentAnswersAlreadyExists_Then_VerboseLogSaysSo` - with `--verbose`, a parent that the server reports as existing logs `Parent folder already exists`. A parent that the server creates logs `Created parent folder`;
   - `Test_parentLevels`, `Test_parentLevels_When_Ranged_Then_AllocatesNothing` and `FuzzParentLevels` - the iterator yields each prefix that ends before a delimiter, shortest first. The last level of the prefix must not be empty. An empty delimiter yields nothing. An empty level is never the last level of a parent level, so `/x` and `//x` give none, `a//b` gives `a`, and `/x/y` gives `/x`. A name that ends with the delimiter gives its named parents only. A delimiter of more than one byte gives the right prefixes, also when two of its occurrences overlap in the name. The iteration allocates nothing. The fuzz target compares the result with a split model that skips empty levels. It also checks that a name of L bytes gives at most L/2 levels;
   - `Test_MissingLevels` and `Test_MissingLevels_When_ContextEnded_Then_ReturnsContextError` - the answer holds the parent levels that the cache does not list, and then the name. A cached name gives nothing. A `\Noselect` parent, an INBOX level in another letter case and a listed spelling count as listed. A flat server gives the name only. An empty level is no parent level: `/X` gives `/X`, `a//b` gives `a` and `a//b`, and `x/` gives `x` and `x/`. A context that ended gives its error and no names;
   - `Test_MissingLevels_When_NothingIsMissing_Then_AllocatesNothing` - a lookup of a name with every level listed allocates nothing;
   - `Test_MissingLevels_When_CreateMailboxRuns_Then_EachNameGetsOneCreateAndNoOtherNameDoes` - the names that `MissingLevels` returns are the names for which `CreateMailbox` sends a CREATE. This holds for empty levels, an INBOX level in another letter case, a `\Noselect` parent and a flat cache. No parent level has an empty last level;
-  - `Test_MissingLevels_When_CacheAndNameAreRandom_Then_ItListsExactlyTheCreatesOfCreateMailbox` - 300 random caches and names, with the delimiter `/`, `.` or none, give the same result. `MissingLevels` is empty exactly for a listed name. Each level is unlisted and extends the level before it, and the last level is the name. The CREATE commands of `CreateMailbox` carry the same names in the same order. The seed is fixed, and the test checks that the generator makes enough listed names and names with missing parents.
+  - `Test_MissingLevels_When_CacheAndNameAreRandom_Then_ItListsExactlyTheCreatesOfCreateMailbox` - 300 random caches and names, with the delimiter `/`, `.` or none, give the same result. `MissingLevels` is empty exactly for a listed name. Each level is unlisted and extends the level before it, and the last level is the name. The CREATE commands of `CreateMailbox` carry the same names in the same order. The test uses a fixed seed, and it checks that the generator makes enough listed names and names with missing parents.
 
   The provider profiles have these tests:
   - `TestDetectProvider` - a Gmail address gives the whole profile, also with a port, capital letters or spaces. An unknown address gives no profile;
   - `TestKnownProviders_When_RecommendedRateRunsForADay_Then_StaysUnderTheDailyQuota` - the test checks each provider and each direction with a daily quota. The recommended rate is 95% of the quota, divided by the seconds in one day and rounded down to a multiple of 500. One day at this rate, with the burst of the limiter, moves at most 95% of the quota. The test reads the table and does not change it.
-- **`internal/ratelimit`** - token starvation, nil-limiter pass-through, read+write directions independent.
+- **`internal/ratelimit`** - the rate limit of a connection. The tests cover a limiter with no tokens, a nil limiter that lets all bytes through, and read and write limits that are independent.
   The mode with no wait has these tests:
   - `TestConn_When_WaitIsOff_Then_ReadAndWriteTakeTokensWithoutWaiting` - on a limiter in debt, a `Write` and a `Read` return at once with no error. Each direction loses exactly the bytes that moved;
   - `TestConn_When_WaitIsOff_Then_ChargeSplitsAtTheBurst` - a `Write` of 3 bursts and 1 byte returns at once and charges all of the bytes;
@@ -267,7 +267,7 @@
   - `TestConn_When_LimitersAreNilAndWaitIsOff_Then_PassesThrough` - both directions pass through when the limiters are `nil`;
   - `Test_chargeN_When_BurstIsZero_Then_Returns` - a limiter with burst 0 does not cause an endless loop.
 - **`internal/utils`** - `AskConfirm` and its helpers. The tests cover the `-y/--confirm` flow. `AskConfirm` reads each answer from one shared buffered reader.
-- **`internal/app`** - sync plan diff (count of copies for each Message-Id), subfolder expansion, delimiter reconciliation, worker pool dispatch.
+- **`internal/app`** - the code that runs the `sync` and `show` commands. The tests cover the diff of the sync plan (the count of copies for each Message-Id). They also cover the expansion of subfolders, the delimiter fix and the dispatch to the worker pool.
   The `runSync` and `runShow` tests run end to end against a fake IMAP server that holds mailboxes in memory. These tests cover:
   - the plan-confirm-execute order, and the rule that `--quiet` needs `--confirm`;
   - an idempotent second run, and the delimiter rewrite on both sides;
@@ -275,12 +275,12 @@
   - a read-only source (no write commands, no `\Seen` change);
   - a cancel at each boundary between sync phases;
   - the refusal paths (login, LIST, EXAMINE, CREATE, APPEND);
-  - a source that drops the connection on a folder with a throttle phrase in its name, where the folder is still copied (`TestRunSync_When_SourceDropsOnFolderNamedLikeThrottle_Then_FolderIsStillCopied`);
+  - a source that drops the connection on a folder with a throttle phrase in its name, where the run still copies the folder (`TestRunSync_When_SourceDropsOnFolderNamedLikeThrottle_Then_FolderIsStillCopied`);
   - a CREATE that gets the Gmail reply `Duplicate folder name`, where the sync completes (`TestRunSync_When_CreateAnswersDuplicateFolderName_Then_SyncCompletes`);
   - a destination that refuses LOGIN in the middle of a run, where the worker sends one refused LOGIN (`TestRunSync_When_DestinationRefusesLoginMidRun_Then_WorkerSendsOneRefusedLogin`);
   - a source folder that fails its scan: a refused EXAMINE, a mapping with a typo, a missing folder and a planning client that gives up;
   - a source scan failure, where the other folders still copy, the failure list shows also with `--quiet`, and the run returns `ErrSilentExit`;
-  - a destination that sends no UID in the Message-Id scan, in the planning scan and in the check after CREATE, where the run copies only the missing messages and a second run copies nothing (`TestRunSync_When_DestinationScanSendsNoUID_Then_CopiesOnlyTheMissingMessage`, `TestRunSync_When_DestinationScanSendsNoUIDForSharedMessageIdCopies_Then_CopiesOnlyTheMissingCopy` and `TestRunSync_When_ExistingDestinationScanSendsNoUID_Then_TheRecheckDropsTheHeldMessage`);
+  - a destination that sends no UID in the Message-Id scan, in the planning scan and in the check after CREATE. The run copies only the missing messages, and a second run copies nothing (`TestRunSync_When_DestinationScanSendsNoUID_Then_CopiesOnlyTheMissingMessage`, `TestRunSync_When_DestinationScanSendsNoUIDForSharedMessageIdCopies_Then_CopiesOnlyTheMissingCopy` and `TestRunSync_When_ExistingDestinationScanSendsNoUID_Then_TheRecheckDropsTheHeldMessage`);
   - a source that sends no UID in the Message-Id scan, where the folder fails and the other folders copy (`TestRunSync_When_SourceScanSendsNoUID_Then_FolderFailsAndOtherFoldersCopy`);
   - a run with failed folders and nothing to copy, where the sync asks no question and ends non-zero;
   - a `\Noselect` source folder, where only the subfolders copy;
@@ -290,22 +290,29 @@
   - an unlisted parent that refuses to open, where the plan skips it, prints one line and keeps the exit code (`isHierarchyLevel`);
   - an unlisted INBOX with subfolders that refuses to open, which stays a failure;
   - an unlisted parent whose session drops, which stays a failure;
-  - a destination that CREATE reports as existing but LIST did not show, where the run copies only the missing messages and a second run sends no APPEND, opens no worker connection and sends one LIST (`TestRunSync_When_CreateReportsExistingFolderWithMessages_Then_CopiesOnlyTheDifference`);
-  - the same check for an empty existing destination, which sends no source command (`TestRunSync_When_ExistingDestinationIsEmpty_Then_SourceIsNotScannedAgain`), and for a folder that CREATE made, which gets no scan (`TestRunSync_When_CreateSucceeds_Then_NewFolderIsNotScanned`);
-  - a destination LIST that has names that are not valid modified UTF-7, where a folder that CREATE made is also checked. The check copies only the missing messages when the folder holds some (`TestRunSync_When_DestinationListsInvalidNameAndCreateAnswersOKForFolderWithMessages_Then_CopiesOnlyTheDifference`). The check reads only the destination when the folder is empty (`TestRunSync_When_DestinationListsInvalidNameAndCreateMakesFolder_Then_RecheckReadsOnlyTheDestination`);
+  - a destination that CREATE reports as existing but LIST did not show. The run copies only the missing messages. A second run sends no APPEND, opens no worker connection and sends one LIST (`TestRunSync_When_CreateReportsExistingFolderWithMessages_Then_CopiesOnlyTheDifference`);
+  - the same check for an empty existing destination, where the run sends no source command (`TestRunSync_When_ExistingDestinationIsEmpty_Then_SourceIsNotScannedAgain`). A folder that CREATE made gets no scan (`TestRunSync_When_CreateSucceeds_Then_NewFolderIsNotScanned`);
+  - a destination LIST that has names that are not valid modified UTF-7, where the run also checks a folder that CREATE made. The check copies only the missing messages when the folder holds some (`TestRunSync_When_DestinationListsInvalidNameAndCreateAnswersOKForFolderWithMessages_Then_CopiesOnlyTheDifference`). The check reads only the destination when the folder is empty (`TestRunSync_When_DestinationListsInvalidNameAndCreateMakesFolder_Then_RecheckReadsOnlyTheDestination`);
   - a destination folder that LIST does not show, where the run copies only the missing messages and checks only that folder (`TestRunSync_When_DestinationInboxIsMissingFromList_Then_OnlyTheDifferenceIsCopied` and `TestRunSync_When_OnlyOneDestinationIsMissingFromList_Then_OnlyThatFolderIsChecked`);
   - the same check with `--quiet`, where the run copies the missing messages and prints no "already exists and holds" line (`TestRunSync_When_ExistingDestinationHoldsMessagesInQuietMode_Then_PrintsNoInfoLine`);
-  - an existing destination that cannot be scanned, where the folder failure shows also with `--quiet`, the other plans still copy, and the run opens no worker connection when no plan is left (`TestRunSync_When_ExistingDestinationCannotBeScanned_Then_ReportsFolderFailure`);
-  - a source that cannot be scanned again during the check, which gives a folder failure and no APPEND (`TestRunSync_When_SourceRescanFails_Then_ReportsFolderFailure`);
+  - an existing destination that the run cannot scan. The folder failure shows also with `--quiet`, and the other plans still copy. The run opens no worker connection when no plan remains (`TestRunSync_When_ExistingDestinationCannotBeScanned_Then_ReportsFolderFailure`);
+  - a source that the run cannot scan again during the check. The run gives a folder failure and sends no APPEND (`TestRunSync_When_SourceRescanFails_Then_ReportsFolderFailure`);
   - a context that ends during the check, where `runSync` returns `context.Canceled`, sends no APPEND and prints no failure list (`TestRunSync_When_ContextEndsDuringDestinationRecheck_Then_ReturnsCanceledWithoutAppend`);
-  - a context that has ended before `recheckExistingDestinations` starts, where a plan outside the set passes and the first plan in the set sends no command, and the call returns `context.Canceled` with no kept plan and no failure (`Test_recheckExistingDestinations_When_ContextAlreadyEnded_Then_SendsNoCommand`);
-  - a source that changes between the plan and the check (`TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesAreCopied`): new mail is not copied, and a planned message that leaves the source is not copied. For new mail, the run prints the "holds 2 of the 3" line and no "no longer holds" line. For a message that leaves the source, it prints the "holds 2 of the 3" line and the "no longer holds 1 of the 3" line, and never "holds 3 of the 3";
-  - `Test_recheckExistingDestinations_When_PlannedMessagesAreDropped_Then_EachCauseHasItsOwnLine` - the exact output and the kept plans for these cases: the destination holds some messages, the source lost one, both causes, nothing left, both causes with `--quiet` (no output), nothing dropped (no output), and folder names with control characters (escaped output and exact plan names);
+  - a context that ended before `recheckExistingDestinations` starts. A plan outside the set passes, and the first plan in the set sends no command. The call returns `context.Canceled` with no kept plan and no failure (`Test_recheckExistingDestinations_When_ContextAlreadyEnded_Then_SendsNoCommand`);
+  - a source that changes between the plan and the check (`TestRunSync_When_SourceChangesAfterTheCreateReply_Then_OnlyPlannedMessagesAreCopied`). The run does not copy new mail, and it does not copy a planned message that leaves the source. For new mail, the run prints the "holds 2 of the 3" line and no "no longer holds" line. If a message leaves the source, the run prints the "holds 2 of the 3" line. It also prints the "no longer holds 1 of the 3" line, and it never prints "holds 3 of the 3";
+  - `Test_recheckExistingDestinations_When_PlannedMessagesAreDropped_Then_EachCauseHasItsOwnLine` - the test checks the exact output and the kept plans. The cases are:
+    - the destination holds some messages;
+    - the source lost one message;
+    - both causes;
+    - no planned message remains;
+    - both causes with `--quiet`: the check prints no output;
+    - a check that drops nothing: it prints no output;
+    - folder names with control characters: the output has escapes, and the plan names stay exact;
   - `Test_destinationDiff` - the diff of a destination with one plan never adds a UID. It drops the UIDs that the destination holds or the source lost. It scales the size, and it leaves the input slice unchanged. The test helper `rediffOnePlan` runs `destinationDiff` on one plan. For each case, `held` and `gone` have the expected values, and `held`, `gone` and the kept UIDs add up to the planned UIDs;
   - `Test_destinationDiff_When_ScanListsOneUIDUnderTwoMessageIds_Then_EachPlannedUIDCountsOnce` - a scan that lists one UID under two Message-Ids counts that planned UID one time. If the destination holds only one of the two Message-Ids, the plan keeps the UID and `held` and `gone` are 0. If the destination holds both, `held` is 1 and `gone` is 0;
   - `Test_recheckExistingDestinations_When_PlansShareADestination_Then_TheyAreComparedTogether` - the exact output and the kept plans for plans that share a destination. In the first case, the destination holds the copy that matches the second plan. The second case is the same case with `--quiet`, and it gives no output. The third case has a planned message that is gone next to a held one. The fourth case has the plans of two destinations in interleaved order. The lines and the kept plans follow the plan order. The input `SrcUIDs` slices do not change;
   - `Test_recheckExistingDestinations_When_PlansShareADestination_Then_TheDestinationIsReadOnce` - a group of two plans sends one Message-Id FETCH and one EXAMINE to the destination, and one EXAMINE for each source folder;
-  - `Test_recheckExistingDestinations_When_OneSharedPlanCannotBeRescanned_Then_OnlyItFails` - a refused EXAMINE of the source folder (`errSourceScan`) and a changed UIDVALIDITY (`client.ErrUIDValidityChanged`) each give one folder failure for that plan only. The other plan is still checked;
+  - `Test_recheckExistingDestinations_When_OneSharedPlanCannotBeRescanned_Then_OnlyItFails` - a refused EXAMINE of the source folder (`errSourceScan`) and a changed UIDVALIDITY (`client.ErrUIDValidityChanged`) each give one folder failure for that plan only. The run still checks the other plan;
   - `Test_recheckExistingDestinations_When_SharedDestinationCannotBeRead_Then_EveryPlanOfItFails` - every plan of that destination fails with `errDestinationRecheck`, and the run sends no source command for them. The run checks the plan of another destination as usual;
   - `Test_recheckExistingDestinations_When_SharedDestinationIsEmpty_Then_NoSourceIsScanned` - the plans keep their UIDs and get `DestinationFolderExists`, and the source gets no EXAMINE, STATUS or FETCH;
   - `Test_recheckExistingDestinations_When_ContextEndsBetweenSharedSourceScans_Then_ReturnsCanceledWithoutOutput` - a context that ends with the second source EXAMINE gives `context.Canceled`, no kept plan, no failure and no output;
@@ -319,11 +326,11 @@
   - a config with an unknown key, an unsupported `auth` value or a `map` item with no folder name, which both adapters refuse before they connect.
 
   The delimiter fix has these tests:
-  - `Test_delimiterRewrite` and `Test_delimiterRewrite_When_TypedNameAndItsRewriteAreBothListed_Then_KeepsTheTypedName` - a rewrite is offered only for an unlisted name with a listed result; a listed name never changes;
+  - `Test_delimiterRewrite` and `Test_delimiterRewrite_When_TypedNameAndItsRewriteAreBothListed_Then_KeepsTheTypedName` - the function offers a rewrite only for an unlisted name with a listed result; a listed name never changes;
   - `Test_delimiterRewrite_When_ContextEnded_Then_ReturnsContextError`, `Test_delimiterRewrite_When_ContextEndsBetweenLookups_Then_ReturnsContextError` and `Test_collectDelimiterFixes_When_ContextEndsDuringLookup_Then_ReturnsContextError` - a context that ends returns its error;
   - `TestRunSync_When_TypedNameIsListed_Then_NoDelimiterPrompt` - a listed name gives no question;
   - `TestRunSync_When_TypedNameAndItsRewriteAreMissing_Then_NameIsKeptWithoutPrompt` - an unlisted name with no listed rewrite stays as typed, on the source side and on the destination side, with no question;
-  - `TestRunSync_When_TypedNameAndItsRewriteAreBothListed_Then_OnlyTheTypedFolderIsCopied` - the typed folder is copied and its rewrite is not;
+  - `TestRunSync_When_TypedNameAndItsRewriteAreBothListed_Then_OnlyTheTypedFolderIsCopied` - the run copies the typed folder and does not copy its rewrite;
   - `TestRunSync_When_DestinationListsTheRewrittenPath_Then_PathIsRewrittenAfterConfirmation` - the rewrite happens after the answer, or with `-y`;
   - `TestRunSync_When_DelimiterIsRewritten_Then_ConfigMapKeepsTheTypedNames` - the config `map` of the caller does not change;
   - `TestRunSync_When_MirroredNameHoldsDelimiterText_Then_FolderIsCopiedUnchanged` - a mirror run asks no question and keeps a name that holds delimiter text;
@@ -340,8 +347,8 @@
   - `TestRunSync_When_RenamedNameCarriesControlCharacters_Then_WarningShowsEscapesAndServerGetsExactName` - the notice escapes the names, and the servers get the exact names.
 
   The options `--src-folder` and `--dest-folder` have these tests:
-  - `TestRunSync_When_FolderFlagsNameAFolderWithSubfolders_Then_EachSubfolderIsCopiedBelowTheDestinationFolder` - the two options copy the folder and each subfolder at any depth below the destination folder. A sibling with the same prefix is not copied. A source with `.` gets `/` names on the destination. The command renames a level that holds the destination delimiter with `_`. A second run copies nothing;
-  - `TestRunSync_When_MappedSourceIsNoSelect_Then_OnlyItsChildrenAreCopied` - the config `map` and the two options give the same result. The source gets no EXAMINE for a `\Noselect` folder, and its subfolders copy below the destination folder;
+  - `TestRunSync_When_FolderFlagsNameAFolderWithSubfolders_Then_EachSubfolderIsCopiedBelowTheDestinationFolder` - the two options copy the folder and each subfolder at any depth below the destination folder. The run does not copy a sibling with the same prefix. A source with `.` gets `/` names on the destination. The run renames a level that holds the destination delimiter: `_` replaces the delimiter in that level. A second run copies nothing;
+  - `TestRunSync_When_MappedSourceIsNoSelect_Then_OnlyItsChildrenAreCopied` - with the config `map` and with the two options, the source gets no EXAMINE for a `\Noselect` folder. Its subfolders copy below the destination folder;
   - `TestRunSync_When_BothFolderFlagsGiven_Then_TheyReplaceConfiguredMappings` - the two options replace the config `map` items;
   - `TestRunSync_When_FolderOptionsNameTheInboxOfADotServer_Then_EachSubfolderGoesBelowTheDestinationInbox` - a source with the delimiter `.` holds INBOX, `INBOX.Trash` and `INBOX.Junk`. The options `-s INBOX -d INBOX` copy to a destination with the delimiter `/`. The subfolders go to `INBOX/Trash` and `INBOX/Junk`. The run asks no delimiter question and prints no rename notice. The destination can list `Inbox/Trash` on a server that matches the letter case of an INBOX child. Then the command copies the missing messages to that folder and creates only `INBOX/Junk`. A second run copies nothing, and the source gets no write command.
 
@@ -421,7 +428,7 @@
   - `TestRunSync_When_MirrorRunHasAGmailDestination_Then_EveryFolderAndSubfolderGetsOneCopyPerMessageId` - in a mirror run, each folder and each subfolder gets one copy of each Message-Id. Neither server gets an EXAMINE for the `\Noselect` folder `[Gmail]`. A second run copies nothing;
   - `TestRunSync_When_GmailDestinationRunsQuiet_Then_PrintsNoRepeatedCopiesLine` - with `--quiet`, the run prints no preview and no repeated-copies line;
   - `TestRunSync_When_VerbosePreviewHasRepeatedCopies_Then_LineComesBeforeTheUIDList` - with `--verbose`, the repeated-copies line comes after the "will copy" line and before the UID list;
-  - `TestRunSync_When_OnlyTheSourceAdvertisesGmailExtension_Then_CopyByCountStays` - a source that advertises the capability does not change the plan. All three copies are planned, and the preview has no repeated-copies line;
+  - `TestRunSync_When_OnlyTheSourceAdvertisesGmailExtension_Then_CopyByCountStays` - a source that advertises the capability does not change the plan. The plan holds all three copies, and the preview has no repeated-copies line;
   - `TestRunSync_When_DestinationAdvertisesGmailExtension_Then_VerboseRunNamesTheOneCopyRule` - with `--verbose`, the run prints the rule line one time, after the server delimiters and before the next section. This holds also when the destination already holds the Message-Id. The run prints no line without `--verbose`, with `--verbose` and `--quiet` together, or when only the source advertises the capability.
 
   The capability read in `runSync` and `runShow` has these tests:
@@ -442,14 +449,14 @@
   - `TestRunSync_When_TheFirstSharedMappingFails_Then_TheSecondCopiesTheSharedMessage` - a failed scan of the first mapping gives a folder failure, and the second mapping copies the shared message;
   - `TestRunSync_When_TheLastSharedMappingFailsItsScan_Then_EarlierPlansStillCopy` - a failed scan of the last mapping releases the reservations, and the earlier plans still copy;
   - `TestRunSync_When_TheFirstSharedMappingFailsAtCopyTime_Then_TheStandbyCopiesTheSharedMessageAndTheNextRunCopiesTheRest` - the source folder of the first mapping changes its UIDVALIDITY after the plan. The copy of the second mapping replaces the shared message in the same run. The first mapping counts one error. The next run copies the rest;
-  - `TestRunSync_When_AnEarlierMappingCoversALaterOne_Then_TheLaterOneHasNoPlan` - a later mapping whose messages are all covered gets no plan;
+  - `TestRunSync_When_AnEarlierMappingCoversALaterOne_Then_TheLaterOneHasNoPlan` - a later mapping gets no plan when an earlier mapping covers all its messages;
   - `TestRunSync_When_ExpandedSubfolderAndMappingShareADestination_Then_EachMessageIsCopiedOnce` - an expanded subfolder and a mapping with one destination copy each message one time;
   - `TestRunSync_When_MappingsNameOneDestinationInTwoLetterCasesOfInbox_Then_TheyShareTheFolder` - two letter cases of an INBOX level in the destination names give one folder;
   - `TestRunSync_When_SharedDestinationExistsButLISTHidesIt_Then_TheRecheckKeepsEachMessageOnce` - the check after CREATE keeps each message one time. This holds when the folder holds a message of the first plan, and when it holds a message of the second plan;
   - `TestRunSync_When_HiddenSharedDestinationHoldsOneSizeOfAMessageId_Then_ItEndsWithEverySize` - two mappings share a destination that holds one copy of a Message-Id. The destination is a folder that LIST hides, an INBOX that LIST hides, or a folder that LIST shows. The folder ends with both sizes and one APPEND, and the first run prints one "holds" line, for the second mapping. Two more runs copy nothing;
   - `TestRunSync_When_ThreeMappingsShareAHiddenDestination_Then_ItEndsWithTheLargestCount` - three mappings share a hidden destination, with one worker and with two workers. The run sends two APPEND commands, prints one "holds" line, for the second mapping, and the folder ends with three sizes. A second run copies nothing;
   - `TestRunSync_When_HiddenSharedDestinationKeepsTheFirstMappingsCopyAndItsBodyIsEmpty_Then_ItsStandbyArrives` - the plan that stays after the check keeps its standbys, so the copy of the second mapping replaces a first copy with an empty body;
-  - `TestRunSync_When_SharedDestinationCopiesDifferInSize_Then_EachDistinctCopyArrivesOnce` - copies of one Message-Id that differ in size arrive one time each;
+  - `TestRunSync_When_SharedDestinationCopiesDifferInSize_Then_EachDistinctCopyArrivesOnce` - copies of one Message-Id that are different in size arrive one time each;
   - `TestRunSync_When_SharedDestinationNameCarriesControlCharacters_Then_PreviewListsItOnceEscapedAndServerGetsOneExactCreate` - the list of folders to create names the destination one time, with escapes. The server gets one CREATE with the exact name.
 
   The standbys and the refused bodies have these tests:
@@ -488,7 +495,7 @@
 
   The UIDVALIDITY of a source folder has these tests:
   - `Test_buildSyncPlan_When_SourceFoldersHaveOwnUIDValidity_Then_EachPlanCarriesIt` - each plan holds the UIDVALIDITY of its own source folder;
-  - `TestRunSync_When_SourceSendsNoUIDValidity_Then_SyncCopiesNormally` - a plan with no UIDVALIDITY is never checked, also in the check after CREATE;
+  - `TestRunSync_When_SourceSendsNoUIDValidity_Then_SyncCopiesNormally` - the run never checks a plan with no UIDVALIDITY, also in the check after CREATE;
   - `TestRunSync_When_SourceUIDValidityChangesBeforeCopy_Then_PlanFailsAndNothingIsAppended` and `TestRunSync_When_SourceStopsReportingUIDValidityBeforeCopy_Then_PlanFailsAndNothingIsAppended` - a changed value, or no value, ends the stream before any UID FETCH. The run exits with code 1, and the next run copies the rest;
   - `TestRunSync_When_SourceUIDValidityChangesBeforeRecheck_Then_FolderFailsBeforeCopy` and `TestRunSync_When_SourceStopsReportingUIDValidityBeforeRecheck_Then_FolderFailsBeforeCopy` - the check after CREATE gives a folder failure before any APPEND. This holds for a kept selection and for a new EXAMINE;
   - `TestRunSync_When_CreateReportsExistingEmptyFolderAndSourceIsRebuilt_Then_TheStreamStopsBeforeAnyAppend` - an existing empty destination needs no source scan, so only the stream catches the change. The stream stops before any APPEND, and the next run copies all messages;
@@ -549,7 +556,7 @@
   - `Test_expandMappingsWithSubfolders_When_ExplicitMappingsNest_Then_MostSpecificWinsInEveryOrder` and `TestRunSync_When_ThreeNestedMappingsAreGiven_Then_MostSpecificWinsInEveryOrder` - the nearest mapping decides, whatever the order of the items;
   - `Test_expandMappingsWithSubfolders_When_ChildMappingOverridesParent_Then_VerboseNamesBothDestinations` - with `--verbose`, `printExpansion` prints the line "goes to ..., not to ..." that names both destinations. It prints one found-subfolder line, with the destination of the winner. The two orders of the items give one output. Without `--verbose`, it prints nothing;
   - `Test_expandMappingsWithSubfolders_When_ExplicitChildIsNoSelectOrUnlisted_Then_ItsChildrenFollowIt` - the children of a mapped `\Noselect` or unlisted folder follow the mapping of that folder;
-  - `Test_expandMappingsWithSubfolders_When_ExplicitDestinationEqualsRenamedDerivedName_Then_ExplicitEntryIsKept` - an explicit mapping keeps its typed destination when it equals a renamed derived name, and its entry is not marked renamed;
+  - `Test_expandMappingsWithSubfolders_When_ExplicitDestinationEqualsRenamedDerivedName_Then_ExplicitEntryIsKept` - a typed mapping keeps its destination when the destination equals a renamed derived name. The program does not mark its entry as renamed;
   - `Test_expandMappingsWithSubfolders_When_OverrideNamesCarryControlCharacters_Then_LineShowsEscapes` - the override line escapes the names;
   - `Test_expandMappingsWithSubfolders_When_QuietAndVerboseAreBothSet_Then_NothingIsPrinted` - with `--verbose` and `--quiet` together, `printExpansion` prints nothing, and the expansion still holds three folders;
   - `TestRunSync_When_ParentAndChildFoldersAreBothMapped_Then_ChildMappingWinsInEitherOrder` - the child mapping decides, and a second run sends no APPEND;
@@ -629,7 +636,7 @@
   - `TestRunSync_When_DestinationsDifferOnlyInLetterCase_Then_WarningShowsAndEachFolderCopies` - the warning shows before the prompt, also with `--quiet`, and each folder gets its messages.
 
   The provider warning has these tests:
-  - `Test_buildProviderWarning_When_SideHasADailyQuota_Then_NamesTheDailyCap` - the full text for a Gmail destination, a Gmail source and Gmail on both sides, with and without a limiter. Each Gmail side gets one line with the daily quota of its direction: upload for a destination and download for a source. The line also shows when the user sets a limiter. The recommended rates are 5000 and 27000;
+  - `Test_buildProviderWarning_When_SideHasADailyQuota_Then_NamesTheDailyCap` - the full text for a Gmail destination, a Gmail source and Gmail on both sides, with and without a limiter. Each Gmail side gets one line with the daily quota of its direction: upload for a destination and download for a source. The line shows also when the user sets a limiter. The recommended rates are 5000 and 27000;
   - `Test_buildUploadLimitWarning_When_GmailRecommendationRunsWithMostWorkers_Then_ReturnsEmpty` - the recommended upload rate of Gmail gives no upload-limit warning with 10 workers;
   - `TestRunSync_When_ProviderIsKnown_Then_WarnsBeforeConnecting` - the warning shows before any dial and holds the daily quota line and the recommended rate. With `--quiet`, the run writes nothing.
 
@@ -640,7 +647,7 @@
   - `TestRunSync_When_ExistingDestinationNeedsARecheck_Then_PlanningSessionsLogOutAfterItAndBeforeTheWorkers` - the check after CREATE uses the planning Clients. Each server sees LOGIN and LOGOUT for the planning session, then LOGIN and LOGOUT for the worker. A check after the logout shows as a reconnect LOGIN, so the test expects none;
   - `TestRunSync_When_OnePlanningSideFailsToConnect_Then_TheOtherSideLogsOutOnce` - a refused LOGIN on the source, or on the destination, ends the run with the error `source connection failed` or `destination connection failed`. The other side connects first and logs out one time. Neither server gets an EXAMINE, STATUS, FETCH, CREATE or APPEND;
   - `TestRunSync_When_PlanningServersNeverAnswerLogout_Then_WorkersConnectAfterOneLogoutLimit` - with a cap of 1, both servers hold the first LOGOUT and never answer it. The first worker logs in about one logout limit (2 s) after the planning LOGOUT, because both planning sessions log out at the same time. The server refuses no LOGIN, and the largest number of open sessions is 1;
-  - `TestFakeServer_watchSessions_When_LoginsExceedTheLimit_Then_OnlyThoseLoginsAreRefused` - the session log keeps the LOGIN and LOGOUT commands in order and refuses a LOGIN above the limit. It accepts a LOGIN after a LOGOUT frees a session. It counts the largest number of open sessions and the refused LOGINs;
+  - `TestFakeServer_watchSessions_When_LoginsExceedTheLimit_Then_OnlyThoseLoginsAreRefused` - the session log keeps the LOGIN and LOGOUT commands in order. It refuses a LOGIN above the limit. It accepts a LOGIN after a LOGOUT frees a session. It counts the largest number of open sessions and the refused LOGINs;
   - `TestFakeServer_watchSessions_When_RefusedConnectionLogsOut_Then_OpenSessionsStayCounted` - a LOGOUT on a refused connection frees no session, so the server refuses the later LOGIN too.
 
   The screen model has this test:
@@ -659,10 +666,10 @@
     - The cases are:
       - a success;
       - refused appends;
-      - a folder that cannot be scanned;
+      - a folder that the run cannot scan;
       - refused appends with a failed folder;
       - a throttle stop;
-      - a throttle stop with an unstarted plan and a folder that cannot be scanned;
+      - a throttle stop with an unstarted plan and a folder that the run cannot scan;
       - a throttle stop with `--quiet`: the output holds no escape sequence, and the stop line shows one time;
   - `TestRunSync_When_PlanAndWorkerCountsDiffer_Then_EachRedrawHoldsAtMostOneTrackerPerBusyWorker` - no redraw of the copy rewinds more rows than the number of workers that have a plan. Each server sees one LOGIN for the planning Client and one for each worker that has a plan. Each plan shows one numbered row, and the final row of each plan shows done, error or `Stopped`. No `Waiting` row shows. The cases are:
     - one worker, four plans;
@@ -729,7 +736,7 @@
   - `TestRunSync_When_ParentLevelNameCarriesControlCharacters_Then_PreviewShowsEscapesAndServerGetsExactNames` - the preview escapes a parent level and its child. The CREATE commands carry the exact names;
   - `TestRunSync_When_HiddenParentAnswersAlreadyExists_Then_CounterLeavesItOut` - a parent that LIST hides and CREATE reports as existing is in the preview, but the counter does not count it (`Created 1 folders`);
   - `TestRunSync_When_HiddenFolderAnswersAlreadyExistsAfterItsParentIsMade_Then_OnlyTheMissingMessageIsCopied` - a folder that LIST hides, below a parent that CREATE makes, gets only the missing message. The counter shows `Created 1 folders`, and a second run sends no APPEND;
-  - `TestRunSync_When_SourceFolderHasNoMessageToCopy_Then_NoDestinationFolderIsCreated` - a mirror run creates a destination folder only for a source folder that has a message to copy. It also creates the missing parents of that folder. Each subtest checks the CREATE commands on the wire. The subtests are:
+  - `TestRunSync_When_SourceFolderHasNoMessageToCopy_Then_NoDestinationFolderIsCreated` - a mirror run creates a destination folder only for a source folder that has a message to copy. The run also creates the missing parents of that folder. Each subtest checks the CREATE commands on the wire. The subtests are:
     - `empty folder next to a folder with a message` - the CREATE commands name `A` only, and the destination has no `Empty` folder. The preview lists `A` only, directly before the total of 1 message. The source gets no write command. After the test adds a message to `Empty`, a second run creates `Empty` and copies the message;
     - `folder whose messages have no Message-Id` - the CREATE commands name `A` only, and the destination has no `NoIds` folder. The preview lists `A` only;
     - `no folder has a message to copy` - the output shows `All folders already synced!`. It shows no list of folders to create and no question. The destination gets no CREATE and no APPEND;
@@ -747,7 +754,7 @@
   - `Test_newShowColors` - quiet mode gives plain colours. Normal mode gives a bold bright-cyan title and bold totals;
   - `TestPrintAccountInfo_When_MailboxesGiven_Then_RendersHeaderRowsAndTotals` - plain colours give output with no escape sequence. The `show` colours give the same text after the test removes the sequences;
   - the other `show` tests read quiet output raw (`shownText`), so any ESC byte fails them. They remove colour codes only from output that is not quiet.
-- **`internal/progress`** - interface compliance against the contract `internal/client` expects. The `Stop` tests cover the render loop:
+- **`internal/progress`** - the progress display. The tests check that the package follows the interface contract that `internal/client` expects. The `Stop` tests cover the render loop:
   - `TestWriter_Stop_whenCalledRightAfterStart_endsTheRenderGoroutine` - a `Stop` right after `Start` ends the render loop, in 500 runs;
   - `TestWriter_Stop_isSafeBeforeStartAndWhenRepeated` - `Stop` is safe before `Start` and when repeated, and no render loop runs after it;
   - `TestWriter_Stop_whenQuiet_writesNothingToStdout` - a quiet writer with a tracker and a queued log writes nothing to stdout;
@@ -771,8 +778,8 @@
   - `Test_execute_When_FirstArgumentNamesNoCommand_Then_PrintsOneErrorLineAndExits1` - a first argument that is not a command gives one `Error: unknown command ...` line on stderr, no output on stdout and exit code 1. This holds for `snyc`, `h`, `help x`, `help help`, an empty argument and an argument with a line break. The root action does not load the config file, also when the `-c` file does not exist. `help sync extra` gives one `unexpected argument` line;
   - `Test_execute_When_FormIsValid_Then_KeepsItsOutputAndExits0` - no argument, `--`, `-h` and `help` print the same root help as `--help`. `help sync`, `help show` and `--help sync` print the help of that command. `--version` and `-v` print the version. Each form exits with code 0 and prints nothing on stderr;
   - `Test_execute_When_RootHelpIsShown_Then_VersionSectionHoldsTheOfflineBuildString` - the VERSION section of the root help is the text from `helpers.Version`. It is not the release tag from GitHub, which only `--version` shows;
-  - `Test_execute_When_HelpFlagNamesNoCommand_Then_PrintsOneErrorLineAndExits1` - `--help x`, `x --help` and `-h x` give one `Error:` line with the text of urfave/cli, and exit code 1. The test checks only that the line starts with the word `Error:` and holds `x`;
-  - `Test_execute_When_FirstArgumentNamesACommand_Then_TheCommandHandlesTheRest` - `sync help` and `show extra` keep their `unexpected argument` line. `show` with a missing config file gives one line that starts with `Error: load config:`. No case gives `unknown command`;
+  - `Test_execute_When_HelpFlagNamesNoCommand_Then_PrintsOneErrorLineAndExits1` - `--help x`, `x --help` and `-h x` give one `Error:` line with the text of urfave/cli, and exit code 1. The test checks only that the line starts with `Error:` and a space, and holds `x`;
+  - `Test_execute_When_FirstArgumentNamesACommand_Then_TheCommandHandlesTheRest` - `sync help` and `show extra` keep their `unexpected argument` line. `show` with a missing config file gives one line that starts with `Error: load config:` and a space. No case gives `unknown command`;
   - `Test_execute_When_OptionIsWrong_Then_PrintsUsageThenOneErrorLineAndExits1` - a wrong option gives the help and the usage, and then one `Error:` line. The cases are `snyc -y`, `-y`, `--bogus`, `sync -s` with no value, `sync --bogus` and `show --bogus`. The help of the root or of the command goes to stdout. Stderr holds the `Incorrect Usage:` line of urfave/cli, an empty line and one `Error:` line with the same reason. The exit code is 1. The test checks the shape and not the words of the reason;
   - `Test_execute_When_HelpFormIsRefused_Then_PrintsOneErrorLineAndExits1` - `help --help` and `help sync --help` give one `Error:` line, no output on stdout and exit code 1. The second form gives `unexpected argument "--help"`;
   - `Test_execute_When_ConfigFlagHasNoCommand_Then_ShowsRootHelpWithoutLoadingTheFile` - `-c FILE`, `--config FILE`, `-c FILE help` and `-c FILE --` print the root help, also when the file does not exist. Each form exits with code 0 and prints nothing on stderr;
@@ -793,7 +800,7 @@
 ## Rules for fake-server fixtures
 
 - A fixture that refuses a command writes the tagged NO or BAD reply and keeps the session open. It does not close the socket before the next command of the client.
-- Do not write a refusal and a close together. go-imap v1 `execute` picks at random between a closed session and a status reply that are both ready (`vendor/github.com/emersion/go-imap/client/client.go:276-292`). On some runs, the client then reads `imap: connection closed`, which is `ClassTransient`. Such a test can fail at random, mostly under CPU load.
+- Do not write a refusal and a close together. The `execute` function of go-imap v1 picks at random between a closed session and a status reply that are both ready (`vendor/github.com/emersion/go-imap/client/client.go:276-292`). On some runs, the client then reads `imap: connection closed`, which is `ClassTransient`. Such a test can fail at random, mostly under CPU load.
 - A fixture can close the socket with the refusal only when the test result does not depend on the reply. For example, the test cancels the Client first (`Test_StreamMessagesByUIDs_When_CancelledAfterARefusedBatch_Then_ReturnsCanceledAndFetchesNoMore`).
 - If a test needs a BYE or a closed socket after a refusal, the fixture sends it as the answer to the next command. `Test_StreamMessagesByUIDs_When_UIDValidityChangesAfterARefusedBatch_Then_TheStreamStops` sends the BYE for the second UID FETCH. `connHandlerWithLoginReply` keeps the socket open after a refused LOGIN.
 - CLAUDE.md, Section 3, describes the effect of this pick on a real server.
@@ -803,32 +810,32 @@
 - A hook that reads `callCount` is correct only when one connection sends the verb at a time. An example is a test with one worker.
 - A test of a hook that acts on the nth command sends the verb from all connections together (`atOnce`). It holds each command until the server records all of them (`gatherCommands`). `TestFakeServer_stallNth_When_ConnectionsSendTheVerbAtOnce_Then_OnlyTheNthCommandIsHeld`, `TestFakeServer_refuseLoginAt_When_ConnectionsLoginAtOnce_Then_OnlyTheNthLoginIsRefused` and `TestFakeServer_dropAtAppendAndRefuseLogin_When_ConnectionsAppendAtOnce_Then_OnlyTheNthAppendIsDropped` follow this pattern.
 
-## What we deliberately don't test
+## What we do not test
 
-If a behaviour is hard to test, test it at integration level. If you cannot do that, record it in this file as a deliberate exclusion and give the reason. These are examples of acceptable exclusions:
+If a behaviour is hard to test, test it at the integration level. If you cannot do that, record it in this file as a deliberate exclusion. Give the reason. These are examples of acceptable exclusions:
 
-- The TLS handshake itself (delegated to stdlib).
-- `goreleaser` output (delegated to goreleaser).
-- The `urfave/cli/v3` flag parsing wiring in `cmd/imapsync-go/main.go` (declarative; failure mode is a CLI parse error from the library).
+- The TLS handshake. The standard library does it.
+- The output of `goreleaser`. The `goreleaser` project tests it.
+- The wiring of the `urfave/cli/v3` flag parsing in `cmd/imapsync-go/main.go`. The wiring only declares the flags, and a failure gives a CLI parse error from the library.
 
 ### Deliberate exclusions in `internal/client`
 
-- **`client.New`** - the `Test_New_*` tests cover CRAM-MD5, dial failure, LIST refusal, CAPABILITY refusal, cancel during LOGIN, cancel during the CAPABILITY read and shared limiters. Only `internal/app` tests cover two branches: the `tls.Dialer` path and the default dial timeout. The `tls.Dialer` test uses a plaintext server, so a handshake error is expected. The standard library handles a successful TLS handshake, so no test covers it.
+- **`client.New`** - the `Test_New_*` tests cover CRAM-MD5, dial failure, LIST refusal, CAPABILITY refusal, cancel during LOGIN, cancel during the CAPABILITY read and shared limiters. Only `internal/app` tests cover two branches: the `tls.Dialer` path and the default dial timeout. The `tls.Dialer` test uses a plaintext server, so the test expects a handshake error. The standard library handles a successful TLS handshake, so no test covers it.
 - **Goroutine count after a failed `client.New`** - a goroutine count is not stable in a process that runs parallel tests. So the tests for a connection that drops during the capability check do not count goroutines. They prove that the client closes every socket:
   - the fake server keeps each session open until the client hangs up. `dropThenHold` half-closes the first session like a dropped connection. `holdAfterLoginReply` answers LOGOUT without a BYE, so only the client can close the session;
   - each test waits until the server sees the end of every session, so it fails when `New` leaves one session open;
   - `disableGC` stops a finalizer from closing a socket that the code leaked. This setting is process-wide, so these two tests run in sequence;
   - `Test_New_When_ConnectionDropsDuringCapabilityCheckAndReloginIsRefusedPermanently_Then_FailsAndClosesEverySocket` also checks the error text, the class `ClassPermanent` and two LOGIN commands;
   - `Test_New_When_ConnectionDropsDuringCapabilityCheckAndEveryReloginFailsTemporarily_Then_FailsWithTheLabel` also checks that the error names the label. It checks one LOGIN for the first session and one for each reconnect attempt.
-- **`Client.SetProgressTracker`** - symmetric with `SetProgressWriter`; both are nil-and-non-nil atomic.Pointer stores already exercised by `SetProgressWriter` tests.
-- **`realSleepCtx`** - production sleep implementation. Tests substitute the package-level `sleepCtx` var; the real implementation is stdlib `time.NewTimer` and its correctness is delegated to stdlib.
+- **`Client.SetProgressTracker`** - the function works in the same way as `SetProgressWriter`. Both store a nil or a non-nil value in an atomic.Pointer, and the tests of `SetProgressWriter` already test this store.
+- **`realSleepCtx`** - the production sleep function. The tests replace the package-level `sleepCtx` variable. The real function uses `time.NewTimer` from the standard library, and the standard library tests the timer.
 - **Post-success `ctx.Err()` re-checks** - each check runs after a call succeeds. `withCancel` terminates the connection asynchronously, so the outcome at that boundary is a race. The checks are in these places:
   - `StreamMessagesByUIDs`, at the top of the second and later batches;
   - `CreateMailbox`, after the parent walk;
   - `createParentFolders`, at the top of the loop;
   - `ListMailboxes`, after the LIST;
   - `getFolderSize`, after success.
-- **`greet` tie between the context and the timer** - the context and `dialTimeout` can end at the same moment. Both events close the connection, so they race. Both resulting errors describe the failure correctly. No deterministic test can reach the tie. Two tests cover the separate causes:
+- **`greet` tie between the context and the timer** - the context and `dialTimeout` can end at the same moment. Both events close the connection, so they race. Both errors describe the failure correctly. No deterministic test can reach the tie. Two tests cover the separate causes:
   - `Test_New_When_ServerNeverGreets_Then_ContextCancelReturns` covers the context;
   - `Test_New_When_ServerNeverGreets_Then_FailsAfterDialTimeout` covers the timer.
 - **`greet` failure paths that route the logger of a dropped client** - `greet` calls `routeErrorLog` also when it drops the client, so the reader of that client does not write to stderr. `imapclient.New` creates its logger on `os.Stderr`, and the dropped client is not reachable from a test. A check needs a capture of `os.Stderr` for the whole process. Two tests cover the routing on the success path:
@@ -841,18 +848,18 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
   - `connectAndLogin` stores `c.idle` before `c.c`.
 
   A deterministic test needs a production hook between two atomic operations. The tests cover the behaviour on both sides of each ordering.
-- **`AppendMessage` with a server that is silent between the `{N}` line and the `+` continuation** - go-imap blocks the caller on `<-w.continues`, and a closed socket does not release it. A test of this window would hang. The cause is the same as in the Known limitation in `CLAUDE.md`. Two nearby paths have tests:
+- **`AppendMessage` with a server that is silent between the `{N}` line and the `+` continuation** - go-imap blocks the caller on `<-w.continues`, and a closed socket does not release it. A test of this window can hang. The cause is the same as in the Known limitation in `CLAUDE.md`. Two nearby paths have tests:
   - `Test_AppendMessage_When_ServerNeverAnswersAfterLiteral_Then_WatchdogTripsAndRepairs` covers a server that is silent after the literal;
   - `Test_AppendMessage_When_ServerStopsReadingLiteral_Then_WatchdogTripsAndRepairs` covers a server that stops reading the literal.
-- **`StreamMessagesByUIDs`, the status check after the kept-selection fallback** - `status` is nil there only when a BYE arrives between the mailbox read in `selectIfNeeded` and the fallback read. go-imap v1 sets `LogoutState` and clears the mailbox under one lock, so the UID FETCH returns `ErrNoMailboxSelected` and sends no command. `classifyError` treats this error as `ClassTransient`, so `safeCall` reconnects and the retry session runs the check again. A deterministic test needs a hook between the two mailbox reads. `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` covers the kept-selection path on both sides of the UIDVALIDITY comparison.
+- **`StreamMessagesByUIDs`, the status check after the kept-selection fallback** - `status` is nil there only when a BYE arrives between the mailbox read in `selectIfNeeded` and the fallback read. The go-imap v1 library sets `LogoutState` and clears the mailbox under one lock, so the UID FETCH returns `ErrNoMailboxSelected` and sends no command. `classifyError` treats this error as `ClassTransient`, so `safeCall` reconnects and the retry session runs the check again. A deterministic test needs a hook between the two mailbox reads. `Test_StreamMessagesByUIDs_When_KeptSelectionHasOtherUIDValidity_Then_FetchesNothing` covers the kept-selection path on both sides of the UIDVALIDITY comparison.
 - **The buffer of the scans that fetch no body** - `messageChanBuffer` only sets how far the reader goroutine runs ahead of the scan loop. Two scans use it: the Message-Id scan in `fetch.go` (`scanMessageIDs`) and the size scan of `ListMailboxes` in `mailbox.go` (`getFolderSize`). Neither loop waits for a caller, so no command, count or result depends on the size. `Test_StreamMessagesByUIDs_When_CallbackBlocks_Then_AtMostOneBodyIsReadAhead` tests the body stream, which must not use the buffer.
 
 ### Deliberate exclusions in `internal/app`
 
-- **`runFolderSync` post-append `ctx.Err()` check** - The check stops the loop when an APPEND finishes after the context is canceled. `withCancel` registers a `context.AfterFunc` that calls `Cancel()`, and `Cancel()` terminates the connection asynchronously. An APPEND that finishes at the same time can return nil, not an error. This is a race window, and the test has no deterministic hook to reach it. The `(synced, errors)` result is the same with or without the check. The check saves at most one extra iteration.
-- **`app.traceTracker`** - a diagnostic that writes to stderr. It is active only when `IMAPSYNC_TRACE` is set.
+- **`runFolderSync` post-append `ctx.Err()` check** - The check stops the loop when an APPEND finishes after the context ends. `withCancel` registers a `context.AfterFunc` that calls `Cancel()`, and `Cancel()` terminates the connection asynchronously. An APPEND that finishes at the same time can return nil, not an error. This is a race window, and the test has no deterministic hook to reach it. The `(synced, errors)` result is the same with or without the check. The check saves at most one extra iteration.
+- **`app.traceTracker`** - a diagnostic that writes to stderr. It is active only when the environment variable `IMAPSYNC_TRACE` is not empty.
 - **`ActionSync` verbose `Fetching config...` line** - `ActionSync` writes it to `os.Stdout` before the config loads. It is the only output that does not go through the injected writer.
-- **Boundary `ctx.Err()` re-checks** - each check reads the context of the caller between two calls that give no observable event. A test can reach such a check only with a context that ends on a given call of `Err`. That test depends on the number of `Err` calls in `internal/client` and in the code before the check, so a refactor that keeps the behaviour breaks it. `TestRunSync_When_CanceledAtPhaseBoundary_Then_NothingMoreIsSent` and `TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted` test the end-to-end property. The re-checks are in these places:
+- **Boundary `ctx.Err()` re-checks** - each check reads the context of the caller between two calls that give no event that a test can see. A test can reach such a check only with a context that ends on a given call of `Err`. That test depends on the number of `Err` calls in `internal/client` and in the code before the check. So a refactor that keeps the behaviour breaks the test. `TestRunSync_When_CanceledAtPhaseBoundary_Then_NothingMoreIsSent` and `TestRunSync_When_CanceledDuringAppend_Then_NoFurtherPlanIsStarted` test the end-to-end property. The re-checks are in these places:
   - `runSync`, after the connect errgroup;
   - `runSync`, at the top of the dispatch loop;
   - `expandMappingsWithSubfolders`, in the per-mapping loop, after `getSubfolders` and in the per-subfolder loop;
@@ -874,25 +881,25 @@ If a behaviour is hard to test, test it at integration level. If you cannot do t
 - **The Justfile tests without `just` or `git`** - `TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild` and `TestJustfile_When_VersionHoldsShellSyntax_Then_BuildRecipesPassLdflagsAsOneArgument` run the real `just` and `git` programs. If one of them is not in PATH, the test skips with `t.Skipf`. CI and the developer machine have both programs.
 - **`helpers.latestTag`** - the function makes a live call to the GitHub API. The tests skip it through `IMAPSYNC_OFFLINE` or `CI`. `TestFetchTag` covers `fetchTag`, which sends the request, against an `httptest` server. The other tests cover only the offline return and the `Version` format.
 
-If the tester finds an untested branch that does not match an existing exclusion, the choice is:
+This procedure is for the tester. If a branch has no test and matches no existing exclusion, do one of these steps:
 
-1. Add a test (preferred).
-2. If the branch is genuinely untestable in isolation (e.g. network races), propose an integration test or add it to the exclusions list with reasoning.
+1. Add a test. This is the first choice.
+2. Use this step if you cannot test the branch by itself, for example a network race. Propose an integration test or add the branch to the list of exclusions with the reason.
 
 ## Test commands
 
-- `just test` - full suite.
-- `go test ./internal/client -run TestFunc` - single test.
-- `go test -race ./...` - race detector. Run before declaring done on anything that touches goroutines.
-- `go test -cover ./internal/<pkg>` - coverage for one package.
-- `go test -coverprofile=cover.out ./... && go tool cover -func=cover.out | sort -k3 -n` - coverage report sorted by % (find the holes fast).
+- `just test` - runs all the tests.
+- `go test ./internal/client -run TestFunc` - runs one test.
+- `go test -race ./...` - runs the tests with the race detector. Run it before you report a change that touches goroutines as done.
+- `go test -cover ./internal/<pkg>` - shows the coverage of one package.
+- `go test -coverprofile=cover.out ./... && go tool cover -func=cover.out | sort -k3 -n` - shows the coverage report, sorted by percentage. Use it to find the functions with low coverage.
 
 ## When a test fails
 
-- Do not "fix" by adjusting the assertion to match observed behaviour. Find the regression.
-- If the failure is in a test the developer just wrote and the new code is correct, the test is wrong - fix the test, explain in the developer→architect report.
-- If the failure is in a pre-existing test, stop. Report to architect. Do not modify pre-existing tests without explicit instruction.
+- Do not change the assertion to match the result of the code. Find the regression.
+- If a test that the developer wrote for this change fails and the new code is correct, the test is wrong. Fix the test. Explain the change in the report from the developer to the architect.
+- If an existing test fails, stop. Report the failure to the architect. Do not change an existing test without a clear instruction.
 
 ## Race detector
 
-`just run` runs `go run -race`. If you introduce concurrency, run `go test -race ./...` locally and report the result.
+`just run` runs `go run -race`. If you add concurrency, run `go test -race ./...` on your computer. Report the result.

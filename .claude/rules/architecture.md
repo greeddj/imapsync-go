@@ -18,7 +18,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 3. **`BODY.PEEK[...]` everywhere a body or header is fetched** - `FetchRFC822` sets `\Seen` on the source, which is a write a sync tool must not perform.
 4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. After a `ClassTransient` failure, it reconnects and sends the APPEND again one time, only when go-imap did not start to read the body. After go-imap started to read the body, it sends no second APPEND, because the server can already have the message. The next run's Message-Id diff copies it. Do not move `AppendMessage` into `safeCall`, because `safeCall` retries also after a partial read.
 5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch - servers reject longer arg lists.
-6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state. Do not store the selected folder in the Client: a stored copy can differ from the real session.
+6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state. Do not store the selected folder in the Client: a stored copy can be different from the real session.
 7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
 8. **`FetchMessageMap` limits the size hint of its map to `maxMessageMapHint`.** The server sets the message count, and a very large count must not cause a large allocation.
 9. **The body stream has no read-ahead buffer.** The message channel of `StreamMessagesByUIDs` has no buffer, because go-imap holds each body fully in memory. A worker then holds at most two bodies. `messageChanBuffer` is only for the scans that fetch no body.
@@ -79,7 +79,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 
 - `fieldalignment` is enforced. Reorder struct fields, never silence the linter.
 - Config format is extension-driven (`.json` / `.yaml` / `.yml`). Add new fields to both example files.
-- Config decoding is strict: `DisallowUnknownFields` for JSON and `KnownFields(true)` for YAML. Do not relax it. A new config field needs a `json` tag and a `yaml` tag with the same key. If the keys differ, one format rejects the key.
+- Config decoding is strict: `DisallowUnknownFields` for JSON and `KnownFields(true)` for YAML. Do not relax it. A new config field needs a `json` tag and a `yaml` tag with the same key. If the keys are different, one format rejects the key.
 - Deps are vendored. After `go.mod` changes, `just deps` (which runs `mod tidy && mod vendor`) is mandatory.
 - Releases are produced by `goreleaser`. Do not hand-edit `dist/`.
 - The container build context is a per-platform tree (`<goos>/<goarch>/dist/imapsync-go`). `dockers_v2` in `.goreleaser.yml`, the `ARG TARGETPLATFORM` copy in `Dockerfile`, and the staging step in the Justfile `oci` target must agree on it. `latest` is emitted only when the git tag carries no prerelease part - `.Prerelease` is read from the tag, not from `.Version`, so a local snapshot still tags `latest`.
