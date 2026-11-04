@@ -44,7 +44,6 @@ func run() int {
 	return execute(ctx, os.Args, os.Stdout, os.Stderr)
 }
 
-// printVersion shows only the version.
 func printVersion(c *cli.Command) {
 	_, _ = fmt.Fprintln(c.Writer, helpers.LatestVersion(Version))
 }
@@ -116,7 +115,7 @@ type signalError struct{ sig os.Signal }
 
 func (e signalError) Error() string { return e.sig.String() + " signal received" }
 
-// exitInterrupt is 128 + SIGINT. A cancel that no signal names also exits with it.
+// A cancel that no signal names exits with the SIGINT code.
 const exitInterrupt = 128 + int(syscall.SIGINT)
 
 // cancelExitCode gives 128 + the signal number, so the exit code tells SIGTERM from Ctrl-C.

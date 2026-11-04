@@ -19680,7 +19680,6 @@ func TestRunSync_When_OnePlanningSideFailsToConnect_Then_TheOtherSideLogsOutOnce
 	}
 }
 
-// firstStamp keeps the time of the first call to set.
 type firstStamp struct {
 	at time.Time
 	mu sync.Mutex

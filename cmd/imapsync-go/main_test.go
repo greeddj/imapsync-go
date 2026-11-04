@@ -55,7 +55,6 @@ func TestInstallQuitDump_When_SIGQUITArrives_Then_DumpsEveryGoroutineAndExits131
 	}
 }
 
-// otherSignal is an os.Signal that is not a syscall.Signal.
 type otherSignal struct{}
 
 func (otherSignal) Signal()        {}
@@ -317,7 +316,6 @@ func Test_notifySignals_When_SignalArrives_Then_ExitCodeNamesIt(t *testing.T) {
 	}
 }
 
-// The first lines of the help of each command, as urfave/cli prints them.
 const (
 	rootHelpName = "NAME:\n   imapsync-go - IMAP to IMAP synchronization tool\n"
 	syncHelpName = "NAME:\n   imapsync-go sync - sync IMAP dir(s) between two servers\n"
@@ -1153,8 +1151,7 @@ func Test_execute_When_ConfigFlagHasNoCommand_Then_ShowsRootHelpWithoutLoadingTh
 	}
 }
 
-// listenSilent accepts connections and never answers. A TLS handshake against
-// it waits until the caller gives up. accepted closes at the first connection.
+// A TLS handshake against a silent server waits for the caller, so the command still runs when the signal arrives.
 func listenSilent(t *testing.T) (addr string, accepted <-chan struct{}) {
 	t.Helper()
 

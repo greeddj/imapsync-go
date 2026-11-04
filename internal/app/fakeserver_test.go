@@ -1038,7 +1038,6 @@ func (s *fakeServer) refuseLoginAt(n int) {
 	s.store.loginRefusal = n
 }
 
-// sessionLog records the LOGIN and LOGOUT commands of one server in arrival order, and how many sessions are open at once.
 type sessionLog struct {
 	// LOGIN numbers of the open sessions; the cleanup LOGOUT of a refused connection frees none.
 	admitted map[int]bool
@@ -1049,7 +1048,6 @@ type sessionLog struct {
 	refused  int
 }
 
-// watchSessions logs the sessions of a store-backed server and refuses each LOGIN above a positive limit.
 // LOGINs must be sequential: refuseLoginAt holds one number. A LOGOUT frees only admitted sessions.
 func (s *fakeServer) watchSessions(limit int) *sessionLog {
 	l := &sessionLog{admitted: make(map[int]bool)}
@@ -1077,7 +1075,7 @@ func (s *fakeServer) watchSessions(limit int) *sessionLog {
 	return l
 }
 
-// endSessions runs when a LOGOUT arrives, before any hook can stall its reply, so the server frees the session at once. logins holds the LOGIN numbers of the connection.
+// endSessions runs before any hook can stall the LOGOUT reply, so the server frees the session at once.
 func (s *fakeServer) endSessions(logins []int) {
 	s.mu.Lock()
 	l := s.sessions
@@ -2203,7 +2201,6 @@ func TestFakeServer_refuseLoginAt_When_ConnectionsLoginAtOnce_Then_OnlyTheNthLog
 	}
 }
 
-// storeCommand sends one tagged command and returns the tagged reply, without the untagged lines before it.
 func storeCommand(t *testing.T, c *storeConn, tag, text string) string {
 	t.Helper()
 	if err := c.write(tag + " " + text + "\r\n"); err != nil {

@@ -2071,7 +2071,7 @@ func printExpansion(out io.Writer, r expansionReport, planned []folderMapping, v
 	}
 }
 
-// runSync logs the planning clients out before the workers connect, so every maxConn slot goes to a worker. The result is at least 1.
+// maxConn needs no slot for a planning client, because runSync logs the planning clients out before the workers connect.
 func computeEffectiveWorkers(workers, maxConn, planCount int) int {
 	eff := workers
 	if maxConn > 0 && maxConn < eff {

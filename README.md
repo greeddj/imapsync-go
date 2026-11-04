@@ -413,7 +413,8 @@ When the source or the destination is `imap.gmail.com`, `sync` shows a warning b
 
 - 15 IMAP sessions at the same time for each account.
 - 2,500 MB of download and 500 MB of upload for each account each day.
-- If an account goes above a limit, Gmail can stop its IMAP access for 1 to 24 hours.
+
+If an account goes above a limit, Gmail can stop its IMAP access for 1 to 24 hours.
 
 For each Gmail side, the warning also names the daily quota of the direction that `sync` uses. This is the upload quota for a destination and the download quota for a source.
 
@@ -463,7 +464,7 @@ A refusal that repeats a folder name can stop `sync`. Some servers repeat the fo
 - **Ctrl-C** exits with code 130 and prints `Cancelled.` - this is the standard Unix convention for SIGINT termination and makes it composable in shell scripts.
 - **SIGTERM** (for example from `kill` or `podman stop`) prints `Cancelled.` and exits with code 143, which is 128 plus the signal number.
 - **Ctrl+\\** (SIGQUIT) writes the stacks of all goroutines to stderr and exits with code 131.
-- **`--version` on source builds** makes one HTTPS request to the GitHub releases API to fetch the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default. Other commands and `--help` make no request.
+- **`--version` on a build without a version** (for example `go build` with no `-X main.Version`) makes one HTTPS request to the GitHub releases API. The request fetches the latest tag. Set `IMAPSYNC_OFFLINE=1` or run inside a CI environment (any non-empty `CI` variable) to skip that call and fall back to the build-time default. Other commands and `--help` make no request. The recipes `just build` and `just build_linux` set the version from `git describe`, so these binaries make no request.
 
 ## Terminal output
 
