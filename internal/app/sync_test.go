@@ -19468,6 +19468,9 @@ func TestRunSync_When_MaxConnectionsIsSet_Then_NoSideHoldsMoreSessionsThanTheCap
 		{name: "cap of one", workers: 4, maxConn: 1, plans: 3, wantWorkers: 1},
 		{name: "cap of three with more plans than workers", workers: 4, maxConn: 3, plans: 5, wantWorkers: 3},
 		{name: "no cap", workers: 2, maxConn: 0, plans: 3, wantWorkers: 2},
+		{name: "cap and workers above the plans", workers: 4, maxConn: 3, plans: 2, wantWorkers: 2},
+		{name: "no cap and workers above the plans", workers: 4, maxConn: 0, plans: 2, wantWorkers: 2},
+		{name: "cap above the plans and the workers", workers: 4, maxConn: 9, plans: 2, wantWorkers: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -19600,6 +19603,327 @@ func TestRunSync_When_RunEndsBeforeTheCopy_Then_EachPlanningSessionLogsOutOnce(t
 			assertContainsNone(t, out.String(), "Sync completed successfully")
 			assertIDs(t, "source events", srcSessions.eventList(), tt.wantEvents...)
 			assertIDs(t, "destination events", dstSessions.eventList(), tt.wantEvents...)
+		})
+	}
+}
+
+func TestRunSync_When_ExistingDestinationNeedsARecheck_Then_PlanningSessionsLogOutAfterItAndBeforeTheWorkers(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"Work": fakeMsgs("m1@x", "m2@x", "m3@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Work": fakeMsgs("m1@x", "m2@x")})
+	dst.hideFromList("Work")
+	srcSessions, dstSessions := src.watchSessions(0), dst.watchSessions(0)
+
+	first := runSyncOnce(t, e2eConfig(src, dst, 1, mapping("Work", "Work")))
+
+	assertContainsAll(t, first, "Destination folder Work already exists and holds 2 of the 3 planned messages", "Sync completed successfully")
+	assertIDs(t, "dst APPENDs", dst.appended("Work"), "m3@x")
+	// A recheck after the logout would show as a reconnect LOGIN.
+	wantEvents := []string{"LOGIN", "LOGOUT", "LOGIN", "LOGOUT"}
+	assertIDs(t, "source events", srcSessions.eventList(), wantEvents...)
+	assertIDs(t, "destination events", dstSessions.eventList(), wantEvents...)
+}
+
+func TestRunSync_When_OnePlanningSideFailsToConnect_Then_TheOtherSideLogsOutOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		wantErr   string
+		refuseSrc bool
+	}{
+		{name: "source login refused", refuseSrc: true, wantErr: "source connection failed"},
+		{name: "destination login refused", wantErr: "destination connection failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			failing, healthy := dst, src
+			if tt.refuseSrc {
+				failing, healthy = src, dst
+			}
+			failingSessions, healthySessions := failing.watchSessions(0), healthy.watchSessions(0)
+			failing.refuseLogin()
+			// The refusal waits for the last connect command of the healthy side, then pauses, so that side connects before the group fails.
+			ready := make(chan struct{})
+			healthy.onCommand("CAPABILITY", sync.OnceFunc(func() { close(ready) }))
+			failing.onNthCommand("LOGIN", func(int) {
+				select {
+				case <-ready:
+					time.Sleep(100 * time.Millisecond)
+				case <-time.After(e2eTimeout):
+				}
+			})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("INBOX", "INBOX")), opts)
+
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
+			}
+			assertIDs(t, "healthy side events", healthySessions.eventList(), "LOGIN", "LOGOUT")
+			assertIDs(t, "failing side events", failingSessions.eventList(), "LOGIN", "LOGOUT")
+			for name, srv := range map[string]*fakeServer{"source": src, "destination": dst} {
+				for _, verb := range []string{"EXAMINE", "STATUS", "FETCH", "CREATE", "APPEND"} {
+					if n := srv.callCount(verb); n != 0 {
+						t.Errorf("%s saw %d %s commands, want 0: the run must fail before any scan or write", name, n, verb)
+					}
+				}
+			}
+		})
+	}
+}
+
+// firstStamp keeps the time of the first call to set.
+type firstStamp struct {
+	at time.Time
+	mu sync.Mutex
+}
+
+func (f *firstStamp) set() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.at.IsZero() {
+		f.at = time.Now()
+	}
+}
+
+func (f *firstStamp) get() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.at
+}
+
+func TestRunSync_When_PlanningServersNeverAnswerLogout_Then_WorkersConnectAfterOneLogoutLimit(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{"A": fakeMsgs("a1@x"), "B": fakeMsgs("b1@x")})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 4, mapping("A", "A"), mapping("B", "B"))
+	cfg.RateLimit.MaxConnections = 1
+	type side struct {
+		srv      *fakeServer
+		sessions *sessionLog
+		logout   *firstStamp
+		login    *firstStamp
+		name     string
+	}
+	sides := []*side{{srv: src, name: "source"}, {srv: dst, name: "destination"}}
+	for _, s := range sides {
+		s.sessions = s.srv.watchSessions(1)
+		s.logout, s.login = &firstStamp{}, &firstStamp{}
+		// The first LOGOUT is the planning session and the second LOGIN is the first worker. The stamps come before the stall.
+		s.srv.onNthCommand("LOGOUT", func(n int) {
+			if n == 1 {
+				s.logout.set()
+			}
+		})
+		s.srv.onNthCommand("LOGIN", func(n int) {
+			if n == 2 {
+				s.login.set()
+			}
+		})
+		s.srv.stallNth(t, "LOGOUT", 1)
+	}
+
+	first := runSyncOnce(t, cfg)
+
+	assertContainsAll(t, first, "Sync completed successfully")
+	assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x")
+	assertIDs(t, "dst B", dst.folderMsgIDs("B"), "b1@x")
+	for _, s := range sides {
+		if n := s.sessions.refusedLogins(); n != 0 {
+			t.Errorf("%s refused %d LOGIN commands, want 0", s.name, n)
+		}
+		if n := s.sessions.peakOpen(); n != 1 {
+			t.Errorf("%s peak of open sessions = %d, want 1", s.name, n)
+		}
+		// The client closes the socket after the logout limit of 2 s. Both planning sessions wait together.
+		gap := s.login.get().Sub(s.logout.get())
+		if gap < 1500*time.Millisecond || gap > 3500*time.Millisecond {
+			t.Errorf("%s: the worker logged in %s after the planning LOGOUT, want about one logout limit of 2s", s.name, gap)
+		}
+	}
+}
+
+func TestRunSync_When_TypedMappingsHaveAnEmptySourceFolder_Then_OnlyFoldersWithMessagesGetADestination(t *testing.T) {
+	t.Parallel()
+
+	t.Run("map item with an empty source next to one with mail", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"Empty": nil, "Full": fakeMsgs("f1@x")})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+		cfg := e2eConfig(src, dst, 1, mapping("Empty", "EmptyDst"), mapping("Full", "FullDst"))
+
+		first := runSyncOnce(t, cfg)
+
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "FullDst")
+		if dst.hasFolder("EmptyDst") {
+			t.Error("dst has the folder EmptyDst, want none")
+		}
+		assertContainsAll(t, first, foldersToCreateHeader+folderBullets("FullDst")+"\n📨 Total new messages to sync: 1")
+		assertContainsNone(t, first, "Empty →", "• EmptyDst")
+		assertReadOnly(t, "source", src)
+
+		src.addMessage("Empty", "e1@x")
+
+		second := runSyncOnce(t, cfg)
+
+		assertIDs(t, "dst CREATE names over both runs", dst.capturedNames("CREATE"), "FullDst", "EmptyDst")
+		assertIDs(t, "dst EmptyDst", dst.folderMsgIDs("EmptyDst"), "e1@x")
+		assertContainsAll(t, second, foldersToCreateHeader+folderBullets("EmptyDst")+"\n📨 Total new messages to sync: 1")
+	})
+
+	t.Run("every map item has an empty source", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"Empty1": nil, "Empty2": nil})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+
+		err := runSync(e2eContext(t), e2eConfig(src, dst, 1, mapping("Empty1", "D1"), mapping("Empty2", "D2")), opts)
+
+		if err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+		assertContainsAll(t, out.String(), "All folders already synced!")
+		assertContainsNone(t, out.String(), "Folders to be created on destination", "Proceed with synchronization?")
+		if n := dst.callCount("CREATE"); n != 0 {
+			t.Errorf("dst saw %d CREATE commands, want 0", n)
+		}
+		if n := dst.callCount("APPEND"); n != 0 {
+			t.Errorf("dst saw %d APPEND commands, want 0", n)
+		}
+	})
+
+	t.Run("folder options name an empty folder with a subfolder that has mail", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"A": nil, "A/Sub": fakeMsgs("s1@x")})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+		cfg := e2eConfig(src, dst, 1)
+
+		first := runSyncConfirmed(t, cfg, "A", "B")
+
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "B", "B/Sub")
+		assertIDs(t, "dst B", dst.folderMsgIDs("B"))
+		assertIDs(t, "dst B/Sub", dst.folderMsgIDs("B/Sub"), "s1@x")
+		assertContainsAll(t, first, foldersToCreateHeader+folderBullets("B", "B/Sub")+"\n📨 Total new messages to sync: 1")
+		assertContainsNone(t, first, "A → B will copy")
+
+		second := runSyncConfirmed(t, cfg, "A", "B")
+
+		assertContainsAll(t, second, "All folders already synced!")
+		assertIDs(t, "dst CREATE names over both runs", dst.capturedNames("CREATE"), "B", "B/Sub")
+		assertReadOnly(t, "source", src)
+	})
+
+	orders := []struct {
+		name     string
+		mappings []config.DirectoryMapping
+	}{
+		{name: "the empty source comes first", mappings: []config.DirectoryMapping{mapping("Empty", "Archive"), mapping("Full", "Archive")}},
+		{name: "the empty source comes last", mappings: []config.DirectoryMapping{mapping("Full", "Archive"), mapping("Empty", "Archive")}},
+	}
+	for _, tt := range orders {
+		t.Run("an empty source and a source with mail share one destination, "+tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"Empty": nil, "Full": fakeMsgs("f1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1, tt.mappings...)
+
+			first := runSyncOnce(t, cfg)
+
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Archive")
+			assertIDs(t, "dst Archive", dst.folderMsgIDs("Archive"), "f1@x")
+			assertContainsAll(t, first,
+				"• Full → Archive will copy 1 messages",
+				foldersToCreateHeader+folderBullets("Archive")+"\n📨 Total new messages to sync: 1")
+			assertContainsNone(t, first, "Empty → Archive")
+
+			second := runSyncOnce(t, cfg)
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("CREATE"); n != 1 {
+				t.Errorf("dst saw %d CREATE commands over both runs, want 1", n)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_FolderOptionsNameTheInboxOfADotServer_Then_EachSubfolderGoesBelowTheDestinationInbox(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		dstFolders  map[string][]fakeMsg
+		name        string
+		wantCreates []string
+		wantTrash   string
+		wantAppends []string
+		bareInbox   bool
+	}{
+		{
+			name:        "the destination lists only INBOX",
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil},
+			wantCreates: []string{"INBOX/Junk", "INBOX/Trash"},
+			wantTrash:   "INBOX/Trash",
+			wantAppends: []string{"i1@x", "j1@x", "t1@x", "t2@x"},
+		},
+		{
+			name:        "the destination lists the Trash folder with INBOX in another letter case",
+			dstFolders:  map[string][]fakeMsg{"INBOX": nil, "Inbox/Trash": fakeMsgs("t1@x")},
+			bareInbox:   true,
+			wantCreates: []string{"INBOX/Junk"},
+			wantTrash:   "Inbox/Trash",
+			wantAppends: []string{"i1@x", "j1@x", "t2@x"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, ".", map[string][]fakeMsg{
+				"INBOX":       fakeMsgs("i1@x"),
+				"INBOX.Trash": fakeMsgs("t1@x", "t2@x"),
+				"INBOX.Junk":  fakeMsgs("j1@x"),
+			})
+			dst := newStoreServer(t, "/", tt.dstFolders)
+			if tt.bareInbox {
+				dst.foldOnlyBareInbox()
+			}
+			cfg := e2eConfig(src, dst, 1)
+
+			first := runSyncConfirmed(t, cfg, "INBOX", "INBOX")
+
+			assertIDs(t, "dst CREATE names", slices.Sorted(slices.Values(dst.capturedNames("CREATE"))), tt.wantCreates...)
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "i1@x")
+			assertIDs(t, "dst Trash", slices.Sorted(slices.Values(dst.folderMsgIDs(tt.wantTrash))), "t1@x", "t2@x")
+			assertIDs(t, "dst INBOX/Junk", dst.folderMsgIDs("INBOX/Junk"), "j1@x")
+			allAppends := slices.Concat(dst.appended("INBOX"), dst.appended(tt.wantTrash), dst.appended("INBOX/Junk"))
+			assertIDs(t, "dst APPENDs", slices.Sorted(slices.Values(allAppends)), tt.wantAppends...)
+			assertContainsNone(t, first, "delimiter mismatch", "Fix folder delimiters", "is renamed to", folderFailuresHeader)
+			for _, name := range []string{"INBOX.Trash", "INBOX.Junk"} {
+				if dst.hasFolder(name) {
+					t.Errorf("dst has the folder %s, want the slash form below INBOX", name)
+				}
+			}
+
+			second := runSyncConfirmed(t, cfg, "INBOX", "INBOX")
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := len(dst.appended("INBOX")) + len(dst.appended(tt.wantTrash)) + len(dst.appended("INBOX/Junk")); n != len(tt.wantAppends) {
+				t.Errorf("dst saw %d APPENDs over both runs, want %d", n, len(tt.wantAppends))
+			}
+			assertReadOnly(t, "source", src)
 		})
 	}
 }

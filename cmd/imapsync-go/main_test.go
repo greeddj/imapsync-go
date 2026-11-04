@@ -7,12 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/greeddj/imapsync-go/cmd/imapsync-go/helpers"
@@ -314,9 +317,24 @@ func Test_notifySignals_When_SignalArrives_Then_ExitCodeNamesIt(t *testing.T) {
 	}
 }
 
+// The first lines of the help of each command, as urfave/cli prints them.
+const (
+	rootHelpName = "NAME:\n   imapsync-go - IMAP to IMAP synchronization tool\n"
+	syncHelpName = "NAME:\n   imapsync-go sync - sync IMAP dir(s) between two servers\n"
+	showHelpName = "NAME:\n   imapsync-go show - show IMAP dirs in source and destination servers\n"
+)
+
 // runCLI runs the real root command. It fails the test when urfave/cli tries to
 // exit inside Run or writes to its global error writer, because both skip reportError.
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+
+	return runCLIWithContext(t, context.Background(), args...)
+}
+
+// runCLIWithContext is runCLI for a context that the caller ends. The 5 second
+// limit stops a hung command, and the cause of the caller context still reaches execute.
+func runCLIWithContext(t *testing.T, parent context.Context, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 
 	prevExiter, prevErrWriter := cli.OsExiter, cli.ErrWriter
@@ -327,7 +345,7 @@ func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	cli.ErrWriter = &global
 	t.Cleanup(func() { cli.OsExiter, cli.ErrWriter = prevExiter, prevErrWriter })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 
 	var out, errOut bytes.Buffer
@@ -424,8 +442,8 @@ func Test_execute_When_FormIsValid_Then_KeepsItsOutputAndExits0(t *testing.T) {
 	syncHelp := reference("sync", "--help")
 	showHelp := reference("show", "--help")
 
-	if want := "NAME:\n   imapsync-go - IMAP to IMAP synchronization tool\n"; !strings.HasPrefix(rootHelp, want) {
-		t.Errorf("root help does not start with %q:\n%s", want, rootHelp)
+	if !strings.HasPrefix(rootHelp, rootHelpName) {
+		t.Errorf("root help does not start with %q:\n%s", rootHelpName, rootHelp)
 	}
 	wantCommands := "\nCOMMANDS:\n" +
 		"   sync  sync IMAP dir(s) between two servers\n" +
@@ -433,11 +451,11 @@ func Test_execute_When_FormIsValid_Then_KeepsItsOutputAndExits0(t *testing.T) {
 	if !strings.Contains(rootHelp, wantCommands) {
 		t.Errorf("root help does not list only sync and show under COMMANDS:\n%s", rootHelp)
 	}
-	if want := "NAME:\n   imapsync-go sync - sync IMAP dir(s) between two servers\n"; !strings.HasPrefix(syncHelp, want) {
-		t.Errorf("sync help does not start with %q:\n%s", want, syncHelp)
+	if !strings.HasPrefix(syncHelp, syncHelpName) {
+		t.Errorf("sync help does not start with %q:\n%s", syncHelpName, syncHelp)
 	}
-	if want := "NAME:\n   imapsync-go show - show IMAP dirs in source and destination servers\n"; !strings.HasPrefix(showHelp, want) {
-		t.Errorf("show help does not start with %q:\n%s", want, showHelp)
+	if !strings.HasPrefix(showHelp, showHelpName) {
+		t.Errorf("show help does not start with %q:\n%s", showHelpName, showHelp)
 	}
 
 	wantVersion := helpers.LatestVersion(Version) + "\n"
@@ -749,6 +767,43 @@ func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing
 				return "v1.2.3-1-g" + r.hash() + "-dirty", r.hash()
 			},
 		},
+		{
+			name: "annotated tag on the commit",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "-a", "v1.2.3", "-m", "release")
+				return "v1.2.3", r.hash()
+			},
+		},
+		{
+			name: "annotated tag and one commit after it",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "-a", "v1.2.3", "-m", "release")
+				r.commit("second")
+				return "v1.2.3-1-g" + r.hash(), r.hash()
+			},
+		},
+		{
+			name: "staged change",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.write("a staged change")
+				r.runGit("add", "tracked.txt")
+				return r.hash() + "-dirty", r.hash()
+			},
+		},
+		{
+			// git describe --dirty ignores a file that git does not track.
+			name: "untracked file only",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				if err := os.WriteFile(filepath.Join(r.dir, "untracked.txt"), []byte("new"), 0o600); err != nil {
+					r.t.Fatalf("write untracked file: %v", err)
+				}
+				return r.hash(), r.hash()
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -771,6 +826,290 @@ func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing
 			if !strings.HasSuffix(ldflags, " -X main.BuiltBy=just") {
 				t.Errorf("LDFLAGS = %q, want it to end with %q", ldflags, " -X main.BuiltBy=just")
 			}
+		})
+	}
+}
+
+// Not parallel: runCLI replaces the urfave/cli globals OsExiter and ErrWriter.
+// The words come from urfave/cli, so the test pins the shape and the two prefixes, not the reason text.
+func Test_execute_When_OptionIsWrong_Then_PrintsUsageThenOneErrorLineAndExits1(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantHelp string
+		args     []string
+	}{
+		{name: "misspelt command with a short option", args: []string{"snyc", "-y"}, wantHelp: rootHelpName},
+		{name: "short option that the root does not define", args: []string{"-y"}, wantHelp: rootHelpName},
+		{name: "long option that the root does not define", args: []string{"--bogus"}, wantHelp: rootHelpName},
+		{name: "sync option without its value", args: []string{"sync", "-s"}, wantHelp: syncHelpName},
+		{name: "sync option that does not exist", args: []string{"sync", "--bogus"}, wantHelp: syncHelpName},
+		{name: "show option that does not exist", args: []string{"show", "--bogus"}, wantHelp: showHelpName},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, tt.args...)
+
+			if code != 1 {
+				t.Errorf("exit code = %d, want 1", code)
+			}
+			if !strings.HasPrefix(stdout, tt.wantHelp) {
+				t.Errorf("stdout does not start with %q:\n%s", tt.wantHelp, stdout)
+			}
+			usage, last, ok := strings.Cut(stderr, "\n\nError: ")
+			reason, hasPrefix := strings.CutPrefix(usage, "Incorrect Usage: ")
+			if !ok || !hasPrefix || reason == "" || strings.Contains(reason, "\n") {
+				t.Fatalf("stderr = %q, want a usage line, an empty line and an Error line", stderr)
+			}
+			if want := reason + "\n"; last != want {
+				t.Errorf("Error line = %q, want %q", last, want)
+			}
+		})
+	}
+}
+
+// Not parallel: runCLI replaces the urfave/cli globals OsExiter and ErrWriter.
+func Test_execute_When_HelpFormIsRefused_Then_PrintsOneErrorLineAndExits1(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+		args []string
+	}{
+		{
+			name: "help with the help flag",
+			args: []string{"help", "--help"},
+		},
+		{
+			name: "help for a command with the help flag",
+			args: []string{"help", "sync", "--help"},
+			want: `Error: unexpected argument "--help", run "imapsync-go --help" for usage` + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, tt.args...)
+
+			if code != 1 {
+				t.Errorf("exit code = %d, want 1", code)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want empty", stdout)
+			}
+			if !isOneLine(stderr) || !strings.HasPrefix(stderr, "Error: ") {
+				t.Errorf("stderr = %q, want one line that starts with \"Error: \"", stderr)
+			}
+			if tt.want != "" && stderr != tt.want {
+				t.Errorf("stderr = %q, want %q", stderr, tt.want)
+			}
+		})
+	}
+}
+
+// Not parallel: runCLI replaces the urfave/cli globals OsExiter and ErrWriter.
+func Test_execute_When_ConfigFlagHasNoCommand_Then_ShowsRootHelpWithoutLoadingTheFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.json")
+
+	code, rootHelp, stderr := runCLI(t, "--help")
+	if code != 0 || stderr != "" || rootHelp == "" {
+		t.Fatalf("root help: exit code = %d, stderr = %q, stdout = %q, want 0, empty and some help", code, stderr, rootHelp)
+	}
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "config flag alone", args: []string{"-c", missing}},
+		{name: "long config flag alone", args: []string{"--config", missing}},
+		{name: "config flag and the word help", args: []string{"-c", missing, "help"}},
+		{name: "config flag and the end of the flags", args: []string{"-c", missing, "--"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, tt.args...)
+
+			if code != 0 {
+				t.Errorf("exit code = %d, want 0", code)
+			}
+			if stderr != "" {
+				t.Errorf("stderr = %q, want empty", stderr)
+			}
+			if stdout != rootHelp {
+				t.Errorf("stdout = %q, want the root help %q", stdout, rootHelp)
+			}
+		})
+	}
+}
+
+// listenSilent accepts connections and never answers. A TLS handshake against
+// it waits until the caller gives up. accepted closes at the first connection.
+func listenSilent(t *testing.T) (addr string, accepted <-chan struct{}) {
+	t.Helper()
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var (
+		mu     sync.Mutex
+		conns  []net.Conn
+		once   sync.Once
+		closed bool
+	)
+	first := make(chan struct{})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if closed {
+				mu.Unlock()
+				_ = conn.Close()
+				return
+			}
+			conns = append(conns, conn)
+			mu.Unlock()
+			once.Do(func() { close(first) })
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		closed = true
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+	return ln.Addr().String(), first
+}
+
+// Not parallel: runCLIWithContext replaces the urfave/cli globals OsExiter and
+// ErrWriter. The signal comes through a channel, so no signal reaches the test
+// process.
+func Test_execute_When_SignalEndsARunningCommand_Then_PrintsCancelledAndExitsWithTheSignalCode(t *testing.T) {
+	commands := []struct {
+		args func(cfgPath string) []string
+		name string
+	}{
+		{name: "show", args: func(cfgPath string) []string { return []string{"-c", cfgPath, "show", "-q"} }},
+		{name: "sync", args: func(cfgPath string) []string { return []string{"-c", cfgPath, "sync", "-q", "-y"} }},
+	}
+	signals := []struct {
+		sig      os.Signal
+		name     string
+		wantCode int
+	}{
+		{name: "SIGTERM", sig: syscall.SIGTERM, wantCode: 143},
+		{name: "SIGINT", sig: syscall.SIGINT, wantCode: 130},
+	}
+	for _, cmd := range commands {
+		for _, sig := range signals {
+			t.Run(cmd.name+" after "+sig.name, func(t *testing.T) {
+				addr, accepted := listenSilent(t)
+				cfgPath := filepath.Join(t.TempDir(), "config.json")
+				cfg := fmt.Sprintf(`{
+  "src": {"server": %q, "user": "alice", "pass": "secret"},
+  "dst": {"server": %q, "user": "bob", "pass": "secret"},
+  "map": [{"src": "INBOX", "dst": "INBOX"}]
+}`, addr, addr)
+				if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+				delivered := make(chan os.Signal, 1)
+				ctx, stop := cancelOnSignal(context.Background(), delivered)
+				t.Cleanup(stop)
+				done := make(chan struct{})
+				defer close(done)
+				go func() {
+					select {
+					case <-accepted:
+						delivered <- sig.sig
+					case <-done:
+					}
+				}()
+
+				code, stdout, stderr := runCLIWithContext(t, ctx, cmd.args(cfgPath)...)
+
+				if code != sig.wantCode {
+					t.Errorf("exit code = %d, want %d", code, sig.wantCode)
+				}
+				if stderr != "Cancelled.\n" {
+					t.Errorf("stderr = %q, want %q", stderr, "Cancelled.\n")
+				}
+				if stdout != "" {
+					t.Errorf("stdout = %q, want empty", stdout)
+				}
+			})
+		}
+	}
+}
+
+// Not parallel: runCLIWithContext replaces the urfave/cli globals OsExiter and ErrWriter.
+func Test_execute_When_ContextEndedBeforeTheRun_Then_ExitCodeFollowsTheCause(t *testing.T) {
+	tests := []struct {
+		cause    error
+		name     string
+		wantCode int
+	}{
+		{name: "SIGTERM", cause: signalError{sig: syscall.SIGTERM}, wantCode: 143},
+		{name: "SIGINT", cause: signalError{sig: os.Interrupt}, wantCode: 130},
+		{name: "wrapped SIGTERM", cause: fmt.Errorf("stop: %w", signalError{sig: syscall.SIGTERM}), wantCode: 143},
+		{name: "a cancel that no signal names", cause: context.Canceled, wantCode: 130},
+	}
+	commands := [][]string{{"show", "-q"}, {"sync", "-q", "-y"}}
+	for _, tt := range tests {
+		for _, args := range commands {
+			t.Run(args[0]+" after "+tt.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancelCause(context.Background())
+				cancel(tt.cause)
+
+				code, stdout, stderr := runCLIWithContext(t, ctx, args...)
+
+				if code != tt.wantCode {
+					t.Errorf("exit code = %d, want %d", code, tt.wantCode)
+				}
+				if stderr != "Cancelled.\n" {
+					t.Errorf("stderr = %q, want %q", stderr, "Cancelled.\n")
+				}
+				if stdout != "" {
+					t.Errorf("stdout = %q, want empty", stdout)
+				}
+			})
+		}
+	}
+}
+
+func Test_cancelOnSignal_When_ContextEnds_Then_TheGoroutineEnds(t *testing.T) {
+	t.Parallel()
+
+	// Only the case ends the context, so a goroutine that the case leaves blocked makes
+	// synctest.Test fail when the bubble function returns.
+	tests := []struct {
+		end  func(signals chan os.Signal, parent context.CancelFunc, stop context.CancelFunc)
+		name string
+	}{
+		{name: "stop runs", end: func(_ chan os.Signal, _, stop context.CancelFunc) { stop() }},
+		{name: "signal arrives", end: func(signals chan os.Signal, _, _ context.CancelFunc) { signals <- syscall.SIGTERM }},
+		{name: "parent ends", end: func(_ chan os.Signal, parent, _ context.CancelFunc) { parent() }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				parent, cancelParent := context.WithCancel(context.Background())
+				signals := make(chan os.Signal, 1)
+				ctx, stop := cancelOnSignal(parent, signals)
+
+				tt.end(signals, cancelParent, stop)
+				synctest.Wait()
+
+				if ctx.Err() == nil {
+					t.Error("ctx.Err() = nil, want the context to end")
+				}
+			})
 		})
 	}
 }

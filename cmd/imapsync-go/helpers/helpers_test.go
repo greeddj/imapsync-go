@@ -147,3 +147,14 @@ func TestFetchTag(t *testing.T) {
 		})
 	}
 }
+
+func TestVersion_When_DateIsEmpty_Then_LeavesTheDateOut(t *testing.T) {
+	t.Parallel()
+
+	got := Version("v1.2.3", "abc1234", "", "just")
+
+	want := "v1.2.3 (commit abc1234, built by just) // " + runtime.Version()
+	if got != want {
+		t.Errorf("Version() = %q, want %q", got, want)
+	}
+}

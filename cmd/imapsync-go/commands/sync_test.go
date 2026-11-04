@@ -4,10 +4,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/greeddj/imapsync-go/internal/client"
 	"github.com/greeddj/imapsync-go/internal/config"
 	"github.com/urfave/cli/v3"
 )
@@ -157,5 +161,78 @@ func TestSync_When_RateLimitIsSetToZero_Then_ConfigLimitIsLifted(t *testing.T) {
 				t.Errorf("RateLimit = %+v, want %+v", got.RateLimit, tt.want)
 			}
 		})
+	}
+}
+
+func flagUsage(t *testing.T, cmd *cli.Command, name string) string {
+	t.Helper()
+
+	for _, f := range cmd.Flags {
+		if !slices.Contains(f.Names(), name) {
+			continue
+		}
+		doc, ok := f.(cli.DocGenerationFlag)
+		if !ok {
+			t.Fatalf("flag %s does not expose its usage", name)
+		}
+		return doc.GetUsage()
+	}
+	t.Fatalf("command %s has no flag %s", cmd.Name, name)
+	return ""
+}
+
+func TestSync_When_ProviderHasRecommendedRates_Then_FlagUsageNamesThem(t *testing.T) {
+	t.Parallel()
+
+	gmail, ok := client.DetectProvider("imap.gmail.com:993")
+	if !ok {
+		t.Fatal("imap.gmail.com is not a known provider")
+	}
+	tests := []struct {
+		flag string
+		want int
+	}{
+		{flag: "bps-down", want: gmail.DownBPS},
+		{flag: "bps-up", want: gmail.UpBPS},
+	}
+	for _, tt := range tests {
+		t.Run(tt.flag, func(t *testing.T) {
+			t.Parallel()
+
+			usage := flagUsage(t, Sync(), tt.flag)
+
+			if want := "for Gmail try " + strconv.Itoa(tt.want) + ")"; !strings.Contains(usage, want) {
+				t.Errorf("usage of --%s = %q, want it to contain %q", tt.flag, usage, want)
+			}
+		})
+	}
+}
+
+func TestDocs_When_ProviderHasRecommendedRates_Then_ReadmeAndExampleConfigNameThem(t *testing.T) {
+	t.Parallel()
+
+	gmail, ok := client.DetectProvider("imap.gmail.com:993")
+	if !ok {
+		t.Fatal("imap.gmail.com is not a known provider")
+	}
+	readme, err := os.ReadFile(filepath.Join("..", "..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	example, err := os.ReadFile(filepath.Join("..", "..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	down, up := strconv.Itoa(gmail.DownBPS), strconv.Itoa(gmail.UpBPS)
+
+	for _, want := range []string{"--bps-down " + down, "--bps-up " + up} {
+		if !strings.Contains(string(readme), want) {
+			t.Errorf("README does not hold %q", want)
+		}
+	}
+	for _, rate := range []string{down, up} {
+		if !regexp.MustCompile(`\b` + rate + `\b`).Match(example) {
+			t.Errorf("config.example.yaml does not name the rate %s", rate)
+		}
 	}
 }

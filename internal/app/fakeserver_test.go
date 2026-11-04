@@ -29,6 +29,7 @@ import (
 type fakeServer struct {
 	ln             net.Listener
 	store          *mailStore
+	sessions       *sessionLog
 	counts         map[string]int
 	names          map[string][]string
 	hooks          map[string][]func(n int)
@@ -1039,16 +1040,22 @@ func (s *fakeServer) refuseLoginAt(n int) {
 
 // sessionLog records the LOGIN and LOGOUT commands of one server in arrival order, and how many sessions are open at once.
 type sessionLog struct {
-	events  []string
-	mu      sync.Mutex
-	open    int
-	peak    int
-	refused int
+	// LOGIN numbers of the open sessions; the cleanup LOGOUT of a refused connection frees none.
+	admitted map[int]bool
+	events   []string
+	mu       sync.Mutex
+	open     int
+	peak     int
+	refused  int
 }
 
-// watchSessions logs the sessions of a store-backed server. A positive limit refuses each LOGIN above it, like a per-account cap. It needs sequential LOGINs, because refuseLoginAt holds one number.
+// watchSessions logs the sessions of a store-backed server and refuses each LOGIN above a positive limit.
+// LOGINs must be sequential: refuseLoginAt holds one number. A LOGOUT frees only admitted sessions.
 func (s *fakeServer) watchSessions(limit int) *sessionLog {
-	l := &sessionLog{}
+	l := &sessionLog{admitted: make(map[int]bool)}
+	s.mu.Lock()
+	s.sessions = l
+	s.mu.Unlock()
 	s.onNthCommand("LOGIN", func(n int) {
 		l.mu.Lock()
 		defer l.mu.Unlock()
@@ -1058,6 +1065,7 @@ func (s *fakeServer) watchSessions(limit int) *sessionLog {
 			l.refused++
 			return
 		}
+		l.admitted[n] = true
 		l.open++
 		l.peak = max(l.peak, l.open)
 	})
@@ -1065,11 +1073,26 @@ func (s *fakeServer) watchSessions(limit int) *sessionLog {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		l.events = append(l.events, "LOGOUT")
-		if l.open > 0 {
-			l.open--
-		}
 	})
 	return l
+}
+
+// endSessions runs when a LOGOUT arrives, before any hook can stall its reply, so the server frees the session at once. logins holds the LOGIN numbers of the connection.
+func (s *fakeServer) endSessions(logins []int) {
+	s.mu.Lock()
+	l := s.sessions
+	s.mu.Unlock()
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, n := range logins {
+		if l.admitted[n] {
+			delete(l.admitted, n)
+			l.open--
+		}
+	}
 }
 
 func (l *sessionLog) eventList() []string {
@@ -1321,6 +1344,7 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 
 	rd := bufio.NewReader(conn)
 	var selected string
+	var logins []int
 	for {
 		raw, err := rd.ReadString('\n')
 		if err != nil {
@@ -1332,6 +1356,12 @@ func (s *fakeServer) serveStore(conn net.Conn) {
 		}
 		tag, verb, arg := splitCommand(raw)
 		n := s.recordCommand(verb, arg)
+		switch verb {
+		case "LOGIN":
+			logins = append(logins, n)
+		case "LOGOUT":
+			s.endSessions(logins)
+		}
 		s.runHooks(verb, n)
 
 		switch verb {
@@ -2173,34 +2203,36 @@ func TestFakeServer_refuseLoginAt_When_ConnectionsLoginAtOnce_Then_OnlyTheNthLog
 	}
 }
 
+// storeCommand sends one tagged command and returns the tagged reply, without the untagged lines before it.
+func storeCommand(t *testing.T, c *storeConn, tag, text string) string {
+	t.Helper()
+	if err := c.write(tag + " " + text + "\r\n"); err != nil {
+		t.Fatalf("write %s: %v", text, err)
+	}
+	for {
+		line, err := c.readLine()
+		if err != nil {
+			t.Fatalf("read the reply to %s: %v", text, err)
+		}
+		if strings.HasPrefix(line, tag+" ") {
+			return line
+		}
+	}
+}
+
 func TestFakeServer_watchSessions_When_LoginsExceedTheLimit_Then_OnlyThoseLoginsAreRefused(t *testing.T) {
 	t.Parallel()
 
 	srv := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
 	sessions := srv.watchSessions(2)
 	conns := dialStoreConns(t, srv, 4)
-	command := func(c *storeConn, tag, text string) string {
-		t.Helper()
-		if err := c.write(tag + " " + text + "\r\n"); err != nil {
-			t.Fatalf("write %s: %v", text, err)
-		}
-		for {
-			line, err := c.readLine()
-			if err != nil {
-				t.Fatalf("read the reply to %s: %v", text, err)
-			}
-			if strings.HasPrefix(line, tag+" ") {
-				return line
-			}
-		}
-	}
 
 	replies := []string{
-		command(conns[0], "a1", "LOGIN user pass"),
-		command(conns[1], "a2", "LOGIN user pass"),
-		command(conns[2], "a3", "LOGIN user pass"),
-		command(conns[0], "a4", "LOGOUT"),
-		command(conns[3], "a5", "LOGIN user pass"),
+		storeCommand(t, conns[0], "a1", "LOGIN user pass"),
+		storeCommand(t, conns[1], "a2", "LOGIN user pass"),
+		storeCommand(t, conns[2], "a3", "LOGIN user pass"),
+		storeCommand(t, conns[0], "a4", "LOGOUT"),
+		storeCommand(t, conns[3], "a5", "LOGIN user pass"),
 	}
 
 	for i, want := range []string{"OK", "OK", "NO", "OK", "OK"} {
@@ -2214,6 +2246,34 @@ func TestFakeServer_watchSessions_When_LoginsExceedTheLimit_Then_OnlyThoseLogins
 	}
 	if n := sessions.refusedLogins(); n != 1 {
 		t.Errorf("refused = %d, want 1", n)
+	}
+}
+
+func TestFakeServer_watchSessions_When_RefusedConnectionLogsOut_Then_OpenSessionsStayCounted(t *testing.T) {
+	t.Parallel()
+
+	srv := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	sessions := srv.watchSessions(1)
+	conns := dialStoreConns(t, srv, 3)
+
+	replies := []string{
+		storeCommand(t, conns[0], "a1", "LOGIN user pass"),
+		storeCommand(t, conns[1], "a2", "LOGIN user pass"),
+		storeCommand(t, conns[1], "a3", "LOGOUT"),
+		storeCommand(t, conns[2], "a4", "LOGIN user pass"),
+	}
+
+	for i, want := range []string{"OK", "NO", "OK", "NO"} {
+		if got := strings.Fields(replies[i])[1]; got != want {
+			t.Errorf("reply %d = %q, want status %s", i+1, replies[i], want)
+		}
+	}
+	assertIDs(t, "events", sessions.eventList(), "LOGIN", "LOGIN", "LOGOUT", "LOGIN")
+	if n := sessions.peakOpen(); n != 1 {
+		t.Errorf("peak = %d, want 1", n)
+	}
+	if n := sessions.refusedLogins(); n != 2 {
+		t.Errorf("refused = %d, want 2", n)
 	}
 }
 
