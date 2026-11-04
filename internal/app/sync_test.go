@@ -5062,7 +5062,12 @@ func TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSub
 			}
 
 			got := out.String()
-			assertContainsAll(t, got, tt.wantFound...)
+			for _, line := range tt.wantFound {
+				if n := strings.Count(got, line); n != 1 {
+					t.Errorf("output holds %d times the line %q, want 1\noutput: %s", n, line, got)
+				}
+			}
+			assertContainsNone(t, got, "already covered")
 			if n := strings.Count(got, "subfolders, total folders to sync"); n != 1 {
 				t.Errorf("output holds %d count lines, want 1\noutput: %s", n, got)
 			}
@@ -13001,6 +13006,54 @@ func Test_checkSourceConflicts(t *testing.T) {
 	}
 }
 
+func Test_dropRepeatedMappings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   []config.DirectoryMapping
+		want []config.DirectoryMapping
+	}{
+		{name: "no items"},
+		{
+			name: "no repeat",
+			in:   []config.DirectoryMapping{mapping("A", "X"), mapping("B", "Y"), mapping("C", "Z")},
+			want: []config.DirectoryMapping{mapping("A", "X"), mapping("B", "Y"), mapping("C", "Z")},
+		},
+		{
+			name: "adjacent repeat",
+			in:   []config.DirectoryMapping{mapping("A", "X"), mapping("A", "X")},
+			want: []config.DirectoryMapping{mapping("A", "X")},
+		},
+		{
+			name: "repeats keep the first item and the order",
+			in:   []config.DirectoryMapping{mapping("A", "X"), mapping("B", "Y"), mapping("A", "X"), mapping("B", "Y"), mapping("C", "Z")},
+			want: []config.DirectoryMapping{mapping("A", "X"), mapping("B", "Y"), mapping("C", "Z")},
+		},
+		{
+			name: "one destination for two sources",
+			in:   []config.DirectoryMapping{mapping("A", "X"), mapping("B", "X")},
+			want: []config.DirectoryMapping{mapping("A", "X"), mapping("B", "X")},
+		},
+		{
+			name: "one source for two destinations",
+			in:   []config.DirectoryMapping{mapping("A", "X"), mapping("A", "Y")},
+			want: []config.DirectoryMapping{mapping("A", "X"), mapping("A", "Y")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := dropRepeatedMappings(slices.Clone(tt.in))
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("dropRepeatedMappings = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRunSync_When_TwoMappingsNameOneSourceWithDifferentDestinations_Then_RunStopsBeforeThePlan(t *testing.T) {
 	t.Parallel()
 
@@ -13575,6 +13628,209 @@ func TestRunSync_When_MapRepeatsAnItemExactly_Then_RunMatchesASingleItem(t *test
 		if !slices.Equal(repeated.appends[folder], want) {
 			t.Errorf("APPENDs to %s = %v, want %v: a repeated item must not copy a folder twice", folder, repeated.appends[folder], want)
 		}
+	}
+}
+
+// verboseExpansion splits a verbose output at the end of the count line. The block starts at the "Checking for subfolders" line.
+func verboseExpansion(t *testing.T, out string) (prefix, block string) {
+	t.Helper()
+
+	const head, count = "Checking for subfolders...\n", "subfolders, total folders to sync"
+	start := strings.Index(out, head)
+	countAt := strings.Index(out, count)
+	if start < 0 || countAt < start {
+		t.Fatalf("output has no expansion block that ends with the count line\noutput: %s", out)
+	}
+	if n := strings.Count(out, count); n != 1 {
+		t.Fatalf("output holds %d count lines, want 1\noutput: %s", n, out)
+	}
+	lineEnd := strings.IndexByte(out[countAt:], '\n')
+	if lineEnd < 0 {
+		t.Fatalf("the count line has no line end\noutput: %s", out)
+	}
+	end := countAt + lineEnd + 1
+	return out[:end], out[start:end]
+}
+
+func TestRunSync_When_MapRepeatsAnItem_Then_VerboseExpansionMatchesASingleItem(t *testing.T) {
+	t.Parallel()
+
+	type outcome struct {
+		appends map[string][]string
+		cfgMap  []config.DirectoryMapping
+		out     string
+		examine []string
+		create  []string
+	}
+	srcFolders := func() map[string][]fakeMsg {
+		return map[string][]fakeMsg{
+			"INBOX": fakeMsgs("i1@x"), "INBOX/Sub": fakeMsgs("s1@x"),
+			"Work": fakeMsgs("w1@x"), "Work/a": fakeMsgs("a1@x"), "Work/a/c": fakeMsgs("c1@x"), "Work/b": fakeMsgs("b1@x"),
+			"Other": fakeMsgs("o1@x"), "Other/x": fakeMsgs("x1@x"),
+		}
+	}
+	run := func(t *testing.T, mappings []config.DirectoryMapping) outcome {
+		t.Helper()
+		src := newStoreServer(t, "/", srcFolders())
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+		cfg := e2eConfig(src, dst, 1, slices.Clone(mappings)...)
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm, opts.verbose = true, true
+
+		if err := runSync(e2eContext(t), cfg, opts); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+
+		got := outcome{
+			out: out.String(), cfgMap: cfg.Map,
+			examine: src.capturedNames("EXAMINE"), create: dst.capturedNames("CREATE"),
+			appends: map[string][]string{},
+		}
+		slices.Sort(got.examine)
+		slices.Sort(got.create)
+		for _, folder := range append([]string{"INBOX"}, got.create...) {
+			got.appends[folder] = dst.appended(folder)
+		}
+		return got
+	}
+
+	tests := []struct {
+		name       string
+		repeated   []config.DirectoryMapping
+		single     []config.DirectoryMapping
+		wantNotice []string
+	}{
+		{
+			name:     "exact repeat",
+			repeated: []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Work", "Moved")},
+			single:   []config.DirectoryMapping{mapping("Work", "Moved")},
+		},
+		{
+			name:     "another item between the repeats",
+			repeated: []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Other", "O"), mapping("Work", "Moved")},
+			single:   []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Other", "O")},
+		},
+		{
+			name:     "two spellings of the INBOX source",
+			repeated: []config.DirectoryMapping{mapping("inbox", "Mail"), mapping("INBOX", "Mail")},
+			single:   []config.DirectoryMapping{mapping("INBOX", "Mail")},
+		},
+		{
+			name:     "two spellings of the INBOX on both sides",
+			repeated: []config.DirectoryMapping{mapping("inbox", "inbox/Mail"), mapping("INBOX", "INBOX/Mail")},
+			single:   []config.DirectoryMapping{mapping("INBOX", "INBOX/Mail")},
+		},
+		{
+			name:       "repeat made by the delimiter fix",
+			repeated:   []config.DirectoryMapping{mapping("Work.a", "Moved"), mapping("Work/a", "Moved")},
+			single:     []config.DirectoryMapping{mapping("Work/a", "Moved")},
+			wantNotice: []string{`Mapping 1: Source folder "Work.a"`},
+		},
+		{
+			name:       "delimiter fix on both items",
+			repeated:   []config.DirectoryMapping{mapping("Work.a", "Moved"), mapping("Work.a", "Moved")},
+			single:     []config.DirectoryMapping{mapping("Work/a", "Moved")},
+			wantNotice: []string{`Mapping 1: Source folder "Work.a"`, `Mapping 2: Source folder "Work.a"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			single := run(t, tt.single)
+			repeated := run(t, tt.repeated)
+
+			singlePrefix, singleBlock := verboseExpansion(t, single.out)
+			repeatedPrefix, repeatedBlock := verboseExpansion(t, repeated.out)
+			if repeatedBlock != singleBlock {
+				t.Errorf("repeated expansion = %q, want %q", repeatedBlock, singleBlock)
+			}
+			if len(tt.wantNotice) == 0 {
+				if repeatedPrefix != singlePrefix {
+					t.Errorf("repeated output before the scan = %q, want %q", repeatedPrefix, singlePrefix)
+				}
+			} else {
+				assertContainsAll(t, repeated.out, tt.wantNotice...)
+				assertContainsNone(t, single.out, "delimiter mismatch", "Mapping 1:")
+			}
+			assertContainsNone(t, repeated.out, "already covered")
+			found := 0
+			for line := range strings.Lines(single.out) {
+				if !strings.Contains(line, "Found subfolder:") {
+					continue
+				}
+				found++
+				if n := strings.Count(repeated.out, line); n != 1 {
+					t.Errorf("repeated output holds %d times the line %q, want 1", n, line)
+				}
+			}
+			if found == 0 {
+				t.Fatalf("single output holds no found-subfolder line\noutput: %s", single.out)
+			}
+
+			if !slices.Equal(repeated.examine, single.examine) {
+				t.Errorf("source EXAMINE names = %q, want %q", repeated.examine, single.examine)
+			}
+			if !slices.Equal(repeated.create, single.create) {
+				t.Errorf("destination CREATE names = %q, want %q", repeated.create, single.create)
+			}
+			for folder, want := range single.appends {
+				if !slices.Equal(repeated.appends[folder], want) {
+					t.Errorf("APPENDs to %s = %v, want %v", folder, repeated.appends[folder], want)
+				}
+			}
+			if !slices.Equal(repeated.cfgMap, tt.repeated) {
+				t.Errorf("config map after the run = %v, want %v: the run must not change the map of the caller", repeated.cfgMap, tt.repeated)
+			}
+		})
+	}
+}
+
+func TestRunSync_When_RepeatedItemComesBeforeAFailingItem_Then_ErrorNamesTheConfigPosition(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		wantErr  error
+		name     string
+		wantText string
+		mappings []config.DirectoryMapping
+	}{
+		{
+			name:     "source conflict after a repeat",
+			mappings: []config.DirectoryMapping{mapping("inbox", "X"), mapping("INBOX", "X"), mapping("Inbox", "Y")},
+			wantErr:  errSourceConflict,
+			wantText: "map entries 1 and 3: different destination folders for source folder INBOX",
+		},
+		{
+			name:     "empty level after a repeat",
+			mappings: []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Work", "Moved"), mapping("INBOX", "a//b")},
+			wantErr:  errEmptyLevel,
+			wantText: `map entry 3: destination folder has an empty level: "a//b", destination delimiter "/"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": fakeMsgs("m1@x"), "Work": fakeMsgs("w1@x")})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm = true
+
+			err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts)
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v\noutput: %s", err, tt.wantErr, out.String())
+			}
+			if err.Error() != tt.wantText {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantText)
+			}
+			assertContainsNone(t, out.String(), "Messages to be copied")
+			assertNoCommandsAfterSetup(t, "src", src)
+			assertNoCommandsAfterSetup(t, "dst", dst)
+		})
 	}
 }
 

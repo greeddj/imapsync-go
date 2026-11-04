@@ -85,6 +85,10 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - I is the position of the item in the config `map`, counted from 1. With `--src-folder` and `--dest-folder`, the text `--dest-folder` replaces `map entry I`.
      - NAME is the typed text after `resolveMappings`. That step folds a leading INBOX level to upper case and changes no other byte of an unlisted name. `reportError` escapes the `Error:` line.
      - The run prints no plan and shows no sync prompt. The delimiter question of `offerDelimiterFixes` can come before the check. The servers see only LOGIN or AUTHENTICATE, CAPABILITY, LIST and LOGOUT. They see no EXAMINE, STATUS, FETCH, CREATE or APPEND.
+   - In a typed run, `runSync` removes each repeated item after `checkDestinationLevels` (`dropRepeatedMappings`). A repeated item has the same source and the same destination as an earlier item. `dropRepeatedMappings` compares the items after the delimiter fix and `resolveMappings`. So two spellings of one INBOX source with one destination are a repeated item.
+     - The first item stays, and the order does not change.
+     - The delimiter notice and the checks before `dropRepeatedMappings` read all the items. So they give the positions in the config `map`. If the delimiter fix changes a repeated item, the notice shows one line for each position.
+     - The config `map` of the caller does not change.
    - A mirror run builds its mappings with `mirrorMappings`. It gives each listed source name to `convertFolderPath` and asks no question.
    - `convertFolderPath(path, srcDelimiter, dstDelimiter)` gives the destination name. These rules apply in this order:
      - If the destination has no delimiter, or the two delimiters are the same, the path does not change.
@@ -143,7 +147,7 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - the entry is a subfolder of its root;
      - a planned mapping names the source folder of the entry.
    - The second number of the count line is the number of planned mappings. A subfolder with a mapping of its own is a root, so the first number leaves it out.
-   - The code counts these entries. It does not subtract the number of roots from the number of mappings. A `\Noselect` root has no entry. A repeated `map` item gives two roots for one mapping. If the code subtracts, the count is wrong when a root is `\Noselect` or when a `map` item repeats.
+   - The code counts these entries. It does not subtract the number of roots from the number of mappings. A `\Noselect` root has no entry. If the code subtracts, the count is wrong when a root is `\Noselect`. A repeated item gives no second root (step 1). So its found-subfolder lines show one time, and it gives no `Mapping ... skipped` line.
    - `printFolderRenames` prints one escaped warning line for each renamed mapping that remains after both splits, before the scan. The line shows the two names and the destination delimiter. It shows also without `--verbose` and with `--quiet`.
    - `printCaseVariantDestinations` prints one escaped warning line for each group of destination names that are different only in letter case. It runs after `printFolderRenames` and before the scan, in typed runs and in mirror runs. It reads the planned mappings, which come after `splitDestinationClashes` and `splitEmptyLevelDestinations`.
      - A group holds destination names that are equal after `strings.ToLower` but have different bytes. INBOX levels already have the listed spelling, so INBOX spellings are not variants.

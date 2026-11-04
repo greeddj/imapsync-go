@@ -365,6 +365,8 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err := checkDestinationLevels(ctx, dstClient, mappings, destinationFlag); err != nil {
 			return err
 		}
+		// The checks above report positions in the config map, so repeats go only after them.
+		mappings = dropRepeatedMappings(mappings)
 		if !quiet && verbose {
 			_, _ = fmt.Fprintln(out, "Checking for subfolders...")
 		}
@@ -1642,6 +1644,18 @@ func checkDestinationLevels(ctx context.Context, dst *client.Client, mappings []
 
 func hasEmptyLevel(name, delimiter string) bool {
 	return delimiter != "" && (strings.HasPrefix(name, delimiter) || strings.HasSuffix(name, delimiter) || strings.Contains(name, delimiter+delimiter))
+}
+
+// dropRepeatedMappings keeps the first of each exact repeat. A repeat adds a second root whose entries lose to the first root but still show in the verbose lines.
+func dropRepeatedMappings(mappings []config.DirectoryMapping) []config.DirectoryMapping {
+	seen := make(map[config.DirectoryMapping]struct{}, len(mappings))
+	return slices.DeleteFunc(mappings, func(m config.DirectoryMapping) bool {
+		if _, ok := seen[m]; ok {
+			return true
+		}
+		seen[m] = struct{}{}
+		return false
+	})
 }
 
 func typedMappings(in []config.DirectoryMapping) []folderMapping {

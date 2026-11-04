@@ -152,6 +152,7 @@ The command checks the configuration file when it loads the file.
   command stops with an error. The error shows the numbers of the two items,
   counted from 1.
 - Two identical items are valid. Two items with the same `dst` are also valid.
+  `sync` uses identical items as one item.
 - `sync` makes this check again after it finds the folder names on the server.
   For example, `inbox` and `INBOX` are one source folder.
 - `sync` also refuses a `dst` name that has an empty level and that the

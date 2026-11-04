@@ -562,6 +562,15 @@
   - `TestRunSync_When_ParentAndChildFoldersAreBothMapped_Then_ChildMappingWinsInEitherOrder` - the child mapping decides, and a second run sends no APPEND;
   - `TestRunSync_When_TwoMappingsNameOneSourceWithDifferentDestinations_Then_RunStopsBeforeThePlan` - two spellings of INBOX, or a rewritten delimiter, make one source and stop the run before the scan;
   - `TestRunSync_When_MapRepeatsAnItemExactly_Then_RunMatchesASingleItem` - a repeated item causes no extra scan, CREATE or APPEND;
+  - `Test_dropRepeatedMappings` - the function removes each repeated item, keeps the first item and keeps the order. Two items with one destination, or two items with one source and two destinations, are not repeated items, so both items stay;
+  - `TestRunSync_When_MapRepeatsAnItem_Then_VerboseExpansionMatchesASingleItem` - with `--verbose`, a repeated item gives the same expansion block as one item. The block starts at the line `Checking for subfolders...` and ends with the count line. Each found-subfolder line shows one time, and no `already covered` line shows. The wire is the same: the source EXAMINE names, the destination CREATE names and the APPENDs of each destination folder. The `map` of the caller does not change. Six cases run:
+    - two equal items;
+    - two equal items with another item between them;
+    - two spellings of the INBOX source;
+    - two spellings of the INBOX on both sides;
+    - a repeated item that the delimiter fix makes. The notice names `Mapping 1`;
+    - a delimiter fix on both items. The notice names `Mapping 1` and `Mapping 2`;
+  - `TestRunSync_When_RepeatedItemComesBeforeAFailingItem_Then_ErrorNamesTheConfigPosition` - a repeated item comes before an item that fails a check. The error gives the position of the failing item in the config `map`. Two spellings of INBOX with one destination, then a third spelling with another destination, give `map entries 1 and 3`. Two equal items, then a destination with an empty level, give `map entry 3`. The servers see no command after the connect phase;
   - `TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother` - in a mirror run, each listed folder keeps its own mapping;
   - `TestRunSync_When_MirrorRunIsVerboseWithNestedFolders_Then_NoSubfolderLinesShowAndEachFolderIsCopiedOnce` - a verbose mirror run of a nested tree prints none of these lines: `Checking for subfolders`, a found-subfolder line, `Mapping ... skipped`, a count line, `goes to` and `wins over`. The line `Folder Projects skipped` for the `\Noselect` folder shows one time. The test runs with the destination delimiter `/` and with `.`. In the dot case, the notice for `Archive/v1.2` shows. Each destination folder gets its one message, and the destination sees one APPEND for each source message. The CREATE commands name the folders and their parents. The source gets no command for `Projects` and no write command. A second run prints `All folders already synced!` and sends no APPEND;
   - `Test_expandMirrorRoots_When_TreeVaries_Then_MatchesTheFullExpansionOfTheSameRoots` - the test runs five trees with five pairs of delimiters. `expandMirrorRoots` gives the same mappings and the same skipped names as `expandMappingsWithSubfolders` for the same roots. The report holds no entry and no winner, and the roots do not change. `printExpansion` prints only the `Folder ... skipped` lines. The pairs include a flat source and a flat destination. The trees hold these cases:
@@ -581,7 +590,7 @@
     - with `--verbose`, the subfolder `Projects/ok` has a mapping of its own to `Special`. This mapping wins over `Projects`. The line "goes to ..., not to ..." shows. The count line does not show;
     - without `--verbose`, the output has no expansion line;
     - with `--verbose` and `--quiet` together, the output has no expansion line. The list of failed folders still shows;
-  - `TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSubfolders` - with `--verbose`, the count line shows one time in each of two cases:
+  - `TestRunSync_When_RootHasNoEntryOrIsRepeated_Then_VerboseCountsThePlannedSubfolders` - with `--verbose`, the count line shows one time in each of two cases. In both cases, each found-subfolder line shows one time, and no `already covered` line shows:
     - the root `Box` is `\Noselect` and has two subfolders. The line shows the numbers 2 and 2. The found-subfolder lines name both subfolders. The run copies each of them;
     - a `map` item repeats. The line shows the numbers 1 and 2. The run copies the root and its subfolder.
 
