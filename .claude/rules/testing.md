@@ -599,8 +599,29 @@
     - an empty level, with another destination;
     - an empty level, with the destination of the parent expansion.
 
-    In each case, the output is exact, and no line names a failed folder. The lines of `Work/sub` still show. In the two cases with another destination, the lines of `Work/sub/ok` also show. A control call gets the expansion before the splits as the planned mappings. Its output holds the lost line of each failed folder, so the plan decides the output;
-  - `TestRunSync_When_WinningMappingFailsInASplit_Then_VerboseNamesNoLostEntryOfIt` - the same four cases run end to end with `--verbose` and `-y`. The run ends with `ErrSilentExit`. The output holds the exact expansion text after `Checking for subfolders...`, and no line names a failed folder. The lines of `Work/sub` still show. In the two cases with another destination, the lines of `Work/sub/ok` also show. The failure list holds the exact line of each failed folder. The summary line counts the copied messages and the failed folders. No command on either server names a failed folder.
+    In each case, the output is exact, and no line names a failed folder. The lines of `Work/sub` still show. In the two cases with another destination, the lines of `Work/sub/ok` also show. A control call gets the expansion before the splits as the planned mappings. Its output names each failed folder in a `goes to` line or in a found-subfolder line, so the plan decides the output;
+  - `TestRunSync_When_WinningMappingFailsInASplit_Then_VerboseNamesNoLostEntryOfIt` - the same four cases run end to end with `--verbose` and `-y`. The run ends with `ErrSilentExit`. The output holds the exact expansion text after `Checking for subfolders...`, and no line names a failed folder. The lines of `Work/sub` still show. In the two cases with another destination, the lines of `Work/sub/ok` also show. The failure list holds the exact line of each failed folder. The summary line counts the copied messages and the failed folders. No command on either server names a failed folder;
+  - `TestRunSync_When_NestedMapItemsShareTheParentTree_Then_EachVerboseLineShowsOnce` - the `map` holds `Work`, `Work/a` and `Work/a/b`, and the source holds `Work/a/b/c` below them. With `--verbose` and `-y`, the expansion block holds these lines and no other line:
+    - one found-subfolder line for `Work/a/b/c`;
+    - one `Mapping ... skipped` line for `Work/a` and one for `Work/a/b`;
+    - the count line with the numbers 1 and 4.
+
+    Each line shows one time in the whole output. No `Mapping ... skipped` line names `Work/a/b/c`, and no `goes to` line shows. The CREATE commands name `M`, `M/a`, `M/a/b` and `M/a/b/c`, and each folder holds its own message. The reverse order of the items gives the same lines in another order;
+  - `Test_printExpansion_When_NestedMapItemsCoverOneSource_Then_EachSourceGetsOneLineOfEachKind` - the test checks the exact output of three cases. In each case, every order of the `map` items gives the same lines in any order. The cases are:
+    - three nested items with the destinations of the parent expansion. The output holds two `Mapping ... skipped` lines, and it holds no found-subfolder line and no count line;
+    - an item for `Work/a` next to a subfolder that a walk finds. The output holds the found-subfolder lines of `Work/b` and `Work/a/x`, one `Mapping ... skipped` line for `Work/a`, and the count line with the numbers 2 and 4. No `Mapping ... skipped` line names `Work/a/x`;
+    - three nested items where `Work/a` has another destination. The `Mapping ... skipped` line for `Work/a/b` shows one time, and it does not hide the two `goes to` lines;
+  - `Test_printExpansion_When_NestedMapItemsVary_Then_FoundLinesMatchTheCountAndNoLineRepeats` - the test runs each non-empty set of the items `Work`, `Work/a` and `Work/a/b`, with each choice of destination and each order of the items. The source holds `Work/a/b/c` and `Work/d` also. In each run, `printExpansion` gets the mappings that remain after both splits. The test checks these properties:
+    - no line shows two times;
+    - the number of found-subfolder lines is the first number of the count line, and the count line is absent when this number is 0;
+    - the second number of the count line is the number of planned mappings;
+    - each found-subfolder line names a planned source that is not a map item, with its planned destination;
+    - each planned source that is not a map item has one found-subfolder line;
+    - each `Mapping ... skipped` line names a map item;
+    - the lines are the lines of a model that uses only the items, and every order of the items gives the same lines in any order.
+
+    The test fails when no run prints a found-subfolder line, a `Mapping ... skipped` line or a `goes to` line;
+  - `Test_expandMappingsWithSubfolders_verboseLogging` - the `map` holds `INBOX` and `INBOX/Sub` with the destinations of the parent expansion. The output is exactly one `Mapping ... skipped` line for `INBOX/Sub`. It holds no found-subfolder line and no count line, because the child has a map item of its own.
 
   The typed destination name with an empty level has these tests:
   - `TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_RunIsRefusedBeforeAnyCommandThatChangesTheDestination` - on a `/` server, the names `/X`, `a//b`, `x/` and `/` give `errEmptyLevel`. On a `.` server, the names `.X`, `a..b` and `x.` give it. The text is `map entry 2: destination folder has an empty level: "NAME", destination delimiter "D"`. The number is the position of the failing item, and the item before it is valid. The output is empty. Each server sees only LOGIN, CAPABILITY, LIST and LOGOUT (`assertNoCommandsAfterSetup`);

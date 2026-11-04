@@ -794,7 +794,7 @@ func customListHandler(srv *fakeServer, mailboxes []string) func(net.Conn) {
 
 // Test_expandMappingsWithSubfolders_verboseLogging asserts that the verbose
 // path in expandMappingsWithSubfolders produces the correct deduplication
-// result and writes the found-subfolder and skipped-mapping lines.
+// result and writes one skipped-mapping line for the map item that a parent covers.
 func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
@@ -802,7 +802,7 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	delimiter := srcC.GetDelimiter()
 
-	// The explicit mapping and the derived one agree on the destination, so one is dropped. Verbose prints the found-subfolder and dropped-mapping lines.
+	// The explicit mapping and the derived one agree on the destination, so one is dropped. Verbose prints the dropped-mapping line only: the child is a map item, so no walk found it.
 	mappings := rootMappings(mapping("INBOX", "INBOX"), mapping("INBOX/Sub", "INBOX/Sub"))
 	var out strings.Builder
 	dstC := newDestinationClient(t, delimiter)
@@ -814,11 +814,8 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len=%d, want 2 (INBOX + INBOX/Sub), got %v", len(got), got)
 	}
-	if want := "Found subfolder: INBOX/Sub"; !strings.Contains(out.String(), want) {
-		t.Errorf("output %q does not contain %q", out.String(), want)
-	}
-	if want := "Mapping \"INBOX/Sub\" skipped - already covered by a parent mapping's expansion"; !strings.Contains(out.String(), want) {
-		t.Errorf("output %q does not contain %q", out.String(), want)
+	if want := "  ℹ️  Mapping \"INBOX/Sub\" skipped - already covered by a parent mapping's expansion\n"; out.String() != want {
+		t.Errorf("output = %q, want %q", out.String(), want)
 	}
 }
 
@@ -13146,13 +13143,12 @@ func winnerFailsCases() []winnerFailsCase {
 				"INBOX": "inbox@x", "Work": "work@x", "Work/sub": "sub@x",
 				"Work/sub/a.b": "dot@x", "Work/sub/a_b": "under@x",
 			},
-			mappings: []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine.sub")},
-			wantExpansion: "  📁 Found subfolder: Work/sub → Fine.sub\n" +
-				"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n",
-			wantLines: []string{"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n"},
+			mappings:      []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine.sub")},
+			wantExpansion: "  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n",
+			wantLines:     []string{"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n"},
 			wantLost: []string{
-				"Mapping \"Work/sub/a.b\" skipped - already covered by a parent mapping's expansion",
-				"Mapping \"Work/sub/a_b\" skipped - already covered by a parent mapping's expansion",
+				"Found subfolder: Work/sub/a.b → Fine.sub.a_b",
+				"Found subfolder: Work/sub/a_b → Fine.sub.a_b",
 			},
 			wantFailures: []string{
 				"• Work/sub/a.b → Fine.sub.a_b: same destination folder as source folder Work/sub/a_b\n",
@@ -13194,11 +13190,10 @@ func winnerFailsCases() []winnerFailsCase {
 			folders: map[string]string{
 				"INBOX": "inbox@x", "Work": "work@x", "Work/sub": "sub@x", "Work/sub//bad": "bad@x",
 			},
-			mappings: []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine/sub")},
-			wantExpansion: "  📁 Found subfolder: Work/sub → Fine/sub\n" +
-				"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n",
-			wantLines: []string{"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n"},
-			wantLost:  []string{"Mapping \"Work/sub//bad\" skipped - already covered by a parent mapping's expansion"},
+			mappings:      []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine/sub")},
+			wantExpansion: "  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n",
+			wantLines:     []string{"  ℹ️  Mapping \"Work/sub\" skipped - already covered by a parent mapping's expansion\n"},
+			wantLost:      []string{"Found subfolder: Work/sub//bad → Fine/sub//bad"},
 			wantFailures: []string{
 				"• Work/sub//bad → Fine/sub//bad: destination folder has an empty level: \"Fine/sub//bad\", destination delimiter \"/\"\n",
 			},
@@ -13354,6 +13349,343 @@ func Test_printExpansion_When_ARootOrALoserIsNotPlanned_Then_EachLineFollowsTheP
 				assertContainsNone(t, out.String(), "Folder "+source+" goes to", fmt.Sprintf("Mapping %q skipped", source), "Found subfolder: "+source+" ")
 			}
 		})
+	}
+}
+
+const (
+	expansionFoundPrefix   = "  📁 Found subfolder: "
+	expansionSkippedPrefix = "  ℹ️  Mapping "
+	expansionCountFormat   = "📂 Found %d subfolders, total folders to sync: %d"
+)
+
+func coveredLine(source string) string {
+	return fmt.Sprintf("  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", source)
+}
+
+// verboseExpansionOf runs the expansion and both splits as runSync does, then prints the verbose lines.
+func verboseExpansionOf(t *testing.T, srcC, dstC *client.Client, items []config.DirectoryMapping) (string, []folderMapping) {
+	t.Helper()
+
+	expanded, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(items...), "/", "/")
+	if err != nil {
+		t.Fatalf("expandMappingsWithSubfolders: %v", err)
+	}
+	planned, _ := splitDestinationClashes(expanded)
+	planned, _, err = splitEmptyLevelDestinations(t.Context(), dstC, planned, "/")
+	if err != nil {
+		t.Fatalf("splitEmptyLevelDestinations: %v", err)
+	}
+	var out strings.Builder
+	printExpansion(&out, report, planned, true, false)
+	return out.String(), planned
+}
+
+func sortedLines(text string) []string {
+	return slices.Sorted(strings.Lines(text))
+}
+
+func TestRunSync_When_NestedMapItemsShareTheParentTree_Then_EachVerboseLineShowsOnce(t *testing.T) {
+	t.Parallel()
+
+	const head = "Checking for subfolders...\n"
+	foundLine := expansionFoundPrefix + "Work/a/b/c → M/a/b/c\n"
+	count := "📂 Found 1 subfolders, total folders to sync: 4\n"
+	items := []config.DirectoryMapping{mapping("Work", "M"), mapping("Work/a", "M/a"), mapping("Work/a/b", "M/a/b")}
+	reversed := []config.DirectoryMapping{items[2], items[1], items[0]}
+	tests := []struct {
+		name      string
+		wantBlock string
+		mappings  []config.DirectoryMapping
+		sorted    bool
+	}{
+		{
+			name: "map items from the parent down", mappings: items,
+			wantBlock: head + foundLine + coveredLine("Work/a") + coveredLine("Work/a/b") + count,
+		},
+		{
+			name: "map items from the child up", mappings: reversed, sorted: true,
+			wantBlock: head + foundLine + coveredLine("Work/a") + coveredLine("Work/a/b") + count,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX": fakeMsgs("i1@x"), "Work": fakeMsgs("w1@x"), "Work/a": fakeMsgs("a1@x"),
+				"Work/a/b": fakeMsgs("b1@x"), "Work/a/b/c": fakeMsgs("c1@x"),
+			})
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			got := out.String()
+			_, block := verboseExpansion(t, got)
+			if tt.sorted {
+				if !slices.Equal(sortedLines(block), sortedLines(tt.wantBlock)) {
+					t.Errorf("expansion block lines = %q, want the lines of %q in any order", sortedLines(block), tt.wantBlock)
+				}
+			} else if block != tt.wantBlock {
+				t.Errorf("expansion block = %q, want %q", block, tt.wantBlock)
+			}
+			for line := range strings.Lines(tt.wantBlock) {
+				if n := strings.Count(got, line); n != 1 {
+					t.Errorf("output holds %d times the line %q, want 1\noutput: %s", n, line, got)
+				}
+			}
+			assertContainsNone(t, got, `Mapping "Work/a/b/c"`, "goes to", "Found subfolder: Work/a ", "Found subfolder: Work/a/b ")
+			create := dst.capturedNames("CREATE")
+			slices.Sort(create)
+			if want := []string{"M", "M/a", "M/a/b", "M/a/b/c"}; !slices.Equal(create, want) {
+				t.Errorf("destination CREATE names = %q, want %q", create, want)
+			}
+			for folder, id := range map[string]string{"M": "w1@x", "M/a": "a1@x", "M/a/b": "b1@x", "M/a/b/c": "c1@x"} {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), id)
+			}
+			assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"))
+		})
+	}
+}
+
+func Test_printExpansion_When_NestedMapItemsCoverOneSource_Then_EachSourceGetsOneLineOfEachKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		want     string
+		folders  []string
+		mappings []config.DirectoryMapping
+	}{
+		{
+			name:     "each folder has a map item of its own",
+			folders:  []string{"INBOX", "Work", "Work/a", "Work/a/b"},
+			mappings: []config.DirectoryMapping{mapping("Work", "M"), mapping("Work/a", "M/a"), mapping("Work/a/b", "M/a/b")},
+			want:     coveredLine("Work/a") + coveredLine("Work/a/b"),
+		},
+		{
+			name:     "a child with a map item next to a child that a walk finds",
+			folders:  []string{"INBOX", "Work", "Work/a", "Work/a/x", "Work/b"},
+			mappings: []config.DirectoryMapping{mapping("Work", "M"), mapping("Work/a", "M/a")},
+			want: expansionFoundPrefix + "Work/b → M/b\n" +
+				expansionFoundPrefix + "Work/a/x → M/a/x\n" +
+				coveredLine("Work/a") +
+				"📂 Found 2 subfolders, total folders to sync: 4\n",
+		},
+		{
+			name:     "a covered line does not hide a goes-to line",
+			folders:  []string{"INBOX", "Work", "Work/a", "Work/a/b"},
+			mappings: []config.DirectoryMapping{mapping("Work", "M"), mapping("Work/a", "X"), mapping("Work/a/b", "M/a/b")},
+			want: "  ℹ️  Folder Work/a goes to X, not to M/a: the mapping of Work/a wins over the mapping of Work\n" +
+				coveredLine("Work/a/b") +
+				"  ℹ️  Folder Work/a/b goes to M/a/b, not to X/b: the mapping of Work/a/b wins over the mapping of Work/a\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			folders := make(map[string][]fakeMsg, len(tt.folders))
+			for _, folder := range tt.folders {
+				folders[folder] = nil
+			}
+			srcC := newAppClient(t, newStoreServer(t, "/", folders), "src")
+			dstC := newDestinationClient(t, "/")
+
+			got, _ := verboseExpansionOf(t, srcC, dstC, tt.mappings)
+
+			if got != tt.want {
+				t.Errorf("printExpansion output = %q, want %q", got, tt.want)
+			}
+			wantLines := sortedLines(tt.want)
+			for _, order := range permutations(len(tt.mappings)) {
+				items := make([]config.DirectoryMapping, 0, len(order))
+				for _, i := range order {
+					items = append(items, tt.mappings[i])
+				}
+				out, _ := verboseExpansionOf(t, srcC, dstC, items)
+				if !slices.Equal(sortedLines(out), wantLines) {
+					t.Errorf("map order %v gives the lines %q, want the lines %q in any order", order, sortedLines(out), wantLines)
+				}
+			}
+		})
+	}
+}
+
+// expectedExpansionLines derives the verbose lines from the map items alone: the longest item above a folder decides its destination.
+func expectedExpansionLines(tree []string, items []config.DirectoryMapping) []string {
+	under := func(root, folder string) bool { return folder == root || strings.HasPrefix(folder, root+"/") }
+	var found, goesTo []string
+	covered := make(map[string]struct{})
+	planned := 0
+	for _, folder := range tree {
+		var roots []config.DirectoryMapping
+		for _, item := range items {
+			if under(item.Source, folder) {
+				roots = append(roots, item)
+			}
+		}
+		if len(roots) == 0 {
+			continue
+		}
+		planned++
+		winner := slices.MaxFunc(roots, func(a, b config.DirectoryMapping) int { return cmp.Compare(len(a.Source), len(b.Source)) })
+		destination := winner.Destination + strings.TrimPrefix(folder, winner.Source)
+		if folder != winner.Source {
+			found = append(found, fmt.Sprintf("%s%s → %s\n", expansionFoundPrefix, folder, destination))
+		}
+		for _, root := range roots {
+			if root == winner {
+				continue
+			}
+			derived := root.Destination + strings.TrimPrefix(folder, root.Source)
+			switch {
+			case derived != destination:
+				goesTo = append(goesTo, fmt.Sprintf("  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s\n",
+					folder, destination, derived, winner.Source, root.Source))
+			case folder == winner.Source:
+				covered[folder] = struct{}{}
+			}
+		}
+	}
+	lines := slices.Concat(found, goesTo)
+	for _, folder := range slices.Sorted(maps.Keys(covered)) {
+		lines = append(lines, coveredLine(folder))
+	}
+	if len(found) > 0 {
+		lines = append(lines, fmt.Sprintf(expansionCountFormat+"\n", len(found), planned))
+	}
+	slices.Sort(lines)
+	return lines
+}
+
+func Test_printExpansion_When_NestedMapItemsVary_Then_FoundLinesMatchTheCountAndNoLineRepeats(t *testing.T) {
+	t.Parallel()
+
+	tree := []string{"INBOX", "Work", "Work/a", "Work/a/b", "Work/a/b/c", "Work/d"}
+	folders := make(map[string][]fakeMsg, len(tree))
+	for _, folder := range tree {
+		folders[folder] = nil
+	}
+	srcC := newAppClient(t, newStoreServer(t, "/", folders), "src")
+	dstC := newDestinationClient(t, "/")
+	candidates := []struct {
+		source       string
+		destinations []string
+	}{
+		{"Work", []string{"M"}},
+		{"Work/a", []string{"M/a", "X"}},
+		{"Work/a/b", []string{"M/a/b", "X/b", "Y"}},
+	}
+	total := 1
+	for _, c := range candidates {
+		total *= len(c.destinations) + 1
+	}
+	var runs, withFound, withCovered, withGoesTo int
+
+	// Code 0 is the empty set of items. A digit of 0 leaves a candidate out, and a digit of k picks its k-th destination.
+	for code := 1; code < total; code++ {
+		var items []config.DirectoryMapping
+		isItem := make(map[string]bool)
+		rest := code
+		for _, c := range candidates {
+			digit := rest % (len(c.destinations) + 1)
+			rest /= len(c.destinations) + 1
+			if digit > 0 {
+				items = append(items, mapping(c.source, c.destinations[digit-1]))
+				isItem[c.source] = true
+			}
+		}
+		wantLines := expectedExpansionLines(tree, items)
+
+		for _, order := range permutations(len(items)) {
+			ordered := make([]config.DirectoryMapping, 0, len(items))
+			for _, i := range order {
+				ordered = append(ordered, items[i])
+			}
+			out, planned := verboseExpansionOf(t, srcC, dstC, ordered)
+			runs++
+			label := fmt.Sprintf("items %v in order %v", items, order)
+
+			if got := sortedLines(out); !slices.Equal(got, wantLines) {
+				t.Errorf("%s: lines = %q, want %q in any order", label, got, wantLines)
+			}
+			plannedTo := make(map[string]string, len(planned))
+			for _, m := range planned {
+				plannedTo[m.Source] = m.Destination
+			}
+			seen := make(map[string]int)
+			foundFor := make(map[string]int)
+			var foundLines, countFound, countPlanned int
+			var hasCovered, hasGoesTo bool
+			for line := range strings.Lines(out) {
+				seen[line]++
+				switch {
+				case strings.HasPrefix(line, expansionFoundPrefix):
+					foundLines++
+					source, destination, ok := strings.Cut(strings.TrimSuffix(strings.TrimPrefix(line, expansionFoundPrefix), "\n"), " → ")
+					if !ok || isItem[source] || plannedTo[source] != destination {
+						t.Errorf("%s: found line %q must name a planned source that is no map item, with its planned destination %v", label, line, plannedTo)
+					}
+					foundFor[source]++
+				case strings.HasPrefix(line, expansionSkippedPrefix):
+					hasCovered = true
+					quoted, _, _ := strings.Cut(strings.TrimPrefix(line, expansionSkippedPrefix), " skipped")
+					if source, err := strconv.Unquote(quoted); err != nil || !isItem[source] {
+						t.Errorf("%s: skipped line %q must name a map item", label, line)
+					}
+				case strings.Contains(line, " goes to "):
+					hasGoesTo = true
+				case strings.HasPrefix(line, "📂 "):
+					if n, err := fmt.Sscanf(strings.TrimSuffix(line, "\n"), expansionCountFormat, &countFound, &countPlanned); n != 2 || err != nil {
+						t.Errorf("%s: count line %q does not parse: %v", label, line, err)
+					}
+				}
+			}
+
+			for line, n := range seen {
+				if n != 1 {
+					t.Errorf("%s: line %q shows %d times, want 1", label, line, n)
+				}
+			}
+			if countFound != foundLines {
+				t.Errorf("%s: count line says %d subfolders, output holds %d found lines", label, countFound, foundLines)
+			}
+			if foundLines > 0 && countPlanned != len(planned) {
+				t.Errorf("%s: count line says %d folders, want %d planned", label, countPlanned, len(planned))
+			}
+			if foundLines == 0 && strings.Contains(out, "📂") {
+				t.Errorf("%s: output holds a count line with no found line: %q", label, out)
+			}
+			for source := range plannedTo {
+				want := 1
+				if isItem[source] {
+					want = 0
+				}
+				if foundFor[source] != want {
+					t.Errorf("%s: planned source %q has %d found lines, want %d", label, source, foundFor[source], want)
+				}
+			}
+			if foundLines > 0 {
+				withFound++
+			}
+			if hasCovered {
+				withCovered++
+			}
+			if hasGoesTo {
+				withGoesTo++
+			}
+		}
+	}
+
+	for what, n := range map[string]int{"a found line": withFound, "a skipped line": withCovered, "a goes-to line": withGoesTo} {
+		if n == 0 {
+			t.Errorf("none of the %d runs printed %s, so the generator misses a case", runs, what)
+		}
 	}
 }
 

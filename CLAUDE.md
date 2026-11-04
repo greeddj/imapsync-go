@@ -131,25 +131,24 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - With `--verbose` and without `--quiet`, `runSync` prints the line `Checking for subfolders...` before the expansion in a typed run. A mirror run prints no such line. `printExpansion` prints the other lines of the expansion. It prints them only with `--verbose` and without `--quiet`.
    - `runSync` calls `printExpansion` after `splitDestinationClashes` and `splitEmptyLevelDestinations`, and before `printFolderRenames`. The function gets the planned mappings, which are the mappings that remain after both splits. It prints these groups in this order:
      - one escaped line, two spaces and then `📁 Found subfolder: %s → %s`, for each entry, in the order of the entries, when all these conditions are true:
+       - the entry wins (`mostSpecific`), so its destination is the destination that the plan uses;
        - the entry is a subfolder of its root, so its source name is different from its root;
        - a planned mapping names the source folder of the entry;
-       - the destination of the entry is the destination of its winner;
      - one escaped line, two spaces and then `ℹ️  Folder %s skipped - %s`, for each skipped name, in name order;
      - one line for each entry that lost, in the order of the entries, when a planned mapping names the source folder of the entry:
-       - an entry with another destination gives the escaped line two spaces and then `ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s`;
-       - an entry with the same destination gives the existing `%q` line `Mapping ... skipped - already covered by a parent mapping's expansion`;
+       - an entry with another destination than its winner gives the escaped line two spaces and then `ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s`;
+       - an entry with the same destination as its winner gives the existing `%q` line `Mapping ... skipped - already covered by a parent mapping's expansion`. This holds only when the winner is the map item of that source folder. The line shows one time for each source folder;
+       - an entry with the same destination as a winner that a subfolder walk made gives no line. The found-subfolder line of the winner names that folder;
      - the line `📂 Found %d subfolders, total folders to sync: %d`, only when the first number is more than 0.
+   - A source folder has one entry for each root that is equal to it or above it. Only the winner of these entries gives a found-subfolder line. So each planned source folder gets one found-subfolder line at most. A source folder that has a map item of its own gets none, because it is a root. A `Mapping ... skipped` line names only a map item.
    - The planned mappings change the found-subfolder lines, the lines of the entries that lost and the count line. The `Folder ... skipped` lines do not use them. A failure after the splits, such as a failed scan, changes no line, because `printExpansion` runs before the scan.
    - An entry that lost has the same source folder as its winner, and the expansion keeps one mapping for each source folder. So the condition is true only when the winner is in the plan.
    - So a found-subfolder line never names a destination that lost. In a found-subfolder line, a `goes to` line and a `Mapping ... skipped` line, the first folder never failed in a split. The folder-failure list names that folder and the reason.
    - A `goes to` line can name a root whose own mapping failed in a split, in a part `the mapping of %s`. That mapping still gives the destination of each subfolder for which it wins.
    - A mirror run has no entry in its report. So `printExpansion` prints no found-subfolder line, no `goes to` line, no `Mapping ... skipped` line and no count line. It prints only the `Folder ... skipped` lines.
-   - The first number of the count line is the number of entries for which all these conditions are true:
-     - the entry wins (`mostSpecific`);
-     - the entry is a subfolder of its root;
-     - a planned mapping names the source folder of the entry.
+   - The first number of the count line is the number of found-subfolder lines. The code counts a line when it prints the line.
    - The second number of the count line is the number of planned mappings. A subfolder with a mapping of its own is a root, so the first number leaves it out.
-   - The code counts these entries. It does not subtract the number of roots from the number of mappings. A `\Noselect` root has no entry. If the code subtracts, the count is wrong when a root is `\Noselect`. A repeated item gives no second root (step 1). So its found-subfolder lines show one time, and it gives no `Mapping ... skipped` line.
+   - The code counts the printed lines. It does not subtract the number of roots from the number of mappings. A `\Noselect` root has no entry. If the code subtracts, the count is wrong when a root is `\Noselect`. A repeated item gives no second root (step 1). So it gives no `Mapping ... skipped` line.
    - `printFolderRenames` prints one escaped warning line for each renamed mapping that remains after both splits, before the scan. The line shows the two names and the destination delimiter. It shows also without `--verbose` and with `--quiet`.
    - `printCaseVariantDestinations` prints one escaped warning line for each group of destination names that are different only in letter case. It runs after `printFolderRenames` and before the scan, in typed runs and in mirror runs. It reads the planned mappings, which come after `splitDestinationClashes` and `splitEmptyLevelDestinations`.
      - A group holds destination names that are equal after `strings.ToLower` but have different bytes. INBOX levels already have the listed spelling, so INBOX spellings are not variants.

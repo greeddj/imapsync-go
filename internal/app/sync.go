@@ -2076,33 +2076,43 @@ func printExpansion(out io.Writer, r expansionReport, planned []folderMapping, v
 	for _, m := range planned {
 		used[m.Source] = struct{}{}
 	}
+	// A root has no entry of its own when its source is \Noselect, so the printed entries are counted, not subtracted from the roots.
+	subfolders := 0
 	for i, e := range r.entries {
-		if _, ok := used[e.Source]; ok && e.root != e.Source && e.Destination == r.entries[r.winners[i]].Destination {
+		if _, ok := used[e.Source]; ok && r.winners[i] == i && e.root != e.Source {
 			_, _ = fmt.Fprintf(out, "  📁 Found subfolder: %s → %s\n", termsafe.Escape(e.Source), termsafe.Escape(e.Destination))
+			subfolders++
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(r.skipped)) {
 		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s skipped - %s\n", termsafe.Escape(name), r.skipped[name])
 	}
+	// A source has one entry for each root above it, so these lines follow its winner and not each entry.
+	var covered map[int]struct{}
 	for i, e := range r.entries {
-		if _, ok := used[e.Source]; !ok || r.winners[i] == i {
+		winner := r.winners[i]
+		if _, ok := used[e.Source]; !ok || winner == i {
 			continue
 		}
-		kept := r.entries[r.winners[i]]
-		if e.Destination == kept.Destination {
-			_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", e.Source)
+		kept := r.entries[winner]
+		if e.Destination != kept.Destination {
+			_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s\n",
+				termsafe.Escape(e.Source), termsafe.Escape(kept.Destination), termsafe.Escape(e.Destination),
+				termsafe.Escape(kept.root), termsafe.Escape(e.root))
 			continue
 		}
-		_, _ = fmt.Fprintf(out, "  ℹ️  Folder %s goes to %s, not to %s: the mapping of %s wins over the mapping of %s\n",
-			termsafe.Escape(e.Source), termsafe.Escape(kept.Destination), termsafe.Escape(e.Destination),
-			termsafe.Escape(kept.root), termsafe.Escape(e.root))
-	}
-	// A root has no entry of its own when its source is \Noselect, so the planned entries are counted, not subtracted from the roots.
-	subfolders := 0
-	for i, e := range r.entries {
-		if _, ok := used[e.Source]; ok && r.winners[i] == i && e.root != e.Source {
-			subfolders++
+		// A winner from a subfolder walk has its own found line, and no map item of the user exists to name.
+		if kept.root != kept.Source {
+			continue
 		}
+		if _, seen := covered[winner]; seen {
+			continue
+		}
+		if covered == nil {
+			covered = make(map[int]struct{})
+		}
+		covered[winner] = struct{}{}
+		_, _ = fmt.Fprintf(out, "  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", e.Source)
 	}
 	if subfolders > 0 {
 		_, _ = fmt.Fprintf(out, "📂 Found %d subfolders, total folders to sync: %d\n", subfolders, len(planned))
