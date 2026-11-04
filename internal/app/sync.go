@@ -1646,7 +1646,7 @@ func hasEmptyLevel(name, delimiter string) bool {
 	return delimiter != "" && (strings.HasPrefix(name, delimiter) || strings.HasSuffix(name, delimiter) || strings.Contains(name, delimiter+delimiter))
 }
 
-// dropRepeatedMappings keeps the first of each exact repeat. A repeat adds a second root whose entries lose to the first root but still show in the verbose lines.
+// A repeated item makes a second root, which adds a false `already covered` line and repeats each `goes to` line of that root.
 func dropRepeatedMappings(mappings []config.DirectoryMapping) []config.DirectoryMapping {
 	seen := make(map[config.DirectoryMapping]struct{}, len(mappings))
 	return slices.DeleteFunc(mappings, func(m config.DirectoryMapping) bool {

@@ -792,9 +792,6 @@ func customListHandler(srv *fakeServer, mailboxes []string) func(net.Conn) {
 	}
 }
 
-// Test_expandMappingsWithSubfolders_verboseLogging asserts that the verbose
-// path in expandMappingsWithSubfolders produces the correct deduplication
-// result and writes one skipped-mapping line for the map item that a parent covers.
 func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcSrv := newFakeServer(t)
 	srcSrv.addConnHandler(customListHandler(srcSrv, []string{"INBOX", "INBOX/Sub"}))
@@ -802,7 +799,7 @@ func Test_expandMappingsWithSubfolders_verboseLogging(t *testing.T) {
 	srcC := newAppClient(t, srcSrv, "src")
 	delimiter := srcC.GetDelimiter()
 
-	// The explicit mapping and the derived one agree on the destination, so one is dropped. Verbose prints the dropped-mapping line only: the child is a map item, so no walk found it.
+	// The map item of the child wins over the entry of the INBOX walk with the same destination, so verbose prints only the dropped-mapping line and no found line.
 	mappings := rootMappings(mapping("INBOX", "INBOX"), mapping("INBOX/Sub", "INBOX/Sub"))
 	var out strings.Builder
 	dstC := newDestinationClient(t, delimiter)
@@ -12266,7 +12263,7 @@ func Test_expandMirrorRoots_When_ContextEnded_Then_ReturnsContextErrorAndNoMappi
 	}
 }
 
-// mirrorTreeSpec is one random source tree, its \Noselect marks and the folders that the destination lists. Names are wire names, so a non-ASCII level is in modified UTF-7.
+// Names are wire names, so a non-ASCII level is in modified UTF-7.
 type mirrorTreeSpec struct {
 	paths             map[string][]string
 	noSelect          map[string]bool
@@ -12284,7 +12281,7 @@ type mirrorTreeSpec struct {
 
 func (s mirrorTreeSpec) name(p []string) string { return joinMirrorLevels(s.srcDelimiter, p) }
 
-// joinMirrorLevels joins levels with the delimiter. A flat server has no delimiter, so a slash is plain text in its names.
+// A flat server has no delimiter, so a slash is plain text in its names.
 func joinMirrorLevels(delimiter string, levels []string) string {
 	if delimiter == "" {
 		delimiter = "/"
@@ -13362,7 +13359,7 @@ func coveredLine(source string) string {
 	return fmt.Sprintf("  ℹ️  Mapping %q skipped - already covered by a parent mapping's expansion\n", source)
 }
 
-// verboseExpansionOf runs the expansion and both splits as runSync does, then prints the verbose lines.
+// The calls must keep the order of runSync: the expansion, both splits, then the verbose print.
 func verboseExpansionOf(t *testing.T, srcC, dstC *client.Client, items []config.DirectoryMapping) (string, []folderMapping) {
 	t.Helper()
 
@@ -14606,7 +14603,6 @@ func TestRunSync_When_MapRepeatsAnItemExactly_Then_RunMatchesASingleItem(t *test
 	}
 }
 
-// verboseExpansion splits a verbose output at the end of the count line. The block starts at the "Checking for subfolders" line.
 func verboseExpansion(t *testing.T, out string) (prefix, block string) {
 	t.Helper()
 
