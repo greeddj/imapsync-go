@@ -1,5 +1,6 @@
 PROJECT := "imapsync-go"
-VERSION := `sh -c 'git describe --tags --always --dirty 2>/dev/null || echo dev'`
+# Skip tags whose ref name holds a character outside this set. An annotated tag can carry another name, so an unsafe result falls back to the commit hash.
+VERSION := `sh -c 'export LC_ALL=C; v=$(git describe --tags --always --dirty --exclude="*[!A-Za-z0-9._+/-]*" 2>/dev/null) || v=dev; case $v in *[!A-Za-z0-9._+/-]*) v=$(git describe --always --dirty --exclude="*" 2>/dev/null) || v=dev ;; esac; echo "$v"'`
 COMMIT := `sh -c 'git rev-parse --short HEAD 2>/dev/null || true'`
 DATE := `date -u +%Y-%m-%dT%H:%M:%SZ`
 LDFLAGS := "-s -w" \
@@ -42,13 +43,13 @@ build: check lint test
 	@echo "===== Build {{PROJECT}} ====="
 	mkdir -p dist
 	test -f dist/{{PROJECT}} && rm -f dist/{{PROJECT}} || echo "Not exist dist/{{PROJECT}}"
-	CGO_ENABLED=0 go build -trimpath -ldflags="{{LDFLAGS}}"  -o ./dist/{{PROJECT}} ./cmd/{{ PROJECT }}/main.go
+	CGO_ENABLED=0 go build -trimpath -ldflags={{quote(LDFLAGS)}}  -o ./dist/{{PROJECT}} ./cmd/{{ PROJECT }}/main.go
 
 build_linux: check
 	@echo "===== Build {{PROJECT}} for Linux / amd64 ====="
 	mkdir -p dist
 	test -f dist/{{PROJECT}} && rm -f dist/{{PROJECT}} || echo "Not exist dist/{{PROJECT}}"
-	GOOS="linux" GOARCH="amd64" CGO_ENABLED=0 go build -trimpath -ldflags="{{LDFLAGS}}" -o dist/{{PROJECT}} ./cmd/{{ PROJECT }}/main.go
+	GOOS="linux" GOARCH="amd64" CGO_ENABLED=0 go build -trimpath -ldflags={{quote(LDFLAGS)}} -o dist/{{PROJECT}} ./cmd/{{ PROJECT }}/main.go
 
 oci executor="podman" tag="local": build_linux
 	@echo "===== Build Local OCI {{PROJECT}} ====="

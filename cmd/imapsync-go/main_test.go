@@ -681,6 +681,28 @@ func (r *scratchRepo) evaluate(justfile, name string) string {
 	return r.run(r.just, "--justfile", justfile, "--working-directory", r.dir, "--evaluate", name)
 }
 
+const canary = "pwned"
+
+func (r *scratchRepo) tagObject(ref, embedded string) {
+	r.t.Helper()
+
+	body := "object " + r.runGit("rev-parse", "HEAD") + "\ntype commit\ntag " + embedded +
+		"\ntagger example <example@example.invalid> 1700000000 +0000\n\nrelease\n"
+	file := filepath.Join(r.t.TempDir(), "tag-object")
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		r.t.Fatalf("write tag object: %v", err)
+	}
+	r.runGit("update-ref", "refs/tags/"+ref, r.runGit("hash-object", "-t", "tag", "-w", file))
+}
+
+func (r *scratchRepo) requireNoFile(name string) {
+	r.t.Helper()
+
+	if _, err := os.Lstat(filepath.Join(r.dir, name)); !errors.Is(err, os.ErrNotExist) {
+		r.t.Errorf("file %q: Lstat error = %v, want it to be missing", name, err)
+	}
+}
+
 func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing.T) {
 	t.Parallel()
 
@@ -804,6 +826,120 @@ func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing
 				return r.hash(), r.hash()
 			},
 		},
+		{
+			name: "only tag holds a command substitution",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v9$(touch${IFS}"+canary+")")
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "unsafe tag on the commit after a safe tag",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				r.commit("second")
+				r.runGit("tag", "v9$(id)")
+				return "v1.2.3-1-g" + r.hash(), r.hash()
+			},
+		},
+		{
+			// git describe breaks a tie between lightweight tags by name, so the unsafe name sorts first.
+			name: "safe and unsafe tag on the same commit",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				r.runGit("tag", "v0`id`")
+				return "v1.2.3", r.hash()
+			},
+		},
+		{
+			name: "only tag holds a double quote",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", `v9"x`)
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "only tag holds a single quote",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v9'x")
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "only tag holds a semicolon",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v9;x")
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "only tag holds a bidi control",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3\u202e")
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "only tag holds a C1 control",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1\u0085")
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "unsafe tag and a local change",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v9$(id)")
+				r.write("a local change")
+				return r.hash() + "-dirty", r.hash()
+			},
+		},
+		{
+			// git describe prints the name stored in the tag object, not the ref name.
+			name: "annotated tag object names an unsafe tag under a safe ref",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.tagObject("v1.2.3", "v9$(touch${IFS}"+canary+")")
+				return r.hash(), r.hash()
+			},
+		},
+		{
+			name: "annotated tag object names a bidi control under a safe ref and a local change",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.tagObject("v1.2.3", "v1.2.3\u202e")
+				r.write("a local change")
+				return r.hash() + "-dirty", r.hash()
+			},
+		},
+		{
+			// Without a slash match in the glob, only the check of the result would catch this tag, and it gives the bare hash.
+			name: "unsafe text after a slash in the tag on the next commit",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "v1.2.3")
+				r.commit("second")
+				r.runGit("tag", "rel/v9$(id)")
+				return "v1.2.3-1-g" + r.hash(), r.hash()
+			},
+		},
+		{
+			name: "tag holds a slash and a plus sign",
+			setup: func(r *scratchRepo) (string, string) {
+				r.initWithCommit()
+				r.runGit("tag", "release/v1.2.3+build.5")
+				return "release/v1.2.3+build.5", r.hash()
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -826,7 +962,85 @@ func TestJustfile_When_TreeStateVaries_Then_VersionNamesTheExactBuild(t *testing
 			if !strings.HasSuffix(ldflags, " -X main.BuiltBy=just") {
 				t.Errorf("LDFLAGS = %q, want it to end with %q", ldflags, " -X main.BuiltBy=just")
 			}
+			r.requireNoFile(canary)
 		})
+	}
+}
+
+func writeFakeTool(t *testing.T, dir, name, body string) {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+}
+
+func TestJustfile_When_VersionHoldsShellSyntax_Then_BuildRecipesPassLdflagsAsOneArgument(t *testing.T) {
+	justPath, err := exec.LookPath("just")
+	if err != nil {
+		t.Skipf("just is not in PATH: %v", err)
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is not in PATH: %v", err)
+	}
+	justfile, err := filepath.Abs(filepath.Join("..", "..", "Justfile"))
+	if err != nil {
+		t.Fatalf("resolve the Justfile path: %v", err)
+	}
+	// The stat makes the go test cache notice an edited Justfile, because reads by a subprocess are not tracked.
+	if _, err := os.Stat(justfile); err != nil {
+		t.Fatalf("the Justfile is missing: %v", err)
+	}
+
+	// The scripts exist before t.Parallel: on Linux a parallel fork can hold the write descriptor of a new script, and exec then fails with ETXTBSY.
+	fakeBin := t.TempDir()
+	const argvVar = "IMAPSYNC_TEST_ARGV"
+	writeFakeTool(t, fakeBin, "go", `if [ "$1" = build ]; then printf '%s\0' "$@" > "$`+argvVar+`"; fi; exit 0`)
+	writeFakeTool(t, fakeBin, "golangci-lint", "exit 0")
+	path := fakeBin + string(os.PathListSeparator) + os.Getenv("PATH")
+
+	t.Parallel()
+
+	const fixedDate = "2026-01-02T03:04:05Z"
+	versions := []struct{ name, value string }{
+		{name: "command substitution", value: "v1$(touch${IFS}" + canary + ")"},
+		{name: "backticks", value: "v1`touch " + canary + "`"},
+		{name: "single quote", value: "v1'x;touch " + canary + ";'"},
+		{name: "double quote", value: `v1";touch ` + canary + `;"`},
+	}
+	for _, recipe := range []string{"build", "build_linux"} {
+		for _, v := range versions {
+			t.Run(recipe+" with "+v.name, func(t *testing.T) {
+				t.Parallel()
+
+				r := newScratchRepo(t, justPath, gitPath)
+				r.initWithCommit()
+				argvFile := filepath.Join(t.TempDir(), "argv")
+				// exec keeps the last of two equal keys.
+				r.env = append(r.env, "PATH="+path, argvVar+"="+argvFile)
+
+				r.run(r.just, "--justfile", justfile, "--working-directory", r.dir,
+					"--set", "VERSION", v.value, "--set", "DATE", fixedDate, recipe)
+
+				raw, err := os.ReadFile(argvFile)
+				if err != nil {
+					t.Fatalf("read the recorded go build arguments: %v", err)
+				}
+				var ldflags []string
+				for _, arg := range strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00") {
+					if strings.HasPrefix(arg, "-ldflags=") {
+						ldflags = append(ldflags, arg)
+					}
+				}
+				want := "-ldflags=-s -w -X main.Version=" + v.value + " -X main.Commit=" + r.hash() +
+					" -X main.Date=" + fixedDate + " -X main.BuiltBy=just"
+				if len(ldflags) != 1 || ldflags[0] != want {
+					t.Errorf("-ldflags arguments = %q, want exactly [%q]", ldflags, want)
+				}
+				r.requireNoFile(canary)
+			})
+		}
 	}
 }
 
