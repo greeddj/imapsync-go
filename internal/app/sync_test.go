@@ -5178,6 +5178,100 @@ func TestRunSync_When_HiddenFolderAnswersAlreadyExistsAfterItsParentIsMade_Then_
 	assertContainsNone(t, second, "Syncing messages")
 }
 
+func TestRunSync_When_SourceFolderHasNoMessageToCopy_Then_NoDestinationFolderIsCreated(t *testing.T) {
+	t.Parallel()
+
+	mirror := func(t *testing.T, src, dst *fakeServer, autoConfirm bool) string {
+		t.Helper()
+		out := &syncBuffer{}
+		opts := e2eOptions(out, "")
+		opts.autoConfirm = autoConfirm
+		if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts); err != nil {
+			t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+		}
+		return out.String()
+	}
+
+	t.Run("empty folder next to a folder with a message", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Empty": nil, "A": fakeMsgs("a1@x")})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+
+		first := mirror(t, src, dst, true)
+
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A")
+		if dst.hasFolder("Empty") {
+			t.Error("dst has the folder Empty, want none")
+		}
+		assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x")
+		assertContainsAll(t, first, foldersToCreateHeader+folderBullets("A")+"\n📨 Total new messages to sync: 1")
+		assertContainsNone(t, first, "Empty →", "• Empty")
+		assertReadOnly(t, "source", src)
+
+		src.addMessage("Empty", "e1@x")
+
+		second := mirror(t, src, dst, true)
+
+		assertIDs(t, "dst CREATE names over both runs", dst.capturedNames("CREATE"), "A", "Empty")
+		assertIDs(t, "dst Empty", dst.folderMsgIDs("Empty"), "e1@x")
+		assertContainsAll(t, second, foldersToCreateHeader+folderBullets("Empty")+"\n📨 Total new messages to sync: 1")
+	})
+
+	t.Run("folder whose messages have no Message-Id", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{
+			"INBOX": nil,
+			"NoIds": {{body: bodyOfSize("", 300)}},
+			"A":     fakeMsgs("a1@x"),
+		})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+
+		got := mirror(t, src, dst, true)
+
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "A")
+		if dst.hasFolder("NoIds") {
+			t.Error("dst has the folder NoIds, want none")
+		}
+		assertIDs(t, "dst A", dst.folderMsgIDs("A"), "a1@x")
+		assertContainsAll(t, got, foldersToCreateHeader+folderBullets("A")+"\n📨 Total new messages to sync: 1")
+		assertContainsNone(t, got, "NoIds →", "• NoIds")
+	})
+
+	t.Run("no folder has a message to copy", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Empty": nil})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+
+		got := mirror(t, src, dst, false)
+
+		assertContainsAll(t, got, "All folders already synced!")
+		assertContainsNone(t, got, "Folders to be created on destination", "Proceed with synchronization?")
+		if n := dst.callCount("CREATE"); n != 0 {
+			t.Errorf("dst saw %d CREATE commands, want 0", n)
+		}
+		if n := dst.callCount("APPEND"); n != 0 {
+			t.Errorf("dst saw %d APPEND commands, want 0", n)
+		}
+	})
+
+	t.Run("empty parent of a folder with a message", func(t *testing.T) {
+		t.Parallel()
+
+		src := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil, "Projects": nil, "Projects/2024": fakeMsgs("p1@x")})
+		dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+
+		got := mirror(t, src, dst, true)
+
+		assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Projects", "Projects/2024")
+		assertContainsAll(t, got, foldersToCreateHeader+folderBullets("Projects", "Projects/2024")+"\n📨 Total new messages to sync: 1")
+		assertIDs(t, "dst Projects", dst.folderMsgIDs("Projects"))
+		assertIDs(t, "dst Projects/2024", dst.folderMsgIDs("Projects/2024"), "p1@x")
+	})
+}
+
 func Test_foldersToCreate(t *testing.T) {
 	t.Parallel()
 

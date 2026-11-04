@@ -123,6 +123,9 @@ map:
 > the same name. If the two servers use different hierarchy delimiters, the
 > command converts the name. Refer to
 > [Folder names and hierarchy delimiters](#folder-names-and-hierarchy-delimiters).
+> The command creates a destination folder only when the sync plan copies a message to this folder or to one of its subfolders.
+> Refer to
+> [Destination folders that the command creates](#destination-folders-that-the-command-creates).
 > You can also use `--src-folder` / `--dest-folder` to sync a single
 > folder without a config file `map` section.
 
@@ -300,6 +303,26 @@ If the server answers NIL for the delimiter of each folder, or lists no folder, 
 - The command creates no parent folder on a flat destination.
 - A flat source has no subfolders. Each mapped folder gives one folder.
 - On a flat destination, a subfolder keeps the delimiter of the source as part of its name.
+
+### Destination folders that the command creates
+
+`sync` creates a destination folder only for a plan that copies at least one message. It also creates the missing parent folders of this folder. Refer to [Parent folders that the command creates](#parent-folders-that-the-command-creates).
+
+A source folder gives no plan when it has no message to copy. Then the command sends no CREATE for it. These are examples:
+
+- The source folder is empty.
+- No message in the source folder has a `Message-Id`. Refer to [Idempotency caveats](#idempotency-caveats).
+- The destination server lists the destination folder, and this folder already holds each message of the source folder.
+
+So an empty source folder gets no destination folder. `sync` copies messages. It does not copy empty folders. This rule applies to `map` items and to a run without `map` items.
+
+An empty source folder can be the parent of a folder that has messages to copy. Then the command creates its destination folder as a parent folder.
+
+Another source folder can have the same destination folder and messages to copy. Then the command creates this destination folder for that source folder.
+
+If no source folder has a message to copy and no folder failed, the command creates no folder and asks no question. Without `-q`, it prints `All folders already synced!`.
+
+A later run creates the destination folder when the source folder gets a message to copy.
 
 ### Parent folders that the command creates
 

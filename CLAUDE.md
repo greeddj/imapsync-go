@@ -213,6 +213,17 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - When the plan has no message to copy and a folder failure exists, the run shows no prompt. It prints the error summary line and exits with code 1 (`ErrSilentExit`).
    - After the copy, when a folder failure exists, the run exits with code 1 (`ErrSilentExit`). Without `--quiet`, it first lists the folder failures again. It always prints the error summary line, with the count of failed folders.
 4. **Pre-create destination folders** for the active plans (sequential, with per-folder mutex on `Client.folderLocks`). New mailboxes are added back into the cache. A name that LIST marks `\Noselect` counts as existing, so the client sends no CREATE for it, also when it is a parent.
+   - The creation stage creates a destination folder only for a plan, and the missing parent levels of that folder. This behaviour is on purpose: `sync` copies messages, not empty folders. Do not add a CREATE for a mapping that has no plan.
+     - `maybeDiff` makes a plan only when it plans at least one UID (step 3). So a source folder with no message to copy gets no CREATE.
+     - These source folders have no message to copy:
+       - an empty folder;
+       - a folder in which no message has a Message-Id, because the scan skips such messages;
+       - a folder whose messages the destination folder already holds, when the destination LIST shows that folder.
+     - A destination folder that LIST hides gets no destination scan, so `maybeDiff` compares the source with an empty destination. The run sends a CREATE for it. When the CREATE reply says that the folder exists, the check after CREATE removes from the plan the messages that the folder holds.
+     - When `TotalNew` is 0, `runSync` returns through `endRunWithoutCopy` before this stage. Without failures and without `--quiet`, it prints `✅ All folders already synced!`.
+     - The destination folder of an empty source folder is created only as a missing parent level of a planned folder (`MissingLevels`), or when another mapping with the same destination has a plan (`sharedDestinations`, step 3).
+     - A later run creates the folder when the source folder gets a message to copy. No state is kept between runs.
+     - `TestRunSync_When_SourceFolderHasNoMessageToCopy_Then_NoDestinationFolderIsCreated` tests this behaviour in a mirror run.
    - `destinationsToCreate` and `foldersToCreate` list the names for which the creation stage sends a CREATE. The preview, the creation counter and the CREATE commands use one order. So all three agree while the server accepts each CREATE.
      - `destinationsToCreate` takes the destination folder of each plan that copies a message to a folder that the plan did not find. It sorts the folders in byte order and keeps each folder one time. `runSync` calls it one time and keeps the result as `createTargets`. Byte order puts a parent path before its children.
      - `foldersToCreate` takes `createTargets`. For each folder, in this order, it asks `Client.MissingLevels`.

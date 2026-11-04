@@ -718,7 +718,12 @@
   - `TestRunSync_When_ContextEndsBeforeTheFoldersToCreateAreListed_Then_ReturnsCanceledWithoutPreview` - a context that ends after the folder-failure list gives `context.Canceled`. The run prints no preview and no question, and the destination gets no CREATE and no APPEND;
   - `TestRunSync_When_ParentLevelNameCarriesControlCharacters_Then_PreviewShowsEscapesAndServerGetsExactNames` - the preview escapes a parent level and its child. The CREATE commands carry the exact names;
   - `TestRunSync_When_HiddenParentAnswersAlreadyExists_Then_CounterLeavesItOut` - a parent that LIST hides and CREATE reports as existing is in the preview, but the counter does not count it (`Created 1 folders`);
-  - `TestRunSync_When_HiddenFolderAnswersAlreadyExistsAfterItsParentIsMade_Then_OnlyTheMissingMessageIsCopied` - a folder that LIST hides, below a parent that CREATE makes, gets only the missing message. The counter shows `Created 1 folders`, and a second run sends no APPEND.
+  - `TestRunSync_When_HiddenFolderAnswersAlreadyExistsAfterItsParentIsMade_Then_OnlyTheMissingMessageIsCopied` - a folder that LIST hides, below a parent that CREATE makes, gets only the missing message. The counter shows `Created 1 folders`, and a second run sends no APPEND;
+  - `TestRunSync_When_SourceFolderHasNoMessageToCopy_Then_NoDestinationFolderIsCreated` - a mirror run creates a destination folder only for a source folder that has a message to copy, and for the missing parents of that folder. Each subtest checks the CREATE commands on the wire. The subtests are:
+    - `empty folder next to a folder with a message` - the CREATE commands name `A` only, and the destination has no `Empty` folder. The preview lists `A` only, directly before the total of 1 message. The source gets no write command. After the test adds a message to `Empty`, a second run creates `Empty` and copies the message;
+    - `folder whose messages have no Message-Id` - the CREATE commands name `A` only, and the destination has no `NoIds` folder. The preview lists `A` only;
+    - `no folder has a message to copy` - the output shows `All folders already synced!`. It shows no list of folders to create and no question. The destination gets no CREATE and no APPEND;
+    - `empty parent of a folder with a message` - the CREATE commands name `Projects` and `Projects/2024`, in this order. The preview lists both folders. `Projects` stays empty, and `Projects/2024` holds the message.
 
   The `show` command has these tests for colour codes and tracker lines:
   - `TestRunShow_When_BothAccountsLoad_Then_TheirTrackerLinesStayAboveTheTables` - the two lines `Done (N mailboxes)` with the done mark stay on the screen, above the first table;
