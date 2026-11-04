@@ -2918,6 +2918,118 @@ func TestRunSync_When_BothFolderFlagsGiven_Then_TheyReplaceConfiguredMappings(t 
 	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "Archive")
 }
 
+func TestRunSync_When_FolderFlagsNameAFolderWithSubfolders_Then_EachSubfolderIsCopiedBelowTheDestinationFolder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src          map[string][]fakeMsg
+		wantDst      map[string][]string
+		name         string
+		srcDelimiter string
+		wantSrcOpen  []string
+		wantCreates  []string
+		absentDst    []string
+		wantOut      []string
+		wantNoOut    []string
+		wantAppends  int
+	}{
+		{
+			name:         "both servers use slash",
+			srcDelimiter: "/",
+			src: map[string][]fakeMsg{
+				"A":          fakeMsgs("a1@x"),
+				"A/Sub":      fakeMsgs("s1@x"),
+				"A/Sub/Deep": fakeMsgs("d1@x"),
+				"Ab":         fakeMsgs("x1@x"),
+				"Other":      fakeMsgs("o1@x"),
+			},
+			wantDst:     map[string][]string{"B": {"a1@x"}, "B/Sub": {"s1@x"}, "B/Sub/Deep": {"d1@x"}},
+			wantCreates: []string{"B", "B/Sub", "B/Sub/Deep"},
+			wantSrcOpen: []string{"A", "A/Sub", "A/Sub/Deep"},
+			absentDst:   []string{"A", "Ab", "Other"},
+			wantNoOut:   []string{"delimiter mismatch", "Fix folder delimiters", "is renamed to"},
+			wantAppends: 3,
+		},
+		{
+			name:         "source uses dot",
+			srcDelimiter: ".",
+			src: map[string][]fakeMsg{
+				"A":          fakeMsgs("a1@x"),
+				"A.Sub":      fakeMsgs("s1@x"),
+				"A.Sub.Deep": fakeMsgs("d1@x"),
+				"Ab":         fakeMsgs("x1@x"),
+			},
+			wantDst:     map[string][]string{"B": {"a1@x"}, "B/Sub": {"s1@x"}, "B/Sub/Deep": {"d1@x"}},
+			wantCreates: []string{"B", "B/Sub", "B/Sub/Deep"},
+			wantSrcOpen: []string{"A", "A.Sub", "A.Sub.Deep"},
+			absentDst:   []string{"A", "Ab", "A.Sub", "A.Sub.Deep"},
+			wantNoOut:   []string{"delimiter mismatch", "Fix folder delimiters", "is renamed to"},
+			wantAppends: 3,
+		},
+		{
+			name:         "a source level holds the destination delimiter",
+			srcDelimiter: ".",
+			src: map[string][]fakeMsg{
+				"A":     fakeMsgs("a1@x"),
+				"A.x/y": fakeMsgs("s1@x"),
+			},
+			wantDst:     map[string][]string{"B": {"a1@x"}, "B/x_y": {"s1@x"}},
+			wantCreates: []string{"B", "B/x_y"},
+			wantSrcOpen: []string{"A", "A.x/y"},
+			absentDst:   []string{"A", "A.x/y", "B/x/y"},
+			wantOut:     []string{"Folder A.x/y is renamed to B/x_y"},
+			wantAppends: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, tt.srcDelimiter, tt.src)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			cfg := e2eConfig(src, dst, 1)
+
+			first := runSyncConfirmed(t, cfg, "A", "B")
+			appends, creates := dst.callCount("APPEND"), dst.callCount("CREATE")
+			second := runSyncConfirmed(t, cfg, "A", "B")
+
+			for folder, ids := range tt.wantDst {
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), ids...)
+			}
+			for _, folder := range tt.absentDst {
+				if dst.hasFolder(folder) {
+					t.Errorf("dst has %s, a folder the options do not copy", folder)
+				}
+			}
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), tt.wantCreates...)
+			if appends != tt.wantAppends {
+				t.Errorf("dst APPEND count after the first run = %d, want %d", appends, tt.wantAppends)
+			}
+			examined := src.capturedNames("EXAMINE")
+			for _, name := range examined {
+				if !slices.Contains(tt.wantSrcOpen, name) {
+					t.Errorf("source EXAMINE of %q, want only %v", name, tt.wantSrcOpen)
+				}
+			}
+			for _, name := range tt.wantSrcOpen {
+				if !slices.Contains(examined, name) {
+					t.Errorf("source EXAMINE names = %v, want them to contain %s", examined, name)
+				}
+			}
+			assertContainsAll(t, first, tt.wantOut...)
+			assertContainsNone(t, first, tt.wantNoOut...)
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("APPEND"); n != appends {
+				t.Errorf("dst APPEND count went from %d to %d on the second run", appends, n)
+			}
+			if n := dst.callCount("CREATE"); n != creates {
+				t.Errorf("dst CREATE count went from %d to %d on the second run", creates, n)
+			}
+			assertReadOnly(t, "source", src)
+		})
+	}
+}
+
 func TestRunSync_When_NoMappingsConfigured_Then_EverySourceFolderIsSynced(t *testing.T) {
 	t.Parallel()
 

@@ -339,6 +339,11 @@
   - `TestRunSync_When_FolderIsRenamed_Then_WarningShowsWithoutVerboseAndBeforePrompt` - the rename notice shows before the prompt, also without `--verbose` and with `--quiet`;
   - `TestRunSync_When_RenamedNameCarriesControlCharacters_Then_WarningShowsEscapesAndServerGetsExactName` - the notice escapes the names, and the servers get the exact names.
 
+  The options `--src-folder` and `--dest-folder` have these tests:
+  - `TestRunSync_When_FolderFlagsNameAFolderWithSubfolders_Then_EachSubfolderIsCopiedBelowTheDestinationFolder` - the two options copy the folder and each subfolder at any depth below the destination folder. A sibling with the same prefix is not copied. A source with `.` gets `/` names on the destination. A level that holds the destination delimiter is renamed with `_`. A second run copies nothing;
+  - `TestRunSync_When_MappedSourceIsNoSelect_Then_OnlyItsChildrenAreCopied` - with the config `map` and with the two options, the source gets no EXAMINE for a `\Noselect` folder, and its subfolders copy below the destination folder;
+  - `TestRunSync_When_BothFolderFlagsGiven_Then_TheyReplaceConfiguredMappings` - the two options replace the config `map` items.
+
   The clash of destination names has these tests:
   - `Test_splitDestinationClashes` - a group with a renamed mapping fails every member, and a group with no renamed mapping stays;
   - `TestRunSync_When_RenameMakesTwoSourcesShareADestination_Then_BothFailAndNothingMerges` - both folders fail, the run opens neither folder on the source, and it creates no destination folder for them;

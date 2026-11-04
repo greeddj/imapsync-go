@@ -126,10 +126,13 @@ map:
 > The command creates a destination folder only when the sync plan copies a message to this folder or to one of its subfolders.
 > Refer to
 > [Destination folders that the command creates](#destination-folders-that-the-command-creates).
-> You can also use `--src-folder` / `--dest-folder` to sync a single
-> folder without a config file `map` section.
+> You can also use the options `-s` and `-d`. If you use them, the command does
+> not use the `map` section. Refer to [Command-line Options](#command-line-options).
 
 A `map` item applies to its source folder and to all subfolders of this folder.
+The options `-s` and `-d` give one item of this type. For example, on two servers
+that use `/`, `-s Projects -d Archive` copies `Projects` to `Archive` and
+`Projects/2024` to `Archive/2024`.
 If two `map` items apply to one folder, the item with the nearest source folder
 decides. The order of the items does not change the result. For example, with
 `INBOX` to `Old` and `INBOX/Work` to `Work`, the command copies `INBOX/Work` to
@@ -190,7 +193,7 @@ imapsync-go show
 # Sync all folders (from config map or auto-discovered from source)
 imapsync-go sync -w 4
 
-# Sync a single folder
+# Sync one folder and all its subfolders
 imapsync-go sync -s INBOX -d INBOX
 imapsync-go sync -s 'Test.[some_group].box' -d 'Test/some_group/box'
 
@@ -228,8 +231,8 @@ sync -w 4
 
 **Sync command:**
 
-- `-s, --src-folder` - Source folder (overrides config) (env: `IMAPSYNC_SOURCE_FOLDER`)
-- `-d, --dest-folder` - Destination folder (overrides config). The command refuses a name with an empty level that the destination server does not list (refer to [Names that you type](#names-that-you-type)). (env: `IMAPSYNC_DESTINATION_FOLDER`)
+- `-s, --src-folder` - Source folder. The command copies this folder and all its subfolders. You must also use `-d`. If you use `-s` and `-d`, the command does not use the `map` items of the config file. (env: `IMAPSYNC_SOURCE_FOLDER`)
+- `-d, --dest-folder` - Destination folder for `-s`. The subfolders of the source folder go below this folder. The command refuses a name with an empty level that the destination server does not list (refer to [Names that you type](#names-that-you-type)). (env: `IMAPSYNC_DESTINATION_FOLDER`)
 - `-w, --workers` - Number of parallel workers (default: 4, max: 10) (env: `IMAPSYNC_WORKERS`)
 - `-y, --confirm, --yes` - Auto-confirm without prompt. The `-q` option needs this option. (env: `IMAPSYNC_CONFIRM`)
 - `-V, --verbose` - Enable verbose output (env: `IMAPSYNC_VERBOSE`)
@@ -275,7 +278,7 @@ The command sends no EXAMINE, STATUS, FETCH, CREATE or APPEND to a server. It sh
 
 ### Names that the command converts
 
-If `map` has no items and you do not use `-s` and `-d`, the command builds the destination name from the source name. It does the same for each subfolder of a mapped folder. It replaces the delimiter of the source server with the delimiter of the destination server.
+If `map` has no items and you do not use `-s` and `-d`, the command builds the destination name from the source name. It does the same for each subfolder of a mapped folder. It replaces the delimiter of the source server with the delimiter of the destination server. The folder that you give with `-s` is also a mapped folder.
 
 If a level of the source name holds the delimiter of the destination server as text, the command replaces this character with `_`. It uses `-` when the delimiter of the destination server is `_`. For example, `Clients/acme.com` on a `/` server becomes `Clients.acme_com` on a `.` server.
 

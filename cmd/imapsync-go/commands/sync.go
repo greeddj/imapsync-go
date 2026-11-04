@@ -16,11 +16,13 @@ func Sync() *cli.Command {
 			&cli.StringFlag{
 				Name:    "src-folder",
 				Aliases: []string{"s"},
+				Usage:   "source folder to sync, with all its subfolders; replaces the config map and needs --dest-folder",
 				Sources: cli.EnvVars("IMAPSYNC_SOURCE_FOLDER"),
 			},
 			&cli.StringFlag{
 				Name:    "dest-folder",
 				Aliases: []string{"d"},
+				Usage:   "destination folder for --src-folder; the subfolders of the source folder go below it",
 				Sources: cli.EnvVars("IMAPSYNC_DESTINATION_FOLDER"),
 			},
 			&cli.IntFlag{
