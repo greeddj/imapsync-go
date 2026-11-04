@@ -12269,6 +12269,247 @@ func Test_expandMirrorRoots_When_ContextEnded_Then_ReturnsContextErrorAndNoMappi
 	}
 }
 
+// mirrorTreeSpec is one random source tree, its \Noselect marks and the folders that the destination lists. Names are wire names, so a non-ASCII level is in modified UTF-7.
+type mirrorTreeSpec struct {
+	paths             map[string][]string
+	noSelect          map[string]bool
+	srcDelimiter      string
+	dstDelimiter      string
+	markedSpelling    string
+	unmarkedSpelling  string
+	dstPaths          [][]string
+	depth             int
+	hasInboxPair      bool
+	hasOtherDelimiter bool
+	hasNonASCII       bool
+	hasEmptyLevel     bool
+}
+
+func (s mirrorTreeSpec) name(p []string) string { return joinMirrorLevels(s.srcDelimiter, p) }
+
+// joinMirrorLevels joins levels with the delimiter. A flat server has no delimiter, so a slash is plain text in its names.
+func joinMirrorLevels(delimiter string, levels []string) string {
+	if delimiter == "" {
+		delimiter = "/"
+	}
+	return strings.Join(levels, delimiter)
+}
+
+func randomMirrorTree(rng *rand.Rand, srcDelimiter, dstDelimiter string) mirrorTreeSpec {
+	// The empty level makes names with an empty level, and the levels with a dot or a slash hold the other delimiter.
+	levels := []string{"a", "b", "c", "Work", "mid", "x y", "&ANw-n&AO8-", "&ZeVnLA-", "v1.2", "v1/2", "v_3", ""}
+	spec := mirrorTreeSpec{
+		paths:        map[string][]string{"INBOX": {"INBOX"}},
+		noSelect:     map[string]bool{},
+		srcDelimiter: srcDelimiter,
+		dstDelimiter: dstDelimiter,
+		depth:        1,
+	}
+	add := func(p []string) {
+		if !slices.ContainsFunc(p, func(level string) bool { return level != "" }) {
+			return
+		}
+		spec.paths[spec.name(p)] = p
+		spec.depth = max(spec.depth, len(p))
+	}
+	level := func() string { return levels[rng.IntN(len(levels))] }
+
+	maxDepth := 1 + rng.IntN(8)
+	var grow func(prefix []string)
+	grow = func(prefix []string) {
+		if len(prefix) >= maxDepth || len(spec.paths) >= 48 {
+			return
+		}
+		for range []int{0, 1, 1, 2, 3, 4}[rng.IntN(6)] {
+			child := append(slices.Clone(prefix), level())
+			add(child)
+			grow(child)
+		}
+	}
+	for range 1 + rng.IntN(4) {
+		top := []string{level()}
+		add(top)
+		grow(top)
+	}
+	if rng.IntN(4) == 0 {
+		chain := make([]string, 0, 8)
+		for range 8 {
+			chain = append(chain, level())
+			if rng.IntN(2) == 0 || len(chain) == 8 {
+				add(slices.Clone(chain))
+			}
+		}
+	}
+
+	// A server that does not fold the letter case of an INBOX child lists the two spellings as two folders.
+	if rng.IntN(2) == 0 {
+		spec.hasInboxPair = true
+		tails := [][]string{{"Work"}, {"Alpha"}, {"Alpha", "Deep"}, {"Beta"}}
+		rng.Shuffle(len(tails), func(i, j int) { tails[i], tails[j] = tails[j], tails[i] })
+		other := []string{"Inbox", "inbox"}[rng.IntN(2)]
+		for _, tail := range tails[:1+rng.IntN(len(tails))] {
+			add(append([]string{"INBOX"}, tail...))
+			add(append([]string{other}, tail...))
+		}
+		if rng.IntN(2) == 0 {
+			spec.markedSpelling, spec.unmarkedSpelling = spec.name([]string{"INBOX", "Work"}), spec.name([]string{other, "Work"})
+			add([]string{"INBOX", "Work"})
+			add([]string{other, "Work"})
+			spec.noSelect[spec.markedSpelling] = true
+		}
+	}
+
+	names := slices.Sorted(maps.Keys(spec.paths))
+	for _, name := range names {
+		p := spec.paths[name]
+		if name == "INBOX" || name == spec.unmarkedSpelling {
+			continue
+		}
+		if name != spec.markedSpelling && rng.IntN(6) == 0 {
+			spec.noSelect[name] = true
+		}
+		for _, l := range p {
+			spec.hasOtherDelimiter = spec.hasOtherDelimiter || strings.ContainsAny(l, "./")
+			spec.hasNonASCII = spec.hasNonASCII || strings.Contains(l, "&")
+		}
+		spec.hasEmptyLevel = spec.hasEmptyLevel || hasEmptyLevel(name, srcDelimiter)
+	}
+
+	// The destination lists some INBOX children in another letter case, and some other folders.
+	for _, name := range names {
+		p := spec.paths[name]
+		switch {
+		case p[0] == "INBOX" && len(p) > 1 && rng.IntN(3) == 0:
+			spec.dstPaths = append(spec.dstPaths, append([]string{"Inbox"}, p[1:]...))
+		case rng.IntN(8) == 0:
+			spec.dstPaths = append(spec.dstPaths, p)
+		}
+	}
+	return spec
+}
+
+func Test_expandMirrorRoots_When_RandomTreesAreExpanded_Then_MatchesTheFullExpansionOfTheSameRoots(t *testing.T) {
+	t.Parallel()
+
+	// Every pair of source and destination delimiters, with slash, dot and flat on each side.
+	pairs := []struct{ src, dst string }{{"/", "/"}, {"/", "."}, {".", "/"}, {"", "/"}, {"/", ""}, {"", ""}, {".", "."}, {".", ""}, {"", "."}}
+	const cases = 200
+	rng := rand.New(rand.NewPCG(2026, 11))
+	specs := make([]mirrorTreeSpec, cases)
+	var ran atomic.Int64
+	var counts struct {
+		noSelect, halfMarked, renamed, resolved, pair, depth8, empty, nonASCII, otherDelimiter, flatSource, flatDestination atomic.Int64
+	}
+	for i := range specs {
+		pair := pairs[i%len(pairs)]
+		specs[i] = randomMirrorTree(rng, pair.src, pair.dst)
+		spec := specs[i]
+		for _, c := range []struct {
+			counter *atomic.Int64
+			present bool
+		}{
+			{&counts.pair, spec.hasInboxPair}, {&counts.empty, spec.hasEmptyLevel}, {&counts.nonASCII, spec.hasNonASCII},
+			{&counts.otherDelimiter, spec.hasOtherDelimiter}, {&counts.depth8, spec.depth == 8},
+			{&counts.halfMarked, spec.markedSpelling != ""}, {&counts.flatSource, spec.srcDelimiter == ""}, {&counts.flatDestination, spec.dstDelimiter == ""},
+		} {
+			if c.present {
+				c.counter.Add(1)
+			}
+		}
+	}
+
+	t.Run("cases", func(t *testing.T) {
+		for i, spec := range specs {
+			t.Run(fmt.Sprintf("tree %03d, source %q, destination %q", i, spec.srcDelimiter, spec.dstDelimiter), func(t *testing.T) {
+				t.Parallel()
+				ran.Add(1)
+
+				srcFolders := make(map[string][]fakeMsg, len(spec.paths))
+				for name := range spec.paths {
+					srcFolders[name] = nil
+				}
+				src := newStoreServer(t, spec.srcDelimiter, srcFolders)
+				src.markNoSelect(slices.Sorted(maps.Keys(spec.noSelect))...)
+				dstFolders := map[string][]fakeMsg{"INBOX": nil}
+				for _, p := range spec.dstPaths {
+					dstFolders[joinMirrorLevels(spec.dstDelimiter, p)] = nil
+				}
+				srcC := newAppClient(t, src, "src")
+				dstC := newAppClient(t, newStoreServer(t, spec.dstDelimiter, dstFolders), "dst")
+				roots := mirrorMappings(srcC.MailboxNames(), spec.srcDelimiter, spec.dstDelimiter)
+				before := slices.Clone(roots)
+
+				got, gotReport, err := expandMirrorRoots(e2eContext(t), srcC, dstC, roots)
+				if err != nil {
+					t.Fatalf("expandMirrorRoots: %v", err)
+				}
+				want, wantReport, err := expandMappingsWithSubfolders(e2eContext(t), srcC, dstC, roots, spec.srcDelimiter, spec.dstDelimiter)
+				if err != nil {
+					t.Fatalf("expandMappingsWithSubfolders: %v", err)
+				}
+
+				if !slices.Equal(got, want) {
+					t.Errorf("expandMirrorRoots = %+v, want the %+v of the full expansion, in the same order", got, want)
+				}
+				if !maps.Equal(gotReport.skipped, wantReport.skipped) {
+					t.Errorf("skipped = %v, want %v", gotReport.skipped, wantReport.skipped)
+				}
+				if len(gotReport.skipped) != len(spec.noSelect) {
+					t.Errorf("skipped %d names, want the %d that the server marks \\Noselect", len(gotReport.skipped), len(spec.noSelect))
+				}
+				if len(got)+len(gotReport.skipped) != len(roots) {
+					t.Errorf("%d mappings and %d skipped names, want one of the two for each of the %d listed names", len(got), len(gotReport.skipped), len(roots))
+				}
+				if len(gotReport.entries) != 0 || len(gotReport.winners) != 0 {
+					t.Errorf("report holds %d entries and %d winners, want none", len(gotReport.entries), len(gotReport.winners))
+				}
+				if !slices.Equal(roots, before) {
+					t.Errorf("roots = %+v after both calls, want the input %+v unchanged", roots, before)
+				}
+				if spec.markedSpelling != "" {
+					if _, ok := gotReport.skipped[spec.markedSpelling]; !ok {
+						t.Errorf("skipped = %v, want the marked spelling %q", gotReport.skipped, spec.markedSpelling)
+					}
+					if _, ok := gotReport.skipped[spec.unmarkedSpelling]; ok {
+						t.Errorf("skipped = %v, want the other spelling %q selectable", gotReport.skipped, spec.unmarkedSpelling)
+					}
+					if !slices.ContainsFunc(got, func(m folderMapping) bool { return m.Source == spec.unmarkedSpelling }) {
+						t.Errorf("expandMirrorRoots = %+v, want a mapping for the selectable spelling %q", got, spec.unmarkedSpelling)
+					}
+				}
+
+				if len(gotReport.skipped) > 0 {
+					counts.noSelect.Add(1)
+				}
+				if slices.ContainsFunc(got, func(m folderMapping) bool { return m.renamed }) {
+					counts.renamed.Add(1)
+				}
+				if slices.ContainsFunc(got, func(m folderMapping) bool { return !slices.Contains(roots, m) }) {
+					counts.resolved.Add(1)
+				}
+			})
+		}
+	})
+
+	// A run that selects only some trees leaves the counters of the other trees at 0.
+	if ran.Load() != cases {
+		return
+	}
+	for _, c := range []struct {
+		n    *atomic.Int64
+		what string
+	}{
+		{&counts.noSelect, "a \\Noselect name"}, {&counts.pair, "a pair of INBOX child spellings"}, {&counts.halfMarked, "a pair with one spelling \\Noselect"},
+		{&counts.renamed, "a renamed mapping"}, {&counts.resolved, "a destination name that resolves to a listed spelling"},
+		{&counts.depth8, "a name of depth 8"}, {&counts.empty, "a name with an empty level"}, {&counts.nonASCII, "a non-ASCII name"},
+		{&counts.otherDelimiter, "a level that holds the other delimiter"}, {&counts.flatSource, "a flat source"}, {&counts.flatDestination, "a flat destination"},
+	} {
+		if c.n.Load() == 0 {
+			t.Errorf("the generator made no tree with %s, so the property can pass on trivial input", c.what)
+		}
+	}
+}
+
 func TestRunSync_When_FlatSourceHoldsNameWithSlash_Then_UnlistedParentIsAFailureNotASkip(t *testing.T) {
 	t.Parallel()
 
@@ -13017,6 +13258,105 @@ func Test_printExpansion_When_WinnerFailsInASplit_Then_ItsLostEntriesGetNoLine(t
 	}
 }
 
+func Test_printExpansion_When_ARootOrALoserIsNotPlanned_Then_EachLineFollowsThePlannedSourceOfItsEntry(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		dstDelimiter string
+		want         string
+		folders      []string
+		noSelect     []string
+		mappings     []config.DirectoryMapping
+		wantFailed   []string
+	}{
+		{
+			name:         "the root with its own mapping fails in a clash and its child stays planned",
+			dstDelimiter: ".",
+			folders:      []string{"INBOX", "Work", "Work/a.b", "Work/sub", "Work/sub/ok"},
+			mappings:     []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Fine.a_b")},
+			wantFailed:   []string{"Work/a.b", "Work/sub"},
+			want: "  📁 Found subfolder: Work/sub/ok → Fine.a_b.ok\n" +
+				"  ℹ️  Folder Work/sub/ok goes to Fine.a_b.ok, not to Fine.sub.ok: the mapping of Work/sub wins over the mapping of Work\n" +
+				"📂 Found 1 subfolders, total folders to sync: 2\n",
+		},
+		{
+			name:         "a clash and an empty level fail under one winning root",
+			dstDelimiter: ".",
+			folders:      []string{"INBOX", "Work", "Work/sub", "Work/sub//bad", "Work/sub/a.b", "Work/sub/a_b", "Work/sub/ok"},
+			mappings:     []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work/sub", "Special")},
+			wantFailed:   []string{"Work/sub//bad", "Work/sub/a.b", "Work/sub/a_b"},
+			want: "  📁 Found subfolder: Work/sub/ok → Special.ok\n" +
+				"  ℹ️  Folder Work/sub goes to Special, not to Fine.sub: the mapping of Work/sub wins over the mapping of Work\n" +
+				"  ℹ️  Folder Work/sub/ok goes to Special.ok, not to Fine.sub.ok: the mapping of Work/sub wins over the mapping of Work\n" +
+				"📂 Found 1 subfolders, total folders to sync: 3\n",
+		},
+		{
+			name:         "a lost entry whose own destination has an empty level",
+			dstDelimiter: "/",
+			folders:      []string{"INBOX", "Work", "Work//x", "Work/ok"},
+			mappings:     []config.DirectoryMapping{mapping("Work", "Fine"), mapping("Work//x", "Special")},
+			want: "  📁 Found subfolder: Work/ok → Fine/ok\n" +
+				"  ℹ️  Folder Work//x goes to Special, not to Fine//x: the mapping of Work//x wins over the mapping of Work\n" +
+				"📂 Found 1 subfolders, total folders to sync: 3\n",
+		},
+		{
+			name:         "a lost entry whose noselect root has no entry of its own",
+			dstDelimiter: "/",
+			folders:      []string{"INBOX", "Container", "Container/k", "Container/k/leaf", "Container/other"},
+			noSelect:     []string{"Container"},
+			mappings:     []config.DirectoryMapping{mapping("Container", "A"), mapping("Container/k", "B")},
+			want: "  📁 Found subfolder: Container/other → A/other\n" +
+				"  📁 Found subfolder: Container/k/leaf → B/leaf\n" +
+				"  ℹ️  Folder Container skipped - the source server marks it \\Noselect\n" +
+				"  ℹ️  Folder Container/k goes to B, not to A/k: the mapping of Container/k wins over the mapping of Container\n" +
+				"  ℹ️  Folder Container/k/leaf goes to B/leaf, not to A/k/leaf: the mapping of Container/k wins over the mapping of Container\n" +
+				"📂 Found 2 subfolders, total folders to sync: 3\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			folders := make(map[string][]fakeMsg, len(tt.folders))
+			for _, folder := range tt.folders {
+				folders[folder] = nil
+			}
+			src := newStoreServer(t, "/", folders)
+			src.markNoSelect(tt.noSelect...)
+			srcC := newAppClient(t, src, "src")
+			dstC := newDestinationClient(t, tt.dstDelimiter)
+			expanded, report, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, rootMappings(tt.mappings...), "/", tt.dstDelimiter)
+			if err != nil {
+				t.Fatalf("expandMappingsWithSubfolders: %v", err)
+			}
+			planned, clashes := splitDestinationClashes(expanded)
+			planned, emptyLevels, err := splitEmptyLevelDestinations(t.Context(), dstC, planned, tt.dstDelimiter)
+			if err != nil {
+				t.Fatalf("splitEmptyLevelDestinations: %v", err)
+			}
+			var failed []string
+			for _, failure := range slices.Concat(clashes, emptyLevels) {
+				failed = append(failed, failure.SourceFolder)
+			}
+			slices.Sort(failed)
+			if !slices.Equal(failed, tt.wantFailed) {
+				t.Fatalf("failed sources = %q, want %q", failed, tt.wantFailed)
+			}
+
+			var out strings.Builder
+			printExpansion(&out, report, planned, true, false)
+
+			if out.String() != tt.want {
+				t.Errorf("printExpansion output = %q, want %q", out.String(), tt.want)
+			}
+			for _, source := range tt.wantFailed {
+				assertContainsNone(t, out.String(), "Folder "+source+" goes to", fmt.Sprintf("Mapping %q skipped", source), "Found subfolder: "+source+" ")
+			}
+		})
+	}
+}
+
 func Test_expandMappingsWithSubfolders_When_OverrideNamesCarryControlCharacters_Then_LineShowsEscapes(t *testing.T) {
 	t.Parallel()
 
@@ -13262,6 +13602,96 @@ func Test_dropRepeatedMappings(t *testing.T) {
 
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("dropRepeatedMappings = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_dropRepeatedMappings_When_RandomMapsRepeatItems_Then_TheExpansionIsTheSameAsWithTheRepeats(t *testing.T) {
+	t.Parallel()
+
+	// Each source has one destination, as the source conflict check demands. Two spellings of the INBOX are one item after resolveMappings.
+	pool := []config.DirectoryMapping{
+		mapping("Work", "Moved"), mapping("Work/a", "Special"), mapping("Work/a/b", "Deep"), mapping("Work/a.b", "Dotted"),
+		mapping("Other", "O"), mapping("Container", "C"), mapping("Container/k", "K"), mapping("Archive", "Old"), mapping("Archive/2024", "Y"),
+		mapping("INBOX", "Mail"), mapping("inbox", "Mail"), mapping("INBOX/Sub", "Mail/Sub"), mapping("inbox/Sub", "Mail/Sub"), mapping("Inbox/Sub", "Mail/Sub"),
+	}
+	const cases = 300
+	for _, dstDelimiter := range []string{"/", "."} {
+		t.Run(fmt.Sprintf("destination %q", dstDelimiter), func(t *testing.T) {
+			t.Parallel()
+
+			src := newStoreServer(t, "/", map[string][]fakeMsg{
+				"INBOX": nil, "INBOX/Sub": nil, "Inbox/Sub": nil, "Work": nil, "Work/a": nil, "Work/a/b": nil, "Work/a.b": nil, "Work/c": nil,
+				"Other": nil, "Other/x": nil, "Container": nil, "Container/k": nil, "Archive/2024": nil,
+			})
+			src.markNoSelect("Container")
+			srcC := newAppClient(t, src, "src")
+			dstC := newDestinationClient(t, dstDelimiter)
+			rng := rand.New(rand.NewPCG(31, 37))
+			var triple, apart, repeated, distinct int
+
+			for range cases {
+				m := make([]config.DirectoryMapping, 1+rng.IntN(8))
+				for i := range m {
+					m[i] = pool[rng.IntN(len(pool))]
+				}
+				resolveMappings(m, srcC, dstC)
+				var first []config.DirectoryMapping
+				var hasTriple, hasApart bool
+				seen := map[config.DirectoryMapping]int{}
+				for i, item := range m {
+					if seen[item]++; seen[item] == 1 {
+						first = append(first, item)
+					} else if seen[item] == 3 {
+						hasTriple = true
+					} else if i > 0 && m[i-1] != item {
+						hasApart = true
+					}
+				}
+				if hasTriple {
+					triple++
+				}
+				if hasApart {
+					apart++
+				}
+				if len(first) < len(m) {
+					repeated++
+				} else {
+					distinct++
+				}
+
+				dropped := dropRepeatedMappings(slices.Clone(m))
+				if !slices.Equal(dropped, first) {
+					t.Fatalf("dropRepeatedMappings(%v) = %v, want the first of each item in order, %v", m, dropped, first)
+				}
+				got, gotReport, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, typedMappings(dropped), "/", dstDelimiter)
+				if err != nil {
+					t.Fatalf("expandMappingsWithSubfolders(%v): %v", dropped, err)
+				}
+				want, wantReport, err := expandMappingsWithSubfolders(t.Context(), srcC, dstC, typedMappings(m), "/", dstDelimiter)
+				if err != nil {
+					t.Fatalf("expandMappingsWithSubfolders(%v): %v", m, err)
+				}
+
+				if !slices.Equal(got, want) {
+					t.Fatalf("map %v: the expansion without the repeats = %+v, want the %+v of the expansion with them", m, got, want)
+				}
+				if !maps.Equal(gotReport.skipped, wantReport.skipped) {
+					t.Errorf("map %v: skipped = %v, want %v", m, gotReport.skipped, wantReport.skipped)
+				}
+				type origin struct{ root, source string }
+				origins := make(map[origin]bool, len(gotReport.entries))
+				for _, e := range gotReport.entries {
+					if origins[origin{e.root, e.Source}] {
+						t.Errorf("map %v: the report holds two entries of root %q for %q, want one", m, e.root, e.Source)
+					}
+					origins[origin{e.root, e.Source}] = true
+				}
+			}
+
+			if triple == 0 || apart == 0 || repeated == 0 || distinct == 0 {
+				t.Errorf("the generator made %d maps with an item three times, %d with a repeat that is not next to the first item, %d with a repeat and %d without, want each more than 0", triple, apart, repeated, distinct)
 			}
 		})
 	}
@@ -14047,6 +14477,143 @@ func TestRunSync_When_RepeatedItemComesBeforeAFailingItem_Then_ErrorNamesTheConf
 	}
 }
 
+func TestRunSync_When_RepeatedItemsMeetANoSelectRootOrAnOverridingChild_Then_EachVerboseLineShowsOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		wantBlock string
+		folders   []string
+		noSelect  []string
+		mappings  []config.DirectoryMapping
+	}{
+		{
+			name:     "repeated item with a noselect source",
+			folders:  []string{"INBOX", "Container/a", "Container/b", "Container/b/c"},
+			noSelect: []string{"Container"},
+			mappings: []config.DirectoryMapping{mapping("Container", "Archive"), mapping("Container", "Archive")},
+			wantBlock: "Checking for subfolders...\n" +
+				"  📁 Found subfolder: Container/a → Archive/a\n" +
+				"  📁 Found subfolder: Container/b → Archive/b\n" +
+				"  📁 Found subfolder: Container/b/c → Archive/b/c\n" +
+				"  ℹ️  Folder Container skipped - the source server marks it \\Noselect\n" +
+				"📂 Found 3 subfolders, total folders to sync: 3\n",
+		},
+		{
+			name:     "repeated item with a noselect source that three items name",
+			folders:  []string{"INBOX", "Container/a", "Container/b"},
+			noSelect: []string{"Container"},
+			mappings: []config.DirectoryMapping{mapping("Container", "Archive"), mapping("INBOX", "Mail"), mapping("Container", "Archive"), mapping("Container", "Archive")},
+			wantBlock: "Checking for subfolders...\n" +
+				"  📁 Found subfolder: Container/a → Archive/a\n" +
+				"  📁 Found subfolder: Container/b → Archive/b\n" +
+				"  ℹ️  Folder Container skipped - the source server marks it \\Noselect\n" +
+				"📂 Found 2 subfolders, total folders to sync: 3\n",
+		},
+		{
+			name:     "repeated item before a child with its own item",
+			folders:  []string{"INBOX", "Work", "Work/a", "Work/a/b", "Work/c"},
+			mappings: []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Work", "Moved"), mapping("Work/a", "Special")},
+			wantBlock: "Checking for subfolders...\n" +
+				"  📁 Found subfolder: Work/c → Moved/c\n" +
+				"  📁 Found subfolder: Work/a/b → Special/b\n" +
+				"  ℹ️  Folder Work/a goes to Special, not to Moved/a: the mapping of Work/a wins over the mapping of Work\n" +
+				"  ℹ️  Folder Work/a/b goes to Special/b, not to Moved/a/b: the mapping of Work/a wins over the mapping of Work\n" +
+				"📂 Found 2 subfolders, total folders to sync: 4\n",
+		},
+		{
+			name:     "repeated item after a child with its own item",
+			folders:  []string{"INBOX", "Work", "Work/a", "Work/a/b", "Work/c"},
+			mappings: []config.DirectoryMapping{mapping("Work/a", "Special"), mapping("Work", "Moved"), mapping("Work/a", "Special"), mapping("Work", "Moved")},
+			wantBlock: "Checking for subfolders...\n" +
+				"  📁 Found subfolder: Work/a/b → Special/b\n" +
+				"  📁 Found subfolder: Work/c → Moved/c\n" +
+				"  ℹ️  Folder Work/a goes to Special, not to Moved/a: the mapping of Work/a wins over the mapping of Work\n" +
+				"  ℹ️  Folder Work/a/b goes to Special/b, not to Moved/a/b: the mapping of Work/a wins over the mapping of Work\n" +
+				"📂 Found 2 subfolders, total folders to sync: 4\n",
+		},
+		{
+			name:     "item that repeats three times",
+			folders:  []string{"INBOX", "Work", "Work/a", "Work/a/b", "Other"},
+			mappings: []config.DirectoryMapping{mapping("Work", "Moved"), mapping("Work", "Moved"), mapping("Other", "O"), mapping("Work", "Moved")},
+			wantBlock: "Checking for subfolders...\n" +
+				"  📁 Found subfolder: Work/a → Moved/a\n" +
+				"  📁 Found subfolder: Work/a/b → Moved/a/b\n" +
+				"📂 Found 2 subfolders, total folders to sync: 4\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			folders := make(map[string][]fakeMsg, len(tt.folders))
+			for i, folder := range tt.folders {
+				folders[folder] = fakeMsgs(fmt.Sprintf("m%d@x", i))
+			}
+			src := newStoreServer(t, "/", folders)
+			src.markNoSelect(tt.noSelect...)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			out := &syncBuffer{}
+			opts := e2eOptions(out, "")
+			opts.autoConfirm, opts.verbose = true, true
+
+			if err := runSync(e2eContext(t), e2eConfig(src, dst, 1, tt.mappings...), opts); err != nil {
+				t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+			}
+
+			_, block := verboseExpansion(t, out.String())
+			if block != tt.wantBlock {
+				t.Errorf("expansion block = %q, want %q", block, tt.wantBlock)
+			}
+			for line := range strings.Lines(tt.wantBlock) {
+				if n := strings.Count(out.String(), line); n != 1 {
+					t.Errorf("output holds %d times the line %q, want 1", n, line)
+				}
+			}
+			assertContainsNone(t, out.String(), "already covered", folderFailuresHeader)
+		})
+	}
+}
+
+func TestRunSync_When_DelimiterFixIsDeclinedForTwoItemsOfOneDestination_Then_BothItemsStay(t *testing.T) {
+	t.Parallel()
+
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX": nil, "Work": fakeMsgs("w1@x"), "Work/a": fakeMsgs("a1@x"), "Work/a/b": fakeMsgs("b1@x"),
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "n\ny\n")
+	opts.verbose = true
+	cfg := e2eConfig(src, dst, 1, mapping("Work.a", "Moved"), mapping("Work/a", "Moved"))
+
+	err := runSync(e2eContext(t), cfg, opts)
+
+	if !errors.Is(err, ErrSilentExit) {
+		t.Fatalf("error = %v, want ErrSilentExit\noutput: %s", err, out.String())
+	}
+	got := out.String()
+	assertContainsAll(t, got,
+		"Mapping 1: Source folder \"Work.a\" uses delimiter \".\", server expects \"/\"",
+		"Please note if delimiter is not corresponding to the server configuration",
+		"Checking for subfolders...\n  📁 Found subfolder: Work/a/b → Moved/b\n📂 Found 1 subfolders, total folders to sync: 3\n",
+		"• Work.a → Moved: cannot scan source folder:",
+		"2 messages uploaded, 0 errors occurred, 1 folders failed",
+	)
+	assertContainsNone(t, got, "Mapping 2:", "Fixed source", "already covered")
+	if n := strings.Count(got, "Fix folder delimiters to match server configuration?"); n != 1 {
+		t.Errorf("output holds the delimiter question %d times, want 1", n)
+	}
+	assertIDs(t, "dst Moved", dst.folderMsgIDs("Moved"), "a1@x")
+	assertIDs(t, "dst Moved/b", dst.folderMsgIDs("Moved/b"), "b1@x")
+	if !slices.Contains(src.capturedNames("EXAMINE"), "Work.a") {
+		t.Errorf("source EXAMINE names = %q, want the typed name Work.a among them: the declined fix keeps the first item", src.capturedNames("EXAMINE"))
+	}
+	if want := []config.DirectoryMapping{mapping("Work.a", "Moved"), mapping("Work/a", "Moved")}; !slices.Equal(cfg.Map, want) {
+		t.Errorf("config map after the run = %v, want %v", cfg.Map, want)
+	}
+}
+
 func TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother(t *testing.T) {
 	t.Parallel()
 
@@ -14205,6 +14772,161 @@ func TestRunSync_When_MirrorRunIsVerboseWithNestedFolders_Then_NoSubfolderLinesS
 				t.Errorf("the second run left %d APPEND commands in total, want %d", n, len(tt.wantDst))
 			}
 		})
+	}
+}
+
+func TestRunSync_When_MirrorListsTwoSpellingsOfAnInboxChildThatShareAMessageId_Then_TheFirstSpellingInByteOrderCopiesIt(t *testing.T) {
+	t.Parallel()
+
+	firstBody, secondBody := subjectBody("shared@x", "first"), subjectBody("shared@x", "second")
+	src := newStoreServer(t, "/", map[string][]fakeMsg{
+		"INBOX":     fakeMsgs("m1@x"),
+		"INBOX/Sub": {{msgID: "shared@x", body: firstBody}, {msgID: "p1@x"}},
+		"Inbox/Sub": {{msgID: "shared@x", body: secondBody}, {msgID: "q1@x"}},
+	})
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	cfg := e2eConfig(src, dst, 1)
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	if err := runSync(e2eContext(t), cfg, opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+	secondRun := runSyncConfirmed(t, cfg, "", "")
+
+	got := out.String()
+	assertContainsAll(t, got,
+		"• INBOX → INBOX will copy 1 messages",
+		"• INBOX/Sub → INBOX/Sub will copy 2 messages",
+		"• Inbox/Sub → INBOX/Sub will copy 1 messages",
+		"Folders to be created on destination:\n• INBOX/Sub\n\n",
+		"Total new messages to sync: 4",
+	)
+	assertContainsNone(t, got, "Checking for subfolders", "Found subfolder", "already covered", folderFailuresHeader)
+	ids, bodies := dst.folderMsgIDs("INBOX/Sub"), dst.folderBodies("INBOX/Sub")
+	sharedBodies := []string{}
+	for i, id := range ids {
+		if id == "shared@x" {
+			sharedBodies = append(sharedBodies, bodies[i])
+		}
+	}
+	if !slices.Equal(sharedBodies, []string{firstBody}) {
+		t.Errorf("dst INBOX/Sub holds the shared Message-Id with bodies %q, want only the body of INBOX/Sub, the first mapping in byte order", sharedBodies)
+	}
+	assertIDs(t, "dst INBOX/Sub", slices.Sorted(slices.Values(ids)), "p1@x", "q1@x", "shared@x")
+	assertIDs(t, "dst INBOX", dst.folderMsgIDs("INBOX"), "m1@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), "INBOX/Sub")
+	examined := src.capturedNames("EXAMINE")
+	for _, want := range []string{"INBOX/Sub", "Inbox/Sub"} {
+		if !slices.Contains(examined, want) {
+			t.Errorf("source EXAMINE names = %q, want %q among them: the server lists both spellings", examined, want)
+		}
+	}
+	assertContainsAll(t, secondRun, "All folders already synced!")
+	if n := dst.callCount("APPEND"); n != 4 {
+		t.Errorf("destination saw %d APPEND commands after the second run, want 4: the shared message arrives once", n)
+	}
+	assertReadOnly(t, "src", src)
+}
+
+func TestRunSync_When_MirrorSourceHasANoSelectNameWithControlCharacters_Then_TheSkipLineShowsEscapesOnceAndChildrenCopy(t *testing.T) {
+	t.Parallel()
+
+	const (
+		wire       = "Zed&ABs-[2J&IC4-x&MWQ-"
+		name       = "Zed\x1b[2J\u202ex\u3164"
+		shown      = `Zed\x1b[2J\u202ex\u3164`
+		childWire  = wire + "/Kid"
+		childShown = shown + "/Kid"
+	)
+	src := newStoreServer(t, "/", map[string][]fakeMsg{childWire: fakeMsgs("k1@x")})
+	src.markNoSelect(wire)
+	dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+	out := &syncBuffer{}
+	opts := e2eOptions(out, "")
+	opts.autoConfirm, opts.verbose = true, true
+
+	if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts); err != nil {
+		t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+	}
+
+	got := out.String()
+	const skipLine = "Folder " + shown + " skipped - the source server marks it \\Noselect\n"
+	if n := strings.Count(got, skipLine); n != 1 {
+		t.Errorf("output holds the skip line %d times, want 1\noutput: %s", n, got)
+	}
+	assertContainsAll(t, got, "• "+childShown+" → "+childShown+" will copy 1 messages", "Sync completed successfully")
+	assertContainsNone(t, got, name, "\u202e", "\x1b[2J", "Checking for subfolders", "Found subfolder", "already covered", "goes to", folderFailuresHeader)
+	for line := range strings.SplitSeq(got, "\n") {
+		if strings.Contains(line, "skipped") && strings.Contains(line, "\u3164") {
+			t.Errorf("skip line holds the raw rune U+3164: %q", line)
+		}
+	}
+	assertNoCommandFor(t, "source", src, wire)
+	assertIDs(t, "dst APPENDs to the child", dst.appended(childWire), "k1@x")
+	assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), wire, childWire)
+	assertReadOnly(t, "source", src)
+}
+
+func TestRunSync_When_MirrorSourceHasNothingToScan_Then_RunEndsWithoutPromptOrWrites(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		noSelect    []string
+		wantSkipped []string
+	}{
+		{name: "LIST is empty"},
+		{
+			name:        "LIST holds only noselect names",
+			noSelect:    []string{"[Gmail]", "Container/Sub", "Container"},
+			wantSkipped: []string{"Container", "Container/Sub", "[Gmail]"},
+		},
+	}
+	for _, tt := range tests {
+		for _, verbose := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s verbose=%t", tt.name, verbose), func(t *testing.T) {
+				t.Parallel()
+
+				src := newStoreServer(t, "/", map[string][]fakeMsg{})
+				src.markNoSelect(tt.noSelect...)
+				dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+				out := &syncBuffer{}
+				opts := e2eOptions(out, "")
+				opts.verbose = verbose
+
+				err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts)
+
+				if err != nil {
+					t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+				}
+				got := out.String()
+				assertContainsAll(t, got, "All folders already synced!")
+				assertContainsNone(t, got, "Checking for subfolders", "Found subfolder", "subfolders, total folders to sync", "Messages to be copied", "Proceed", "Syncing messages", folderFailuresHeader)
+				var skipped []string
+				for line := range strings.Lines(got) {
+					if name, ok := strings.CutPrefix(line, "  ℹ️  Folder "); ok {
+						name, _, _ = strings.Cut(name, " skipped - ")
+						skipped = append(skipped, name)
+					}
+				}
+				want := tt.wantSkipped
+				if !verbose {
+					want = nil
+				}
+				if !slices.Equal(skipped, want) {
+					t.Errorf("skip lines = %q, want %q in name order", skipped, want)
+				}
+				assertNoCommandsAfterSetup(t, "src", src)
+				assertNoCommandsAfterSetup(t, "dst", dst)
+				for name, srv := range map[string]*fakeServer{"src": src, "dst": dst} {
+					if n := srv.callCount("LIST"); n != 1 {
+						t.Errorf("%s LIST count = %d, want 1: the expansion reads the mailbox cache", name, n)
+					}
+				}
+			})
+		}
 	}
 }
 
