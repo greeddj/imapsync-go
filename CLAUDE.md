@@ -91,11 +91,11 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - If the path holds no text of the destination delimiter, each source delimiter becomes the destination delimiter.
      - If not, the destination delimiter inside a level is name text. The function replaces it with `_` (with `-` when the destination delimiter is `_`) and joins the levels with the destination delimiter. The result is a renamed name (`folderMapping.renamed`).
    - A typed destination is never converted. The relative path of each subfolder gets the conversion. A subfolder is renamed when this conversion renamed it or when its root is renamed.
-2. **Expand mappings**: each configured mapping is expanded with subfolders. `expandMappingsWithSubfolders` calls `client.ListSubfolders`, which serves the answer from the per-Client mailbox cache (one `LIST "" "*"` populates it on first connect).
+2. **Expand mappings**: only a typed run expands its mappings with subfolders. `expandMappingsWithSubfolders` calls `client.ListSubfolders`, which serves the answer from the per-Client mailbox cache (one `LIST "" "*"` populates it on first connect). A mirror run uses `expandMirrorRoots` and walks no subfolder (see below).
    - The expansion skips each source name that `Client.IsNoSelect` reports. This applies to the mapped name and to each subfolder.
    - `IsNoSelect` reads the mailbox cache. The cache marks a name when the same `LIST "" "*"` gives it the `\Noselect` or `\NonExistent` attribute. The attribute can have any letter case.
    - The expansion keeps the subfolders of a skipped name.
-   - `expandMappingsWithSubfolders` prints nothing. It returns the expanded mappings and an `expansionReport`. The report holds the entries, the winner of each entry and the skipped names.
+   - `expandMappingsWithSubfolders` prints nothing. It returns the expanded mappings and an `expansionReport`. The report holds the entries, the winner of each entry and the skipped names. `expandMirrorRoots` also prints nothing, and its report holds only the skipped names.
    - A mapped source name that LIST does not show stays in the expansion, also when LIST shows its subfolders. Step 3 scans it.
    - A flat source has an empty delimiter. The expansion lists no subfolder for it, so each mapping gives one folder.
    - The expansion sorts the subfolders of each mapping in byte order, because the cache lists names in map order. So the plans and the failure lines are the same on each run.
@@ -104,7 +104,14 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
    - Inside the expansion, `dstClient.ResolveName` gives each mapped and each derived destination the listed spelling of its INBOX level.
    - `mostSpecific` gives each source name one entry. The entry of the mapping whose source is the name itself, or its nearest ancestor, wins. This is the longest root.
      - When two roots have the same length (two listed spellings of one INBOX level), the smaller root in byte order wins.
-     - The order of the map items does not change the result. In a mirror run, the own mapping of each folder wins.
+     - The order of the map items does not change the result. A mirror run does not use `mostSpecific`.
+   - A mirror run does not expand its mappings with subfolders. `expandMirrorRoots` gives one mapping for each listed source name, because each listed name is a root and its own mapping wins over each derived entry.
+     - `runSync` gives the function the output of `mirrorMappings`. The destination name comes from `convertFolderPath` (step 1), with the `renamed` flag of that conversion. `dstClient.ResolveName` then gives the destination the listed spelling of its INBOX level.
+     - The function skips each source name that `Client.IsNoSelect` reports, with the same reason as the typed expansion. It keeps the order of `MailboxNames`, which is byte order.
+     - The function calls neither `ListSubfolders` nor `mostSpecific`. It sends no command and reads only the mailbox cache. The cost is linear in the number of listed names. If the context ended, it returns the context error.
+     - The report holds only the skipped names.
+     - The result is the same as the result of `expandMappingsWithSubfolders` for the same mappings.
+     - A subfolder walk of the mirror mappings makes one entry for each pair of a mapping and a listed descendant. For a chain of depth d, that is about d*d/2 entries with about d*d*d bytes of names. `mostSpecific` keeps only the d entries of the roots.
    - `splitDestinationClashes` groups the expanded mappings by destination. When a group holds two or more mappings and at least one is renamed, every mapping of the group fails. Its `FolderFailure` wraps `errDestinationClash` and names one other source folder of the group. A group with no renamed mapping stays unchanged.
    - `splitEmptyLevelDestinations` runs after `splitDestinationClashes` and before the scan. It checks the destination name of each planned mapping. So it covers the names that the code builds, for example the subfolders of a mapping and the names of a mirror run. A mapping fails when all these conditions are true:
      - the destination has a delimiter. A flat destination has no levels, so it never gives this failure;
@@ -117,7 +124,7 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - In step 1, `checkDestinationLevels` refuses each typed name that fails this rule. So only a derived name fails here. The other mappings go on.
      - A name with no empty level gets no `MailboxExists` call. So an ended context gives its error only for a name with an empty level, and `runSync` returns that error.
    - `runSync` puts the clash failures first, then the empty-level failures, then the failures of the scan in `SyncSummary.Failures`. A clash or an empty level gives no plan, so the run creates no destination folder for it. `printFolderFailures` shows the failure after the scan, also with `--quiet`. The run ends with exit code 1 (`ErrSilentExit`), as for each folder failure (step 3).
-   - With `--verbose` and without `--quiet`, `runSync` prints the line `Checking for subfolders...` before the expansion. `printExpansion` prints the other lines of the expansion. It prints them only with `--verbose` and without `--quiet`.
+   - With `--verbose` and without `--quiet`, `runSync` prints the line `Checking for subfolders...` before the expansion in a typed run. A mirror run prints no such line. `printExpansion` prints the other lines of the expansion. It prints them only with `--verbose` and without `--quiet`.
    - `runSync` calls `printExpansion` after `splitDestinationClashes` and `splitEmptyLevelDestinations`, and before `printFolderRenames`. The function gets the planned mappings, which are the mappings that remain after both splits. It prints these groups in this order:
      - one escaped line, two spaces and then `📁 Found subfolder: %s → %s`, for each entry, in the order of the entries, when all these conditions are true:
        - the entry is a subfolder of its root, so its source name is different from its root;
@@ -130,6 +137,7 @@ The sync flow is **plan, confirm, execute** - not stream-as-you-go:
      - the line `📂 Found %d subfolders, total folders to sync: %d`, only when the first number is more than 0.
    - The planned mappings change only the found-subfolder lines and the count line. The other lines do not use them. A failure after the splits, such as a failed scan, changes no line, because `printExpansion` runs before the scan.
    - So a found-subfolder line never names a destination that lost, or a subfolder that failed in a split.
+   - A mirror run has no entry in its report. So `printExpansion` prints no found-subfolder line, no `goes to` line, no `Mapping ... skipped` line and no count line. It prints only the `Folder ... skipped` lines.
    - The first number of the count line is the number of entries for which all these conditions are true:
      - the entry wins (`mostSpecific`);
      - the entry is a subfolder of its root;

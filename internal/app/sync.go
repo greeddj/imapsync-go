@@ -344,7 +344,11 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		}
 	}
 
-	var roots []folderMapping
+	var (
+		expanded []folderMapping
+		found    expansionReport
+		err      error
+	)
 	if typed {
 		if err := offerDelimiterFixes(ctx, out, in, srcClient, dstClient, mappings, autoConfirm); err != nil {
 			return err
@@ -361,17 +365,14 @@ func runSync(ctx context.Context, cfg *config.Config, opts syncOptions) error {
 		if err := checkDestinationLevels(ctx, dstClient, mappings, destinationFlag); err != nil {
 			return err
 		}
-		roots = typedMappings(mappings)
+		if !quiet && verbose {
+			_, _ = fmt.Fprintln(out, "Checking for subfolders...")
+		}
+		expanded, found, err = expandMappingsWithSubfolders(ctx, srcClient, dstClient, typedMappings(mappings), srcDelimiter, dstDelimiter)
 	} else {
 		// The names come from the planning client's mailbox cache, so no extra session opens.
-		roots = mirrorMappings(srcClient.MailboxNames(), srcDelimiter, dstDelimiter)
+		expanded, found, err = expandMirrorRoots(ctx, srcClient, dstClient, mirrorMappings(srcClient.MailboxNames(), srcDelimiter, dstDelimiter))
 	}
-
-	// Expand mappings to include subfolders
-	if !quiet && verbose {
-		_, _ = fmt.Fprintln(out, "Checking for subfolders...")
-	}
-	expanded, found, err := expandMappingsWithSubfolders(ctx, srcClient, dstClient, roots, srcDelimiter, dstDelimiter)
 	if err != nil {
 		return fmt.Errorf("failed to expand mappings: %w", err)
 	}
@@ -2027,6 +2028,29 @@ func expandMappingsWithSubfolders(ctx context.Context, srcClient, dstClient *cli
 		}
 	}
 	return expanded, expansionReport{skipped: skipped, entries: entries, winners: winners}, nil
+}
+
+// Every listed name is a mirror root, and its own mapping beats each derived entry, so a subfolder walk only builds entries that mostSpecific drops.
+func expandMirrorRoots(ctx context.Context, srcClient, dstClient *client.Client, roots []folderMapping) ([]folderMapping, expansionReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, expansionReport{}, err
+	}
+
+	var skipped map[string]string
+	expanded := make([]folderMapping, 0, len(roots))
+	for _, root := range roots {
+		if srcClient.IsNoSelect(root.Source) {
+			if skipped == nil {
+				skipped = make(map[string]string)
+			}
+			skipped[root.Source] = skipReasonNoSelect
+			continue
+		}
+		own := root
+		own.Destination = dstClient.ResolveName(root.Destination)
+		expanded = append(expanded, own)
+	}
+	return expanded, expansionReport{skipped: skipped}, nil
 }
 
 // A found line shows only a destination that the plan uses, so verbose never names one that lost or one that failed in a split.

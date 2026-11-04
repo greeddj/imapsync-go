@@ -340,7 +340,7 @@
   - `Test_convertFolderPath`, `Test_convertFolderPath_When_AnyDelimiterPair_Then_LevelsMatchTheSource` and `FuzzConvertFolderPath` - the rules of `convertFolderPath`, and the levels of the result for any pair of delimiters;
   - `Test_expandMappingsWithSubfolders_When_SegmentHoldsDestinationDelimiter_Then_ItBecomesUnderscore` and `Test_expandMappingsWithSubfolders_When_RootIsRenamed_Then_SubfoldersAreRenamed` - the rename of a level, and a root that passes the rename to its subfolders;
   - `Test_expandMappingsWithSubfolders_When_ListOrderVaries_Then_SubfoldersFollowByteOrder` - the order of the subfolders does not depend on the LIST order;
-  - `Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfolderAgreesWithMirrorMappings` - an expanded subfolder and its mirror mapping give the same destination;
+  - `Test_expandMappingsWithSubfolders_When_MirrorRootIsExpanded_Then_EachSubfolderAgreesWithMirrorMappings` - an expanded subfolder and its mirror mapping give the same destination. This agreement is why a mirror run needs no subfolder walk (`expandMirrorRoots`);
   - `Test_expandMappingsWithSubfolders_When_ListedChildSpellsInboxInAnotherCase_Then_RelativePathIsCutByLength` - the relative path of an INBOX child in another letter case;
   - `TestRunSync_When_SourceSegmentHoldsDestinationDelimiter_Then_FolderIsRenamedNotNested`, `TestRunSync_When_MirrorCrossesDelimiters_Then_DestinationUsesItsDelimiterWithoutPrompt` and `TestRunSync_When_TypedDestinationHoldsDestinationDelimiter_Then_NameIsNotRenamed` - the end-to-end results, and a typed destination that stays as typed;
   - `TestRunSync_When_FolderIsRenamed_Then_WarningShowsWithoutVerboseAndBeforePrompt` - the rename notice shows before the prompt, also without `--verbose` and with `--quiet`;
@@ -562,7 +562,16 @@
   - `TestRunSync_When_ParentAndChildFoldersAreBothMapped_Then_ChildMappingWinsInEitherOrder` - the child mapping decides, and a second run sends no APPEND;
   - `TestRunSync_When_TwoMappingsNameOneSourceWithDifferentDestinations_Then_RunStopsBeforeThePlan` - two spellings of INBOX, or a rewritten delimiter, make one source and stop the run before the scan;
   - `TestRunSync_When_MapRepeatsAnItemExactly_Then_RunMatchesASingleItem` - a repeated item causes no extra scan, CREATE or APPEND;
-  - `TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother` - in a mirror run, the own mapping of each folder wins;
+  - `TestRunSync_When_MirrorHoldsNestedAndRenamedFolders_Then_NoMappingOverridesAnother` - in a mirror run, each listed folder keeps its own mapping;
+  - `TestRunSync_When_MirrorRunIsVerboseWithNestedFolders_Then_NoSubfolderLinesShowAndEachFolderIsCopiedOnce` - a verbose mirror run of a nested tree prints none of these lines: `Checking for subfolders`, a found-subfolder line, `Mapping ... skipped`, a count line, `goes to` and `wins over`. The line `Folder Projects skipped` for the `\Noselect` folder shows one time. The test runs with the destination delimiter `/` and with `.`. In the dot case, the notice for `Archive/v1.2` shows. Each destination folder gets its one message, and the destination sees one APPEND for each source message. The CREATE commands name the folders and their parents. The source gets no command for `Projects` and no write command. A second run prints `All folders already synced!` and sends no APPEND;
+  - `Test_expandMirrorRoots_When_TreeVaries_Then_MatchesTheFullExpansionOfTheSameRoots` - the test runs five trees with five pairs of delimiters. `expandMirrorRoots` gives the same mappings and the same skipped names as `expandMappingsWithSubfolders` for the same roots. The report holds no entry and no winner, and the roots do not change. `printExpansion` prints only the `Folder ... skipped` lines. The pairs include a flat source and a flat destination. The trees hold these cases:
+    - a chain of depth seven;
+    - the `\Noselect` container `[Gmail]` with two children, and the `\Noselect` folder `Work/mid` in the middle of a chain;
+    - two listed spellings of an INBOX child, and a destination that lists another INBOX child in another letter case;
+    - a segment that holds the destination delimiter;
+    - names with empty levels;
+  - `Test_expandMirrorRoots_When_SourceIsADeepChain_Then_OneMappingPerNameAndAllocationsDoNotGrow` - a chain of depth 256 and a chain of depth 512 give one mapping for each name. Each server sees only the LIST of `New`, and the source gets no EXAMINE, STATUS or FETCH. The call allocates at most 2 times at depth 256, and the same number of times at depth 512;
+  - `Test_expandMirrorRoots_When_ContextEnded_Then_ReturnsContextErrorAndNoMapping` - an ended context gives its error, no mapping and the zero report. The servers get no command after `New`;
   - `TestRunSync_When_ExplicitChildDestinationEqualsRenamedSiblingDestination_Then_BothFailAsAClash` - a typed destination that equals a renamed destination gives a clash, and both folders fail.
 
   The verbose expansion lines have these tests:
