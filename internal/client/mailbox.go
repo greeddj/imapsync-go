@@ -53,7 +53,18 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (created bool, 
 		return false, 0, nil
 	}
 
-	parents, err = c.createParentFolders(ctx, name, c.delimiter)
+	hint := 0
+	if c.delimiter != "" {
+		// A level needs a non-empty segment and a delimiter, which bounds the buffer for a name made of delimiters.
+		hint = min(strings.Count(name, c.delimiter), len(name)/(len(c.delimiter)+1))
+	}
+	levels := slices.AppendSeq(make([]string, 0, hint), parentLevels(name, c.delimiter))
+	parent := ""
+	if len(levels) > 0 {
+		parent = levels[len(levels)-1]
+	}
+
+	parents, err = c.createParentFolders(ctx, levels)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return false, parents, ctxErr
@@ -76,33 +87,92 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (created bool, 
 		// between hasMailbox() and Create(). Treat as idempotent success,
 		// and record the folder so later lookups see it.
 		if isAlreadyExistsErr(err) {
-			c.addMailboxToCache(name)
+			c.addRooted(name, parent)
 			return false, parents, nil
 		}
 		return false, parents, fmt.Errorf("[%s] failed to create mailbox %s: %w", c.prefix, name, err)
 	}
-	c.addMailboxToCache(name)
+	c.addRooted(name, parent)
 
 	return true, parents, nil
 }
 
-// MissingLevels returns the names that CreateMailbox(name) sends a CREATE for: missing parents first, then name, or nothing for a cached name. An ended ctx stops the walk with its error.
-func (c *Client) MissingLevels(ctx context.Context, name string) ([]string, error) {
+// MissingLevels lists the names that CreateMailbox sends a CREATE for, run on names in order: missing parents from the top, then the name. A cached name adds none.
+func (c *Client) MissingLevels(ctx context.Context, names ...string) ([]string, error) {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
-	if _, ok := c.mailboxCache.resolve(name); ok {
-		return nil, nil
+	return missingLevels(ctx, names, c.delimiter, func(name string) bool {
+		_, ok := c.mailboxCache.resolve(name)
+		return ok
+	})
+}
+
+func missingLevels(ctx context.Context, names []string, delimiter string, listed func(string) bool) ([]string, error) {
+	var (
+		out []string
+		// seen holds each level whose parent levels this call checked: a string costs at most one lookup as a level, plus one per item of names.
+		seen   map[string]struct{}
+		levels []string
+	)
+	inSeen := func(level string) bool {
+		_, ok := seen[level]
+		return ok
 	}
-	var missing []string
-	for level := range parentLevels(name, c.delimiter) {
+	for _, name := range names {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if _, ok := c.mailboxCache.resolve(level); !ok {
-			missing = append(missing, level)
+		if inSeen(name) || listed(name) {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[string]struct{}, len(names))
+			out = make([]string, 0, len(names))
+		}
+		levels = slices.AppendSeq(levels[:0], parentLevels(name, delimiter))
+		for _, level := range levels[firstUnmarked(levels, inSeen):] {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if !listed(level) {
+				out = append(out, level)
+			}
+			seen[level] = struct{}{}
+		}
+		out = append(out, name)
+		seen[name] = struct{}{}
+	}
+	return out, nil
+}
+
+// firstUnmarked needs marked to hold for a prefix of levels. It probes from the deepest level: a growing chain costs one check, a gap a logarithmic number.
+func firstUnmarked(levels []string, marked func(string) bool) int {
+	n := len(levels)
+	if n == 0 {
+		return 0
+	}
+	if marked(levels[n-1]) {
+		return n
+	}
+	// levels[hi] is unmarked and levels[:lo] are marked.
+	lo, hi := 0, n-1
+	for step := 2; step <= n; step *= 2 {
+		i := n - step
+		if marked(levels[i]) {
+			lo = i + 1
+			break
+		}
+		hi = i
+	}
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if marked(levels[mid]) {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return append(missing, name), nil
+	return lo
 }
 
 // parentLevels yields each prefix of name that ends before a delimiter and has a non-empty last level, shortest first. An empty level names no mailbox. An empty delimiter yields nothing.
@@ -126,33 +196,41 @@ func parentLevels(name, delimiter string) iter.Seq[string] {
 	}
 }
 
-// made counts the CREATE commands that the server accepted, also when err is set.
-func (c *Client) createParentFolders(ctx context.Context, name, delimiter string) (made int, err error) {
-	for parentPath := range parentLevels(name, delimiter) {
+// made counts the CREATE commands that the server accepted, also when err is set. Rooted levels and the levels above them are cached, so the walk skips them.
+func (c *Client) createParentFolders(ctx context.Context, levels []string) (made int, err error) {
+	for i := c.firstUnrooted(levels); i < len(levels); i++ {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return made, ctxErr
+		}
+		parentPath, upper := levels[i], ""
+		if i > 0 {
+			upper = levels[i-1]
 		}
 
 		lock := c.folderLock(parentPath)
 		lock.Lock()
 
-		if !c.hasMailbox(parentPath) {
-			c.log("[%s] Creating parent folder: %s", c.prefix, parentPath)
-			createErr := c.safeCall(func(cli *imapclient.Client) error {
-				return cli.Create(parentPath)
-			})
-			exists := createErr != nil && isAlreadyExistsErr(createErr)
-			if createErr != nil && !exists {
-				lock.Unlock()
-				return made, fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, createErr)
-			}
-			c.addMailboxToCache(parentPath)
-			if exists {
-				c.log("[%s] Parent folder already exists: %s", c.prefix, parentPath)
-			} else {
-				made++
-				c.log("[%s] Created parent folder: %s", c.prefix, parentPath)
-			}
+		if c.hasMailbox(parentPath) {
+			c.markRooted(parentPath, upper)
+			lock.Unlock()
+			continue
+		}
+
+		c.log("[%s] Creating parent folder: %s", c.prefix, parentPath)
+		createErr := c.safeCall(func(cli *imapclient.Client) error {
+			return cli.Create(parentPath)
+		})
+		exists := createErr != nil && isAlreadyExistsErr(createErr)
+		if createErr != nil && !exists {
+			lock.Unlock()
+			return made, fmt.Errorf("[%s] failed to create parent folder %s: %w", c.prefix, parentPath, createErr)
+		}
+		c.addRooted(parentPath, upper)
+		if exists {
+			c.log("[%s] Parent folder already exists: %s", c.prefix, parentPath)
+		} else {
+			made++
+			c.log("[%s] Created parent folder: %s", c.prefix, parentPath)
 		}
 
 		lock.Unlock()

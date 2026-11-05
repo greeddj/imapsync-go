@@ -44,26 +44,26 @@ func TestMailboxCacheLookup(t *testing.T) {
 	}
 }
 
-func TestAddMailboxToCache(t *testing.T) {
+func Test_mailboxCache_add(t *testing.T) {
 	t.Parallel()
 
 	c := newTestClient()
 	// An account with no mailboxes leaves a nil set; the first add creates it.
-	c.addMailboxToCache("X")
+	c.mailboxCache.add("X")
 	if _, ok := c.mailboxCache.folders["X"]; !ok {
-		t.Errorf("addMailboxToCache on an empty cache did not insert: %v", c.mailboxCache.folders)
+		t.Errorf("add on an empty cache did not insert: %v", c.mailboxCache.folders)
 	}
 
 	c.mailboxCache = mailboxCache{
 		folders: map[string]struct{}{"A": {}},
 	}
-	c.addMailboxToCache("B")
+	c.mailboxCache.add("B")
 	if _, ok := c.mailboxCache.folders["B"]; !ok {
-		t.Error("addMailboxToCache after load did not insert")
+		t.Error("add after load did not insert")
 	}
 }
 
-func TestAddMailboxToCache_When_TwoSpellingsShareOneCanonicalForm_Then_SmallerWinsInAnyOrder(t *testing.T) {
+func Test_mailboxCache_add_When_TwoSpellingsShareOneCanonicalForm_Then_SmallerWinsInAnyOrder(t *testing.T) {
 	t.Parallel()
 
 	for _, order := range [][]string{{"inbox/New", "Inbox/New"}, {"Inbox/New", "inbox/New"}} {
@@ -71,7 +71,7 @@ func TestAddMailboxToCache_When_TwoSpellingsShareOneCanonicalForm_Then_SmallerWi
 		c.mailboxCache = mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"}
 
 		for _, name := range order {
-			c.addMailboxToCache(name)
+			c.mailboxCache.add(name)
 		}
 
 		if got := c.ResolveName("INBOX/New"); got != "Inbox/New" {
@@ -80,6 +80,155 @@ func TestAddMailboxToCache_When_TwoSpellingsShareOneCanonicalForm_Then_SmallerWi
 		if got, want := c.mailboxCache.folders, map[string]struct{}{"INBOX": {}, "inbox/New": {}, "Inbox/New": {}}; !maps.Equal(got, want) {
 			t.Errorf("after adding %q, folders = %v, want %v", order, got, want)
 		}
+	}
+}
+
+func Test_markRooted(t *testing.T) {
+	t.Parallel()
+
+	type mark struct{ level, parent string }
+	tests := []struct {
+		cache mailboxCache
+		name  string
+		marks []mark
+		want  []string
+	}{
+		{
+			name:  "a first level that the cache holds",
+			cache: mailboxCache{folders: map[string]struct{}{"A": {}}},
+			marks: []mark{{"A", ""}},
+			want:  []string{"A"},
+		},
+		{
+			name:  "a level that the cache lacks",
+			cache: mailboxCache{folders: map[string]struct{}{"A": {}}},
+			marks: []mark{{"B", ""}},
+		},
+		{
+			name:  "an empty cache",
+			marks: []mark{{"A", ""}},
+		},
+		{
+			name:  "a child before its parent",
+			cache: mailboxCache{folders: map[string]struct{}{"A": {}, "A/B": {}}, delimiter: "/"},
+			marks: []mark{{"A/B", "A"}},
+		},
+		{
+			name:  "a child after its parent",
+			cache: mailboxCache{folders: map[string]struct{}{"A": {}, "A/B": {}}, delimiter: "/"},
+			marks: []mark{{"A", ""}, {"A/B", "A"}},
+			want:  []string{"A", "A/B"},
+		},
+		{
+			name:  "a child that the cache lacks under a rooted parent",
+			cache: mailboxCache{folders: map[string]struct{}{"A": {}}, delimiter: "/"},
+			marks: []mark{{"A", ""}, {"A/B", "A"}},
+			want:  []string{"A"},
+		},
+		{
+			name:  "a listed child under a parent that is not rooted",
+			cache: mailboxCache{folders: map[string]struct{}{"A/B": {}}, delimiter: "/"},
+			marks: []mark{{"A/B", "A"}},
+		},
+		{
+			name:  "an INBOX spelling that folds to a listed name",
+			cache: mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"},
+			marks: []mark{{"inbox", ""}},
+			want:  []string{"inbox"},
+		},
+		{
+			name: "an INBOX child that the index maps to its listed spelling",
+			cache: mailboxCache{
+				folders:        map[string]struct{}{"INBOX": {}, "Inbox/Old": {}},
+				inboxSpellings: map[string]string{"INBOX/Old": "Inbox/Old"},
+				delimiter:      "/",
+			},
+			marks: []mark{{"INBOX", ""}, {"INBOX/Old", "INBOX"}},
+			want:  []string{"INBOX", "INBOX/Old"},
+		},
+		{
+			name: "a name that cannot hold messages",
+			cache: mailboxCache{
+				folders:  map[string]struct{}{"[Gmail]": {}},
+				noSelect: map[string]struct{}{"[Gmail]": {}},
+			},
+			marks: []mark{{"[Gmail]", ""}},
+			want:  []string{"[Gmail]"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cache := tt.cache
+			for _, m := range tt.marks {
+				cache.markRooted(m.level, m.parent)
+			}
+
+			if got := slices.Sorted(maps.Keys(cache.rooted)); !slices.Equal(got, tt.want) {
+				t.Errorf("rooted = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_addRooted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a name under a rooted parent is cached and rooted", func(t *testing.T) {
+		t.Parallel()
+
+		c := newTestClient()
+		c.mailboxCache = mailboxCache{folders: map[string]struct{}{"A": {}}, delimiter: "/"}
+		c.markRooted("A", "")
+
+		c.addRooted("A/B", "A")
+
+		if !c.hasMailbox("A/B") {
+			t.Error("hasMailbox(A/B) = false, want true")
+		}
+		if got := slices.Sorted(maps.Keys(c.mailboxCache.rooted)); !slices.Equal(got, []string{"A", "A/B"}) {
+			t.Errorf("rooted = %q, want [A A/B]", got)
+		}
+	})
+
+	t.Run("a name under a parent that is not rooted is cached only", func(t *testing.T) {
+		t.Parallel()
+
+		c := newTestClient()
+		c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
+
+		c.addRooted("A/B", "A")
+
+		if !c.hasMailbox("A/B") {
+			t.Error("hasMailbox(A/B) = false, want true")
+		}
+		if len(c.mailboxCache.rooted) != 0 {
+			t.Errorf("rooted = %v, want none", c.mailboxCache.rooted)
+		}
+	})
+}
+
+func Test_loadMailboxCache_When_ReloadedAfterACreateWalk_Then_RootedIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	_, c := newLoadedClient(t, &mailboxScript{folders: []scriptFolder{{name: "INBOX"}}})
+	if _, _, err := c.CreateMailbox(t.Context(), "A/B"); err != nil {
+		t.Fatalf("CreateMailbox: %v", err)
+	}
+	if got := slices.Sorted(maps.Keys(c.mailboxCache.rooted)); !slices.Equal(got, []string{"A", "A/B"}) {
+		t.Fatalf("rooted after the walk = %q, want [A A/B]", got)
+	}
+
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("loadMailboxCache: %v", err)
+	}
+
+	if len(c.mailboxCache.rooted) != 0 {
+		t.Errorf("rooted after the reload = %v, want none: the new LIST decides what the cache holds", c.mailboxCache.rooted)
+	}
+	if c.hasMailbox("A") {
+		t.Error("hasMailbox(A) = true after a LIST that lacks it")
 	}
 }
 

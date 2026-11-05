@@ -29,6 +29,8 @@ type mailboxCache struct {
 	noSelect map[string]struct{}
 	// Maps the canonical form of a listed name under the cache delimiter to its listed spelling, only where the two differ. Nil when none differs.
 	inboxSpellings map[string]string
+	// Names that the cache holds with every parent level, under the keys that CreateMailbox used. A new LIST drops them.
+	rooted map[string]struct{}
 	// Empty when no LIST entry names a delimiter: NIL marks a flat namespace (RFC 3501).
 	delimiter string
 	// Raw names of the latest LIST that are not valid modified UTF-7, sorted. They are not in folders.
@@ -208,6 +210,7 @@ func (c *Client) loadMailboxCache(ctx context.Context) error {
 	c.mailboxCache.folders = folders
 	c.mailboxCache.noSelect = noSelect
 	c.mailboxCache.inboxSpellings = spellings
+	c.mailboxCache.rooted = nil
 	c.mailboxCache.delimiter = delim
 	c.mailboxCache.setInvalid(invalid)
 	c.mailboxCacheMu.Unlock()
@@ -222,15 +225,48 @@ func (c *Client) hasMailbox(name string) bool {
 	return ok
 }
 
-// addMailboxToCache records a freshly created mailbox.
-func (c *Client) addMailboxToCache(name string) {
+func (m *mailboxCache) add(name string) {
+	if m.folders == nil {
+		m.folders = make(map[string]struct{})
+	}
+	m.folders[name] = struct{}{}
+	m.inboxSpellings = noteSpelling(m.inboxSpellings, name, m.delimiter)
+}
+
+// A level needs a cached name and a rooted or empty parent, so rooted stays closed under the parent level. The caller holds the write lock.
+func (m *mailboxCache) markRooted(level, parent string) {
+	if _, ok := m.resolve(level); !ok {
+		return
+	}
+	if _, ok := m.rooted[parent]; !ok && parent != "" {
+		return
+	}
+	if m.rooted == nil {
+		m.rooted = make(map[string]struct{})
+	}
+	m.rooted[level] = struct{}{}
+}
+
+func (c *Client) markRooted(level, parent string) {
 	c.mailboxCacheMu.Lock()
 	defer c.mailboxCacheMu.Unlock()
-	if c.mailboxCache.folders == nil {
-		c.mailboxCache.folders = make(map[string]struct{})
-	}
-	c.mailboxCache.folders[name] = struct{}{}
-	c.mailboxCache.inboxSpellings = noteSpelling(c.mailboxCache.inboxSpellings, name, c.mailboxCache.delimiter)
+	c.mailboxCache.markRooted(level, parent)
+}
+
+func (c *Client) addRooted(name, parent string) {
+	c.mailboxCacheMu.Lock()
+	defer c.mailboxCacheMu.Unlock()
+	c.mailboxCache.add(name)
+	c.mailboxCache.markRooted(name, parent)
+}
+
+func (c *Client) firstUnrooted(levels []string) int {
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	return firstUnmarked(levels, func(level string) bool {
+		_, ok := c.mailboxCache.rooted[level]
+		return ok
+	})
 }
 
 // listSubfoldersFromCache returns the listed children of parent. It returns nil when neither delimiter is set, as on a flat server.

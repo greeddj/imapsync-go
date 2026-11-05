@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/bits"
 	"math/rand/v2"
 	"net"
 	"slices"
@@ -1926,6 +1927,7 @@ func FuzzParentLevels(f *testing.F) {
 	seeds := []struct{ name, delimiter string }{
 		{"A/B/C", "/"}, {"A.B.C", "."}, {"a//b", "/"}, {"/x", "/"}, {"x/", "/"}, {"A/B/C", ""}, {"Archive", "/"},
 		{"", "/"}, {"a::b::c", "::"}, {"aXXXXb", "XX"}, {"aXYXYXbXYXc", "XYX"}, {"///", "/"}, {"a\xff/b", "/"}, {"a/b//c", "/"}, {"//x/y", "/"},
+		{"aXYXYXYXb", "XYX"}, {"aXYXYXbXYXc/x", "XYX"},
 	}
 	for _, s := range seeds {
 		f.Add(s.name, s.delimiter)
@@ -1952,6 +1954,12 @@ func FuzzParentLevels(f *testing.F) {
 		}
 		if len(got) > len(name)/2 {
 			t.Errorf("parentLevels(%q, %q) yields %d levels, want at most %d", name, delimiter, len(got), len(name)/2)
+		}
+		// The creation walk reuses the levels of one name for each of its levels.
+		for i, level := range got {
+			if above := slices.Collect(parentLevels(level, delimiter)); !slices.Equal(above, got[:i]) {
+				t.Errorf("parentLevels(%q, %q) = %q, want the levels before it, %q", level, delimiter, above, got[:i])
+			}
 		}
 	})
 }
@@ -2363,5 +2371,833 @@ func Test_CreateMailbox_When_ParentAnswersAlreadyExists_Then_VerboseLogSaysSo(t 
 				t.Errorf("log = %q, want no line with %q", logged, tt.notWant)
 			}
 		})
+	}
+}
+
+// chainNames returns "a", "a/a", "a/a/a" and so on, depth names in byte order. Each name is the parent level of the next one.
+func chainNames(depth int) []string {
+	names := make([]string, depth)
+	for i := range names {
+		names[i] = strings.TrimSuffix(strings.Repeat("a/", i+1), "/")
+	}
+	return names
+}
+
+func Test_CreateMailbox_When_NamesFormADeepChain_Then_EachCallLocksOnlyItsNewLevels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		// pick maps the chain to the names that the test creates, in order.
+		pick func(chain []string) []string
+		name string
+		// wantLocks is the number of folder locks that one call takes.
+		wantLocks   int
+		wantParents int
+	}{
+		{name: "every level is created in turn", pick: func(chain []string) []string { return chain }, wantLocks: 1, wantParents: 0},
+		{
+			name: "only the even depths are created",
+			pick: func(chain []string) []string {
+				var even []string
+				for i := 1; i < len(chain); i += 2 {
+					even = append(even, chain[i])
+				}
+				return even
+			},
+			wantLocks:   2,
+			wantParents: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			totals := make(map[int]int)
+			for _, depth := range []int{256, 512} {
+				chain := chainNames(depth)
+				names := tt.pick(chain)
+				srv, c := newScriptedClient(t, &mailboxScript{})
+				c.delimiter = "/"
+				c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
+
+				for i, name := range names {
+					c.folderLocksMu.Lock()
+					clear(c.folderLocks)
+					c.folderLocksMu.Unlock()
+
+					created, parents, err := c.CreateMailbox(t.Context(), name)
+
+					if err != nil {
+						t.Fatalf("depth %d: CreateMailbox(depth %d): %v", depth, strings.Count(name, "/")+1, err)
+					}
+					if !created || parents != tt.wantParents {
+						t.Fatalf("depth %d: call %d: created, parents = %v, %d, want true, %d", depth, i, created, parents, tt.wantParents)
+					}
+					c.folderLocksMu.Lock()
+					locks := len(c.folderLocks)
+					c.folderLocksMu.Unlock()
+					if locks != tt.wantLocks {
+						t.Fatalf("depth %d: call %d (name of %d levels) took %d folder locks, want %d", depth, i, strings.Count(name, "/")+1, locks, tt.wantLocks)
+					}
+					totals[depth] += locks
+				}
+
+				if got := srv.capturedNames("CREATE"); !slices.Equal(got, chain) {
+					t.Errorf("depth %d: CREATE names differ from the chain: got %d names, want %d", depth, len(got), len(chain))
+				}
+			}
+
+			if totals[512] != 2*totals[256] {
+				t.Errorf("folder locks at depth 512 = %d, want twice the %d at depth 256", totals[512], totals[256])
+			}
+		})
+	}
+}
+
+func Test_missingLevels_When_NamesFormADeepChain_Then_EachLevelIsLookedUpOnce(t *testing.T) {
+	t.Parallel()
+
+	type lookups struct{ calls, bytes int }
+	tests := []struct {
+		// names picks the names to create, listed picks the chain depths that the cache holds.
+		names  func(chain []string) []string
+		listed func(depth int) bool
+		// want gives the list and the lookups that the walk needs for a chain.
+		want func(chain []string) ([]string, lookups)
+		name string
+	}{
+		{
+			name:   "empty cache and every level is a name",
+			names:  func(chain []string) []string { return chain },
+			listed: func(int) bool { return false },
+			want: func(chain []string) ([]string, lookups) {
+				var l lookups
+				for _, name := range chain {
+					l.calls++
+					l.bytes += len(name)
+				}
+				return chain, l
+			},
+		},
+		{
+			name: "only the names at even depths",
+			names: func(chain []string) []string {
+				var even []string
+				for i := 1; i < len(chain); i += 2 {
+					even = append(even, chain[i])
+				}
+				return even
+			},
+			listed: func(int) bool { return false },
+			want: func(chain []string) ([]string, lookups) {
+				var l lookups
+				for _, name := range chain {
+					l.calls++
+					l.bytes += len(name)
+				}
+				return chain, l
+			},
+		},
+		{
+			name:   "every third depth is listed",
+			names:  func(chain []string) []string { return chain },
+			listed: func(depth int) bool { return depth%3 == 0 },
+			want: func(chain []string) ([]string, lookups) {
+				var (
+					l    lookups
+					want []string
+				)
+				for i, name := range chain {
+					depth := i + 1
+					l.calls++
+					l.bytes += len(name)
+					if depth%3 == 0 {
+						// The next name looks its listed parent up again, as a level.
+						if depth+1 <= len(chain) {
+							l.calls++
+							l.bytes += len(name)
+						}
+						continue
+					}
+					want = append(want, name)
+				}
+				return want, l
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := make(map[int]lookups)
+			for _, depth := range []int{256, 512} {
+				chain := chainNames(depth)
+				cache := make(map[string]struct{})
+				for i, name := range chain {
+					if tt.listed(i + 1) {
+						cache[name] = struct{}{}
+					}
+				}
+				var l lookups
+				listed := func(name string) bool {
+					l.calls++
+					l.bytes += len(name)
+					_, ok := cache[name]
+					return ok
+				}
+
+				out, err := missingLevels(t.Context(), tt.names(chain), "/", listed)
+
+				if err != nil {
+					t.Fatalf("depth %d: missingLevels: %v", depth, err)
+				}
+				wantOut, wantLookups := tt.want(chain)
+				if !slices.Equal(out, wantOut) {
+					t.Fatalf("depth %d: got %d names, want %d: the list differs", depth, len(out), len(wantOut))
+				}
+				if l != wantLookups {
+					t.Errorf("depth %d: lookups = %+v, want %+v: each level needs a constant number of lookups", depth, l, wantLookups)
+				}
+				got[depth] = l
+			}
+
+			if got[512].calls != 2*got[256].calls {
+				t.Errorf("lookups at depth 512 = %d, want twice the %d at depth 256", got[512].calls, got[256].calls)
+			}
+		})
+	}
+}
+
+// numberedLevels returns n distinct levels and a predicate that holds for the first boundary of them. checks counts its calls.
+func numberedLevels(n, boundary int) (levels []string, marked func(string) bool, checks *int) {
+	levels = make([]string, n)
+	index := make(map[string]int, n)
+	for i := range levels {
+		levels[i] = strconv.Itoa(i)
+		index[levels[i]] = i
+	}
+	checks = new(int)
+	marked = func(level string) bool {
+		*checks++
+		return index[level] < boundary
+	}
+	return levels, marked, checks
+}
+
+func Test_firstUnmarked(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an empty list needs no check", func(t *testing.T) {
+		t.Parallel()
+
+		_, marked, checks := numberedLevels(0, 0)
+
+		if got := firstUnmarked(nil, marked); got != 0 {
+			t.Errorf("firstUnmarked(nil) = %d, want 0", got)
+		}
+		if *checks != 0 {
+			t.Errorf("checks = %d, want 0", *checks)
+		}
+	})
+
+	t.Run("one level", func(t *testing.T) {
+		t.Parallel()
+
+		for boundary := range 2 {
+			levels, marked, _ := numberedLevels(1, boundary)
+
+			if got := firstUnmarked(levels, marked); got != boundary {
+				t.Errorf("one level, boundary %d: firstUnmarked = %d, want %d", boundary, got, boundary)
+			}
+		}
+	})
+
+	t.Run("every level is marked", func(t *testing.T) {
+		t.Parallel()
+
+		for _, n := range []int{1, 2, 3, 8, 100} {
+			levels, marked, checks := numberedLevels(n, n)
+
+			if got := firstUnmarked(levels, marked); got != n {
+				t.Errorf("n=%d: firstUnmarked = %d, want %d", n, got, n)
+			}
+			if *checks != 1 {
+				t.Errorf("n=%d: checks = %d, want 1: the deepest level decides", n, *checks)
+			}
+		}
+	})
+
+	t.Run("no level is marked", func(t *testing.T) {
+		t.Parallel()
+
+		for _, n := range []int{1, 2, 3, 8, 100} {
+			levels, marked, checks := numberedLevels(n, 0)
+
+			if got := firstUnmarked(levels, marked); got != 0 {
+				t.Errorf("n=%d: firstUnmarked = %d, want 0", n, got)
+			}
+			if limit := 2 * bits.Len(uint(n)); *checks > limit {
+				t.Errorf("n=%d: checks = %d, want at most %d", n, *checks, limit)
+			}
+		}
+	})
+
+	t.Run("every boundary of short lists", func(t *testing.T) {
+		t.Parallel()
+
+		for n := 1; n <= 17; n++ {
+			for boundary := 0; boundary <= n; boundary++ {
+				levels, marked, checks := numberedLevels(n, boundary)
+
+				if got := firstUnmarked(levels, marked); got != boundary {
+					t.Errorf("n=%d boundary=%d: firstUnmarked = %d", n, boundary, got)
+				}
+				if limit := max(1, 2*bits.Len(uint(n-boundary))); *checks > limit {
+					t.Errorf("n=%d boundary=%d: checks = %d, want at most %d", n, boundary, *checks, limit)
+				}
+			}
+		}
+	})
+}
+
+func Test_firstUnmarked_When_BoundaryIsRandom_Then_MatchesALinearScanWithFewChecks(t *testing.T) {
+	t.Parallel()
+
+	rng := rand.New(rand.NewPCG(3, 5))
+	var gaps int
+	for i := range 2000 {
+		n := 1 + rng.IntN(1100)
+		boundary := rng.IntN(n + 1)
+		if i%4 == 0 {
+			// A refused level leaves everything below it unmarked, and a full chain marks everything.
+			boundary = n - rng.IntN(min(n, 3))
+		}
+		levels, marked, checks := numberedLevels(n, boundary)
+
+		got := firstUnmarked(levels, marked)
+
+		if got != boundary {
+			t.Fatalf("case %d: n=%d boundary=%d: firstUnmarked = %d", i, n, boundary, got)
+		}
+		if boundary == n {
+			if *checks != 1 {
+				t.Fatalf("case %d: n=%d: checks = %d, want 1 when every level is marked", i, n, *checks)
+			}
+			continue
+		}
+		gaps++
+		if limit := 2 * bits.Len(uint(n-boundary)); *checks > limit {
+			t.Fatalf("case %d: n=%d boundary=%d: checks = %d, want at most %d", i, n, boundary, *checks, limit)
+		}
+	}
+	// The seed is fixed, so this count only changes when the generator does.
+	if gaps < 1000 {
+		t.Errorf("the generator made %d lists with an unmarked level, want at least 1000", gaps)
+	}
+}
+
+func Test_firstUnmarked_When_Called_Then_AllocatesNothing(t *testing.T) {
+	levels, _, _ := numberedLevels(64, 40)
+	set := make(map[string]struct{}, 40)
+	for _, level := range levels[:40] {
+		set[level] = struct{}{}
+	}
+	marked := func(level string) bool {
+		_, ok := set[level]
+		return ok
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = firstUnmarked(levels, marked)
+	})
+
+	if allocs != 0 {
+		t.Errorf("firstUnmarked allocates %v times, want 0", allocs)
+	}
+}
+
+func cloneCache(m mailboxCache) mailboxCache {
+	m.folders = maps.Clone(m.folders)
+	m.noSelect = maps.Clone(m.noSelect)
+	m.inboxSpellings = maps.Clone(m.inboxSpellings)
+	m.rooted = nil
+	return m
+}
+
+// referenceMissingLevels is the plain per-name walk: for each name, its unlisted parent levels and then the name, merged in order without repeats.
+func referenceMissingLevels(cache *mailboxCache, delimiter string, names []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(name string) {
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	for _, name := range names {
+		if _, ok := cache.resolve(name); ok {
+			continue
+		}
+		for level := range parentLevels(name, delimiter) {
+			if _, ok := cache.resolve(level); !ok {
+				add(level)
+			}
+		}
+		add(name)
+	}
+	return out
+}
+
+type referenceCreation struct {
+	creates []string
+	parents int
+	created bool
+	failed  bool
+}
+
+// referenceCreate walks every parent level of one name and skips no rooted level. A name in refused gets a refusal, and each accepted name enters cache.
+func referenceCreate(cache *mailboxCache, delimiter, name string, refused map[string]bool) referenceCreation {
+	var r referenceCreation
+	if _, ok := cache.resolve(name); ok {
+		return r
+	}
+	accept := func(created string) {
+		cache.folders[created] = struct{}{}
+		cache.inboxSpellings = noteSpelling(cache.inboxSpellings, created, cache.delimiter)
+	}
+	for level := range parentLevels(name, delimiter) {
+		if _, ok := cache.resolve(level); ok {
+			continue
+		}
+		r.creates = append(r.creates, level)
+		if refused[level] {
+			r.failed = true
+			return r
+		}
+		accept(level)
+		r.parents++
+	}
+	r.creates = append(r.creates, name)
+	if refused[name] {
+		r.failed = true
+		return r
+	}
+	accept(name)
+	r.created = true
+	return r
+}
+
+type randomCreation struct {
+	cache     mailboxCache
+	delimiter string
+	names     []string
+}
+
+// The names spell the INBOX level one way, because the list is computed before any CREATE and an earlier CREATE would fold another spelling.
+func randomCreationCase(rng *rand.Rand) randomCreation {
+	delimiter := []string{"/", ".", "XYX", ""}[rng.IntN(4)]
+	plain := []string{"A", "a", "B", "[Gmail]", ""}
+	joiner := delimiter
+	switch delimiter {
+	case "XYX":
+		plain = []string{"a", "b", "XY", "YX", "X", "Y", ""}
+	case "":
+		joiner = "/"
+	}
+	inboxSpellings := []string{"INBOX", "Inbox", "inbox"}
+	nameWords := append([]string{inboxSpellings[rng.IntN(len(inboxSpellings))]}, plain...)
+	cacheWords := append(slices.Clone(inboxSpellings), plain...)
+	build := func(words []string, levels int) string {
+		parts := make([]string, levels)
+		for i := range parts {
+			parts[i] = words[rng.IntN(len(words))]
+		}
+		return strings.Join(parts, joiner)
+	}
+	extend := func(words []string, base string) string {
+		parts := []string{base}
+		for range rng.IntN(4) {
+			parts = append(parts, words[rng.IntN(len(words))])
+		}
+		return strings.Join(parts, joiner)
+	}
+
+	bases := make([]string, 1+rng.IntN(3))
+	for i := range bases {
+		bases[i] = build(nameWords, 1+rng.IntN(3))
+	}
+	names := make([]string, 0, 8)
+	for range 1 + rng.IntN(8) {
+		if name := extend(nameWords, bases[rng.IntN(len(bases))]); name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		names = append(names, "A")
+	}
+	if rng.IntN(2) == 0 {
+		slices.Sort(names)
+	}
+
+	cache := mailboxCache{folders: map[string]struct{}{}, noSelect: map[string]struct{}{}, delimiter: delimiter}
+	list := func(name string) {
+		// go-imap folds a bare INBOX to upper case before the cache sees it.
+		if strings.EqualFold(name, "INBOX") {
+			name = "INBOX"
+		}
+		cache.folders[name] = struct{}{}
+		cache.inboxSpellings = noteSpelling(cache.inboxSpellings, name, delimiter)
+		if rng.IntN(4) == 0 {
+			cache.noSelect[name] = struct{}{}
+		}
+	}
+	for range rng.IntN(5) {
+		list(extend(cacheWords, bases[rng.IntN(len(bases))]))
+	}
+	// A listed level of a name, without its own parents.
+	if rng.IntN(2) == 0 {
+		if levels := slices.Collect(parentLevels(names[rng.IntN(len(names))], delimiter)); len(levels) > 0 {
+			list(levels[rng.IntN(len(levels))])
+		}
+	}
+	if rng.IntN(3) == 0 {
+		list("INBOX")
+	}
+	return randomCreation{cache: cache, delimiter: delimiter, names: names}
+}
+
+func Test_MissingLevels_When_NamesAndCacheAreRandom_Then_TheListMatchesThePerNameWalkAndTheCreates(t *testing.T) {
+	t.Parallel()
+
+	t.Run("every CREATE is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		srv, c := newScriptedClient(t, &mailboxScript{})
+		rng := rand.New(rand.NewPCG(21, 4))
+		var nested, listed, multi, delimiters int
+		seenDelimiters := make(map[string]bool)
+		for i := range 300 {
+			tc := randomCreationCase(rng)
+			c.delimiter = tc.delimiter
+			c.mailboxCache = cloneCache(tc.cache)
+			model := cloneCache(tc.cache)
+			input := slices.Clone(tc.names)
+
+			want := referenceMissingLevels(&model, tc.delimiter, tc.names)
+			got, err := c.MissingLevels(t.Context(), tc.names...)
+
+			if err != nil {
+				t.Fatalf("case %d: MissingLevels(%q): %v", i, tc.names, err)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("case %d: MissingLevels(%q) = %q, want %q (delimiter %q, cache %v)", i, tc.names, got, want, tc.delimiter, slices.Sorted(maps.Keys(tc.cache.folders)))
+			}
+			if !slices.Equal(tc.names, input) {
+				t.Fatalf("case %d: MissingLevels changed its input: %q, want %q", i, tc.names, input)
+			}
+
+			var wire []string
+			for _, name := range tc.names {
+				before := len(srv.capturedNames("CREATE"))
+				wantCreate := referenceCreate(&model, tc.delimiter, name, nil)
+
+				created, parents, err := c.CreateMailbox(t.Context(), name)
+
+				if err != nil {
+					t.Fatalf("case %d: CreateMailbox(%q): %v", i, name, err)
+				}
+				sent := srv.capturedNames("CREATE")[before:]
+				if !slices.Equal(sent, wantCreate.creates) || created != wantCreate.created || parents != wantCreate.parents {
+					t.Fatalf("case %d: CreateMailbox(%q) sent %q and returned %v, %d, want %q and %v, %d (delimiter %q, cache %v)",
+						i, name, sent, created, parents, wantCreate.creates, wantCreate.created, wantCreate.parents, tc.delimiter, slices.Sorted(maps.Keys(tc.cache.folders)))
+				}
+				wire = append(wire, sent...)
+				if parents > 0 {
+					nested++
+				}
+				if len(wantCreate.creates) == 0 {
+					listed++
+				}
+			}
+			if !slices.Equal(wire, want) {
+				t.Fatalf("case %d: CREATE names = %q, want the list of MissingLevels %q", i, wire, want)
+			}
+			if len(tc.names) > 1 && len(want) > 0 {
+				multi++
+			}
+			if !seenDelimiters[tc.delimiter] {
+				seenDelimiters[tc.delimiter] = true
+				delimiters++
+			}
+		}
+		// The seed is fixed, so these counts only change when the generator does. They keep the loop from passing on trivial cases.
+		if nested < 300 || listed < 100 || multi < 150 || delimiters != 4 {
+			t.Errorf("the generator made %d calls with missing parents, %d calls for listed names, %d lists with several names and %d delimiters, want at least 300, 100, 150 and 4", nested, listed, multi, delimiters)
+		}
+	})
+
+	t.Run("one CREATE is refused", func(t *testing.T) {
+		t.Parallel()
+
+		rng := rand.New(rand.NewPCG(8, 13))
+		var refusedCases, retried int
+		for i := range 80 {
+			tc := randomCreationCase(rng)
+			probe := cloneCache(tc.cache)
+			var candidates []string
+			for _, name := range tc.names {
+				candidates = append(candidates, referenceCreate(&probe, tc.delimiter, name, nil).creates...)
+			}
+			replies := map[string]string{}
+			refused := map[string]bool{}
+			if len(candidates) > 0 {
+				victim := candidates[rng.IntN(len(candidates))]
+				replies[victim], refused[victim] = "NO [CANNOT] permission denied", true
+			}
+			srv, c := newScriptedClient(t, &mailboxScript{createReplies: replies})
+			c.delimiter = tc.delimiter
+			c.mailboxCache = cloneCache(tc.cache)
+			model := cloneCache(tc.cache)
+
+			var victimCalls int
+			for _, name := range tc.names {
+				before := len(srv.capturedNames("CREATE"))
+				want := referenceCreate(&model, tc.delimiter, name, refused)
+
+				created, parents, err := c.CreateMailbox(t.Context(), name)
+
+				sent := srv.capturedNames("CREATE")[before:]
+				if !slices.Equal(sent, want.creates) || created != want.created || parents != want.parents || (err != nil) != want.failed {
+					t.Fatalf("case %d: CreateMailbox(%q) sent %q and returned %v, %d, %v, want %q and %v, %d, failed=%v (delimiter %q, refused %v)",
+						i, name, sent, created, parents, err, want.creates, want.created, want.parents, want.failed, tc.delimiter, slices.Sorted(maps.Keys(refused)))
+				}
+				if want.failed {
+					victimCalls++
+				}
+			}
+			if victimCalls > 0 {
+				refusedCases++
+			}
+			if victimCalls > 1 {
+				retried++
+			}
+			for _, name := range tc.names {
+				for _, level := range append(slices.Collect(parentLevels(name, tc.delimiter)), name) {
+					_, wantCached := model.resolve(level)
+					if got := c.hasMailbox(level); got != wantCached {
+						t.Fatalf("case %d: hasMailbox(%q) = %v, want %v (refused %v)", i, level, got, wantCached, slices.Sorted(maps.Keys(refused)))
+					}
+				}
+			}
+		}
+		if refusedCases < 40 || retried < 5 {
+			t.Errorf("the generator made %d cases with a refusal and %d where a later name sends the refused CREATE again, want at least 40 and 5", refusedCases, retried)
+		}
+	})
+}
+
+func Test_CreateMailbox_When_AParentIsRefused_Then_EachLaterNameRetriesItAndChecksNoDeeperLevel(t *testing.T) {
+	t.Parallel()
+
+	const (
+		depth        = 64
+		refusedDepth = 10
+	)
+	chain := chainNames(depth)
+	refused := chain[refusedDepth-1]
+	srv, c := newScriptedClient(t, &mailboxScript{createReplies: map[string]string{refused: "NO [CANNOT] permission denied"}})
+	c.delimiter = "/"
+	c.mailboxCache = mailboxCache{folders: map[string]struct{}{}, delimiter: "/"}
+
+	for m := 1; m <= depth; m++ {
+		c.folderLocksMu.Lock()
+		clear(c.folderLocks)
+		c.folderLocksMu.Unlock()
+
+		created, parents, err := c.CreateMailbox(t.Context(), chain[m-1])
+
+		c.folderLocksMu.Lock()
+		locks := len(c.folderLocks)
+		c.folderLocksMu.Unlock()
+		var wantErr string
+		wantLocks := 2
+		switch {
+		case m < refusedDepth:
+			wantLocks = 1
+		case m == refusedDepth:
+			wantErr, wantLocks = "failed to create mailbox "+refused, 1
+		default:
+			wantErr = "failed to create parent folder " + refused
+		}
+		if wantErr == "" && (err != nil || !created) {
+			t.Fatalf("depth %d: CreateMailbox = %v, %v, want a created folder", m, created, err)
+		}
+		if wantErr != "" && (err == nil || created || !strings.Contains(err.Error(), wantErr)) {
+			t.Fatalf("depth %d: CreateMailbox = %v, %v, want an error that holds %q", m, created, err, wantErr)
+		}
+		if parents != 0 {
+			t.Errorf("depth %d: parents = %d, want 0: no CREATE of a parent was accepted", m, parents)
+		}
+		if locks != wantLocks {
+			t.Errorf("depth %d: %d folder locks, want %d: only the name and the refused level are walked", m, locks, wantLocks)
+		}
+	}
+
+	want := slices.Clone(chain[:refusedDepth-1])
+	for m := refusedDepth; m <= depth; m++ {
+		want = append(want, refused)
+	}
+	if got := srv.capturedNames("CREATE"); !slices.Equal(got, want) {
+		t.Errorf("CREATE names: got %d, want %d: the chain up to the refused level, then the refused level once for each later call", len(got), len(want))
+	}
+	c.mailboxCacheMu.RLock()
+	rooted := slices.Sorted(maps.Keys(c.mailboxCache.rooted))
+	c.mailboxCacheMu.RUnlock()
+	if wantRooted := slices.Sorted(slices.Values(chain[:refusedDepth-1])); !slices.Equal(rooted, wantRooted) {
+		t.Errorf("rooted names: got %d, want the %d levels above the refused one", len(rooted), len(wantRooted))
+	}
+}
+
+func Test_CreateMailbox_When_CacheIsReloadedAfterACreateWalk_Then_LevelsThatTheNewListLacksGetACreate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		afterWalk   func(t *testing.T, c *Client)
+		name        string
+		listed      []string
+		wantMissing []string
+		wantCreates []string
+	}{
+		{
+			name:        "the new list holds only INBOX",
+			listed:      []string{"INBOX"},
+			afterWalk:   func(t *testing.T, c *Client) { reload(t, c) },
+			wantMissing: []string{"A", "A/B", "A/B/C"},
+			wantCreates: []string{"A", "A/B", "A/B/C"},
+		},
+		{
+			name:        "the new list holds the first level",
+			listed:      []string{"INBOX", "A"},
+			afterWalk:   func(t *testing.T, c *Client) { reload(t, c) },
+			wantMissing: []string{"A/B", "A/B/C"},
+			wantCreates: []string{"A/B", "A/B/C"},
+		},
+		{
+			name:   "a statistics run keeps the cache",
+			listed: []string{"INBOX"},
+			afterWalk: func(t *testing.T, c *Client) {
+				t.Helper()
+				if _, err := c.ListMailboxes(t.Context()); err != nil {
+					t.Fatalf("ListMailboxes: %v", err)
+				}
+			},
+			wantMissing: []string{"A/B/C"},
+			wantCreates: []string{"A/B/C"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			script := &mailboxScript{}
+			for _, name := range tt.listed {
+				script.folders = append(script.folders, scriptFolder{name: name})
+			}
+			srv, c := newScriptedClient(t, script)
+			reload(t, c)
+			if _, _, err := c.CreateMailbox(t.Context(), "A/B"); err != nil {
+				t.Fatalf("CreateMailbox(A/B): %v", err)
+			}
+			before := len(srv.capturedNames("CREATE"))
+
+			tt.afterWalk(t, c)
+			missing, err := c.MissingLevels(t.Context(), "A/B/C")
+			if err != nil {
+				t.Fatalf("MissingLevels: %v", err)
+			}
+			if _, _, err := c.CreateMailbox(t.Context(), "A/B/C"); err != nil {
+				t.Fatalf("CreateMailbox(A/B/C): %v", err)
+			}
+
+			if !slices.Equal(missing, tt.wantMissing) {
+				t.Errorf("MissingLevels = %q, want %q", missing, tt.wantMissing)
+			}
+			if sent := srv.capturedNames("CREATE")[before:]; !slices.Equal(sent, tt.wantCreates) {
+				t.Errorf("CREATE names after the walk = %q, want %q", sent, tt.wantCreates)
+			}
+		})
+	}
+}
+
+// reload runs the LIST that New runs, and sets the Client delimiter as New does.
+func reload(t *testing.T, c *Client) {
+	t.Helper()
+	if err := c.loadMailboxCache(t.Context()); err != nil {
+		t.Fatalf("loadMailboxCache: %v", err)
+	}
+	c.delimiter = c.mailboxCache.delimiter
+}
+
+func Test_rooted_When_MarksAndReadsRunAtOnce_Then_RaceFree(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient()
+	c.delimiter = "/"
+	c.mailboxCache = mailboxCache{folders: map[string]struct{}{"INBOX": {}}, delimiter: "/"}
+	names := []string{"A", "A/B", "A/B/C", "A/B/C/D", "X/Y", "X/Y/Z", "inbox/Q", "INBOX/Q/R", "A//B", "/Z/W"}
+
+	const workers, rounds = 8, 400
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Go(func() {
+			rng := rand.New(rand.NewPCG(uint64(w), 17))
+			for range rounds {
+				name := names[rng.IntN(len(names))]
+				levels := slices.Collect(parentLevels(name, "/"))
+				parentOf := func(i int) string {
+					if i == 0 {
+						return ""
+					}
+					return levels[i-1]
+				}
+				switch rng.IntN(5) {
+				case 0:
+					c.mailboxCacheMu.Lock()
+					c.mailboxCache.add(name)
+					c.mailboxCacheMu.Unlock()
+				case 1:
+					for i, level := range levels {
+						c.markRooted(level, parentOf(i))
+					}
+				case 2:
+					for i, level := range levels {
+						c.addRooted(level, parentOf(i))
+					}
+					c.addRooted(name, parentOf(len(levels)))
+				case 3:
+					if i := c.firstUnrooted(levels); i < 0 || i > len(levels) {
+						t.Errorf("firstUnrooted(%q) = %d, want 0 to %d", levels, i, len(levels))
+					}
+				default:
+					if _, err := c.MissingLevels(t.Context(), names[rng.IntN(len(names))], name); err != nil {
+						t.Errorf("MissingLevels: %v", err)
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	c.mailboxCacheMu.RLock()
+	defer c.mailboxCacheMu.RUnlock()
+	for name := range c.mailboxCache.rooted {
+		if _, ok := c.mailboxCache.resolve(name); !ok {
+			t.Errorf("rooted name %q does not resolve", name)
+		}
+		for level := range parentLevels(name, "/") {
+			if _, ok := c.mailboxCache.rooted[level]; !ok {
+				t.Errorf("rooted name %q has the level %q that is not rooted", name, level)
+			}
+		}
 	}
 }

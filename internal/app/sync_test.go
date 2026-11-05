@@ -4493,6 +4493,99 @@ func TestRunSync_When_NewDestinationHasMoreMissingLevelsThanThePreviewShows_Then
 	})
 }
 
+func TestRunSync_When_MirrorSourceIsADeepChain_Then_PreviewCreatesAndCounterFollowTheChain(t *testing.T) {
+	t.Parallel()
+
+	const depth = 200
+	parts := numberedFolders(depth)
+	chain := make([]string, depth)
+	for i := range chain {
+		chain[i] = strings.Join(parts[:i+1], "/")
+	}
+	tests := []struct {
+		// holdsMail reports whether the source folder at the given depth, counted from 1, holds a message.
+		holdsMail func(depth int) bool
+		name      string
+		verbose   bool
+	}{
+		{name: "one message in each folder", holdsMail: func(int) bool { return true }},
+		{name: "messages only at even depths", holdsMail: func(depth int) bool { return depth%2 == 0 }},
+		{name: "messages only at even depths with verbose", holdsMail: func(depth int) bool { return depth%2 == 0 }, verbose: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srcFolders := map[string][]fakeMsg{"INBOX": nil}
+			messageIDs := make(map[string]string)
+			for i, folder := range chain {
+				srcFolders[folder] = nil
+				if tt.holdsMail(i + 1) {
+					messageIDs[folder] = fmt.Sprintf("m%03d@x", i+1)
+					srcFolders[folder] = fakeMsgs(messageIDs[folder])
+				}
+			}
+			src := newStoreServer(t, "/", srcFolders)
+			dst := newStoreServer(t, "/", map[string][]fakeMsg{"INBOX": nil})
+			mirror := func() string {
+				out := &syncBuffer{}
+				opts := e2eOptions(out, "")
+				opts.autoConfirm, opts.verbose = true, tt.verbose
+				if err := runSync(e2eContext(t), e2eConfig(src, dst, 1), opts); err != nil {
+					t.Fatalf("runSync: %v\noutput: %s", err, out.String())
+				}
+				return out.String()
+			}
+
+			raw := mirror()
+
+			wantBlock := foldersToCreateHeader + folderBullets(chain[:previewFolderLimit]...) +
+				fmt.Sprintf("• … and %d more\n", depth-previewFolderLimit) + fmt.Sprintf("\n📨 Total new messages to sync: %d", len(messageIDs))
+			assertContainsAll(t, raw, wantBlock)
+			assertIDs(t, "dst CREATE names", dst.capturedNames("CREATE"), chain...)
+			rows := screenRows(t, raw)
+			assertOneRow(t, rows, fmt.Sprintf("Created %d folders", depth), "✓ done")
+			for _, folder := range chain {
+				if id, ok := messageIDs[folder]; ok {
+					assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder), id)
+					continue
+				}
+				assertIDs(t, "dst "+folder, dst.folderMsgIDs(folder))
+			}
+			if tt.verbose {
+				var wantCreating, gotCreating []string
+				for i, folder := range chain {
+					if (i+1)%2 == 1 {
+						wantCreating = append(wantCreating, "[dst] Creating parent folder: "+folder)
+						created := "[dst] Created parent folder: " + folder
+						if n := len(slices.DeleteFunc(slices.Clone(rows), func(row string) bool { return row != created })); n != 1 {
+							t.Errorf("screen holds the row %q %d times, want 1", created, n)
+						}
+					}
+				}
+				for _, row := range rows {
+					if strings.HasPrefix(row, "[dst] Creating parent folder: ") {
+						gotCreating = append(gotCreating, row)
+					}
+				}
+				assertIDs(t, "parent folders that the run creates, one line each", gotCreating, wantCreating...)
+			}
+
+			createsBefore, appendsBefore := dst.callCount("CREATE"), dst.callCount("APPEND")
+
+			second := mirror()
+
+			assertContainsAll(t, second, "All folders already synced!")
+			if n := dst.callCount("CREATE") - createsBefore; n != 0 {
+				t.Errorf("the second run sent %d CREATE commands, want 0", n)
+			}
+			if n := dst.callCount("APPEND") - appendsBefore; n != 0 {
+				t.Errorf("the second run sent %d APPEND commands, want 0", n)
+			}
+		})
+	}
+}
+
 func TestRunSync_When_TypedDestinationHasAnEmptyLevel_Then_RunIsRefusedBeforeAnyCommandThatChangesTheDestination(t *testing.T) {
 	t.Parallel()
 

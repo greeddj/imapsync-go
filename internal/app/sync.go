@@ -753,27 +753,9 @@ func destinationsToCreate(plans []FolderSyncPlan) []string {
 	return slices.Compact(folders)
 }
 
-// MissingLevels decides the names, so the preview and the creation counter match the CREATE commands while the server accepts each one.
+// One MissingLevels call decides the names, so the preview and the creation counter match the CREATE commands while the server accepts each one.
 func foldersToCreate(ctx context.Context, destinations []string, dst *client.Client) ([]string, error) {
-	names := make([]string, 0, len(destinations))
-	listed := make(map[string]struct{}, len(destinations))
-	for _, destination := range destinations {
-		levels, err := dst.MissingLevels(ctx, destination)
-		if err != nil {
-			return nil, err
-		}
-		for _, level := range levels {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if _, dup := listed[level]; dup {
-				continue
-			}
-			listed[level] = struct{}{}
-			names = append(names, level)
-		}
-	}
-	return names, nil
+	return dst.MissingLevels(ctx, destinations...)
 }
 
 func printFoldersToCreate(out io.Writer, names []string) {
