@@ -4503,7 +4503,7 @@ func TestRunSync_When_MirrorSourceIsADeepChain_Then_PreviewCreatesAndCounterFoll
 		chain[i] = strings.Join(parts[:i+1], "/")
 	}
 	tests := []struct {
-		// holdsMail reports whether the source folder at the given depth, counted from 1, holds a message.
+		// depth counts from 1.
 		holdsMail func(depth int) bool
 		name      string
 		verbose   bool
@@ -5656,6 +5656,33 @@ func Test_foldersToCreate_When_ContextEnded_Then_ReturnsContextError(t *testing.
 				t.Errorf("foldersToCreate = %q, want no names", got)
 			}
 		})
+	}
+}
+
+func Test_foldersToCreate_When_DestinationsFormADeepChain_Then_AllocationsDoNotGrowWithEachName(t *testing.T) {
+	dstClient := newDestinationClient(t, "/")
+
+	for _, depth := range []int{256, 512} {
+		chain := make([]string, depth)
+		for i := range chain {
+			chain[i] = strings.TrimSuffix(strings.Repeat("a/", i+1), "/")
+		}
+
+		var got []string
+		allocs := testing.AllocsPerRun(5, func() {
+			var err error
+			got, err = foldersToCreate(t.Context(), chain, dstClient)
+			if err != nil {
+				t.Fatalf("foldersToCreate: %v", err)
+			}
+		})
+
+		if len(got) != depth {
+			t.Fatalf("depth %d: foldersToCreate returned %d names, want %d", depth, len(got), depth)
+		}
+		if limit := float64(depth) / 8; allocs > limit {
+			t.Errorf("depth %d: foldersToCreate allocates %v times, want at most %v: one MissingLevels call serves the whole list", depth, allocs, limit)
+		}
 	}
 }
 
