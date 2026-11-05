@@ -19,7 +19,7 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 4. **`AppendMessage` streams the literal** - `msg.GetBody(...)` is handed straight to `cli.Append`. No `io.ReadAll`. After a `ClassTransient` failure, it reconnects and sends the APPEND again one time, only when go-imap did not start to read the body. After go-imap started to read the body, it sends no second APPEND, because the server can already have the message. The next run's Message-Id diff copies it. Do not move `AppendMessage` into `safeCall`, because `safeCall` retries also after a partial read.
 5. **`StreamMessagesByUIDs` batches at `uidFetchBatchSize = 500`.** Do not unbatch - servers reject longer arg lists.
 6. **`selectIfNeeded` over `cli.Select`.** It sends no EXAMINE when the go-imap session reports the folder as selected, which saves a round-trip per batch. A BYE, a failed EXAMINE and a reconnect each clear that state. Do not store the selected folder in the Client: a stored copy can be different from the real session.
-7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. Do not re-LIST eagerly.
+7. **Mailbox cache populated by one `LIST "" "*"` per Client.** `CreateMailbox` adds the new mailbox to the cache. It marks the mailbox as rooted (`rooted`) when its parent level is rooted, or when it has no parent level. Only `loadMailboxCache` clears the marks. Do not re-LIST eagerly.
 8. **`FetchMessageMap` limits the size hint of its map to `maxMessageMapHint`.** The server sets the message count, and a very large count must not cause a large allocation.
 9. **The body stream has no read-ahead buffer.** The message channel of `StreamMessagesByUIDs` has no buffer, because go-imap holds each body fully in memory. A worker then holds at most two bodies. `messageChanBuffer` is only for the scans that fetch no body.
 10. **Each planned UID ends once, as copied, as an error or as gone.** A response without a body never reaches the callback. `ExistingUIDs` tells a message that the source did not deliver from a message that the source no longer holds. A refused UID FETCH batch costs only that batch, and `StreamError` carries the failed batches.
@@ -71,7 +71,8 @@ Read [CLAUDE.md](../../CLAUDE.md) first - this file only adds review-time emphas
 ## Concurrency
 
 - Workers are clamped `[1, 10]` in `config.New`. A value out of range changes to the nearest limit. Do not surface this as a runtime panic.
-- Folder creation uses per-path `sync.Mutex` from `Client.folderLocks`. Do not replace with a global mutex - concurrent creates of unrelated paths must not serialise.
+- Folder creation uses a per-path `sync.Mutex` from `Client.folderLocks`. The lock guards the cache check and the CREATE of one path.
+- `runSync` calls `CreateMailbox` one at a time, because one go-imap v1 Client cannot run two commands at the same time. Do not call `CreateMailbox` on one Client from two goroutines.
 - The worker pool is **persistent**: each worker owns one src + one dst `Client` for the whole sync. Do not reconnect per plan.
 - `runSync` logs out both planning clients before `newSyncWorkerPool`, and no later phase uses them. So `max_connections` counts only worker sessions. A `sync.OnceFunc` gives each planning session one LOGOUT, also when an earlier return ends the run. A worker never reuses a planning client.
 

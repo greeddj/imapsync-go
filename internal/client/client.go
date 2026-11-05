@@ -143,9 +143,7 @@ type Client struct {
 type progressWriterRef struct{ pw ProgressWriter }
 type progressTrackerRef struct{ t ProgressTracker }
 
-// folderLock returns the mutex guarding creation of the given folder path.
-// Locks are per-Client; concurrent CreateMailbox calls on the same instance
-// for nested paths can race on parent creation without this.
+// folderLock returns the mutex that guards the cache check and the CREATE of one path. runSync creates folders one at a time, because go-imap v1 is not goroutine-safe.
 func (c *Client) folderLock(path string) *sync.Mutex {
 	c.mailboxCacheMu.RLock()
 	key := canonicalName(path, c.mailboxCache.delimiter)

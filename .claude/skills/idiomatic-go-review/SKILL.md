@@ -25,7 +25,7 @@ You are reviewing Go in `imapsync-go`. The conventions are stricter than the com
 - `StreamMessagesByUIDs` - batched UID FETCH in chunks of 500, ranges a channel.
 - `FetchMessageMap` / `FetchMessageCopies` - envelope-only via `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`, no full body.
 - `Client.pw` / `Client.tracker` - `atomic.Pointer`, never raw fields.
-- Per-folder `sync.Mutex` map (`folderLocks`) - fine-grained, not a global mutex.
+- Per-path `sync.Mutex` map (`folderLocks`) - guards the cache check and the CREATE of one path. `runSync` calls `CreateMailbox` one at a time.
 
 If a new piece of code is heavier than the equivalent in this list, push back. The codebase has a high bar; new contributions inherit it.
 

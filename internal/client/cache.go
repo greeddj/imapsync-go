@@ -29,7 +29,7 @@ type mailboxCache struct {
 	noSelect map[string]struct{}
 	// Maps the canonical form of a listed name under the cache delimiter to its listed spelling, only where the two differ. Nil when none differs.
 	inboxSpellings map[string]string
-	// Names that the cache holds with every parent level, under the keys that CreateMailbox used. A new LIST drops them.
+	// Names that the cache holds with every parent level, under the keys that CreateMailbox used. Only loadMailboxCache clears them.
 	rooted map[string]struct{}
 	// Empty when no LIST entry names a delimiter: NIL marks a flat namespace (RFC 3501).
 	delimiter string
@@ -233,7 +233,7 @@ func (m *mailboxCache) add(name string) {
 	m.inboxSpellings = noteSpelling(m.inboxSpellings, name, m.delimiter)
 }
 
-// A level needs a cached name and a rooted or empty parent, so rooted stays closed under the parent level. The caller holds the write lock.
+// A level needs a cached name and a rooted or empty parent, so each rooted name has its parent levels in the set. The caller holds the write lock.
 func (m *mailboxCache) markRooted(level, parent string) {
 	if _, ok := m.resolve(level); !ok {
 		return

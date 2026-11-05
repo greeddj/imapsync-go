@@ -97,7 +97,7 @@ func (c *Client) CreateMailbox(ctx context.Context, name string) (created bool, 
 	return true, parents, nil
 }
 
-// MissingLevels lists the names that CreateMailbox sends a CREATE for, run on names in order: missing parents from the top, then the name. A cached name adds none.
+// MissingLevels lists the CREATE targets of CreateMailbox for resolved names in order: missing parents from the top, then the name. A shared level appears once. A cached name adds none.
 func (c *Client) MissingLevels(ctx context.Context, names ...string) ([]string, error) {
 	c.mailboxCacheMu.RLock()
 	defer c.mailboxCacheMu.RUnlock()
@@ -110,7 +110,7 @@ func (c *Client) MissingLevels(ctx context.Context, names ...string) ([]string, 
 func missingLevels(ctx context.Context, names []string, delimiter string, listed func(string) bool) ([]string, error) {
 	var (
 		out []string
-		// seen holds each level whose parent levels this call checked: a string costs at most one lookup as a level, plus one per item of names.
+		// seen holds each unlisted name and all its parent levels, so firstUnmarked finds a prefix. This bounds cache lookups to one per distinct level, plus one per name.
 		seen   map[string]struct{}
 		levels []string
 	)
@@ -145,7 +145,7 @@ func missingLevels(ctx context.Context, names []string, delimiter string, listed
 	return out, nil
 }
 
-// firstUnmarked needs marked to hold for a prefix of levels. It probes from the deepest level: a growing chain costs one check, a gap a logarithmic number.
+// marked must hold for a prefix of levels and then fail. firstUnmarked probes from the deepest level: a growing chain costs one check, a gap a logarithmic number.
 func firstUnmarked(levels []string, marked func(string) bool) int {
 	n := len(levels)
 	if n == 0 {
@@ -196,7 +196,7 @@ func parentLevels(name, delimiter string) iter.Seq[string] {
 	}
 }
 
-// made counts the CREATE commands that the server accepted, also when err is set. Rooted levels and the levels above them are cached, so the walk skips them.
+// made counts the CREATE commands that the server accepted, also when err is set. A rooted level has every level above it cached, so the walk skips them.
 func (c *Client) createParentFolders(ctx context.Context, levels []string) (made int, err error) {
 	for i := c.firstUnrooted(levels); i < len(levels); i++ {
 		if ctxErr := ctx.Err(); ctxErr != nil {
