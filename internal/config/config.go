@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/urfave/cli/v3"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 // Sentinel errors returned by Config.validate. Callers can match on these
@@ -191,7 +191,7 @@ func decodeYAML(data []byte, cfg *Config) error {
 	return restoreNullMapEntries(data, cfg)
 }
 
-// yaml.v3 drops a null sequence item. Keep it as an empty entry, so validate
+// go-yaml drops a null sequence item. Keep it as an empty entry, so validate
 // rejects it and reports its position in the file.
 func restoreNullMapEntries(data []byte, cfg *Config) error {
 	var raw struct {

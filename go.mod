@@ -6,10 +6,10 @@ require (
 	github.com/emersion/go-imap v1.2.1
 	github.com/jedib0t/go-pretty/v6 v6.9.1
 	github.com/urfave/cli/v3 v3.14.0
+	go.yaml.in/yaml/v4 v4.0.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/term v0.48.0
 	golang.org/x/time v0.16.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

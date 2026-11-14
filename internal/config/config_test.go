@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/urfave/cli/v3"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 func writeConfigFile(t *testing.T, ext, content string) string {
